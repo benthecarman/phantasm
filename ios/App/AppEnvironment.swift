@@ -88,12 +88,12 @@ final class AppEnvironment {
 
     func refreshCapabilities() async {
         guard let profile = activeProfile,
-              let base = profile.baseURL,
-              let token = keychain.token(for: profile.id) else {
+              let base = profile.baseURL else {
             backendMode = .plainChatOnly(models: [])
             return
         }
         isProbing = true
+        let token = keychain.token(for: profile.id) ?? ""
         backendMode = await capabilitiesClient.probe(base: base, token: token)
         isProbing = false
         // Cache the discovered model list so it's available instantly next launch.
