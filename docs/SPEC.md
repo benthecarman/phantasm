@@ -51,6 +51,17 @@ response shape and SSE token streaming. This is the **only** chat endpoint and
 MUST work against raw Ollama unchanged. No separate tool endpoint, no custom
 WebSocket protocol — tools are invisible to the app.
 
+### 2.2a Model warm-up (optional, additive)
+
+`POST /v1/warm` with `{ "model": "…" }` (model optional → server default).
+Best-effort preload so the first turn skips cold-start; the app calls it on
+launch and on model switch. For a native-Ollama upstream the server issues a
+no-message "load" (model resident via `keep_alive`, zero tokens); for any other
+upstream it is a no-op. Returns `{ "warmed": bool, "model": "…" }` and MUST NOT
+error the caller — a bare Ollama (no orchestrator) simply lacks this route, and
+the app degrades to a native `/api/chat` load instead. Plain OpenAI-compatible
+backends are not warmed (no free preload).
+
 ### 2.3 Tools are server-side and invisible to the app
 
 Tool execution happens entirely on the **orchestrator ↔ Ollama** hop using

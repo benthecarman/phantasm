@@ -15,6 +15,7 @@ final class AppEnvironment {
     let chatClient = ChatClient()
     let ollamaChatClient = OllamaNativeChatClient()
     let capabilitiesClient = CapabilitiesClient()
+    let warmupClient = WarmupClient()
 
     var profiles: [BackendProfile]
     var activeProfileID: UUID?
@@ -123,6 +124,26 @@ final class AppEnvironment {
         let models = backendMode.models
         if !models.isEmpty {
             profileStore.cacheModels(models, for: profile.id)
+        }
+        warmActiveModel(base: base, token: token)
+    }
+
+    /// Kick off a best-effort preload of the model new chats will use, so the
+    /// first turn after launch / a backend switch skips cold-start.
+    private func warmActiveModel(base: URL, token: String) {
+        guard let model = preferredModel else { return }
+        warm(model: model)
+    }
+
+    /// Fire-and-forget preload of a specific model on the active backend (e.g.
+    /// after the user picks a different model). Failures are silent and never
+    /// block the UI.
+    func warm(model: String) {
+        guard let base = activeProfile?.baseURL else { return }
+        let token = activeToken ?? ""
+        let mode = backendMode
+        Task.detached { [warmupClient] in
+            await warmupClient.warm(model: model, base: base, token: token, mode: mode)
         }
     }
 }

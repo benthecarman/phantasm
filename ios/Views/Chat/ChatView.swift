@@ -125,7 +125,11 @@ struct ChatView: View {
     private var modelBinding: Binding<String> {
         Binding(
             get: { conversation.modelID ?? env.preferredModel ?? "" },
-            set: { conversation.modelID = $0; try? context.save() }
+            set: {
+                conversation.modelID = $0
+                try? context.save()
+                env.warm(model: $0)
+            }
         )
     }
 

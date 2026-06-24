@@ -244,6 +244,45 @@ async fn non_streaming_returns_completion() {
 }
 
 #[tokio::test]
+async fn warm_loads_native_ollama_model() {
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator(&ollama).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/warm"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({ "model": "m" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["warmed"], true);
+    assert_eq!(v["model"], "m");
+}
+
+#[tokio::test]
+async fn warm_is_noop_for_openai_compatible_upstream() {
+    let openai = spawn(mock_openai_compatible()).await;
+    let base = spawn_orchestrator_with_kind(&openai, UpstreamKind::OpenAICompatible).await;
+
+    // No model given → falls back to the configured default; not an error.
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/warm"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["warmed"], false);
+    assert_eq!(v["model"], "m");
+}
+
+#[tokio::test]
 async fn missing_token_is_rejected() {
     let ollama = spawn(mock_ollama()).await;
     let base = spawn_orchestrator(&ollama).await;
