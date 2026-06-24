@@ -27,7 +27,12 @@ struct HistoryDrawer: View {
             Divider()
             footer
         }
-        .background(.background)
+        .background(Color(.secondarySystemBackground))
+        .overlay(alignment: .trailing) {
+            // A hairline on the edge that faces the chat so the drawer reads as a
+            // distinct surface instead of bleeding into the content behind it.
+            Divider()
+        }
     }
 
     private var header: some View {
@@ -35,10 +40,6 @@ struct HistoryDrawer: View {
             Text("Chats")
                 .font(.title3.weight(.semibold))
             Spacer()
-            Button(action: onNewChat) {
-                Image(systemName: "square.and.pencil")
-            }
-            .disabled(env.activeProfile == nil)
         }
         .padding(.horizontal, 16)
         .padding(.top, 14)
@@ -99,12 +100,15 @@ struct HistoryDrawer: View {
                 }
                 .buttonStyle(.plain)
                 .listRowBackground(
-                    result.conversation.id == selection?.id ? Color.accentColor.opacity(0.12) : nil
+                    result.conversation.id == selection?.id ? Color.accentColor.opacity(0.12) : Color.clear
                 )
             }
             .onDelete(perform: deleteConversations)
         }
         .listStyle(.plain)
+        // Let the drawer's surface show through the list instead of the list's own
+        // (system-background) fill, so the whole sidebar reads as one color.
+        .scrollContentBackground(.hidden)
     }
 
     private var footer: some View {
