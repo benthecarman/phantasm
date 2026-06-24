@@ -129,7 +129,7 @@ struct HistoryDrawer: View {
     private var backendModeLabel: String {
         switch env.backendMode {
         case .full:
-            return env.backendMode.showsTools ? "Full (tools available)" : "Full"
+            return env.backendMode.showsTools ? "Tools enabled" : "Tools disabled"
         case .ollamaNative:
             return "Ollama native"
         case .plainChatOnly:
