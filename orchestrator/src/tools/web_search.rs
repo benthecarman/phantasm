@@ -9,6 +9,7 @@
 
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +17,8 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
+
+const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WebSearchArgs {
@@ -134,6 +137,7 @@ async fn do_search(
         .header("Accept", "application/json")
         .header("Accept-Encoding", "gzip")
         .header("X-Subscription-Token", token)
+        .timeout(SEARCH_REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("backend unreachable: {e}"))?;
@@ -200,7 +204,6 @@ async fn fetch_pages(
     results: &[BraveResult],
 ) -> Vec<Option<String>> {
     use futures_util::stream::{self, StreamExt};
-    use std::time::Duration;
 
     let timeout = Duration::from_millis(cfg.search_fetch_timeout_ms);
     let per_extract_cap = (cfg.search_context_char_cap / results.len().max(1)).max(200);

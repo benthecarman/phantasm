@@ -22,6 +22,10 @@ use crate::config::Config;
 use crate::ollama::OllamaClient;
 use crate::state::{CapabilitySnapshot, ToolFlags};
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const OLLAMA_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Compute the capabilities manifest from config + bounded startup probes (FR-O1).
 pub async fn probe_capabilities(
     cfg: &Config,
@@ -31,7 +35,7 @@ pub async fn probe_capabilities(
     let models = if !cfg.models.is_empty() {
         cfg.models.clone()
     } else {
-        match tokio::time::timeout(Duration::from_secs(2), ollama.list_models()).await {
+        match tokio::time::timeout(PROBE_TIMEOUT, ollama.list_models()).await {
             Ok(Ok(m)) => m,
             _ => {
                 warn!("could not list Ollama models at startup; advertising none");
@@ -59,8 +63,9 @@ pub async fn probe_capabilities(
 /// Cheap reachability check with a short timeout; failures are non-fatal.
 pub async fn probe_reachable(http: &reqwest::Client, base: &str, path: &str) -> bool {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let request = http.get(url).timeout(PROBE_TIMEOUT).send();
     matches!(
-        tokio::time::timeout(Duration::from_secs(2), http.get(url).send()).await,
+        tokio::time::timeout(PROBE_TIMEOUT, request).await,
         Ok(Ok(resp)) if resp.status().is_success()
     )
 }
@@ -68,7 +73,10 @@ pub async fn probe_reachable(http: &reqwest::Client, base: &str, path: &str) -> 
 /// Build `AppState` from a loaded config (shared by `main` and tests).
 pub fn build_state(cfg: Arc<Config>, capabilities: Arc<CapabilitySnapshot>) -> state::AppState {
     let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(CONNECT_TIMEOUT)
+        // Per-read only: streaming responses may run indefinitely as long as
+        // bytes keep arriving, but a stalled backend will release its turn.
+        .read_timeout(OLLAMA_READ_TIMEOUT)
         .build()
         .expect("building HTTP client");
     let ollama = OllamaClient::new(http.clone(), cfg.ollama_base.clone());

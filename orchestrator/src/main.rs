@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
     // A throwaway client just for the startup probes; AppState builds its own.
     let probe_http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(2))
         .build()
         .context("building HTTP client")?;
     let probe_ollama = OllamaClient::new(probe_http.clone(), cfg.ollama_base.clone());
