@@ -28,7 +28,7 @@ struct RootView: View {
         .gesture(edgeOpenGesture)
         .animation(.interactiveSpring(response: 0.35, dampingFraction: 0.85), value: isDrawerOpen)
         .sheet(isPresented: $showSettings) {
-            SettingsView()
+            SettingsView(onHistoryCleared: { startNewChat() })
         }
         .task {
             if selection == nil { selection = makeNewChat() }

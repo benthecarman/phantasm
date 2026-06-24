@@ -6,8 +6,14 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
+
+    /// Invoked after chat history is fully cleared, so the host can drop the
+    /// (now-tombstoned) open conversation and present a fresh chat.
+    var onHistoryCleared: () -> Void = {}
+
     @State private var editing: BackendProfile?
     @State private var isCreating = false
+    @State private var isConfirmingDeleteAll = false
 
     var body: some View {
         NavigationStack {
@@ -59,6 +65,16 @@ struct SettingsView: View {
                         Label("Add Backend", systemImage: "plus")
                     }
                 }
+
+                Section {
+                    Button(role: .destructive) {
+                        isConfirmingDeleteAll = true
+                    } label: {
+                        Label("Delete All Chat History", systemImage: "trash")
+                    }
+                } footer: {
+                    Text("Permanently removes every conversation and its messages from this device. This can't be undone.")
+                }
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -71,6 +87,22 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $isCreating) {
                 ProfileEditView(profile: nil)
+            }
+            .confirmationDialog(
+                "Delete all chat history?",
+                isPresented: $isConfirmingDeleteAll,
+                titleVisibility: .visible
+            ) {
+                Button("Delete All", role: .destructive) {
+                    let store = env.store
+                    Task {
+                        try? await store.deleteAllConversations()
+                        onHistoryCleared()
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This permanently removes every conversation from this device and can't be undone.")
             }
         }
     }

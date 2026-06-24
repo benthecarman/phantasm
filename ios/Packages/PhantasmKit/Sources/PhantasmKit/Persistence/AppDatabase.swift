@@ -143,6 +143,19 @@ extension AppDatabase: ChatStore {
         }
     }
 
+    public func deleteAllConversations() async throws {
+        try await dbWriter.write { db in
+            // Hard-delete all messages (cascades to attachments + fires FTS
+            // triggers), then tombstone every live conversation — same shape as
+            // deleteConversation, applied across the whole history.
+            try Message.deleteAll(db)
+            let now = Date()
+            try Conversation
+                .filter(Col.deletedAt == nil)
+                .updateAll(db, Col.deletedAt.set(to: now), Column("updatedAt").set(to: now))
+        }
+    }
+
     public func conversationDetail(id: UUID) async throws -> ConversationDetail? {
         try await dbWriter.read { db in try Self.conversationDetail(db, id: id) }
     }

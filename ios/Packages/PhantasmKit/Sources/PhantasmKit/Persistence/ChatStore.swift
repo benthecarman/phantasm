@@ -55,6 +55,10 @@ public protocol ChatStore: Sendable {
     /// + attachments, reclaiming the heavy data while leaving a slim tombstone.
     func deleteConversation(id: UUID) async throws
 
+    /// Tombstone every conversation and hard-delete all messages + attachments —
+    /// the bulk equivalent of `deleteConversation` across the whole history.
+    func deleteAllConversations() async throws
+
     /// One-shot fetch of a conversation with its ordered message history. Returns
     /// nil if the conversation is missing or tombstoned.
     func conversationDetail(id: UUID) async throws -> ConversationDetail?
