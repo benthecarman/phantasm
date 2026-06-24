@@ -15,6 +15,7 @@ struct ProfileEditView: View {
     @State private var defaultModel: String
     @State private var testResult: TestResult?
     @State private var isTesting = false
+    @State private var revealToken = false
     @State private var models: [String] = []
     @State private var loadingModels = false
 
@@ -39,7 +40,27 @@ struct ProfileEditView: View {
                     TextField("Name", text: $name)
                     TextField("Base URL (e.g. https://ollama.example.ts.net)", text: $urlString)
                         .textInputAutocapitalization(.never)
-                    SecureField("Bearer token", text: $token)
+                    HStack {
+                        Group {
+                            if revealToken {
+                                TextField("Bearer token", text: $token)
+                            } else {
+                                SecureField("Bearer token", text: $token)
+                            }
+                        }
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        if !token.isEmpty {
+                            Button {
+                                revealToken.toggle()
+                            } label: {
+                                Image(systemName: revealToken ? "eye.slash" : "eye")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel(revealToken ? "Hide token" : "Reveal token")
+                        }
+                    }
                 }
 
                 Section {
@@ -130,14 +151,14 @@ struct ProfileEditView: View {
     }
 
     private func loadModels() async {
-        guard let base = URL(string: urlString) else { return }
+        guard let base = URL(string: BackendProfile.normalizedBaseURLString(urlString)) else { return }
         loadingModels = true
         models = await env.capabilitiesClient.models(base: base, token: normalizedToken)
         loadingModels = false
     }
 
     private func test() async {
-        guard let base = URL(string: urlString) else { return }
+        guard let base = URL(string: BackendProfile.normalizedBaseURLString(urlString)) else { return }
         isTesting = true
         testResult = nil
         let result = await env.capabilitiesClient.validate(base: base, token: normalizedToken)
@@ -170,7 +191,7 @@ struct ProfileEditView: View {
         let profile = BackendProfile(
             id: existing?.id ?? UUID(),
             name: name.trimmingCharacters(in: .whitespaces),
-            baseURLString: urlString.trimmingCharacters(in: .whitespaces),
+            baseURLString: BackendProfile.normalizedBaseURLString(urlString),
             defaultModel: defaultModel.isEmpty ? nil : defaultModel
         )
         let token = normalizedToken

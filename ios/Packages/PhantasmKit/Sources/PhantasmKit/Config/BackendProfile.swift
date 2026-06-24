@@ -16,7 +16,22 @@ public struct BackendProfile: Identifiable, Codable, Sendable, Hashable {
     }
 
     public var baseURL: URL? {
-        URL(string: baseURLString)
+        URL(string: Self.normalizedBaseURLString(baseURLString))
+    }
+
+    /// Normalizes a user-entered base URL to the host root the networking layer
+    /// expects. The clients append `v1/...` (and `api/...`) paths themselves, so
+    /// a pasted OpenAI-style `https://host/v1` would otherwise double up to
+    /// `/v1/v1/chat/completions`. Trims surrounding whitespace, drops trailing
+    /// slashes, and strips a single trailing `/v1` segment (case-insensitive).
+    public static func normalizedBaseURLString(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while s.hasSuffix("/") { s.removeLast() }
+        if s.lowercased().hasSuffix("/v1") {
+            s.removeLast(3)
+            while s.hasSuffix("/") { s.removeLast() }
+        }
+        return s
     }
 }
 
