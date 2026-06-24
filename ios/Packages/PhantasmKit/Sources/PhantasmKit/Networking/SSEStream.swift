@@ -154,6 +154,20 @@ public protocol ChatClienting: Sendable {
         -> AsyncThrowingStream<ChatStreamEvent, Error>
 }
 
+public extension ChatClienting {
+    /// Run a request to completion and return the concatenated assistant text,
+    /// ignoring status/progress events. Drains the token stream so it reuses the
+    /// same transport + auth as a normal turn (and works for every backend).
+    /// Intended for short side-queries such as title generation.
+    func complete(_ request: ChatRequest, base: URL, token: String) async throws -> String {
+        var text = ""
+        for try await event in stream(request, base: base, token: token) {
+            if case .token(let t) = event { text += t }
+        }
+        return text
+    }
+}
+
 /// OpenAI-compatible streaming client over `URLSession.bytes`.
 public struct ChatClient: ChatClienting {
     private let session: URLSession

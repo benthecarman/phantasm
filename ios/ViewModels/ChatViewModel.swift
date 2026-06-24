@@ -18,6 +18,7 @@ final class ChatViewModel {
     private var context: ModelContext?
     private var conversation: Conversation?
     private var task: Task<Void, Never>?
+    private var titleTask: Task<Void, Never>?
 
     func configure(env: AppEnvironment, context: ModelContext, conversation: Conversation) {
         self.env = env
@@ -128,11 +129,65 @@ final class ChatViewModel {
             context.insert(assistant)
             conversation.updatedAt = .now
             try? context.save()
+
+            // After the very first assistant reply, replace the first-message
+            // placeholder title with a model-generated one (FR: auto-naming).
+            if conversation.messages.filter({ $0.role == "assistant" }).count == 1 {
+                generateTitle()
+            }
         }
         streamingText = ""
 
         if let error, error != .cancelled {
             errorMessage = error.userMessage
         }
+    }
+
+    /// Side-query the model for a short conversation title once the first reply
+    /// has landed. Fire-and-forget: failures leave the placeholder title in
+    /// place and never surface to the user.
+    private func generateTitle() {
+        guard let env, let conversation,
+              let base = env.activeProfile?.baseURL,
+              let model = env.backendMode.resolvedChatModel(
+                  conversationModel: conversation.modelID,
+                  defaultModel: env.preferredModel
+              ) else { return }
+        let token = env.activeToken ?? ""
+        let client: ChatClienting = env.backendMode.usesOllamaNativeChat
+            ? env.ollamaChatClient
+            : env.chatClient
+        let request = ChatRequest(
+            model: model,
+            messages: conversation.wireHistory() + [WireMessage(role: "user", content: Self.titlePrompt)],
+            stream: true,
+            reasoningEffort: "none"
+        )
+
+        titleTask = Task { [weak self] in
+            guard let raw = try? await client.complete(request, base: base, token: token) else { return }
+            let title = Self.sanitizedTitle(raw)
+            guard !title.isEmpty, let self, let conversation = self.conversation else { return }
+            conversation.title = title
+            try? self.context?.save()
+        }
+    }
+
+    private static let titlePrompt =
+        "Write a short, descriptive title (3-6 words) for this conversation. "
+        + "Reply with only the title text — no quotes, no punctuation, no preamble."
+
+    /// Clean up a raw model title: strip quotes/markdown, drop a "Title:" prefix,
+    /// collapse to one line, and cap the length.
+    static func sanitizedTitle(_ raw: String) -> String {
+        var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let firstLine = t.split(whereSeparator: \.isNewline).first {
+            t = String(firstLine).trimmingCharacters(in: .whitespaces)
+        }
+        if let range = t.range(of: "title:", options: [.caseInsensitive, .anchored]) {
+            t = String(t[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+        }
+        t = t.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`*.# "))
+        return String(t.prefix(60))
     }
 }
