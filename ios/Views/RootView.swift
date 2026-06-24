@@ -78,8 +78,11 @@ struct RootView: View {
     }
 
     private func newChat() {
-        let convo = Conversation(title: "New Chat", profileID: env.activeProfileID)
-        convo.modelID = env.availableModels.first
+        let convo = Conversation(
+            title: "New Chat",
+            modelID: env.preferredModel,
+            profileID: env.activeProfileID
+        )
         context.insert(convo)
         try? context.save()
         selection = convo

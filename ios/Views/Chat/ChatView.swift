@@ -66,17 +66,20 @@ struct ChatView: View {
                         ForEach(env.availableModels, id: \.self) { Text($0).tag($0) }
                     }
                 } label: {
-                    Label(conversation.modelID ?? env.availableModels.first ?? "model",
-                          systemImage: "cpu")
+                    Label(currentModelName, systemImage: "cpu")
                         .font(.caption)
                 }
             }
         }
     }
 
+    private var currentModelName: String {
+        conversation.modelID ?? env.preferredModel ?? "model"
+    }
+
     private var modelBinding: Binding<String> {
         Binding(
-            get: { conversation.modelID ?? env.availableModels.first ?? "" },
+            get: { conversation.modelID ?? env.preferredModel ?? "" },
             set: { conversation.modelID = $0; try? context.save() }
         )
     }

@@ -41,16 +41,33 @@ final class AppEnvironment {
 
     /// Models to offer in the picker for the active backend. Prefers the live
     /// probe result, falls back to the per-backend cache (so the full list shows
-    /// instantly on launch, before the probe completes), then the default model.
+    /// instantly on launch, before the probe completes). The saved default is
+    /// included even if it was not advertised, so existing selections remain
+    /// visible.
     var availableModels: [String] {
-        let advertised = backendMode.models
-        if !advertised.isEmpty { return advertised }
-        if let id = activeProfileID {
-            let cached = profileStore.cachedModels(for: id)
-            if !cached.isEmpty { return cached }
+        var models = discoveredModels
+        if let defaultModel = activeDefaultModel, !models.contains(defaultModel) {
+            models.insert(defaultModel, at: 0)
         }
-        if let m = activeProfile?.defaultModel, !m.isEmpty { return [m] }
-        return []
+        return models
+    }
+
+    /// The model to preselect for new chats and unsent conversations.
+    var preferredModel: String? {
+        if let model = activeDefaultModel { return model }
+        return availableModels.first
+    }
+
+    private var activeDefaultModel: String? {
+        guard let model = activeProfile?.defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else { return nil }
+        return model
+    }
+
+    private var discoveredModels: [String] {
+        if !backendMode.models.isEmpty { return backendMode.models }
+        guard let id = activeProfileID else { return [] }
+        return profileStore.cachedModels(for: id)
     }
 
     func upsert(_ profile: BackendProfile, token: String?) {

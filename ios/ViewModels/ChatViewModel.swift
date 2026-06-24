@@ -39,8 +39,7 @@ final class ChatViewModel {
         let token = env.activeToken ?? ""
 
         let model = conversation.modelID
-            ?? env.activeProfile?.defaultModel
-            ?? env.availableModels.first
+            ?? env.preferredModel
             ?? "llama3.1"
 
         // Persist the user message.
