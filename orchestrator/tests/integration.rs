@@ -102,6 +102,7 @@ fn test_config(ollama_base: &str) -> Config {
         comfy_negative_node: None,
         comfy_seed_node: None,
         comfy_timeout_s: 120,
+        comfy_max_image_bytes: 16 * 1024 * 1024,
         log_format: LogFormat::Text,
         log_content: false,
     }

@@ -51,6 +51,9 @@ pub struct Config {
     pub comfy_negative_node: Option<String>,
     pub comfy_seed_node: Option<String>,
     pub comfy_timeout_s: u64,
+    /// Max bytes accepted from ComfyUI's `/view` for a single image. Guards
+    /// against a misconfigured/4K output stalling or bloating the turn.
+    pub comfy_max_image_bytes: usize,
 
     // Logging
     pub log_format: LogFormat,
@@ -116,6 +119,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             comfy_timeout_s: env_parse("COMFYUI_TIMEOUT_S", 120u64),
+            comfy_max_image_bytes: env_parse("COMFYUI_MAX_IMAGE_BYTES", 16 * 1024 * 1024),
             log_format: if env_or("LOG_FORMAT", "text").eq_ignore_ascii_case("json") {
                 LogFormat::Json
             } else {
@@ -204,6 +208,7 @@ pub mod tests_support {
             comfy_negative_node: None,
             comfy_seed_node: None,
             comfy_timeout_s: 120,
+            comfy_max_image_bytes: 16 * 1024 * 1024,
             log_format: LogFormat::Text,
             log_content: false,
         }

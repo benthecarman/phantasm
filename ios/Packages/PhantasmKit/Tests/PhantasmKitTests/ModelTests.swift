@@ -219,6 +219,19 @@ final class Base64ImageExtractorTests: XCTestCase {
         XCTAssertEqual(result.markdown, md)
         XCTAssertTrue(result.images.isEmpty)
     }
+
+    func testCachedMatchesUncachedAndRepeats() {
+        let payload = Data("hello".utf8).base64EncodedString()
+        let md = "Here: ![generated](data:image/png;base64,\(payload)) done"
+        let direct = Base64ImageExtractor().extract(md)
+        // First call populates the cache; second call hits it. Both must agree
+        // with the uncached extraction.
+        for _ in 0..<2 {
+            let cached = Base64ImageExtractor().extractCached(md)
+            XCTAssertEqual(cached.markdown, direct.markdown)
+            XCTAssertEqual(cached.images, direct.images)
+        }
+    }
 }
 
 /// Persistence + full-text search over the GRDB-backed `ChatStore`. Each test

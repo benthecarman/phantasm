@@ -144,7 +144,11 @@ struct ChatView: View {
                 }
                 .padding()
             }
-            .onChange(of: vm.streamingText) { _, _ in scrollToBottom(proxy) }
+            // During streaming, tokens arrive many-per-second; an animated scroll
+            // per token stacks overlapping animations and janks. Follow the tail
+            // without animation while streaming, and animate the discrete jumps
+            // (new committed message, first appear).
+            .onChange(of: vm.streamingText) { _, _ in scrollToBottom(proxy, animated: false) }
             .onChange(of: messages.count) { _, _ in scrollToBottom(proxy) }
             .onAppear { scrollToBottom(proxy) }
         }
@@ -180,8 +184,12 @@ struct ChatView: View {
 
     private let bottomID = "bottom-anchor"
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        withAnimation(.easeOut(duration: 0.15)) {
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        if animated {
+            withAnimation(.easeOut(duration: 0.15)) {
+                proxy.scrollTo(bottomID, anchor: .bottom)
+            }
+        } else {
             proxy.scrollTo(bottomID, anchor: .bottom)
         }
     }

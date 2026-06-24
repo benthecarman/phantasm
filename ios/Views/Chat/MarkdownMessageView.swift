@@ -9,7 +9,7 @@ struct MarkdownMessageView: View {
     let text: String
 
     var body: some View {
-        let extracted = Base64ImageExtractor().extract(text)
+        let extracted = Base64ImageExtractor().extractCached(text)
         Markdown(extracted.markdown)
             .markdownImageProvider(PhantasmImageProvider(images: extracted.images))
             .markdownBlockStyle(\.codeBlock) { configuration in

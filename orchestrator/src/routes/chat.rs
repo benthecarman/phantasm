@@ -32,13 +32,18 @@ pub async fn chat_completions(
         return AppError::BadRequest("`messages` must not be empty".into()).into_response();
     }
 
-    let model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| state.cfg.default_model.clone());
-    let stream = req.stream;
-    let options = req.extra.clone();
-    let messages = req.messages.clone();
+    // Per XR-2 the app resends full history each turn, including multi-MB base64
+    // image data-URIs from prior turns — so move the heavy fields out of `req`
+    // rather than cloning them.
+    let ChatRequest {
+        model,
+        stream,
+        messages,
+        extra: options,
+        ..
+    } = req;
+    let model_name = model.unwrap_or_else(|| state.cfg.default_model.clone());
+    let model = model_name.clone();
 
     let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel::<TurnEvent>(64);
@@ -76,8 +81,6 @@ pub async fn chat_completions(
             );
         });
     }
-
-    let model_name = req.model.unwrap_or_else(|| state.cfg.default_model.clone());
 
     if stream {
         stream_response(model_name, rx, cancel)

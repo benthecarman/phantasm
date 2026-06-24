@@ -17,6 +17,13 @@ public struct Base64ImageExtractor: Sendable {
 
     public init() {}
 
+    /// Memoized `extract`. Committed messages re-render on every layout/scroll
+    /// pass with stable content, so caching by content avoids re-running the
+    /// regex and re-decoding (potentially multi-MB) base64 on the main thread.
+    public func extractCached(_ markdown: String) -> Result {
+        ExtractionCache.shared.result(for: markdown, extractor: self)
+    }
+
     public func extract(_ markdown: String) -> Result {
         guard let regex = Self.dataURIImageRegex else {
             return Result(markdown: markdown, images: [:])
@@ -62,4 +69,32 @@ public struct Base64ImageExtractor: Sendable {
         pattern: #"!\[[^\]]*\]\(data:image/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=\s]+)\)"#,
         options: []
     )
+}
+
+/// Process-wide LRU memoization for `Base64ImageExtractor.extract`, keyed by the
+/// exact markdown string. Cost is the decoded image byte total so the cache
+/// evicts on memory pressure / a byte budget rather than growing unbounded.
+private final class ExtractionCache: @unchecked Sendable {
+    static let shared = ExtractionCache()
+
+    private final class Box {
+        let result: Base64ImageExtractor.Result
+        init(_ result: Base64ImageExtractor.Result) { self.result = result }
+    }
+
+    private let cache: NSCache<NSString, Box> = {
+        let c = NSCache<NSString, Box>()
+        c.countLimit = 128
+        c.totalCostLimit = 64 * 1024 * 1024
+        return c
+    }()
+
+    func result(for markdown: String, extractor: Base64ImageExtractor) -> Base64ImageExtractor.Result {
+        let key = markdown as NSString
+        if let hit = cache.object(forKey: key) { return hit.result }
+        let result = extractor.extract(markdown)
+        let cost = result.images.values.reduce(0) { $0 + $1.count }
+        cache.setObject(Box(result), forKey: key, cost: cost)
+        return result
+    }
 }

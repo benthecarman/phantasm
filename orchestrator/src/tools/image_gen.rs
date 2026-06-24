@@ -193,6 +193,13 @@ async fn handle_ws_message(
             let same_prompt = data?.get("prompt_id").and_then(|p| p.as_str()) == Some(prompt_id);
             Some(node_is_null && same_prompt)
         }
+        // Newer ComfyUI signals completion with `execution_success` instead of an
+        // `executing` frame carrying `node: null`. Honor both so generation
+        // doesn't run to `comfy_timeout_s` on those versions.
+        "execution_success" => {
+            let same_prompt = data?.get("prompt_id").and_then(|p| p.as_str()) == Some(prompt_id);
+            Some(same_prompt)
+        }
         _ => Some(false),
     }
 }
@@ -226,6 +233,7 @@ async fn fetch_image(
             ("subfolder", image.subfolder.as_str()),
             ("type", image.kind.as_str()),
         ])
+        .timeout(Duration::from_secs(cfg.comfy_timeout_s))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -235,7 +243,23 @@ async fn fetch_image(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("image/png")
         .to_string();
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+    let cap = cfg.comfy_max_image_bytes;
+    // Fast reject on an advertised oversized body before streaming it.
+    if let Some(len) = resp.content_length() {
+        if len as usize > cap {
+            return Err(format!("image too large ({len} bytes > {cap} cap)"));
+        }
+    }
+    // Stream-accumulate so a missing/lying Content-Length can't blow past the cap.
+    let mut bytes = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if bytes.len() + chunk.len() > cap {
+            return Err(format!("image exceeds {cap} byte cap"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     Ok((bytes, mime))
 }
 
@@ -350,6 +374,23 @@ mod tests {
         let img = find_first_image(&hist, "pid").unwrap();
         assert_eq!(img.filename, "out.png");
         assert_eq!(img.kind, "output");
+    }
+
+    #[tokio::test]
+    async fn execution_success_marks_completion() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut last = -1;
+        let msg = r#"{"type":"execution_success","data":{"prompt_id":"pid"}}"#;
+        assert_eq!(
+            handle_ws_message(msg, "pid", &mut last, &tx).await,
+            Some(true)
+        );
+        // A success frame for a different prompt must not end our wait.
+        let other = r#"{"type":"execution_success","data":{"prompt_id":"nope"}}"#;
+        assert_eq!(
+            handle_ws_message(other, "pid", &mut last, &tx).await,
+            Some(false)
+        );
     }
 
     #[test]
