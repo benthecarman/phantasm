@@ -74,15 +74,26 @@ pub async fn detect_upstream(cfg: &Config, http: &reqwest::Client) -> UpstreamDe
 pub async fn probe_capabilities(
     cfg: &Config,
     http: &reqwest::Client,
-    detected_models: &[String],
+    upstream: &UpstreamDetection,
 ) -> CapabilitySnapshot {
     let models = if !cfg.models.is_empty() {
         cfg.models.clone()
-    } else if !detected_models.is_empty() {
-        detected_models.to_vec()
+    } else if !upstream.models.is_empty() {
+        upstream.models.clone()
     } else {
         warn!("could not list upstream models at startup; advertising none");
         Vec::new()
+    };
+
+    // Vision is only knowable for native Ollama (via `/api/show`). For an
+    // OpenAI-compatible upstream we can't tell, so we advertise none and the app
+    // treats image support as unknown (optimistic).
+    let vision_models = match upstream.kind {
+        UpstreamKind::NativeOllama => {
+            let client = OllamaClient::new(http.clone(), cfg.ollama_base.clone());
+            detect_vision_models(&client, &models).await
+        }
+        UpstreamKind::OpenAICompatible => Vec::new(),
     };
 
     let web_search = cfg.web_search_usable();
@@ -93,12 +104,29 @@ pub async fn probe_capabilities(
         version: env!("CARGO_PKG_VERSION").to_string(),
         chat: true,
         models,
+        vision_models,
         tools: ToolFlags {
             web_search,
             image_generation,
         },
         streaming: "sse",
     }
+}
+
+/// Probe each model's `/api/show` capabilities concurrently (best-effort, short
+/// timeout) and return those declaring `"vision"`.
+async fn detect_vision_models(client: &OllamaClient, models: &[String]) -> Vec<String> {
+    let checks = models.iter().map(|model| async move {
+        match tokio::time::timeout(PROBE_TIMEOUT, client.model_capabilities(model)).await {
+            Ok(Ok(caps)) if caps.iter().any(|c| c == "vision") => Some(model.clone()),
+            _ => None,
+        }
+    });
+    futures_util::future::join_all(checks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Cheap reachability check with a short timeout; failures are non-fatal.

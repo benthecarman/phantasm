@@ -85,15 +85,18 @@ public struct OllamaNativeChatClient: ChatClienting {
 
 private extension WireMessage {
     var ollamaMessage: Ollama.Chat.Message {
+        let text = content.plainText
+        let images = content.imageData
+        let attachedImages = images.isEmpty ? nil : images
         switch role {
         case "system":
-            return .system(content)
+            return .system(text, images: attachedImages)
         case "assistant":
-            return .assistant(content)
+            return .assistant(text, images: attachedImages)
         case "tool":
-            return .tool(content)
+            return .tool(text)
         default:
-            return .user(content)
+            return .user(text, images: attachedImages)
         }
     }
 }

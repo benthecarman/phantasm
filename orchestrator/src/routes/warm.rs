@@ -27,7 +27,10 @@ pub struct WarmResponse {
     pub model: String,
 }
 
-pub async fn warm(State(state): State<AppState>, Json(req): Json<WarmRequest>) -> Json<WarmResponse> {
+pub async fn warm(
+    State(state): State<AppState>,
+    Json(req): Json<WarmRequest>,
+) -> Json<WarmResponse> {
     let model = req
         .model
         .filter(|m| !m.trim().is_empty())
@@ -35,7 +38,10 @@ pub async fn warm(State(state): State<AppState>, Json(req): Json<WarmRequest>) -
 
     // Only native Ollama has a free, zero-token preload.
     if state.upstream.kind() != UpstreamKind::NativeOllama {
-        return Json(WarmResponse { warmed: false, model });
+        return Json(WarmResponse {
+            warmed: false,
+            model,
+        });
     }
 
     // Bound concurrent upstream load against in-flight generations (NFR-O2).

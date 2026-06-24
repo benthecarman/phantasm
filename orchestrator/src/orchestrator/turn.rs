@@ -202,7 +202,7 @@ async fn stream_final<B: ChatBackend>(
 mod tests {
     use super::*;
     use crate::ollama::{DeltaStream, StreamDelta};
-    use crate::openai::types::{FunctionCall, RawArguments, ToolCall};
+    use crate::openai::types::{FunctionCall, MessageContent, RawArguments, ToolCall};
     use crate::orchestrator::tools::ToolOutcome;
     use std::sync::Mutex;
 
@@ -219,7 +219,7 @@ mod tests {
     fn assistant(content: &str) -> ChatMessage {
         ChatMessage {
             role: "assistant".into(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_calls: None,
             tool_call_id: None,
             name: None,

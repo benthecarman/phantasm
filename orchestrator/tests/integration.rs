@@ -117,6 +117,7 @@ async fn spawn_orchestrator_with_kind(ollama_base: &str, upstream_kind: Upstream
         version: "test".into(),
         chat: true,
         models: vec!["m".into()],
+        vision_models: vec![],
         tools: ToolFlags {
             web_search: false,
             image_generation: false,

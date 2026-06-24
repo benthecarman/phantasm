@@ -24,10 +24,11 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .context("building HTTP client")?;
     let upstream = detect_upstream(&cfg, &probe_http).await;
-    let capabilities = Arc::new(probe_capabilities(&cfg, &probe_http, &upstream.models).await);
+    let capabilities = Arc::new(probe_capabilities(&cfg, &probe_http, &upstream).await);
     info!(
         upstream = ?upstream.kind,
         models = capabilities.models.len(),
+        vision_models = capabilities.vision_models.len(),
         web_search = capabilities.tools.web_search,
         image_generation = capabilities.tools.image_generation,
         "capabilities resolved"

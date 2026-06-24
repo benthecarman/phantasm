@@ -16,7 +16,7 @@ use url::Url;
 
 use crate::error::AppError;
 use crate::ollama::{ChatBackend, DeltaStream, StreamDelta};
-use crate::openai::types::ChatMessage;
+use crate::openai::types::{ChatMessage, MessageContent};
 
 #[derive(Clone)]
 pub struct OpenAICompatibleClient {
@@ -212,9 +212,9 @@ fn chat_message_from_openai(value: &Value) -> Result<ChatMessage, AppError> {
         .unwrap_or("assistant")
         .to_string();
     let content = match value.get("content") {
-        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::String(s)) => Some(MessageContent::Text(s.clone())),
         Some(Value::Null) | None => None,
-        Some(other) => Some(other.to_string()),
+        Some(other) => Some(MessageContent::Text(other.to_string())),
     };
     let tool_calls = value
         .get("tool_calls")

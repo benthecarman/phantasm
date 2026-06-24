@@ -6,7 +6,7 @@ use futures_util::{Stream, StreamExt};
 use serde_json::{Map, Value};
 use url::Url;
 
-use super::types::{OllamaChatChunk, OllamaChatRequest, OllamaMessage, TagsResponse};
+use super::types::{OllamaChatChunk, OllamaChatRequest, OllamaMessage, ShowResponse, TagsResponse};
 use super::{ChatBackend, DeltaStream, StreamDelta};
 use crate::error::AppError;
 use crate::openai::types::ChatMessage;
@@ -74,6 +74,24 @@ impl OllamaClient {
             .await
             .map_err(|e| AppError::OllamaError(e.to_string()))?;
         Ok(tags.models.into_iter().map(|m| m.name).collect())
+    }
+
+    /// Declared capabilities of a model via `/api/show` (e.g. `"vision"`,
+    /// `"tools"`). Used to advertise which models accept image attachments.
+    pub async fn model_capabilities(&self, model: &str) -> Result<Vec<String>, AppError> {
+        let url = self.endpoint("/api/show")?;
+        let resp = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+        let show: ShowResponse = resp
+            .json()
+            .await
+            .map_err(|e| AppError::OllamaError(e.to_string()))?;
+        Ok(show.capabilities)
     }
 }
 

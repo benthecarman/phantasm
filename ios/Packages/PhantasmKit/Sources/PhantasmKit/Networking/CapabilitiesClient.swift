@@ -104,6 +104,44 @@ public struct CapabilitiesClient: Sendable {
         return decodeModelIDs(data)
     }
 
+    /// Probe each native-Ollama model's `/api/show` capabilities concurrently and
+    /// return the set that declares `"vision"`. Used to gate image attachments
+    /// when talking to a bare Ollama (no orchestrator manifest to consult).
+    public func fetchOllamaVisionModels(
+        base: URL,
+        token: String,
+        models: [String]
+    ) async -> Set<String> {
+        await withTaskGroup(of: String?.self) { group in
+            for model in models {
+                group.addTask {
+                    await self.ollamaModelIsVision(base: base, token: token, model: model)
+                        ? model : nil
+                }
+            }
+            var vision: Set<String> = []
+            for await result in group {
+                if let result { vision.insert(result) }
+            }
+            return vision
+        }
+    }
+
+    private func ollamaModelIsVision(base: URL, token: String, model: String) async -> Bool {
+        var req = URLRequest(url: base.appendingPathComponent("api/show"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        req.timeoutInterval = 8
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model])
+        guard let (data, response) = try? await session.data(for: req),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let show = try? JSONDecoder().decode(OllamaShowResponse.self, from: data) else {
+            return false
+        }
+        return show.capabilities?.contains("vision") ?? false
+    }
+
     /// Best-effort native Ollama model list. `nil` means `/api/tags` did not
     /// look like Ollama; an empty array still means a native endpoint responded.
     private func fetchOllamaModelList(base: URL, token: String) async -> [String]? {
@@ -130,5 +168,9 @@ public struct CapabilitiesClient: Sendable {
     private struct OllamaTagsResponse: Decodable {
         struct Entry: Decodable { let name: String }
         let models: [Entry]
+    }
+
+    private struct OllamaShowResponse: Decodable {
+        let capabilities: [String]?
     }
 }

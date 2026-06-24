@@ -51,6 +51,29 @@ response shape and SSE token streaming. This is the **only** chat endpoint and
 MUST work against raw Ollama unchanged. No separate tool endpoint, no custom
 WebSocket protocol — tools are invisible to the app.
 
+### 2.2b Message content & attachments (multimodal)
+
+A message's `content` is **either** a plain string (the common case, byte-for-byte
+what raw Ollama emits) **or** the standard OpenAI content-parts array:
+
+```jsonc
+{ "role": "user", "content": [
+    { "type": "text", "text": "what is in this picture?" },
+    { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,…" } }
+] }
+```
+
+This keeps the orchestrator a drop-in OpenAI server. Conventions:
+
+- **Images** ride as `image_url` parts whose `url` is a `data:<mime>;base64,…`
+  data URI. The orchestrator strips the prefix and forwards the payload to
+  Ollama native's per-message `images` field (vision models only).
+- **Text files** are extracted to plain text *on the app side* and inlined as
+  extra `text` parts (or folded into the string content), so they work against
+  any text model with no server support. The server treats them as ordinary text.
+- The app only emits the array form when a message carries attachments; plain
+  turns stay a string. Servers MUST accept both shapes.
+
 ### 2.2a Model warm-up (optional, additive)
 
 `POST /v1/warm` with `{ "model": "…" }` (model optional → server default).

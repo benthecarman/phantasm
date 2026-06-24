@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::openai::types::{ChatMessage, FunctionCall, RawArguments, ToolCall};
+use crate::openai::types::{ChatMessage, FunctionCall, MessageContent, RawArguments, ToolCall};
 
 #[derive(Debug, Serialize)]
 pub struct OllamaChatRequest {
@@ -31,6 +31,10 @@ pub struct OllamaMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Base64 image payloads for multimodal turns (vision models). Native Ollama
+    /// carries images per-message here rather than inline in `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OllamaToolCall>>,
     /// Ollama labels tool results by tool *name* rather than call id.
@@ -69,6 +73,14 @@ pub struct TagsResponse {
     pub models: Vec<TagModel>,
 }
 
+/// `/api/show` response (subset). `capabilities` lists declared model features
+/// such as `"vision"`, `"tools"`, `"completion"`.
+#[derive(Debug, Deserialize)]
+pub struct ShowResponse {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TagModel {
     pub name: String,
@@ -77,11 +89,22 @@ pub struct TagModel {
 // ---- conversions ----
 
 impl OllamaMessage {
-    /// Convert our OpenAI-dialect message to the native shape.
+    /// Convert our OpenAI-dialect message to the native shape. Multimodal
+    /// content parts are split: text is concatenated into `content`, image
+    /// payloads move to the native `images` field.
     pub fn from_openai(m: &ChatMessage) -> Self {
+        let (content, images) = match m.content.clone() {
+            Some(c) => c.into_text_and_images(),
+            None => (None, Vec::new()),
+        };
         OllamaMessage {
             role: m.role.clone(),
-            content: m.content.clone(),
+            content,
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(images)
+            },
             tool_calls: m.tool_calls.as_ref().map(|calls| {
                 calls
                     .iter()
@@ -129,10 +152,66 @@ impl OllamaMessage {
             } else {
                 self.role
             },
-            content: self.content,
+            content: self.content.map(MessageContent::Text),
             tool_calls: tool_calls.filter(|v: &Vec<ToolCall>| !v.is_empty()),
             tool_call_id: None,
             name: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openai::types::{ContentPart, ImageUrl};
+
+    #[test]
+    fn from_openai_moves_images_to_native_field() {
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "describe".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,QUJD".into(),
+                    },
+                },
+            ])),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let native = OllamaMessage::from_openai(&msg);
+        assert_eq!(native.content.as_deref(), Some("describe"));
+        assert_eq!(native.images, Some(vec!["QUJD".to_string()]));
+    }
+
+    #[test]
+    fn show_response_extracts_capabilities() {
+        let json = r#"{"template":"…","capabilities":["completion","vision","tools"]}"#;
+        let show: ShowResponse = serde_json::from_str(json).unwrap();
+        assert!(show.capabilities.iter().any(|c| c == "vision"));
+    }
+
+    #[test]
+    fn show_response_without_capabilities_is_empty() {
+        let show: ShowResponse = serde_json::from_str(r#"{"template":"x"}"#).unwrap();
+        assert!(show.capabilities.is_empty());
+    }
+
+    #[test]
+    fn from_openai_plain_text_has_no_images() {
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text("hello".into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let native = OllamaMessage::from_openai(&msg);
+        assert_eq!(native.content.as_deref(), Some("hello"));
+        assert!(native.images.is_none());
     }
 }

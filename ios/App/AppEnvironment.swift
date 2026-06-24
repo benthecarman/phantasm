@@ -21,6 +21,10 @@ final class AppEnvironment {
     var activeProfileID: UUID?
     var backendMode: BackendMode = .plainChatOnly(models: [])
     var isProbing = false
+    /// Models known to accept image input. `nil` means vision is undetectable for
+    /// this backend (e.g. a generic OpenAI endpoint), so images are allowed
+    /// optimistically rather than hidden.
+    var visionModels: Set<String>?
 
     init() {
         // Schema is tiny; container creation is fast (NFR-A5 cold start).
@@ -125,7 +129,32 @@ final class AppEnvironment {
         if !models.isEmpty {
             profileStore.cacheModels(models, for: profile.id)
         }
+        await refreshVisionModels(base: base, token: token)
         warmActiveModel(base: base, token: token)
+    }
+
+    /// Resolve which models accept images for the current backend: from the
+    /// orchestrator manifest when present, by probing Ollama `/api/show` for a
+    /// bare native backend, and unknown (optimistic) for generic OpenAI.
+    private func refreshVisionModels(base: URL, token: String) async {
+        switch backendMode {
+        case .full(let caps):
+            visionModels = caps.visionModels.map(Set.init)
+        case .ollamaNative(let models):
+            visionModels = await capabilitiesClient.fetchOllamaVisionModels(
+                base: base, token: token, models: models
+            )
+        case .plainChatOnly:
+            visionModels = nil
+        }
+    }
+
+    /// Whether `model` can accept image attachments. Unknown backends return
+    /// `true` (optimistic) so we never hide a capability that may exist.
+    func supportsVision(_ model: String?) -> Bool {
+        guard let visionModels else { return true }
+        guard let model else { return false }
+        return visionModels.contains(model)
     }
 
     /// Kick off a best-effort preload of the model new chats will use, so the

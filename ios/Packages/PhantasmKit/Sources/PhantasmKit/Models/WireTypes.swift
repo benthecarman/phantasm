@@ -27,11 +27,114 @@ public struct ChatRequest: Encodable, Sendable {
 
 public struct WireMessage: Codable, Sendable, Equatable {
     public var role: String
-    public var content: String
+    public var content: WireContent
 
     public init(role: String, content: String) {
         self.role = role
+        self.content = .text(content)
+    }
+
+    public init(role: String, content: WireContent) {
+        self.role = role
         self.content = content
+    }
+}
+
+/// A message body that is either a plain string (the common case) or the OpenAI
+/// multimodal content-parts array. We only emit parts when a message carries
+/// attachments, so plain turns stay byte-for-byte compatible with raw Ollama.
+public enum WireContent: Sendable, Equatable {
+    case text(String)
+    case parts([WirePart])
+}
+
+public extension WireContent {
+    /// Concatenated text runs, ignoring images. For string content, the string.
+    var plainText: String {
+        switch self {
+        case .text(let string):
+            return string
+        case .parts(let parts):
+            return parts
+                .compactMap { if case .text(let t) = $0 { return t } else { return nil } }
+                .joined(separator: "\n")
+        }
+    }
+
+    /// Decoded image payloads from any `image_url` data-URI parts (for the
+    /// native Ollama client, which carries images as raw `Data`).
+    var imageData: [Data] {
+        guard case .parts(let parts) = self else { return [] }
+        return parts.compactMap { part -> Data? in
+            guard case .imageURL(let url) = part else { return nil }
+            return WireContent.decodeDataURI(url)
+        }
+    }
+
+    /// Decode the base64 payload of a `data:<mime>;base64,…` URI (or a bare
+    /// base64 string). Returns nil for non-data URLs.
+    static func decodeDataURI(_ url: String) -> Data? {
+        guard let range = url.range(of: ";base64,") else {
+            return url.hasPrefix("data:") ? nil : Data(base64Encoded: url)
+        }
+        return Data(base64Encoded: String(url[range.upperBound...]))
+    }
+}
+
+extension WireContent: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let string = try? container.decode(String.self) {
+            self = .text(string)
+        } else {
+            self = .parts(try container.decode([WirePart].self))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .text(let string): try container.encode(string)
+        case .parts(let parts): try container.encode(parts)
+        }
+    }
+}
+
+/// One element of a multimodal message: a text run or an image (as a data URI).
+public enum WirePart: Sendable, Equatable {
+    case text(String)
+    /// `image_url` part; `url` is a `data:<mime>;base64,…` data URI.
+    case imageURL(String)
+}
+
+extension WirePart: Codable {
+    // Raw values must round-trip through the shared encoder/decoder's
+    // snake_case conversion: "imageUrl" → "image_url" on encode and back.
+    private enum CodingKeys: String, CodingKey {
+        case type, text, imageURL = "imageUrl"
+    }
+    private struct ImageURLBox: Codable, Equatable { var url: String }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(String.self, forKey: .type) {
+        case "image_url":
+            self = .imageURL(try container.decode(ImageURLBox.self, forKey: .imageURL).url)
+        default:
+            self = .text(try container.decode(String.self, forKey: .text))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .text(let text):
+            try container.encode("text", forKey: .type)
+            try container.encode(text, forKey: .text)
+        case .imageURL(let url):
+            try container.encode("image_url", forKey: .type)
+            try container.encode(ImageURLBox(url: url), forKey: .imageURL)
+        }
     }
 }
 
@@ -64,13 +167,24 @@ public struct Capabilities: Decodable, Sendable, Equatable {
     public let version: String
     public let chat: Bool
     public let models: [String]
+    /// Subset of `models` that accept image input. `nil` when the manifest omits
+    /// the field (older orchestrator) — vision is then treated as unknown.
+    public let visionModels: [String]?
     public let tools: Tools?
     public let streaming: String?
 
-    public init(version: String, chat: Bool, models: [String], tools: Tools?, streaming: String?) {
+    public init(
+        version: String,
+        chat: Bool,
+        models: [String],
+        visionModels: [String]? = nil,
+        tools: Tools?,
+        streaming: String?
+    ) {
         self.version = version
         self.chat = chat
         self.models = models
+        self.visionModels = visionModels
         self.tools = tools
         self.streaming = streaming
     }

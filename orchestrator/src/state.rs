@@ -25,6 +25,11 @@ pub struct CapabilitySnapshot {
     pub version: String,
     pub chat: bool,
     pub models: Vec<String>,
+    /// Subset of `models` that accept image input (probed via Ollama `/api/show`).
+    /// Lets the app gate image attachments per model. Empty when undetectable
+    /// (e.g. an OpenAI-compatible upstream that doesn't advertise vision).
+    #[serde(default)]
+    pub vision_models: Vec<String>,
     pub tools: ToolFlags,
     pub streaming: &'static str,
 }

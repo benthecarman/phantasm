@@ -11,16 +11,21 @@ struct MessageBubble: View {
     var body: some View {
         HStack {
             if isUser { Spacer(minLength: 40) }
-            Group {
-                if isUser {
-                    Text(message.content)
-                        .textSelection(.enabled)
-                        .padding(10)
-                        .background(Color.accentColor.opacity(0.15))
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                } else {
-                    MarkdownMessageView(text: message.content)
+            if isUser {
+                VStack(alignment: .trailing, spacing: 6) {
+                    if !message.attachments.isEmpty {
+                        MessageAttachmentsView(attachments: message.orderedAttachments)
+                    }
+                    if !message.content.isEmpty {
+                        Text(message.content)
+                            .textSelection(.enabled)
+                            .padding(10)
+                            .background(Color.accentColor.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
                 }
+            } else {
+                MarkdownMessageView(text: message.content)
             }
             if !isUser { Spacer(minLength: 40) }
         }

@@ -31,9 +31,9 @@ final class ChatViewModel {
         return !isStreaming
     }
 
-    func send(_ rawText: String) {
+    func send(_ rawText: String, attachments: [PendingAttachment] = []) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, canSend,
+        guard (!text.isEmpty || !attachments.isEmpty), canSend,
               let env, let context, let conversation,
               let base = env.activeProfile?.baseURL else { return }
         let token = env.activeToken ?? ""
@@ -52,12 +52,24 @@ final class ChatViewModel {
         // the history list) until their first message is sent.
         context.insert(conversation)
 
-        // Persist the user message.
+        // Persist the user message plus any attachments.
         let user = Message(role: "user", content: text, isComplete: true)
         user.conversation = conversation
         context.insert(user)
+        for pending in attachments {
+            let attachment = Attachment(
+                kind: pending.kind,
+                name: pending.name,
+                data: pending.imageData,
+                mimeType: pending.mimeType,
+                text: pending.text
+            )
+            attachment.message = user
+            context.insert(attachment)
+        }
         if conversation.title == "New Chat" {
-            conversation.title = String(text.prefix(40))
+            let derived = text.isEmpty ? (attachments.first?.name ?? "New Chat") : String(text.prefix(40))
+            conversation.title = derived
         }
         conversation.updatedAt = .now
         conversation.modelID = model

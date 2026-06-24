@@ -24,7 +24,7 @@ pub struct ChatRequest {
 pub struct ChatMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,11 +41,106 @@ impl ChatMessage {
     ) -> Self {
         ChatMessage {
             role: "tool".into(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
         }
+    }
+}
+
+/// A message's `content`: either a plain string (the common case, and what raw
+/// Ollama emits) or the OpenAI multimodal content-parts array. Modelling both
+/// keeps us a drop-in OpenAI server while letting the app attach images
+/// (`image_url` parts) and inlined file text (extra `text` parts).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    /// Either a remote URL or a `data:<mime>;base64,<payload>` data URI.
+    pub url: String,
+}
+
+impl MessageContent {
+    /// Split into (concatenated text, base64 image payloads). Data-URI prefixes
+    /// (`data:<mime>;base64,`) are stripped so the payload is ready for Ollama's
+    /// native per-message `images` field.
+    pub fn into_text_and_images(self) -> (Option<String>, Vec<String>) {
+        match self {
+            MessageContent::Text(s) => (Some(s), Vec::new()),
+            MessageContent::Parts(parts) => {
+                let mut texts = Vec::new();
+                let mut images = Vec::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => texts.push(text),
+                        ContentPart::ImageUrl { image_url } => {
+                            images.push(strip_data_uri(&image_url.url));
+                        }
+                    }
+                }
+                let text = if texts.is_empty() {
+                    None
+                } else {
+                    Some(texts.join("\n"))
+                };
+                (text, images)
+            }
+        }
+    }
+}
+
+/// Strip a `data:<mime>;base64,` prefix, yielding the raw base64 payload. A bare
+/// URL (or already-bare base64) is returned unchanged.
+fn strip_data_uri(url: &str) -> String {
+    if let Some(idx) = url.find(";base64,") {
+        url[idx + ";base64,".len()..].to_string()
+    } else {
+        url.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_string_content_still_parses() {
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert!(matches!(m.content, Some(MessageContent::Text(ref s)) if s == "hi"));
+    }
+
+    #[test]
+    fn content_parts_parse_and_split() {
+        let json = r#"{
+            "role":"user",
+            "content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}
+            ]
+        }"#;
+        let m: ChatMessage = serde_json::from_str(json).unwrap();
+        let (text, images) = m.content.unwrap().into_text_and_images();
+        assert_eq!(text.as_deref(), Some("what is this?"));
+        assert_eq!(images, vec!["QUJD".to_string()]);
+    }
+
+    #[test]
+    fn bare_url_is_not_stripped() {
+        assert_eq!(strip_data_uri("https://x/y.png"), "https://x/y.png");
+        assert_eq!(strip_data_uri("data:image/jpeg;base64,ZZZ"), "ZZZ");
     }
 }
 

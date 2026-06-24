@@ -18,6 +18,22 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(mode.models.count, 2)
     }
 
+    func testManifestDecodesVisionModels() throws {
+        let json = """
+        {"version":"0.1.0","chat":true,"models":["llava","qwen"],
+         "vision_models":["llava"],"tools":{"web_search":false,"image_generation":false},
+         "streaming":"sse"}
+        """
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+        XCTAssertEqual(caps.visionModels, ["llava"])
+    }
+
+    func testManifestWithoutVisionModelsIsNil() throws {
+        let json = #"{"version":"x","chat":true,"models":["m"],"streaming":"sse"}"#
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+        XCTAssertNil(caps.visionModels)
+    }
+
     func testPlainChatModeHasNoToolsButCarriesModels() {
         let mode = BackendMode.plainChatOnly(models: ["qwen2.5:7b", "bwen:8b"])
         XCTAssertFalse(mode.showsTools)
@@ -211,7 +227,7 @@ final class PersistenceTests: XCTestCase {
     private func inMemoryContext() throws -> ModelContext {
         let config = ModelConfiguration(isStoredInMemoryOnly: true)
         let container = try ModelContainer(
-            for: Conversation.self, Message.self,
+            for: Conversation.self, Message.self, Attachment.self,
             configurations: config
         )
         return ModelContext(container)
@@ -244,6 +260,65 @@ final class PersistenceTests: XCTestCase {
         try ctx.save()
         let remaining = try ctx.fetch(FetchDescriptor<Message>())
         XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testImageAttachmentBecomesContentParts() throws {
+        let ctx = try inMemoryContext()
+        let convo = Conversation(title: "T")
+        ctx.insert(convo)
+        let user = Message(role: "user", content: "what is this?")
+        user.conversation = convo
+        ctx.insert(user)
+        let image = Attachment(
+            kind: .image, name: "photo.jpg",
+            data: Data("png-bytes".utf8), mimeType: "image/jpeg"
+        )
+        image.message = user
+        ctx.insert(image)
+        try ctx.save()
+
+        guard case .parts(let parts) = user.wireContent() else {
+            return XCTFail("expected content parts")
+        }
+        XCTAssertEqual(parts.first, .text("what is this?"))
+        let b64 = Data("png-bytes".utf8).base64EncodedString()
+        XCTAssertEqual(parts.last, .imageURL("data:image/jpeg;base64,\(b64)"))
+    }
+
+    func testTextFileAttachmentIsInlinedAsPlainText() throws {
+        let ctx = try inMemoryContext()
+        let convo = Conversation(title: "T")
+        ctx.insert(convo)
+        let user = Message(role: "user", content: "summarize")
+        user.conversation = convo
+        ctx.insert(user)
+        let file = Attachment(kind: .text, name: "notes.txt", text: "line one")
+        file.message = user
+        ctx.insert(file)
+        try ctx.save()
+
+        // Text files stay a plain string so non-vision models still get them.
+        XCTAssertEqual(
+            user.wireContent(),
+            .text("summarize\n\nAttached file \"notes.txt\":\nline one")
+        )
+    }
+
+    func testContentPartsRoundTripThroughWireEncoding() throws {
+        let original = WireMessage(role: "user", content: .parts([
+            .text("hello"),
+            .imageURL("data:image/png;base64,QUJD"),
+        ]))
+        let data = try Wire.encoder().encode(original)
+        // image_url part nests the URL under an object, OpenAI-style.
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let parts = try XCTUnwrap(json["content"] as? [[String: Any]])
+        XCTAssertEqual(parts[1]["type"] as? String, "image_url")
+        XCTAssertEqual((parts[1]["image_url"] as? [String: Any])?["url"] as? String,
+                       "data:image/png;base64,QUJD")
+
+        let decoded = try Wire.decoder().decode(WireMessage.self, from: data)
+        XCTAssertEqual(decoded, original)
     }
 
     func testBufferThenCommitProducesOneCompleteMessage() throws {
