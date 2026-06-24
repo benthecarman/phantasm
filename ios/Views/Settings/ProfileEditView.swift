@@ -13,6 +13,7 @@ struct ProfileEditView: View {
     @State private var urlString: String
     @State private var token: String
     @State private var defaultModel: String
+    @State private var autoWarm: Bool
     @State private var testResult: TestResult?
     @State private var isTesting = false
     @State private var revealToken = false
@@ -24,6 +25,7 @@ struct ProfileEditView: View {
         _name = State(initialValue: profile?.name ?? "")
         _urlString = State(initialValue: profile?.baseURLString ?? "https://")
         _defaultModel = State(initialValue: profile?.defaultModel ?? "")
+        _autoWarm = State(initialValue: profile?.autoWarm ?? false)
         // Pre-fill the token from the Keychain when editing.
         _token = State(initialValue: "")
     }
@@ -84,6 +86,12 @@ struct ProfileEditView: View {
                     if models.isEmpty && !loadingModels {
                         Text("Tap Load to fetch models from the backend.")
                     }
+                }
+
+                Section {
+                    Toggle("Auto-warm model", isOn: $autoWarm)
+                } footer: {
+                    Text("Preload the active model when you connect or switch to this backend, so the first reply skips cold-start. Off by default.")
                 }
 
                 Section {
@@ -192,7 +200,8 @@ struct ProfileEditView: View {
             id: existing?.id ?? UUID(),
             name: name.trimmingCharacters(in: .whitespaces),
             baseURLString: BackendProfile.normalizedBaseURLString(urlString),
-            defaultModel: defaultModel.isEmpty ? nil : defaultModel
+            defaultModel: defaultModel.isEmpty ? nil : defaultModel,
+            autoWarm: autoWarm
         )
         let token = normalizedToken
         env.upsert(profile, token: token.isEmpty ? nil : token)

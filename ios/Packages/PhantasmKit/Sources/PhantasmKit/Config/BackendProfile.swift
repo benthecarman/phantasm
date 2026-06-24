@@ -7,12 +7,34 @@ public struct BackendProfile: Identifiable, Codable, Sendable, Hashable {
     public var name: String
     public var baseURLString: String
     public var defaultModel: String?
+    /// Preload the active model after connecting / switching backends so the
+    /// first turn skips cold-start. Opt-in (off by default): warming wakes the
+    /// backend and can pull a model into memory, which isn't always wanted.
+    public var autoWarm: Bool
 
-    public init(id: UUID = UUID(), name: String, baseURLString: String, defaultModel: String? = nil) {
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        baseURLString: String,
+        defaultModel: String? = nil,
+        autoWarm: Bool = false
+    ) {
         self.id = id
         self.name = name
         self.baseURLString = baseURLString
         self.defaultModel = defaultModel
+        self.autoWarm = autoWarm
+    }
+
+    // Custom decoding so profiles saved before `autoWarm` existed still load
+    // (the synthesized decoder would fail on the missing key).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        baseURLString = try c.decode(String.self, forKey: .baseURLString)
+        defaultModel = try c.decodeIfPresent(String.self, forKey: .defaultModel)
+        autoWarm = try c.decodeIfPresent(Bool.self, forKey: .autoWarm) ?? false
     }
 
     public var baseURL: URL? {

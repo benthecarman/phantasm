@@ -166,10 +166,11 @@ final class AppEnvironment {
     }
 
     /// Fire-and-forget preload of a specific model on the active backend (e.g.
-    /// after the user picks a different model). Failures are silent and never
-    /// block the UI.
+    /// after the user picks a different model). Gated on the profile's `autoWarm`
+    /// opt-in. Failures are silent and never block the UI.
     func warm(model: String) {
-        guard let base = activeProfile?.baseURL else { return }
+        guard let profile = activeProfile, profile.autoWarm,
+              let base = profile.baseURL else { return }
         let token = activeToken ?? ""
         let mode = backendMode
         Task.detached { [warmupClient] in
