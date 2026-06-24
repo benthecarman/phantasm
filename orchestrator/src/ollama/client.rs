@@ -39,6 +39,8 @@ impl OllamaClient {
         options: &Map<String, Value>,
         stream: bool,
     ) -> OllamaChatRequest {
+        let mut options = options.clone();
+        let think = extract_thinking_control(&mut options);
         OllamaChatRequest {
             model: model.to_string(),
             messages: messages.iter().map(OllamaMessage::from_openai).collect(),
@@ -48,10 +50,11 @@ impl OllamaClient {
                 Some(tools.to_vec())
             },
             stream,
+            think,
             options: if options.is_empty() {
                 None
             } else {
-                Some(Value::Object(options.clone()))
+                Some(Value::Object(options))
             },
             keep_alive: Some(KEEP_ALIVE.to_string()),
         }
@@ -173,5 +176,54 @@ fn delta_from(chunk: OllamaChatChunk) -> StreamDelta {
         content,
         done: chunk.done,
         done_reason: chunk.done_reason,
+    }
+}
+
+fn extract_thinking_control(options: &mut Map<String, Value>) -> Option<bool> {
+    if matches!(
+        options.get("reasoning_effort").and_then(Value::as_str),
+        Some(s) if s.eq_ignore_ascii_case("none")
+    ) {
+        options.remove("reasoning_effort");
+        return Some(false);
+    }
+
+    let reasoning_effort = options
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str);
+
+    if matches!(reasoning_effort, Some(s) if s.eq_ignore_ascii_case("none")) {
+        options.remove("reasoning");
+        return Some(false);
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_thinking_control;
+    use serde_json::{json, Map, Value};
+
+    #[test]
+    fn reasoning_effort_none_maps_to_think_false() {
+        let mut options = Map::from_iter([
+            ("reasoning_effort".into(), Value::String("none".into())),
+            ("temperature".into(), json!(0.2)),
+        ]);
+
+        assert_eq!(extract_thinking_control(&mut options), Some(false));
+        assert!(!options.contains_key("reasoning_effort"));
+        assert_eq!(options.get("temperature"), Some(&json!(0.2)));
+    }
+
+    #[test]
+    fn nested_reasoning_none_maps_to_think_false() {
+        let mut options = Map::from_iter([("reasoning".into(), json!({ "effort": "none" }))]);
+
+        assert_eq!(extract_thinking_control(&mut options), Some(false));
+        assert!(!options.contains_key("reasoning"));
     }
 }

@@ -1,17 +1,18 @@
 # Phantasm iOS
 
 A fast, thin AI chat client (SwiftUI, iOS 17+). It speaks OpenAI-compatible
-streaming, so it works against the [Phantasm orchestrator](../orchestrator) *or*
-a bare Ollama instance. Tools (web search, image generation) run server-side and
-are invisible to the app — it just renders the streamed answer, displays images
-embedded as markdown, and reads the optional `x_status` field for progress.
+streaming for the [Phantasm orchestrator](../orchestrator) and generic backends,
+and uses Ollama's native `/api/chat` stream when it detects a bare Ollama
+instance. Tools (web search, image generation) run server-side and are invisible
+to the app — it just renders the streamed answer, displays images embedded as
+markdown, and reads the optional `x_status` field for progress.
 
 ## Architecture
 
 - **`Packages/PhantasmKit/`** — pure, host-testable logic: the SSE parser +
-  streaming `ChatClient`, capability detection, `AppError` taxonomy, Keychain
-  token storage, SwiftData models, profile store, and the base64-image markdown
-  extractor.
+  streaming `ChatClient`, native Ollama chat adapter, capability detection,
+  `AppError` taxonomy, Keychain token storage, SwiftData models, profile store,
+  and the base64-image markdown extractor.
 - **App target** (`App/`, `Views/`, `ViewModels/`) — SwiftUI with `@Observable`
   MVVM. Depends on `PhantasmKit` and [MarkdownUI](https://github.com/gonzalezreal/swift-markdown-ui)
   (the only third-party dependency).
@@ -34,8 +35,8 @@ open Phantasm.xcodeproj
 
 On first launch, open **Settings** (gear icon) → **Add Backend**, enter your
 orchestrator (or Ollama) URL + bearer token, and tap **Test Connection**. The
-app probes `/v1/capabilities`; if absent it falls back to a chat ping and runs
-in plain-chat mode.
+app probes `/v1/capabilities`; if absent it checks `/api/tags` for native
+Ollama, then falls back to generic OpenAI-compatible `/v1/models`.
 
 ## Tests
 
@@ -55,8 +56,9 @@ on an in-memory store.
 - **Buffer-then-commit** persistence: tokens accumulate in memory during a turn;
   one complete assistant message is written on completion (no per-token disk
   writes, NFR-A4).
-- **Graceful degradation**: no manifest → plain chat, tool affordances hidden
-  (XR-1). A status pill shows "Full" vs "Plain chat".
+- **Graceful degradation**: no manifest → native Ollama or plain chat, tool
+  affordances hidden (XR-1). A status pill shows "Full", "Ollama native", or
+  "Plain chat".
 - **Token** stored in the Keychain, keyed by profile id (NFR-A2); profile
   metadata (URL, name, model) in `UserDefaults`.
 - **Markdown** via MarkdownUI with a custom image provider that resolves base64

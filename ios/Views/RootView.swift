@@ -70,10 +70,31 @@ struct RootView: View {
 
     @ViewBuilder
     private var modeBanner: some View {
-        let label = env.backendMode.showsTools ? "Full (tools available)" : "Plain chat"
         if env.activeProfile != nil {
-            StatusPill(text: label, systemImage: env.backendMode.showsTools ? "wand.and.stars" : "text.bubble")
+            StatusPill(text: backendModeLabel, systemImage: backendModeIcon)
                 .padding(.bottom, 8)
+        }
+    }
+
+    private var backendModeLabel: String {
+        switch env.backendMode {
+        case .full:
+            return env.backendMode.showsTools ? "Full (tools available)" : "Full"
+        case .ollamaNative:
+            return "Ollama native"
+        case .plainChatOnly:
+            return "Plain chat"
+        }
+    }
+
+    private var backendModeIcon: String {
+        switch env.backendMode {
+        case .full:
+            return env.backendMode.showsTools ? "wand.and.stars" : "server.rack"
+        case .ollamaNative:
+            return "cpu"
+        case .plainChatOnly:
+            return "text.bubble"
         }
     }
 

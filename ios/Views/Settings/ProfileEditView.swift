@@ -150,6 +150,9 @@ struct ProfileEditView: View {
                 let tools = (caps.tools?.webSearch ?? false) || (caps.tools?.imageGeneration ?? false)
                 let toolNote = tools ? " Web search / image tools available." : " Chat only — no tools advertised."
                 testResult = .success("Connected. \(modelCount(caps.models.count)).\(toolNote)")
+            case .ollamaNative(let models):
+                let suffix = models.isEmpty ? "" : " \(modelCount(models.count))."
+                testResult = .success("Connected — native Ollama chat.\(suffix)")
             case .plainChatOnly(let models):
                 let suffix = models.isEmpty ? "" : " \(modelCount(models.count))."
                 testResult = .success("Connected — chat only (no web search or image tools).\(suffix)")

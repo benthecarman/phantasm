@@ -23,12 +23,144 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertFalse(mode.showsTools)
         XCTAssertEqual(mode.models, ["qwen2.5:7b", "bwen:8b"])
         XCTAssertNil(mode.capabilities)
+        XCTAssertFalse(mode.usesOllamaNativeChat)
+    }
+
+    func testOllamaNativeModeHasNoToolsButUsesNativeChat() {
+        let mode = BackendMode.ollamaNative(models: ["native-model"])
+        XCTAssertFalse(mode.showsTools)
+        XCTAssertEqual(mode.models, ["native-model"])
+        XCTAssertNil(mode.capabilities)
+        XCTAssertTrue(mode.usesOllamaNativeChat)
+    }
+
+    func testOllamaNativeResolverKeepsValidConversationModel() {
+        let mode = BackendMode.ollamaNative(models: ["first-model", "selected-model"])
+
+        XCTAssertEqual(
+            mode.resolvedChatModel(
+                conversationModel: "selected-model",
+                defaultModel: "first-model"
+            ),
+            "selected-model"
+        )
+    }
+
+    func testOllamaNativeResolverUsesValidDefaultWhenConversationModelIsStale() {
+        let mode = BackendMode.ollamaNative(models: ["first-model", "default-model"])
+
+        XCTAssertEqual(
+            mode.resolvedChatModel(
+                conversationModel: "missing-model",
+                defaultModel: "default-model"
+            ),
+            "default-model"
+        )
+    }
+
+    func testOllamaNativeResolverFallsBackToFirstDiscoveredModel() {
+        let mode = BackendMode.ollamaNative(models: ["first-model", "second-model"])
+
+        XCTAssertEqual(
+            mode.resolvedChatModel(
+                conversationModel: "missing-model",
+                defaultModel: "also-missing"
+            ),
+            "first-model"
+        )
+    }
+
+    func testPlainResolverKeepsSavedConversationModel() {
+        let mode = BackendMode.plainChatOnly(models: ["advertised-model"])
+
+        XCTAssertEqual(
+            mode.resolvedChatModel(
+                conversationModel: "custom-model",
+                defaultModel: "advertised-model"
+            ),
+            "custom-model"
+        )
     }
 
     func testManifestWithoutToolsBlock() throws {
         let json = #"{"version":"x","chat":true,"models":[],"streaming":"sse"}"#
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertFalse(BackendMode.full(caps).showsTools)
+    }
+}
+
+final class ChatRequestEncodingTests: XCTestCase {
+    func testReasoningEffortDefaultsToNone() throws {
+        let req = ChatRequest(
+            model: "chat-model",
+            messages: [WireMessage(role: "user", content: "hi")]
+        )
+        let data = try Wire.encoder().encode(req)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["reasoning_effort"] as? String, "none")
+        XCTAssertEqual(json["stream"] as? Bool, true)
+    }
+}
+
+final class CapabilityProbeTests: XCTestCase {
+    final class RoutingProtocol: URLProtocol {
+        nonisolated(unsafe) static var responses: [String: (status: Int, body: String)] = [:]
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            let path = request.url?.path ?? ""
+            let response = Self.responses[path] ?? (404, "not found")
+            let http = HTTPURLResponse(
+                url: request.url!,
+                statusCode: response.status,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data(response.body.utf8))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+    }
+
+    private func session() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RoutingProtocol.self]
+        return URLSession(configuration: config)
+    }
+
+    override func setUp() {
+        super.setUp()
+        RoutingProtocol.responses = [:]
+    }
+
+    func testProbeDetectsNativeOllamaAfterMissingCapabilities() async {
+        RoutingProtocol.responses = [
+            "/v1/capabilities": (404, "not found"),
+            "/api/tags": (200, #"{"models":[{"name":"native-model"}]}"#),
+        ]
+
+        let mode = await CapabilitiesClient(session: session())
+            .probe(base: URL(string: "https://backend.example")!, token: "")
+
+        XCTAssertEqual(mode, .ollamaNative(models: ["native-model"]))
+    }
+
+    func testProbeFallsBackToOpenAIModelsWhenNotOllama() async {
+        RoutingProtocol.responses = [
+            "/v1/capabilities": (404, "not found"),
+            "/api/tags": (404, "not found"),
+            "/v1/models": (200, #"{"data":[{"id":"generic-model"}]}"#),
+        ]
+
+        let mode = await CapabilitiesClient(session: session())
+            .probe(base: URL(string: "https://backend.example")!, token: "")
+
+        XCTAssertEqual(mode, .plainChatOnly(models: ["generic-model"]))
     }
 }
 

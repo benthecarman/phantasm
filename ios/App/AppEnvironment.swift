@@ -13,6 +13,7 @@ final class AppEnvironment {
     let profileStore = ProfileStore()
     let keychain = KeychainStore()
     let chatClient = ChatClient()
+    let ollamaChatClient = OllamaNativeChatClient()
     let capabilitiesClient = CapabilitiesClient()
 
     var profiles: [BackendProfile]
@@ -54,8 +55,10 @@ final class AppEnvironment {
 
     /// The model to preselect for new chats and unsent conversations.
     var preferredModel: String? {
-        if let model = activeDefaultModel { return model }
-        return availableModels.first
+        backendMode.resolvedChatModel(
+            conversationModel: nil,
+            defaultModel: activeDefaultModel
+        )
     }
 
     private var activeDefaultModel: String? {

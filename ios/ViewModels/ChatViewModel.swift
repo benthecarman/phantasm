@@ -38,9 +38,15 @@ final class ChatViewModel {
               let base = env.activeProfile?.baseURL else { return }
         let token = env.activeToken ?? ""
 
-        let model = conversation.modelID
-            ?? env.preferredModel
-            ?? "llama3.1"
+        guard let model = env.backendMode.resolvedChatModel(
+            conversationModel: conversation.modelID,
+            defaultModel: env.preferredModel
+        ) else {
+            errorMessage = AppError.modelError(
+                "No chat model is selected. Choose a model in Settings or wait for model discovery to finish."
+            ).userMessage
+            return
+        }
 
         // Persist the user message.
         let user = Message(role: "user", content: text, isComplete: true)
@@ -60,18 +66,27 @@ final class ChatViewModel {
         statusText = nil
         errorMessage = nil
 
-        let client = env.chatClient
+        let stream = env.backendMode.usesOllamaNativeChat
+            ? env.ollamaChatClient.stream(request, base: base, token: token)
+            : env.chatClient.stream(request, base: base, token: token)
         task = Task { [weak self] in
             do {
-                for try await event in client.stream(request, base: base, token: token) {
+                for try await event in stream {
                     guard let self else { return }
                     switch event {
-                    case .token(let t): self.streamingText += t
+                    case .token(let t):
+                        self.statusText = nil
+                        self.streamingText += t
                     case .status(let s): self.statusText = s
                     case .done: break
                     }
                 }
-                self?.finish(error: nil)
+                let emptyResponse = self?.streamingText.isEmpty ?? false
+                self?.finish(
+                    error: emptyResponse
+                        ? .modelError("The stream completed without any assistant text.")
+                        : nil
+                )
             } catch {
                 self?.finish(error: AppError.from(error))
             }

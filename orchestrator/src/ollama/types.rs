@@ -18,6 +18,8 @@ pub struct OllamaChatRequest {
     pub tools: Option<Vec<Value>>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Value>,
     /// Keep the model resident across turns so KV cache is reused (NFR-O8).
     #[serde(skip_serializing_if = "Option::is_none")]

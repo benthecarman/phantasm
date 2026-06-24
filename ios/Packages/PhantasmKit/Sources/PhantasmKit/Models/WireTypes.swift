@@ -10,11 +10,18 @@ public struct ChatRequest: Encodable, Sendable {
     public var model: String
     public var messages: [WireMessage]
     public var stream: Bool
+    public var reasoningEffort: String?
 
-    public init(model: String, messages: [WireMessage], stream: Bool = true) {
+    public init(
+        model: String,
+        messages: [WireMessage],
+        stream: Bool = true,
+        reasoningEffort: String? = "none"
+    ) {
         self.model = model
         self.messages = messages
         self.stream = stream
+        self.reasoningEffort = reasoningEffort
     }
 }
 
@@ -34,6 +41,7 @@ public struct ChatChunk: Decodable, Sendable {
     public struct Choice: Decodable, Sendable {
         public struct Delta: Decodable, Sendable {
             public let content: String?
+            public let reasoning: String?
         }
         public let delta: Delta
         public let finishReason: String?
@@ -72,6 +80,8 @@ public struct Capabilities: Decodable, Sendable, Equatable {
 public enum BackendMode: Sendable, Equatable {
     /// Manifest present — full feature set advertised.
     case full(Capabilities)
+    /// Raw Ollama detected via `/api/tags` — use native `/api/chat` streaming.
+    case ollamaNative(models: [String])
     /// No manifest (404 / not an orchestrator) — plain chat only, no tool UI.
     /// Carries any models discovered from `/v1/models` so the picker still works.
     case plainChatOnly(models: [String])
@@ -85,6 +95,7 @@ public enum BackendMode: Sendable, Equatable {
     public var models: [String] {
         switch self {
         case .full(let caps): return caps.models
+        case .ollamaNative(let models): return models
         case .plainChatOnly(let models): return models
         }
     }
@@ -92,6 +103,51 @@ public enum BackendMode: Sendable, Equatable {
     public var showsTools: Bool {
         guard let tools = capabilities?.tools else { return false }
         return tools.webSearch || tools.imageGeneration
+    }
+
+    public var usesOllamaNativeChat: Bool {
+        if case .ollamaNative = self { return true }
+        return false
+    }
+
+    public func resolvedChatModel(
+        conversationModel: String?,
+        defaultModel: String?
+    ) -> String? {
+        let conversationModel = conversationModel?.nonEmptyTrimmed
+        let defaultModel = defaultModel?.nonEmptyTrimmed
+
+        switch self {
+        case .ollamaNative(let models):
+            if models.isEmpty {
+                return conversationModel ?? defaultModel
+            }
+            if let conversationModel,
+               let validConversationModel = models.firstMatching(conversationModel) {
+                return validConversationModel
+            }
+            if let defaultModel,
+               let validDefaultModel = models.firstMatching(defaultModel) {
+                return validDefaultModel
+            }
+            return models.first
+
+        case .full, .plainChatOnly:
+            return conversationModel ?? defaultModel ?? models.first
+        }
+    }
+}
+
+private extension Array where Element == String {
+    func firstMatching(_ target: String) -> String? {
+        first { $0.caseInsensitiveCompare(target) == .orderedSame }
+    }
+}
+
+private extension String {
+    var nonEmptyTrimmed: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

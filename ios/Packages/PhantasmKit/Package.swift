@@ -9,9 +9,15 @@ let package = Package(
     products: [
         .library(name: "PhantasmKit", targets: ["PhantasmKit"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/mattt/ollama-swift.git", from: "1.8.0")
+    ],
     targets: [
         .target(
             name: "PhantasmKit",
+            dependencies: [
+                .product(name: "Ollama", package: "ollama-swift")
+            ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
