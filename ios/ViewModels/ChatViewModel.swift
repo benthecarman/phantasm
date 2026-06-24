@@ -26,8 +26,7 @@ final class ChatViewModel {
     }
 
     var canSend: Bool {
-        // The token is optional: a no-auth backend (local Ollama, or an
-        // orchestrator with PHANTASM_AUTH_TOKEN unset) needs only a base URL.
+        // The token is optional for direct no-auth backends such as local Ollama.
         guard let env, env.activeProfile?.baseURL != nil else { return false }
         return !isStreaming
     }

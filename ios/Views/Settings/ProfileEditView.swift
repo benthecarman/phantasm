@@ -115,6 +115,10 @@ struct ProfileEditView: View {
         URL(string: urlString)?.scheme != nil
     }
 
+    private var normalizedToken: String {
+        token.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// The discovered models, plus the currently-saved model if it's not in the
     /// list (so a previously-chosen value still shows as selected).
     private var pickerOptions: [String] {
@@ -128,7 +132,7 @@ struct ProfileEditView: View {
     private func loadModels() async {
         guard let base = URL(string: urlString) else { return }
         loadingModels = true
-        models = await env.capabilitiesClient.models(base: base, token: token)
+        models = await env.capabilitiesClient.models(base: base, token: normalizedToken)
         loadingModels = false
     }
 
@@ -136,7 +140,7 @@ struct ProfileEditView: View {
         guard let base = URL(string: urlString) else { return }
         isTesting = true
         testResult = nil
-        let result = await env.capabilitiesClient.validate(base: base, token: token)
+        let result = await env.capabilitiesClient.validate(base: base, token: normalizedToken)
         isTesting = false
         switch result {
         case .success(let mode):
@@ -166,6 +170,7 @@ struct ProfileEditView: View {
             baseURLString: urlString.trimmingCharacters(in: .whitespaces),
             defaultModel: defaultModel.isEmpty ? nil : defaultModel
         )
+        let token = normalizedToken
         env.upsert(profile, token: token.isEmpty ? nil : token)
         dismiss()
     }

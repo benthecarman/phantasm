@@ -1,9 +1,9 @@
 import XCTest
 @testable import PhantasmKit
 
-/// A no-auth backend (local Ollama, or an orchestrator with PHANTASM_AUTH_TOKEN
-/// unset) is a valid config: the token is optional. These tests lock in that an
-/// empty token sends NO `Authorization` header (rather than a malformed
+/// A direct no-auth backend such as local Ollama is a valid config: the token is
+/// optional. These tests lock in that an empty token sends NO `Authorization`
+/// header (rather than a malformed
 /// `Bearer `), while a real token still does — the regression that left the
 /// send button permanently disabled when no token was entered.
 final class AuthHeaderTests: XCTestCase {

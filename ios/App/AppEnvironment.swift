@@ -59,8 +59,11 @@ final class AppEnvironment {
         } else {
             profiles.append(profile)
         }
-        if let token, !token.isEmpty {
-            try? keychain.setToken(token, for: profile.id)
+        let normalizedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if normalizedToken.isEmpty {
+            try? keychain.delete(for: profile.id)
+        } else {
+            try? keychain.setToken(normalizedToken, for: profile.id)
         }
         profileStore.save(profiles)
         if activeProfileID == nil {
