@@ -43,3 +43,5 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.phantasm.app
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_PREVIEWS: YES
+        DEVELOPMENT_TEAM: "6JWFWV65BL"
+        CODE_SIGN_STYLE: Automatic
