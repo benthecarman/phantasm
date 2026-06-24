@@ -21,7 +21,7 @@ struct ProfileEditView: View {
     init(profile: BackendProfile?) {
         self.existing = profile
         _name = State(initialValue: profile?.name ?? "")
-        _urlString = State(initialValue: profile?.baseURLString ?? "http://")
+        _urlString = State(initialValue: profile?.baseURLString ?? "https://")
         _defaultModel = State(initialValue: profile?.defaultModel ?? "")
         // Pre-fill the token from the Keychain when editing.
         _token = State(initialValue: "")
@@ -37,10 +37,8 @@ struct ProfileEditView: View {
             Form {
                 Section("Connection") {
                     TextField("Name", text: $name)
-                    TextField("Base URL (e.g. http://192.168.1.10:8080)", text: $urlString)
-                        .keyboardType(.URL)
+                    TextField("Base URL (e.g. https://ollama.example.ts.net)", text: $urlString)
                         .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
                     SecureField("Bearer token", text: $token)
                 }
 
