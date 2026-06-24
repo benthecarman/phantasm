@@ -15,21 +15,20 @@ public struct CapabilitiesClient: Sendable {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.timeoutInterval = 8
 
-        guard let (data, response) = try? await session.data(for: req),
-              let http = response as? HTTPURLResponse else {
-            return .plainChatOnly
+        if let (data, response) = try? await session.data(for: req),
+           let http = response as? HTTPURLResponse, http.statusCode == 200,
+           let caps = try? Wire.decoder().decode(Capabilities.self, from: data) {
+            return .full(caps)
         }
-        guard http.statusCode == 200,
-              let caps = try? Wire.decoder().decode(Capabilities.self, from: data) else {
-            return .plainChatOnly
-        }
-        return .full(caps)
+        // Not an orchestrator (or unreachable) — degrade, discovering models if we can.
+        let models = await fetchModelList(base: base, token: token)
+        return .plainChatOnly(models: models)
     }
 
     /// Validate reachability + auth for the Settings "Test connection" button
-    /// (FR-A1). Tries capabilities first; if that 404s (bare Ollama) falls back
-    /// to a tiny non-streaming chat ping to confirm the token works.
-    public func validate(base: URL, token: String, pingModel: String) async -> Result<BackendMode, AppError> {
+    /// (FR-A1). Tries capabilities first; if that 404s (bare Ollama) confirms the
+    /// backend by listing `/v1/models` — no model name required, no generation.
+    public func validate(base: URL, token: String) async -> Result<BackendMode, AppError> {
         var req = URLRequest(url: base.appendingPathComponent("v1/capabilities"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.timeoutInterval = 8
@@ -42,12 +41,13 @@ public struct CapabilitiesClient: Sendable {
                 if let caps = try? Wire.decoder().decode(Capabilities.self, from: data) {
                     return .success(.full(caps))
                 }
-                return .success(.plainChatOnly)
+                let models = await fetchModelList(base: base, token: token)
+                return .success(.plainChatOnly(models: models))
             case 401, 403:
                 return .failure(.authFailed)
             case 404:
-                // Not an orchestrator — confirm auth with a chat ping.
-                return await pingChat(base: base, token: token, model: pingModel)
+                // Not our orchestrator — confirm it's an OpenAI-compatible backend.
+                return await confirmPlainBackend(base: base, token: token)
             default:
                 return .failure(.modelError("HTTP \(http.statusCode)"))
             }
@@ -56,22 +56,53 @@ public struct CapabilitiesClient: Sendable {
         }
     }
 
-    private func pingChat(base: URL, token: String, model: String) async -> Result<BackendMode, AppError> {
-        var req = URLRequest(url: base.appendingPathComponent("v1/chat/completions"))
-        req.httpMethod = "POST"
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 12
-        let body = ChatRequest(model: model, messages: [WireMessage(role: "user", content: "ping")], stream: false)
-        req.httpBody = try? Wire.encoder().encode(body)
+    /// Discover available model ids for the picker. Uses the orchestrator
+    /// manifest when present, otherwise bare `/v1/models`. Empty on failure.
+    public func models(base: URL, token: String) async -> [String] {
+        await probe(base: base, token: token).models
+    }
 
+    /// Confirm a bare backend by listing models. Distinguishes auth failure from
+    /// "reachable but not an OpenAI-compatible endpoint".
+    private func confirmPlainBackend(base: URL, token: String) async -> Result<BackendMode, AppError> {
+        var req = URLRequest(url: base.appendingPathComponent("v1/models"))
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 8
         do {
-            let (_, response) = try await session.data(for: req)
+            let (data, response) = try await session.data(for: req)
             guard let http = response as? HTTPURLResponse else { return .failure(.unreachable) }
-            if let err = AppError.fromStatus(http.statusCode) { return .failure(err) }
-            return .success(.plainChatOnly)
+            switch http.statusCode {
+            case 200:
+                let models = decodeModelIDs(data)
+                return .success(.plainChatOnly(models: models))
+            case 401, 403:
+                return .failure(.authFailed)
+            default:
+                return .failure(.modelError("Not an OpenAI-compatible endpoint (HTTP \(http.statusCode))"))
+            }
         } catch {
             return .failure(.from(error))
         }
+    }
+
+    /// Best-effort model list (empty on any failure).
+    private func fetchModelList(base: URL, token: String) async -> [String] {
+        var req = URLRequest(url: base.appendingPathComponent("v1/models"))
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 8
+        guard let (data, response) = try? await session.data(for: req),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            return []
+        }
+        return decodeModelIDs(data)
+    }
+
+    private func decodeModelIDs(_ data: Data) -> [String] {
+        (try? JSONDecoder().decode(ModelsResponse.self, from: data))?.data.map(\.id) ?? []
+    }
+
+    private struct ModelsResponse: Decodable {
+        struct Entry: Decodable { let id: String }
+        let data: [Entry]
     }
 }

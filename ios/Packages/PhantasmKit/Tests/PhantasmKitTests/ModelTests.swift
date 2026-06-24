@@ -18,10 +18,10 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(mode.models.count, 2)
     }
 
-    func testPlainChatModeHasNoTools() {
-        let mode = BackendMode.plainChatOnly
+    func testPlainChatModeHasNoToolsButCarriesModels() {
+        let mode = BackendMode.plainChatOnly(models: ["qwen2.5:7b", "bwen:8b"])
         XCTAssertFalse(mode.showsTools)
-        XCTAssertTrue(mode.models.isEmpty)
+        XCTAssertEqual(mode.models, ["qwen2.5:7b", "bwen:8b"])
         XCTAssertNil(mode.capabilities)
     }
 

@@ -15,6 +15,8 @@ struct ProfileEditView: View {
     @State private var defaultModel: String
     @State private var testResult: TestResult?
     @State private var isTesting = false
+    @State private var models: [String] = []
+    @State private var loadingModels = false
 
     init(profile: BackendProfile?) {
         self.existing = profile
@@ -40,9 +42,29 @@ struct ProfileEditView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     SecureField("Bearer token", text: $token)
-                    TextField("Default model (optional)", text: $defaultModel)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                }
+
+                Section {
+                    Picker("Default model", selection: $defaultModel) {
+                        Text("Auto (first available)").tag("")
+                        ForEach(pickerOptions, id: \.self) { Text($0).tag($0) }
+                    }
+                    Button {
+                        Task { await loadModels() }
+                    } label: {
+                        HStack {
+                            Label(models.isEmpty ? "Load models" : "Reload models",
+                                  systemImage: "arrow.clockwise")
+                            if loadingModels { Spacer(); ProgressView() }
+                        }
+                    }
+                    .disabled(!canLoadModels || loadingModels)
+                } header: {
+                    Text("Default model")
+                } footer: {
+                    if models.isEmpty && !loadingModels {
+                        Text("Tap Load to fetch models from the backend.")
+                    }
                 }
 
                 Section {
@@ -79,6 +101,9 @@ struct ProfileEditView: View {
                 if let existing, token.isEmpty {
                     token = env.keychain.token(for: existing.id) ?? ""
                 }
+                if canLoadModels {
+                    Task { await loadModels() }
+                }
             }
         }
     }
@@ -88,25 +113,52 @@ struct ProfileEditView: View {
             && URL(string: urlString)?.scheme != nil
     }
 
+    private var canLoadModels: Bool {
+        URL(string: urlString)?.scheme != nil
+    }
+
+    /// The discovered models, plus the currently-saved model if it's not in the
+    /// list (so a previously-chosen value still shows as selected).
+    private var pickerOptions: [String] {
+        var opts = models
+        if !defaultModel.isEmpty && !opts.contains(defaultModel) {
+            opts.insert(defaultModel, at: 0)
+        }
+        return opts
+    }
+
+    private func loadModels() async {
+        guard let base = URL(string: urlString) else { return }
+        loadingModels = true
+        models = await env.capabilitiesClient.models(base: base, token: token)
+        loadingModels = false
+    }
+
     private func test() async {
         guard let base = URL(string: urlString) else { return }
         isTesting = true
         testResult = nil
-        let model = defaultModel.isEmpty ? "llama3.1" : defaultModel
-        let result = await env.capabilitiesClient.validate(base: base, token: token, pingModel: model)
+        let result = await env.capabilitiesClient.validate(base: base, token: token)
         isTesting = false
         switch result {
         case .success(let mode):
+            models = mode.models
             switch mode {
             case .full(let caps):
                 let tools = (caps.tools?.webSearch ?? false) || (caps.tools?.imageGeneration ?? false)
-                testResult = .success("Connected. \(caps.models.count) model(s)\(tools ? ", tools available" : "").")
-            case .plainChatOnly:
-                testResult = .success("Connected (plain chat).")
+                let toolNote = tools ? " Web search / image tools available." : " Chat only — no tools advertised."
+                testResult = .success("Connected. \(modelCount(caps.models.count)).\(toolNote)")
+            case .plainChatOnly(let models):
+                let suffix = models.isEmpty ? "" : " \(modelCount(models.count))."
+                testResult = .success("Connected — chat only (no web search or image tools).\(suffix)")
             }
         case .failure(let error):
             testResult = .failure(error.userMessage)
         }
+    }
+
+    private func modelCount(_ n: Int) -> String {
+        "\(n) model\(n == 1 ? "" : "s")"
     }
 
     private func save() {

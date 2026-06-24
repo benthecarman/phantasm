@@ -17,7 +17,7 @@ final class AppEnvironment {
 
     var profiles: [BackendProfile]
     var activeProfileID: UUID?
-    var backendMode: BackendMode = .plainChatOnly
+    var backendMode: BackendMode = .plainChatOnly(models: [])
     var isProbing = false
 
     init() {
@@ -80,7 +80,7 @@ final class AppEnvironment {
         guard let profile = activeProfile,
               let base = profile.baseURL,
               let token = keychain.token(for: profile.id) else {
-            backendMode = .plainChatOnly
+            backendMode = .plainChatOnly(models: [])
             return
         }
         isProbing = true

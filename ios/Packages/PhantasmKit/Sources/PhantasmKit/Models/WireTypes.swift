@@ -73,7 +73,8 @@ public enum BackendMode: Sendable, Equatable {
     /// Manifest present — full feature set advertised.
     case full(Capabilities)
     /// No manifest (404 / not an orchestrator) — plain chat only, no tool UI.
-    case plainChatOnly
+    /// Carries any models discovered from `/v1/models` so the picker still works.
+    case plainChatOnly(models: [String])
 
     public var capabilities: Capabilities? {
         if case let .full(caps) = self { return caps }
@@ -82,7 +83,10 @@ public enum BackendMode: Sendable, Equatable {
 
     /// Models to offer in the picker (empty => free-text entry).
     public var models: [String] {
-        capabilities?.models ?? []
+        switch self {
+        case .full(let caps): return caps.models
+        case .plainChatOnly(let models): return models
+        }
     }
 
     public var showsTools: Bool {
