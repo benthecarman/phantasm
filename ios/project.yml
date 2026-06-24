@@ -1,0 +1,45 @@
+name: Phantasm
+options:
+  bundleIdPrefix: com.phantasm
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+packages:
+  PhantasmKit:
+    path: Packages/PhantasmKit
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    from: "2.0.0"
+targets:
+  Phantasm:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: App
+      - path: Views
+      - path: ViewModels
+    dependencies:
+      - package: PhantasmKit
+      - package: MarkdownUI
+        product: MarkdownUI
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Phantasm
+        UILaunchScreen: {}
+        NSPhotoLibraryAddUsageDescription: "Phantasm saves generated images to your photo library when you choose to save them."
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.phantasm.app
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_PREVIEWS: YES

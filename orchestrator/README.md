@@ -1,0 +1,107 @@
+# Phantasm Orchestrator
+
+An OpenAI-compatible orchestration proxy for self-hosted AI. It sits between a
+thin chat client (the Phantasm iOS app, or any OpenAI client) and your own
+[Ollama](https://ollama.com) + [ComfyUI](https://github.com/comfyanonymous/ComfyUI),
+adding **web search** and **image generation** via a server-side tool loop that
+is *invisible to the client*.
+
+The client only ever speaks plain OpenAI SSE, so it can point at this
+orchestrator, a bare Ollama instance, or OpenAI itself — unchanged.
+
+## How it works
+
+```
+iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ Ollama
+                             │
+                             ├── Brave Search  (web_search tool)
+                             └── ComfyUI       (image_generation tool)
+```
+
+- **Plain turns** are a near-passthrough: one streaming `/api/chat` call,
+  transcoded chunk-for-chunk to OpenAI SSE.
+- **Tool turns** run the standard function-calling loop *upstream* (orchestrator
+  ↔ Ollama). The client only sees the final streamed answer, plus optional
+  progress on the additive `x_status` SSE field.
+- Generated **images** are embedded in the answer as markdown
+  `![generated](data:image/png;base64,…)`.
+
+> **Why the native Ollama API?** Ollama's OpenAI-compat endpoint silently drops
+> `tool_calls` when streaming, so we use the native `/api/chat` (reliable
+> streaming + tools) upstream while presenting OpenAI to the client.
+
+## Endpoints
+
+| Method | Path                    | Purpose                                  |
+|--------|-------------------------|------------------------------------------|
+| `GET`  | `/v1/capabilities`      | Advertise models + which tools are live  |
+| `POST` | `/v1/chat/completions`  | OpenAI-compatible chat (SSE or JSON)      |
+
+All routes require `Authorization: Bearer <PHANTASM_AUTH_TOKEN>`.
+
+## Run
+
+### Docker (recommended)
+
+```sh
+cp .env.example .env          # set PHANTASM_AUTH_TOKEN (required)
+docker compose up             # builds + starts on :8080
+```
+
+If Ollama/ComfyUI run on the host, the compose file points the container at
+`host.docker.internal` by default.
+
+### Cargo (local dev)
+
+```sh
+PHANTASM_AUTH_TOKEN=dev-secret OLLAMA_BASE_URL=http://localhost:11434 \
+  cargo run
+```
+
+Enable tools with the env toggles in `.env.example`
+(`TOOL_WEB_SEARCH`, `BRAVE_API_KEY`, `TOOL_IMAGE_GEN`, `COMFYUI_WORKFLOW_JSON`).
+Optional full-page search fetching: build with `--features page_fetch`.
+
+## Configuration
+
+Everything is environment-driven — see [`.env.example`](.env.example) for the
+full annotated list.
+
+## Tests
+
+```sh
+cargo test                    # 14 unit + 4 integration, no real backends needed
+cargo clippy --all-targets    # lints
+```
+
+Unit tests cover the tool loop (scripted backend), SSE chunk shapes, and tool
+formatting. Integration tests run the real router in front of a mock Ollama and
+assert the end-to-end SSE stream, the non-streaming completion, and auth.
+
+## Verifying against real backends (on your LAN)
+
+The automated tests use mocks. To confirm against the real thing:
+
+1. **Start it.** `docker compose up` with a valid `.env`.
+2. **Capabilities.**
+   ```sh
+   curl -s localhost:8080/v1/capabilities -H "Authorization: Bearer $TOKEN" | jq
+   ```
+   Expect your models listed and `tools.web_search` / `tools.image_generation`
+   reflecting what you enabled and what's reachable.
+3. **Plain chat.**
+   ```sh
+   curl -N localhost:8080/v1/chat/completions -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"llama3.1","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+   ```
+   Expect `data:` chunks with content deltas, then `data: [DONE]`.
+4. **Search turn** (with `TOOL_WEB_SEARCH=true` + key): ask something current.
+   Expect an `x_status:"searching the web…"` chunk, then a fast answer (~1–2s to
+   first token).
+5. **Image turn** (with `TOOL_IMAGE_GEN=true` + workflow): ask for an image.
+   Expect `x_status:"generating image… N%"` progress, then a `data:` image URI
+   embedded in the final markdown answer.
+6. **Cancellation.** Kill the curl mid-stream; the orchestrator logs the turn
+   finishing and stops upstream work.
+7. **Auth.** A request without the bearer token returns `401`.

@@ -1,0 +1,17 @@
+# Rust
+/orchestrator/target
+**/*.rs.bk
+
+# Env / secrets
+.env
+*.env.local
+
+# iOS / Xcode
+ios/Phantasm.xcodeproj/
+ios/build/
+ios/DerivedData/
+**/.DS_Store
+**/xcuserdata/
+**/*.xcworkspace/xcuserdata/
+.swiftpm/
+ios/Packages/*/.build/

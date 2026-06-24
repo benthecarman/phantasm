@@ -1,0 +1,26 @@
+# Run the orchestrator alongside your existing Ollama / ComfyUI.
+#
+#   cp .env.example .env   # then edit PHANTASM_AUTH_TOKEN
+#   docker compose up
+#
+# The orchestrator reaches Ollama/ComfyUI over the host network; only its own
+# port 8080 is published. If Ollama/ComfyUI run on the host (not in compose),
+# point OLLAMA_BASE_URL / COMFYUI_BASE_URL at host.docker.internal.
+services:
+  orchestrator:
+    build: .
+    image: phantasm-orchestrator:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Override localhost defaults so the container can reach host services.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      COMFYUI_BASE_URL: ${COMFYUI_BASE_URL:-http://host.docker.internal:8188}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Mount a custom workflow without rebuilding the image.
+      - ./workflows:/app/workflows:ro
