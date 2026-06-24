@@ -48,6 +48,10 @@ final class ChatViewModel {
             return
         }
 
+        // Persist the conversation lazily: new chats stay ephemeral (and out of
+        // the history list) until their first message is sent.
+        context.insert(conversation)
+
         // Persist the user message.
         let user = Message(role: "user", content: text, isComplete: true)
         user.conversation = conversation

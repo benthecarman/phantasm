@@ -3,29 +3,45 @@ import SwiftUI
 
 struct ChatView: View {
     let conversation: Conversation
+    /// Reveal the history drawer (FR-A: chat is the root, history slides over).
+    var onOpenHistory: () -> Void = {}
+    /// Start a fresh chat from the composer toolbar.
+    var onNewChat: () -> Void = {}
 
     @Environment(AppEnvironment.self) private var env
     @Environment(\.modelContext) private var context
     @State private var vm = ChatViewModel()
     @State private var input = ""
+    @FocusState private var composerFocused: Bool
+
+    private var isEmpty: Bool { conversation.orderedMessages.isEmpty && !vm.isStreaming }
 
     var body: some View {
-        VStack(spacing: 0) {
-            messageList
-            Divider()
-            ComposerView(
-                input: $input,
-                isStreaming: vm.isStreaming,
-                canSend: vm.canSend,
-                onSend: send,
-                onStop: { vm.stop() }
-            )
+        NavigationStack {
+            VStack(spacing: 0) {
+                if isEmpty {
+                    emptyState
+                } else {
+                    messageList
+                }
+                Divider()
+                ComposerView(
+                    input: $input,
+                    isStreaming: vm.isStreaming,
+                    canSend: vm.canSend,
+                    focus: $composerFocused,
+                    onSend: send,
+                    onStop: { vm.stop() }
+                )
+            }
+            .navigationTitle(isEmpty ? "" : conversation.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { toolbarContent }
         }
-        .navigationTitle(conversation.title)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar { toolbarContent }
         .task(id: conversation.id) {
             vm.configure(env: env, context: context, conversation: conversation)
+            // Claude-style: drop the user straight into the composer on a new chat.
+            if isEmpty { composerFocused = true }
         }
         .alert("Error", isPresented: Binding(
             get: { vm.errorMessage != nil },
@@ -35,6 +51,22 @@ struct ChatView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 44))
+                .foregroundStyle(.secondary)
+            Text("What can I help with?")
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { composerFocused = true }
     }
 
     private var messageList: some View {
@@ -59,7 +91,13 @@ struct ChatView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
+        ToolbarItem(placement: .topBarLeading) {
+            Button(action: onOpenHistory) {
+                Image(systemName: "line.3.horizontal")
+            }
+            .accessibilityLabel("Chat history")
+        }
+        ToolbarItem(placement: .principal) {
             if !env.availableModels.isEmpty {
                 Menu {
                     Picker("Model", selection: modelBinding) {
@@ -70,6 +108,13 @@ struct ChatView: View {
                         .font(.caption)
                 }
             }
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            Button(action: onNewChat) {
+                Image(systemName: "square.and.pencil")
+            }
+            .accessibilityLabel("New chat")
+            .disabled(env.activeProfile == nil)
         }
     }
 
@@ -104,6 +149,7 @@ struct ComposerView: View {
     @Binding var input: String
     let isStreaming: Bool
     let canSend: Bool
+    var focus: FocusState<Bool>.Binding
     let onSend: () -> Void
     let onStop: () -> Void
 
@@ -112,6 +158,7 @@ struct ComposerView: View {
             TextField("Message", text: $input, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...5)
+                .focused(focus)
                 .disabled(isStreaming)
 
             if isStreaming {
