@@ -129,6 +129,44 @@ extension AppDatabase: ChatStore {
         }
     }
 
+    public func editUserMessage(id: UUID, newContent: String) async throws {
+        try await dbWriter.write { db in
+            guard var message = try Message.fetchOne(db, key: id) else { return }
+            let now = Date()
+            // Truncate everything after the edited message (cascades to
+            // attachments + fires the FTS triggers), then update it in place.
+            try Message
+                .filter(Col.conversationId == message.conversationId)
+                .filter(Col.createdAt > message.createdAt)
+                .deleteAll(db)
+            message.content = newContent
+            message.updatedAt = now
+            try message.update(db)
+            // Bump the conversation so the edit re-sorts it to the top.
+            if var convo = try Conversation.fetchOne(db, key: message.conversationId) {
+                convo.updatedAt = now
+                try convo.update(db)
+            }
+        }
+    }
+
+    public func deleteMessagesFrom(id: UUID) async throws {
+        try await dbWriter.write { db in
+            guard let message = try Message.fetchOne(db, key: id) else { return }
+            let now = Date()
+            // Delete this message and everything after it (cascades to attachments
+            // + fires the FTS triggers).
+            try Message
+                .filter(Col.conversationId == message.conversationId)
+                .filter(Col.createdAt >= message.createdAt)
+                .deleteAll(db)
+            if var convo = try Conversation.fetchOne(db, key: message.conversationId) {
+                convo.updatedAt = now
+                try convo.update(db)
+            }
+        }
+    }
+
     public func deleteConversation(id: UUID) async throws {
         try await dbWriter.write { db in
             // Hard-delete the heavy data: removing messages cascades to

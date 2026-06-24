@@ -6,6 +6,20 @@ import SwiftUI
 /// markdown (with images + code copy).
 struct MessageBubble: View {
     let message: ChatMessage
+    /// Whether this row is currently being edited (drives the inline editor).
+    var isEditing = false
+    /// Whether the "Edit" action is offered (user messages, no turn in flight).
+    var canEdit = false
+    /// Whether the "Regenerate" action is offered (assistant messages, idle).
+    var canRegenerate = false
+    /// The shared draft text while editing (only the editing row reads it).
+    var editText: Binding<String> = .constant("")
+    var onBeginEdit: () -> Void = {}
+    var onSubmitEdit: () -> Void = {}
+    var onCancelEdit: () -> Void = {}
+    var onRegenerate: () -> Void = {}
+
+    @FocusState private var editorFocused: Bool
 
     private var isUser: Bool { message.message.role == "user" }
     private var content: String { message.message.content }
@@ -14,23 +28,67 @@ struct MessageBubble: View {
         HStack {
             if isUser { Spacer(minLength: 40) }
             if isUser {
-                VStack(alignment: .trailing, spacing: 6) {
-                    if !message.attachments.isEmpty {
-                        MessageAttachmentsView(attachments: message.attachments)
-                    }
-                    if !content.isEmpty {
-                        Text(content)
-                            .textSelection(.enabled)
-                            .padding(10)
-                            .background(Color.accentColor.opacity(0.15))
-                            .clipShape(RoundedRectangle(cornerRadius: 14))
-                    }
+                if isEditing {
+                    editor
+                } else {
+                    userBubble
                 }
             } else {
                 MarkdownMessageView(text: content)
+                    .conditionalContextMenu(canRegenerate) {
+                        Button(action: onRegenerate) {
+                            Label("Regenerate", systemImage: "arrow.clockwise")
+                        }
+                    }
             }
             if !isUser { Spacer(minLength: 40) }
         }
+    }
+
+    private var userBubble: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            if !message.attachments.isEmpty {
+                MessageAttachmentsView(attachments: message.attachments)
+            }
+            if !content.isEmpty {
+                Text(content)
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .background(Color.accentColor.opacity(0.15))
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .conditionalContextMenu(canEdit) {
+                        Button(action: onBeginEdit) {
+                            Label("Edit", systemImage: "pencil")
+                        }
+                    }
+            }
+        }
+    }
+
+    /// Inline editor shown in place of a user bubble: edit the text and re-ask,
+    /// or cancel back to the original. Attachments ride along unchanged.
+    private var editor: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            if !message.attachments.isEmpty {
+                MessageAttachmentsView(attachments: message.attachments)
+            }
+            TextField("Message", text: editText, axis: .vertical)
+                .lineLimit(1...10)
+                .focused($editorFocused)
+                .padding(10)
+                .background(Color.accentColor.opacity(0.15))
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+            HStack(spacing: 12) {
+                Button("Cancel", role: .cancel, action: onCancelEdit)
+                    .buttonStyle(.bordered)
+                Button("Send", action: onSubmitEdit)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(editText.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .font(.callout)
+            .controlSize(.small)
+        }
+        .onAppear { editorFocused = true }
     }
 }
 
@@ -54,6 +112,21 @@ struct StreamingBubble: View {
                 }
             }
             Spacer(minLength: 40)
+        }
+    }
+}
+
+private extension View {
+    /// Attach a context menu only when `enabled`; otherwise leave the view as-is
+    /// so an idle long-press doesn't surface an empty menu.
+    @ViewBuilder
+    func conditionalContextMenu<Items: View>(
+        _ enabled: Bool, @ViewBuilder items: () -> Items
+    ) -> some View {
+        if enabled {
+            contextMenu(menuItems: items)
+        } else {
+            self
         }
     }
 }

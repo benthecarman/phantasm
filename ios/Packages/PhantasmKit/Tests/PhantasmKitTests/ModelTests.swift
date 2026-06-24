@@ -351,6 +351,69 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(detail?.messages.first?.message.isComplete, true)
     }
 
+    func testEditUserMessageTruncatesAfterItAndKeepsAttachments() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let user = Message(conversationId: convo.id, role: "user", content: "old",
+                           createdAt: t0)
+        let image = Attachment(messageId: user.id, kind: .image, name: "p.jpg",
+                               data: Data("bytes".utf8))
+        try await store.insertMessage(user, attachments: [image])
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "assistant", content: "reply",
+                    createdAt: t0.addingTimeInterval(1)),
+            attachments: []
+        )
+
+        try await store.editUserMessage(id: user.id, newContent: "new")
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        // Only the edited message remains; the later assistant reply is gone.
+        XCTAssertEqual(detail?.messages.count, 1)
+        XCTAssertEqual(detail?.messages.first?.message.content, "new")
+        // Its attachments ride along unchanged.
+        XCTAssertEqual(detail?.messages.first?.attachments.count, 1)
+        try await store.reader.read { db in
+            XCTAssertEqual(try Attachment.fetchCount(db), 1)
+        }
+    }
+
+    func testEditUserMessageKeepsFullTextSearchInSync() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let user = Message(conversationId: convo.id, role: "user", content: "kangaroo")
+        try await store.insertMessage(user, attachments: [])
+
+        try await store.editUserMessage(id: user.id, newContent: "platypus")
+
+        // The old term no longer matches; the new one does (FTS triggers fired).
+        let stale = try await store.searchConversations(matching: "kangaroo")
+        XCTAssertTrue(stale.isEmpty)
+        let fresh = try await store.searchConversations(matching: "platypus")
+        XCTAssertEqual(fresh.map(\.conversation.id), [convo.id])
+    }
+
+    func testDeleteMessagesFromDropsItAndLaterMessages() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let user = Message(conversationId: convo.id, role: "user", content: "ask",
+                           createdAt: t0)
+        try await store.insertMessage(user, attachments: [])
+        let reply = Message(conversationId: convo.id, role: "assistant", content: "answer",
+                            createdAt: t0.addingTimeInterval(1))
+        try await store.insertMessage(reply, attachments: [])
+
+        // Regenerate: drop the assistant reply and re-stream from the user prompt.
+        try await store.deleteMessagesFrom(id: reply.id)
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.messages.map(\.message.role), ["user"])
+        XCTAssertEqual(detail?.messages.first?.message.content, "ask")
+    }
+
     // MARK: Full-text search
 
     func testSearchMatchesMessageContent() async throws {

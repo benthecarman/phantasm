@@ -18,6 +18,9 @@ struct ChatView: View {
     @State private var vm = ChatViewModel()
     @State private var input = ""
     @State private var attachments: [PendingAttachment] = []
+    /// The user message being edited inline, if any (FR-A: edit a previous message).
+    @State private var editingMessageID: UUID?
+    @State private var editingText = ""
     @FocusState private var composerFocused: Bool
     /// Picked once per chat (the view is rebuilt per conversation via `.id`).
     @State private var greeting = GreetingPrompts.random()
@@ -122,7 +125,17 @@ struct ChatView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     ForEach(messages) { message in
-                        MessageBubble(message: message)
+                        MessageBubble(
+                            message: message,
+                            isEditing: editingMessageID == message.id,
+                            canEdit: message.message.role == "user" && !vm.isStreaming,
+                            canRegenerate: message.message.role == "assistant" && !vm.isStreaming,
+                            editText: $editingText,
+                            onBeginEdit: { beginEditing(message) },
+                            onSubmitEdit: { submitEdit() },
+                            onCancelEdit: { editingMessageID = nil },
+                            onRegenerate: { vm.regenerate(messageID: message.id) }
+                        )
                     }
                     if vm.isStreaming {
                         StreamingBubble(text: vm.streamingText, status: vm.statusText)
@@ -180,6 +193,20 @@ struct ChatView: View {
         attachments = []
         composerFocused = false
         vm.send(text, attachments: pending)
+    }
+
+    private func beginEditing(_ message: ChatMessage) {
+        editingText = message.message.content
+        editingMessageID = message.id
+        composerFocused = false
+    }
+
+    /// Commit the inline edit: truncate after this message and re-ask the model.
+    private func submitEdit() {
+        guard let id = editingMessageID else { return }
+        let text = editingText
+        editingMessageID = nil
+        vm.resend(afterEditing: id, newText: text)
     }
 }
 

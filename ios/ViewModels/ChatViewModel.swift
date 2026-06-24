@@ -128,8 +128,96 @@ final class ChatViewModel {
             return
         }
 
-        // Full history each turn (stateless server, XR-2), read back from the store.
-        guard let detail = try? await store.conversationDetail(id: conversation.id) else {
+        await streamReply(
+            conversationId: conversation.id, model: model,
+            base: base, token: token, env: env, store: store
+        )
+    }
+
+    /// Re-ask from an edited earlier message (FR-A: edit a previous message).
+    /// Truncates the conversation after the edited message, then streams a fresh
+    /// reply. The edited message keeps its attachments.
+    func resend(afterEditing messageID: UUID, newText: String) {
+        let text = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let ctx = beginTurn() else { return }
+        ctx.task { store in try await store.editUserMessage(id: messageID, newContent: text) }
+    }
+
+    /// Regenerate an assistant reply (FR-A): drop it and any later messages, then
+    /// re-stream from the preceding history.
+    func regenerate(messageID: UUID) {
+        guard let ctx = beginTurn() else { return }
+        ctx.task { store in try await store.deleteMessagesFrom(id: messageID) }
+    }
+
+    /// The resolved inputs for a streaming turn, plus a helper that runs a
+    /// store mutation and then streams the reply. Shared by `resend`/`regenerate`.
+    private struct TurnContext {
+        let vm: ChatViewModel
+        let convoID: UUID
+        let model: String
+        let base: URL
+        let token: String
+        let env: AppEnvironment
+        let store: ChatStore
+
+        /// Run `mutate` (truncate/edit the history), then stream a fresh reply.
+        @MainActor
+        func task(_ mutate: @escaping @Sendable (ChatStore) async throws -> Void) {
+            vm.task = Task { [weak vm] in
+                do {
+                    try await mutate(store)
+                } catch {
+                    vm?.finish(error: AppError.from(error))
+                    return
+                }
+                await vm?.streamReply(
+                    conversationId: convoID, model: model,
+                    base: base, token: token, env: env, store: store
+                )
+            }
+        }
+    }
+
+    /// Resolve the model/base/token for a new turn and flip the VM into the
+    /// streaming state. Surfaces a user-facing error and returns nil if no turn
+    /// can start (no backend, already streaming, or no model selected).
+    private func beginTurn() -> TurnContext? {
+        guard canSend, let env, let store, let conversation,
+              let base = env.activeProfile?.baseURL else { return nil }
+        guard let model = env.backendMode.resolvedChatModel(
+            conversationModel: conversation.modelID,
+            defaultModel: env.preferredModel
+        ) else {
+            errorMessage = AppError.modelError(
+                "No chat model is selected. Choose a model in Settings or wait for model discovery to finish."
+            ).userMessage
+            return nil
+        }
+
+        isStreaming = true
+        streamingText = ""
+        statusText = nil
+        errorMessage = nil
+
+        return TurnContext(
+            vm: self, convoID: conversation.id, model: model,
+            base: base, token: env.activeToken ?? "", env: env, store: store
+        )
+    }
+
+    /// Load the full history (stateless server, XR-2) and stream the assistant
+    /// reply, committing it on completion via `finish`. Shared by a normal send
+    /// and by re-asking after an edit.
+    private func streamReply(
+        conversationId: UUID,
+        model: String,
+        base: URL,
+        token: String,
+        env: AppEnvironment,
+        store: ChatStore
+    ) async {
+        guard let detail = try? await store.conversationDetail(id: conversationId) else {
             finish(error: .modelError("Could not load the conversation history."))
             return
         }

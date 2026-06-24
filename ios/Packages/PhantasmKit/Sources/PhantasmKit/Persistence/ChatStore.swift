@@ -51,6 +51,21 @@ public protocol ChatStore: Sendable {
         id: UUID, title: String?, modelID: String?, updatedAt: Date?
     ) async throws
 
+    /// Edit a previously sent message in place and truncate the conversation
+    /// after it: replaces the message's content (FTS stays in sync via triggers),
+    /// keeps its attachments, and hard-deletes every later message + its
+    /// attachments. Bumps the conversation's `updatedAt`. Used to re-ask from an
+    /// edited prompt — the caller then re-streams the truncated history. A no-op
+    /// if the message no longer exists.
+    func editUserMessage(id: UUID, newContent: String) async throws
+
+    /// Delete a message and every message after it in the same conversation
+    /// (cascades to attachments, fires the FTS triggers), bumping the
+    /// conversation's `updatedAt`. Used to regenerate an assistant reply: drop it
+    /// (and anything later), then re-stream from the remaining history. A no-op
+    /// if the message no longer exists.
+    func deleteMessagesFrom(id: UUID) async throws
+
     /// Tombstone the conversation (set `deletedAt`) and hard-delete its messages
     /// + attachments, reclaiming the heavy data while leaving a slim tombstone.
     func deleteConversation(id: UUID) async throws
