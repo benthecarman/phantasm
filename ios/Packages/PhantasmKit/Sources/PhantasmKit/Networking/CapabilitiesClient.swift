@@ -12,7 +12,7 @@ public struct CapabilitiesClient: Sendable {
 
     public func probe(base: URL, token: String) async -> BackendMode {
         var req = URLRequest(url: base.appendingPathComponent("v1/capabilities"))
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 8
 
         if let (data, response) = try? await session.data(for: req),
@@ -30,7 +30,7 @@ public struct CapabilitiesClient: Sendable {
     /// backend by listing `/v1/models` — no model name required, no generation.
     public func validate(base: URL, token: String) async -> Result<BackendMode, AppError> {
         var req = URLRequest(url: base.appendingPathComponent("v1/capabilities"))
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 8
 
         do {
@@ -66,7 +66,7 @@ public struct CapabilitiesClient: Sendable {
     /// "reachable but not an OpenAI-compatible endpoint".
     private func confirmPlainBackend(base: URL, token: String) async -> Result<BackendMode, AppError> {
         var req = URLRequest(url: base.appendingPathComponent("v1/models"))
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 8
         do {
             let (data, response) = try await session.data(for: req)
@@ -88,7 +88,7 @@ public struct CapabilitiesClient: Sendable {
     /// Best-effort model list (empty on any failure).
     private func fetchModelList(base: URL, token: String) async -> [String] {
         var req = URLRequest(url: base.appendingPathComponent("v1/models"))
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 8
         guard let (data, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse, http.statusCode == 200 else {

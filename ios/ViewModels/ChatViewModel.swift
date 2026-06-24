@@ -26,7 +26,9 @@ final class ChatViewModel {
     }
 
     var canSend: Bool {
-        guard let env, env.activeProfile?.baseURL != nil, env.activeToken != nil else { return false }
+        // The token is optional: a no-auth backend (local Ollama, or an
+        // orchestrator with PHANTASM_AUTH_TOKEN unset) needs only a base URL.
+        guard let env, env.activeProfile?.baseURL != nil else { return false }
         return !isStreaming
     }
 
@@ -34,8 +36,8 @@ final class ChatViewModel {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, canSend,
               let env, let context, let conversation,
-              let base = env.activeProfile?.baseURL,
-              let token = env.activeToken else { return }
+              let base = env.activeProfile?.baseURL else { return }
+        let token = env.activeToken ?? ""
 
         let model = conversation.modelID
             ?? env.activeProfile?.defaultModel

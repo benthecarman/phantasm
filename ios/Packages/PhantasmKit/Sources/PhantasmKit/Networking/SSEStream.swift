@@ -125,7 +125,9 @@ public struct ChatClient: ChatClienting {
                 do {
                     var urlReq = URLRequest(url: base.appendingPathComponent("v1/chat/completions"))
                     urlReq.httpMethod = "POST"
-                    urlReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                    if !token.isEmpty {
+                        urlReq.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                    }
                     urlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     urlReq.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     urlReq.httpBody = try Wire.encoder().encode(request)
