@@ -193,8 +193,20 @@ fn format_snippets(
         }
         out.push_str(&entry);
     }
-    out.truncate(cap);
+    truncate_at_char_boundary(&mut out, cap);
     out
+}
+
+fn truncate_at_char_boundary(out: &mut String, cap: usize) {
+    if out.len() <= cap {
+        return;
+    }
+
+    let mut end = cap;
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
 }
 
 #[cfg(feature = "page_fetch")]
@@ -276,6 +288,14 @@ mod tests {
         let results = vec![r("T", "long description here", "https://x")];
         let out = format_snippets("q", &results, &[], 20);
         assert!(out.len() <= 20);
+    }
+
+    #[test]
+    fn context_cap_does_not_split_utf8_query() {
+        let query = "\u{1f600}";
+        let cap = "Web search results for \"".len() + 1;
+        let out = format_snippets(query, &[], &[], cap);
+        assert!(out.len() <= cap);
     }
 
     #[test]
