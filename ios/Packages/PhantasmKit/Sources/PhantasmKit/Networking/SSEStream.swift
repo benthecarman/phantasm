@@ -109,6 +109,44 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
     }
 }
 
+/// Split a byte stream into lines, **preserving empty lines**.
+///
+/// `URLSession.AsyncBytes.lines` silently drops blank lines, but SSE uses the
+/// blank line as its event boundary — without it, consecutive `data:` frames
+/// coalesce into one undecodable blob and every token is lost. We split on `\n`
+/// ourselves so the blank boundaries survive (a `\r` left on CRLF streams is
+/// stripped downstream by `classifySSELine`). Byte-level iteration matches what
+/// `AsyncLineSequence` already does internally, so there's no added cost.
+public func sseLines<Bytes: AsyncSequence & Sendable>(
+    _ bytes: Bytes
+) -> AsyncThrowingStream<String, Error> where Bytes.Element == UInt8 {
+    AsyncThrowingStream { continuation in
+        let task = Task {
+            var buffer: [UInt8] = []
+            do {
+                for try await byte in bytes {
+                    try Task.checkCancellation()
+                    if byte == 0x0A { // newline: emit the line (possibly empty)
+                        continuation.yield(String(decoding: buffer, as: UTF8.self))
+                        buffer.removeAll(keepingCapacity: true)
+                    } else {
+                        buffer.append(byte)
+                    }
+                }
+                if !buffer.isEmpty {
+                    continuation.yield(String(decoding: buffer, as: UTF8.self))
+                }
+                continuation.finish()
+            } catch is CancellationError {
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { _ in task.cancel() }
+    }
+}
+
 // MARK: - Chat client
 
 public protocol ChatClienting: Sendable {
@@ -145,7 +183,7 @@ public struct ChatClient: ChatClienting {
                         throw err
                     }
 
-                    for try await event in chatEventStream(lines: bytes.lines) {
+                    for try await event in chatEventStream(lines: sseLines(bytes)) {
                         try Task.checkCancellation()
                         continuation.yield(event)
                     }
