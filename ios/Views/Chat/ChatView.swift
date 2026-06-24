@@ -1,3 +1,4 @@
+import GRDBQuery
 import PhantasmKit
 import PhotosUI
 import SwiftUI
@@ -10,7 +11,10 @@ struct ChatView: View {
     var onNewChat: () -> Void = {}
 
     @Environment(AppEnvironment.self) private var env
-    @Environment(\.modelContext) private var context
+    /// Reactive history for this conversation (drives the list + empty state).
+    @Query<MessagesRequest> private var messages: [ChatMessage]
+    /// The live conversation row, for the (auto-generated) title; nil for a draft.
+    @Query<ConversationRequest> private var liveConversation: Conversation?
     @State private var vm = ChatViewModel()
     @State private var input = ""
     @State private var attachments: [PendingAttachment] = []
@@ -18,11 +22,32 @@ struct ChatView: View {
     /// Picked once per chat (the view is rebuilt per conversation via `.id`).
     @State private var greeting = GreetingPrompts.random()
 
-    private var isEmpty: Bool { conversation.orderedMessages.isEmpty && !vm.isStreaming }
+    init(
+        conversation: Conversation,
+        onOpenHistory: @escaping () -> Void = {},
+        onNewChat: @escaping () -> Void = {}
+    ) {
+        self.conversation = conversation
+        self.onOpenHistory = onOpenHistory
+        self.onNewChat = onNewChat
+        _messages = Query(MessagesRequest(conversationId: conversation.id))
+        _liveConversation = Query(ConversationRequest(id: conversation.id))
+    }
+
+    private var isEmpty: Bool { messages.isEmpty && !vm.isStreaming }
+
+    /// The conversation title to display: the live (possibly auto-named) row when
+    /// persisted, falling back to the in-memory draft.
+    private var title: String { liveConversation?.title ?? conversation.title }
+
+    /// The model selected for this conversation (VM-owned once configured).
+    private var currentModelID: String? {
+        vm.selectedModel ?? conversation.modelID ?? env.preferredModel
+    }
 
     /// Whether the selected model can accept images (vision-capable).
     private var allowsImageAttachments: Bool {
-        env.supportsVision(conversation.modelID ?? env.preferredModel)
+        env.supportsVision(currentModelID)
     }
 
     var body: some View {
@@ -47,7 +72,7 @@ struct ChatView: View {
                     onStop: { vm.stop() }
                 )
             }
-            .navigationTitle(isEmpty ? "" : conversation.title)
+            .navigationTitle(isEmpty ? "" : title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
             .onChange(of: allowsImageAttachments) { _, allowed in
@@ -59,7 +84,7 @@ struct ChatView: View {
             }
         }
         .task(id: conversation.id) {
-            vm.configure(env: env, context: context, conversation: conversation)
+            vm.configure(env: env, store: env.store, conversation: conversation)
             // Claude-style: drop the user straight into the composer on a new chat.
             if isEmpty { composerFocused = true }
         }
@@ -96,7 +121,7 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
-                    ForEach(conversation.orderedMessages) { message in
+                    ForEach(messages) { message in
                         MessageBubble(message: message)
                     }
                     if vm.isStreaming {
@@ -107,7 +132,7 @@ struct ChatView: View {
                 .padding()
             }
             .onChange(of: vm.streamingText) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: conversation.messages.count) { _, _ in scrollToBottom(proxy) }
+            .onChange(of: messages.count) { _, _ in scrollToBottom(proxy) }
             .onAppear { scrollToBottom(proxy) }
         }
     }
@@ -130,17 +155,13 @@ struct ChatView: View {
     }
 
     private var currentModelName: String {
-        conversation.modelID ?? env.preferredModel ?? "model"
+        currentModelID ?? "model"
     }
 
     private var modelBinding: Binding<String> {
         Binding(
-            get: { conversation.modelID ?? env.preferredModel ?? "" },
-            set: {
-                conversation.modelID = $0
-                try? context.save()
-                env.warm(model: $0)
-            }
+            get: { currentModelID ?? "" },
+            set: { vm.setModel($0) }
         )
     }
 

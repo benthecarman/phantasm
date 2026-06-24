@@ -1,6 +1,15 @@
 {
-  "originHash" : "4c96e4a762123d81f2de2f21333392832d479208251a497519eb3d121d602084",
+  "originHash" : "67e7ca58ecddec8cdf9599414949a3e6bf6d2c3aace01a18042bf09ec2ea194d",
   "pins" : [
+    {
+      "identity" : "grdb.swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/groue/GRDB.swift.git",
+      "state" : {
+        "revision" : "b83108d10f42680d78f23fe4d4d80fc88dab3212",
+        "version" : "7.11.1"
+      }
+    },
     {
       "identity" : "ollama-swift",
       "kind" : "remoteSourceControl",

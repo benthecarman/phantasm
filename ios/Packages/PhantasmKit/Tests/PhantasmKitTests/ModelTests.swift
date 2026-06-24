@@ -1,4 +1,3 @@
-import SwiftData
 import XCTest
 @testable import PhantasmKit
 
@@ -222,62 +221,79 @@ final class Base64ImageExtractorTests: XCTestCase {
     }
 }
 
-@MainActor
+/// Persistence + full-text search over the GRDB-backed `ChatStore`. Each test
+/// runs against a fresh in-memory database (`AppDatabase.empty()`).
 final class PersistenceTests: XCTestCase {
-    private func inMemoryContext() throws -> ModelContext {
-        let config = ModelConfiguration(isStoredInMemoryOnly: true)
-        let container = try ModelContainer(
-            for: Conversation.self, Message.self, Attachment.self,
-            configurations: config
-        )
-        return ModelContext(container)
-    }
+    /// Distinct, increasing timestamps so message ordering is deterministic.
+    private let t0 = Date(timeIntervalSince1970: 1_000_000)
 
-    func testCascadeDeleteAndWireHistory() throws {
-        let ctx = try inMemoryContext()
+    func testWireHistoryFiltersIncompleteAndEmpty() async throws {
+        let store = try AppDatabase.empty()
         let convo = Conversation(title: "T")
-        ctx.insert(convo)
-        let user = Message(role: "user", content: "hi")
-        let assistant = Message(role: "assistant", content: "hello", isComplete: true)
-        let streaming = Message(role: "assistant", content: "", isComplete: false)
-        user.conversation = convo
-        assistant.conversation = convo
-        streaming.conversation = convo
-        ctx.insert(user)
-        ctx.insert(assistant)
-        ctx.insert(streaming)
-        try ctx.save()
+        try await store.insertConversation(convo)
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "user", content: "hi", createdAt: t0),
+            attachments: []
+        )
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "assistant", content: "hello",
+                    createdAt: t0.addingTimeInterval(1), isComplete: true),
+            attachments: []
+        )
+        // An empty, still-streaming message is excluded from wire history (XR-2).
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "assistant", content: "",
+                    createdAt: t0.addingTimeInterval(2), isComplete: false),
+            attachments: []
+        )
 
-        // wireHistory only includes complete, non-empty messages (XR-2).
-        let history = convo.wireHistory()
-        XCTAssertEqual(history, [
+        let detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.wireHistory(), [
             WireMessage(role: "user", content: "hi"),
             WireMessage(role: "assistant", content: "hello"),
         ])
-
-        // Deleting the conversation cascades to its messages.
-        ctx.delete(convo)
-        try ctx.save()
-        let remaining = try ctx.fetch(FetchDescriptor<Message>())
-        XCTAssertTrue(remaining.isEmpty)
     }
 
-    func testImageAttachmentBecomesContentParts() throws {
-        let ctx = try inMemoryContext()
+    func testDeleteTombstonesConversationAndHardDeletesChildren() async throws {
+        let store = try AppDatabase.empty()
         let convo = Conversation(title: "T")
-        ctx.insert(convo)
-        let user = Message(role: "user", content: "what is this?")
-        user.conversation = convo
-        ctx.insert(user)
-        let image = Attachment(
-            kind: .image, name: "photo.jpg",
-            data: Data("png-bytes".utf8), mimeType: "image/jpeg"
-        )
-        image.message = user
-        ctx.insert(image)
-        try ctx.save()
+        try await store.insertConversation(convo)
+        let user = Message(conversationId: convo.id, role: "user", content: "hi")
+        let image = Attachment(messageId: user.id, kind: .image, name: "p.jpg",
+                               data: Data("bytes".utf8))
+        try await store.insertMessage(user, attachments: [image])
 
-        guard case .parts(let parts) = user.wireContent() else {
+        let before = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(before?.messages.count, 1)
+        XCTAssertEqual(before?.messages.first?.attachments.count, 1)
+
+        try await store.deleteConversation(id: convo.id)
+
+        // Tombstoned: detail no longer returns the conversation.
+        let after = try await store.conversationDetail(id: convo.id)
+        XCTAssertNil(after)
+
+        // Heavy data is physically gone; the conversation row remains as a tombstone.
+        try await store.reader.read { db in
+            XCTAssertEqual(try Message.fetchCount(db), 0)
+            XCTAssertEqual(try Attachment.fetchCount(db), 0)
+            let row = try Conversation.fetchOne(db, key: convo.id)
+            XCTAssertNotNil(row)
+            XCTAssertNotNil(row?.deletedAt)
+        }
+    }
+
+    func testImageAttachmentBecomesContentParts() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation()
+        try await store.insertConversation(convo)
+        let user = Message(conversationId: convo.id, role: "user", content: "what is this?")
+        let image = Attachment(messageId: user.id, kind: .image, name: "photo.jpg",
+                               data: Data("png-bytes".utf8), mimeType: "image/jpeg")
+        try await store.insertMessage(user, attachments: [image])
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        guard case .parts(let parts) = detail?.messages.first?.wireContent() else {
             return XCTFail("expected content parts")
         }
         XCTAssertEqual(parts.first, .text("what is this?"))
@@ -285,21 +301,18 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(parts.last, .imageURL("data:image/jpeg;base64,\(b64)"))
     }
 
-    func testTextFileAttachmentIsInlinedAsPlainText() throws {
-        let ctx = try inMemoryContext()
-        let convo = Conversation(title: "T")
-        ctx.insert(convo)
-        let user = Message(role: "user", content: "summarize")
-        user.conversation = convo
-        ctx.insert(user)
-        let file = Attachment(kind: .text, name: "notes.txt", text: "line one")
-        file.message = user
-        ctx.insert(file)
-        try ctx.save()
+    func testTextFileAttachmentIsInlinedAsPlainText() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation()
+        try await store.insertConversation(convo)
+        let user = Message(conversationId: convo.id, role: "user", content: "summarize")
+        let file = Attachment(messageId: user.id, kind: .text, name: "notes.txt", text: "line one")
+        try await store.insertMessage(user, attachments: [file])
 
         // Text files stay a plain string so non-vision models still get them.
+        let detail = try await store.conversationDetail(id: convo.id)
         XCTAssertEqual(
-            user.wireContent(),
+            detail?.messages.first?.wireContent(),
             .text("summarize\n\nAttached file \"notes.txt\":\nline one")
         )
     }
@@ -321,22 +334,101 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(decoded, original)
     }
 
-    func testBufferThenCommitProducesOneCompleteMessage() throws {
-        let ctx = try inMemoryContext()
-        let convo = Conversation(title: "T")
-        ctx.insert(convo)
-        // Simulate streaming: insert empty incomplete, then commit once.
-        let msg = Message(role: "assistant", content: "", isComplete: false)
-        msg.conversation = convo
-        ctx.insert(msg)
-        try ctx.save()
-        msg.content = "final answer"
-        msg.isComplete = true
-        try ctx.save()
+    func testBufferThenCommitInsertsSingleCompleteMessage() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation()
+        try await store.insertConversation(convo)
+        // The view model buffers streamed tokens in memory and commits exactly
+        // one complete assistant message (NFR-A4).
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "assistant", content: "final answer",
+                    isComplete: true),
+            attachments: []
+        )
+        let detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.messages.count, 1)
+        XCTAssertEqual(detail?.messages.first?.message.content, "final answer")
+        XCTAssertEqual(detail?.messages.first?.message.isComplete, true)
+    }
 
-        let all = try ctx.fetch(FetchDescriptor<Message>())
-        XCTAssertEqual(all.count, 1)
-        XCTAssertEqual(all.first?.content, "final answer")
-        XCTAssertEqual(all.first?.isComplete, true)
+    // MARK: Full-text search
+
+    func testSearchMatchesMessageContent() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "Untitled")
+        try await store.insertConversation(convo)
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "user", content: "the quick brown fox jumps"),
+            attachments: []
+        )
+        let results = try await store.searchConversations(matching: "brown")
+        XCTAssertEqual(results.map(\.conversation.id), [convo.id])
+        XCTAssertNotNil(results.first?.snippet)
+    }
+
+    func testSearchMatchesTitle() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "Dinner recipes")
+        try await store.insertConversation(convo)
+        // A non-matching message ensures the hit comes from the title alone.
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "user", content: "unrelated"),
+            attachments: []
+        )
+        let results = try await store.searchConversations(matching: "recipes")
+        XCTAssertEqual(results.map(\.conversation.id), [convo.id])
+    }
+
+    func testSearchPrefixMatch() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "About Phantasm")
+        try await store.insertConversation(convo)
+        // Search-as-you-type: a token prefix matches the full term.
+        let results = try await store.searchConversations(matching: "phan")
+        XCTAssertEqual(results.first?.conversation.id, convo.id)
+    }
+
+    func testSearchRanksMessageMatchesAndExcludesNonMatches() async throws {
+        let store = try AppDatabase.empty()
+        let match = Conversation(title: "Match", createdAt: t0)
+        let other = Conversation(title: "Other", createdAt: t0.addingTimeInterval(1))
+        try await store.insertConversation(match)
+        try await store.insertConversation(other)
+        try await store.insertMessage(
+            Message(conversationId: match.id, role: "user", content: "elephants are large"),
+            attachments: []
+        )
+        try await store.insertMessage(
+            Message(conversationId: other.id, role: "user", content: "nothing relevant here"),
+            attachments: []
+        )
+        let results = try await store.searchConversations(matching: "elephants")
+        XCTAssertEqual(results.map(\.conversation.id), [match.id])
+    }
+
+    func testDeletedConversationDropsFromSearch() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "Secret plans")
+        try await store.insertConversation(convo)
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "user", content: "topsecret content"),
+            attachments: []
+        )
+        let beforeDelete = try await store.searchConversations(matching: "topsecret")
+        XCTAssertFalse(beforeDelete.isEmpty)
+
+        try await store.deleteConversation(id: convo.id)
+        // Both the message hit and the title hit must disappear.
+        let byContent = try await store.searchConversations(matching: "topsecret")
+        let byTitle = try await store.searchConversations(matching: "Secret")
+        XCTAssertTrue(byContent.isEmpty)
+        XCTAssertTrue(byTitle.isEmpty)
+    }
+
+    func testEmptyQueryReturnsNoResults() async throws {
+        let store = try AppDatabase.empty()
+        try await store.insertConversation(Conversation(title: "anything"))
+        let results = try await store.searchConversations(matching: "   ")
+        XCTAssertTrue(results.isEmpty)
     }
 }

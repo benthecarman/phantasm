@@ -15,6 +15,12 @@ packages:
   MarkdownUI:
     url: https://github.com/gonzalezreal/swift-markdown-ui
     from: "2.0.0"
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "7.0.0"
+  GRDBQuery:
+    url: https://github.com/groue/GRDBQuery
+    from: "0.11.0"
 targets:
   Phantasm:
     type: application
@@ -28,6 +34,10 @@ targets:
       - package: PhantasmKit
       - package: MarkdownUI
         product: MarkdownUI
+      - package: GRDB
+        product: GRDB
+      - package: GRDBQuery
+        product: GRDBQuery
     info:
       path: App/Info.plist
       properties:

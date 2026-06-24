@@ -1,12 +1,14 @@
 import PhantasmKit
 import SwiftUI
 
-/// A single persisted message. User messages render as plain text in a tinted
-/// bubble; assistant messages render markdown (with images + code copy).
+/// A single persisted message (paired with its ordered attachments). User
+/// messages render as plain text in a tinted bubble; assistant messages render
+/// markdown (with images + code copy).
 struct MessageBubble: View {
-    let message: Message
+    let message: ChatMessage
 
-    private var isUser: Bool { message.role == "user" }
+    private var isUser: Bool { message.message.role == "user" }
+    private var content: String { message.message.content }
 
     var body: some View {
         HStack {
@@ -14,10 +16,10 @@ struct MessageBubble: View {
             if isUser {
                 VStack(alignment: .trailing, spacing: 6) {
                     if !message.attachments.isEmpty {
-                        MessageAttachmentsView(attachments: message.orderedAttachments)
+                        MessageAttachmentsView(attachments: message.attachments)
                     }
-                    if !message.content.isEmpty {
-                        Text(message.content)
+                    if !content.isEmpty {
+                        Text(content)
                             .textSelection(.enabled)
                             .padding(10)
                             .background(Color.accentColor.opacity(0.15))
@@ -25,7 +27,7 @@ struct MessageBubble: View {
                     }
                 }
             } else {
-                MarkdownMessageView(text: message.content)
+                MarkdownMessageView(text: content)
             }
             if !isUser { Spacer(minLength: 40) }
         }

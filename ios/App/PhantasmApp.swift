@@ -1,3 +1,4 @@
+import GRDBQuery
 import PhantasmKit
 import SwiftUI
 
@@ -11,6 +12,8 @@ struct PhantasmApp: App {
                 .environment(env)
                 .task { await env.refreshCapabilities() }
         }
-        .modelContainer(env.container)
+        // Reactive reads (@Query) observe the SQLite store; writes go through
+        // `env.store`, so a read-only context is all the Views need here.
+        .databaseContext(.readOnly { env.database.reader })
     }
 }

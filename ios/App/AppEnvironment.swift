@@ -1,15 +1,17 @@
 import Foundation
 import Observation
 import PhantasmKit
-import SwiftData
 
 /// App-wide services + connection state, injected through the SwiftUI
-/// environment. Holds the SwiftData container, the profile/keychain stores, and
-/// the resolved `BackendMode` for the active profile.
+/// environment. Holds the GRDB-backed chat store, the profile/keychain stores,
+/// and the resolved `BackendMode` for the active profile.
 @MainActor
 @Observable
 final class AppEnvironment {
-    let container: ModelContainer
+    /// On-device chat history (SQLite + FTS5). Reactive reads use GRDBQuery
+    /// against `database.reader`; writes go through the `store` protocol.
+    let database: AppDatabase
+    var store: ChatStore { database }
     let profileStore = ProfileStore()
     let keychain = KeychainStore()
     let chatClient = ChatClient()
@@ -27,11 +29,10 @@ final class AppEnvironment {
     var visionModels: Set<String>?
 
     init() {
-        // Schema is tiny; container creation is fast (NFR-A5 cold start).
-        container = try! ModelContainer(for: Conversation.self, Message.self)
-        let store = profileStore
-        profiles = store.load()
-        activeProfileID = store.activeProfileID ?? profiles.first?.id
+        // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
+        database = try! AppDatabase.makeShared()
+        profiles = profileStore.load()
+        activeProfileID = profileStore.activeProfileID ?? profiles.first?.id
         // Lazily refresh capabilities for the active backend on launch; the
         // picker is seeded from the cache (see `availableModels`) in the meantime.
         Task { await refreshCapabilities() }

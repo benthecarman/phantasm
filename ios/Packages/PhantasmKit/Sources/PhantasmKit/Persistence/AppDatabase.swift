@@ -1,0 +1,242 @@
+import Foundation
+import GRDB
+
+/// GRDB-backed `ChatStore`: owns the SQLite connection, runs schema migrations
+/// (incl. the FTS5 full-text indexes), and implements all writes/search.
+///
+/// Reactive reads in the UI use GRDBQuery against `reader` (see the app target);
+/// this is the one place the read path touches GRDB directly.
+public final class AppDatabase: Sendable {
+    private let dbWriter: any DatabaseWriter
+
+    /// Read access for GRDBQuery's database context.
+    public var reader: any DatabaseReader { dbWriter }
+
+    private init(_ dbWriter: any DatabaseWriter) throws {
+        self.dbWriter = dbWriter
+        try Self.migrator.migrate(dbWriter)
+    }
+
+    /// On-disk database in Application Support (NFR-A3: on-device history).
+    public static func makeShared() throws -> AppDatabase {
+        let fm = FileManager.default
+        let support = try fm.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true
+        )
+        let dir = support.appendingPathComponent("Phantasm", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("phantasm.sqlite").path)
+        return try AppDatabase(pool)
+    }
+
+    /// In-memory database for tests and SwiftUI previews.
+    public static func empty() throws -> AppDatabase {
+        try AppDatabase(DatabaseQueue())
+    }
+
+    // MARK: - Schema
+
+    private static var migrator: DatabaseMigrator {
+        var migrator = DatabaseMigrator()
+        migrator.registerMigration("v1") { db in
+            try db.create(table: "conversation") { t in
+                t.primaryKey("id", .blob).notNull()
+                t.column("title", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.column("deletedAt", .datetime)
+                t.column("modelID", .text)
+                t.column("profileID", .blob)
+            }
+            try db.create(table: "message") { t in
+                t.primaryKey("id", .blob).notNull()
+                t.column("conversationId", .blob).notNull()
+                    .references("conversation", onDelete: .cascade)
+                t.column("role", .text).notNull()
+                t.column("content", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+                t.column("isComplete", .boolean).notNull()
+            }
+            try db.create(table: "attachment") { t in
+                t.primaryKey("id", .blob).notNull()
+                t.column("messageId", .blob).notNull()
+                    .references("message", onDelete: .cascade)
+                t.column("kind", .text).notNull()
+                t.column("name", .text).notNull()
+                t.column("data", .blob).notNull()
+                t.column("mimeType", .text).notNull()
+                t.column("text", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+                t.column("updatedAt", .datetime).notNull()
+            }
+
+            // FTS5 external-content indexes, kept in sync by triggers that GRDB
+            // installs via `synchronize(withTable:)`. unicode61 removes diacritics
+            // by default; searches use prefix patterns for search-as-you-type.
+            try db.create(virtualTable: "message_ft", using: FTS5()) { t in
+                t.synchronize(withTable: "message")
+                t.tokenizer = .unicode61()
+                t.column("content")
+            }
+            try db.create(virtualTable: "conversation_ft", using: FTS5()) { t in
+                t.synchronize(withTable: "conversation")
+                t.tokenizer = .unicode61()
+                t.column("title")
+            }
+        }
+        return migrator
+    }
+}
+
+// MARK: - Column names
+
+private enum Col {
+    static let conversationId = Column("conversationId")
+    static let deletedAt = Column("deletedAt")
+    static let createdAt = Column("createdAt")
+}
+
+// MARK: - ChatStore
+
+extension AppDatabase: ChatStore {
+    public func insertConversation(_ conversation: Conversation) async throws {
+        try await dbWriter.write { db in
+            // Lazy create: re-inserting an existing conversation is a no-op.
+            try conversation.insert(db, onConflict: .ignore)
+        }
+    }
+
+    public func insertMessage(_ message: Message, attachments: [Attachment]) async throws {
+        try await dbWriter.write { db in
+            try message.insert(db)
+            for attachment in attachments {
+                try attachment.insert(db)
+            }
+        }
+    }
+
+    public func updateConversation(
+        id: UUID, title: String?, modelID: String?, updatedAt: Date?
+    ) async throws {
+        try await dbWriter.write { db in
+            guard var convo = try Conversation.fetchOne(db, key: id) else { return }
+            if let title { convo.title = title }
+            if let modelID { convo.modelID = modelID }
+            if let updatedAt { convo.updatedAt = updatedAt }
+            try convo.update(db)
+        }
+    }
+
+    public func deleteConversation(id: UUID) async throws {
+        try await dbWriter.write { db in
+            // Hard-delete the heavy data: removing messages cascades to
+            // attachments (FK) and fires the FTS triggers that clean message_ft.
+            try Message.filter(Col.conversationId == id).deleteAll(db)
+            // Leave a lightweight tombstone so a future sync can propagate the delete.
+            guard var convo = try Conversation.fetchOne(db, key: id) else { return }
+            let now = Date()
+            convo.deletedAt = now
+            convo.updatedAt = now
+            try convo.update(db)
+        }
+    }
+
+    public func conversationDetail(id: UUID) async throws -> ConversationDetail? {
+        try await dbWriter.read { db in try Self.conversationDetail(db, id: id) }
+    }
+
+    public func searchConversations(matching query: String) async throws -> [ConversationSearchResult] {
+        try await dbWriter.read { db in try Self.search(db, matching: query) }
+    }
+}
+
+// MARK: - Synchronous read helpers
+
+/// These run inside an existing database access. They back both the async
+/// `ChatStore` methods above and the app-target GRDBQuery requests, so the query
+/// logic lives in exactly one place.
+public extension AppDatabase {
+    /// Non-tombstoned conversations, most-recently-updated first.
+    static func recentConversations(_ db: Database) throws -> [Conversation] {
+        try Conversation
+            .filter(Col.deletedAt == nil)
+            .order(Column("updatedAt").desc)
+            .fetchAll(db)
+    }
+
+    /// A conversation's messages in chronological order, each with its ordered
+    /// attachments. Empty when the conversation is missing or tombstoned.
+    static func messages(_ db: Database, conversationId: UUID) throws -> [ChatMessage] {
+        let messages = try Message
+            .filter(Col.conversationId == conversationId)
+            .order(Col.createdAt)
+            .fetchAll(db)
+        let messageIDs = messages.map(\.id)
+        let attachments = try Attachment
+            .filter(messageIDs.contains(Column("messageId")))
+            .order(Col.createdAt)
+            .fetchAll(db)
+        let grouped = Dictionary(grouping: attachments, by: \.messageId)
+        return messages.map { ChatMessage(message: $0, attachments: grouped[$0.id] ?? []) }
+    }
+
+    static func conversationDetail(_ db: Database, id: UUID) throws -> ConversationDetail? {
+        guard let convo = try Conversation
+            .filter(key: id)
+            .filter(Col.deletedAt == nil)
+            .fetchOne(db)
+        else { return nil }
+        return ConversationDetail(conversation: convo, messages: try messages(db, conversationId: id))
+    }
+
+    /// Live conversation row (nil if missing or tombstoned) — for observing the title.
+    static func conversation(_ db: Database, id: UUID) throws -> Conversation? {
+        try Conversation.filter(key: id).filter(Col.deletedAt == nil).fetchOne(db)
+    }
+
+    /// Full-text search over titles + message content, ranked by relevance,
+    /// excluding tombstoned conversations. Empty/whitespace query → no results.
+    static func search(_ db: Database, matching query: String) throws -> [ConversationSearchResult] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Prefix-match every token (search-as-you-type), all required.
+        guard !trimmed.isEmpty, let pattern = FTS5Pattern(matchingAllPrefixesIn: trimmed) else {
+            return []
+        }
+
+        // Rank conversations by the best (lowest) bm25 across a title match or any
+        // message match; carry a snippet from the best message hit.
+        let sql = """
+            WITH hits AS (
+                SELECT m.conversationId AS cid,
+                       bm25(message_ft) AS score,
+                       snippet(message_ft, 0, '', '', '…', 12) AS snip
+                FROM message_ft
+                JOIN message m ON m.rowid = message_ft.rowid
+                WHERE message_ft MATCH :pattern
+                UNION ALL
+                SELECT c.id AS cid, bm25(conversation_ft) AS score, NULL AS snip
+                FROM conversation_ft
+                JOIN conversation c ON c.rowid = conversation_ft.rowid
+                WHERE conversation_ft MATCH :pattern
+            )
+            SELECT conversation.*,
+                   (SELECT snip FROM hits
+                    WHERE hits.cid = conversation.id AND snip IS NOT NULL
+                    ORDER BY score LIMIT 1) AS snippet
+            FROM conversation
+            JOIN (SELECT cid, MIN(score) AS best FROM hits GROUP BY cid) ranked
+                ON ranked.cid = conversation.id
+            WHERE conversation.deletedAt IS NULL
+            ORDER BY ranked.best
+            """
+        let rows = try Row.fetchAll(db, sql: sql, arguments: ["pattern": pattern])
+        return try rows.map { row in
+            ConversationSearchResult(
+                conversation: try Conversation(row: row),
+                snippet: row["snippet"]
+            )
+        }
+    }
+}

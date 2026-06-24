@@ -1,5 +1,4 @@
 import PhantasmKit
-import SwiftData
 import SwiftUI
 
 /// Top-level navigation (Claude-style): the app opens straight into a chat with
@@ -7,8 +6,9 @@ import SwiftUI
 /// user pulls in from the leading edge or the toolbar button.
 struct RootView: View {
     @Environment(AppEnvironment.self) private var env
-    @Environment(\.modelContext) private var context
 
+    /// The displayed conversation. A new chat is an in-memory draft (a value with
+    /// a fresh id) that isn't written to the store until its first message is sent.
     @State private var selection: Conversation?
     @State private var showSettings = false
     @State private var isDrawerOpen = false

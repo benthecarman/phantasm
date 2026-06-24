@@ -1,94 +1,162 @@
 import Foundation
-import SwiftData
+import GRDB
 
 /// On-device conversation history (NFR-A3). No cloud dependency in MVP.
+///
+/// These are GRDB value-type records (SQLite-backed) rather than reference types:
+/// relationships are foreign-key columns, not stored object graphs, and the
+/// chronological/wire-format helpers live on the `ChatMessage` aggregate and the
+/// `[ChatMessage]` array (see below) instead of on the records themselves.
+///
+/// Every row carries `updatedAt`; `Conversation` additionally carries a nullable
+/// `deletedAt` tombstone. Deleting a conversation hard-removes its messages +
+/// attachments (reclaiming the heavy data) but leaves the conversation row as a
+/// lightweight tombstone, so a future cloud-sync layer can still propagate the
+/// deletion (SPEC §7). Column names match the property names.
 
-@Model
-public final class Conversation {
-    @Attribute(.unique) public var id: UUID
+public struct Conversation: Identifiable, Codable, Equatable, Sendable,
+    FetchableRecord, PersistableRecord
+{
+    public var id: UUID
     public var title: String
     public var createdAt: Date
     public var updatedAt: Date
+    /// Tombstone: non-nil once the conversation has been deleted.
+    public var deletedAt: Date?
     public var modelID: String?
     public var profileID: UUID?
-
-    @Relationship(deleteRule: .cascade, inverse: \Message.conversation)
-    public var messages: [Message]
 
     public init(
         id: UUID = UUID(),
         title: String = "New Chat",
         createdAt: Date = .now,
+        updatedAt: Date? = nil,
+        deletedAt: Date? = nil,
         modelID: String? = nil,
         profileID: UUID? = nil
     ) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
-        self.updatedAt = createdAt
+        self.updatedAt = updatedAt ?? createdAt
+        self.deletedAt = deletedAt
         self.modelID = modelID
         self.profileID = profileID
-        self.messages = []
     }
 
-    /// Messages in chronological order.
-    public var orderedMessages: [Message] {
-        messages.sorted { $0.createdAt < $1.createdAt }
-    }
-
-    /// Full history mapped to the wire format (stateless server, XR-2). Only
-    /// completed messages with text or attachments are sent.
-    public func wireHistory() -> [WireMessage] {
-        orderedMessages
-            .filter { $0.isComplete && !($0.content.isEmpty && $0.attachments.isEmpty) }
-            .map { WireMessage(role: $0.role, content: $0.wireContent()) }
-    }
+    public static let databaseTableName = "conversation"
 }
 
-@Model
-public final class Message {
-    @Attribute(.unique) public var id: UUID
+public struct Message: Identifiable, Codable, Equatable, Sendable,
+    FetchableRecord, PersistableRecord
+{
+    public var id: UUID
+    public var conversationId: UUID
     public var role: String
     public var content: String
     public var createdAt: Date
+    public var updatedAt: Date
     /// `false` while streaming; flipped to `true` once the turn finishes.
     public var isComplete: Bool
-    public var conversation: Conversation?
-
-    @Relationship(deleteRule: .cascade, inverse: \Attachment.message)
-    public var attachments: [Attachment]
 
     public init(
         id: UUID = UUID(),
+        conversationId: UUID,
         role: String,
         content: String,
         createdAt: Date = .now,
+        updatedAt: Date? = nil,
         isComplete: Bool = true
     ) {
         self.id = id
+        self.conversationId = conversationId
         self.role = role
         self.content = content
         self.createdAt = createdAt
+        self.updatedAt = updatedAt ?? createdAt
         self.isComplete = isComplete
-        self.attachments = []
     }
 
-    /// Attachments in stable insertion order.
-    public var orderedAttachments: [Attachment] {
-        attachments.sorted { $0.createdAt < $1.createdAt }
+    public static let databaseTableName = "message"
+}
+
+/// Kinds of message attachment. Images ride along as vision input; text files
+/// are extracted to plain text on-device and inlined into the prompt.
+public enum AttachmentKind: String, Sendable {
+    case image
+    case text
+}
+
+public struct Attachment: Identifiable, Codable, Equatable, Sendable,
+    FetchableRecord, PersistableRecord
+{
+    public var id: UUID
+    public var messageId: UUID
+    /// `AttachmentKind` raw value.
+    public var kind: String
+    /// Display label — the source filename, or a synthesized name for photos.
+    public var name: String
+    /// Image bytes (for `.image`); empty for text files.
+    public var data: Data
+    /// MIME type of `data` (for `.image`), e.g. `image/jpeg`.
+    public var mimeType: String
+    /// Extracted text (for `.text`); empty for images.
+    public var text: String
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        messageId: UUID,
+        kind: AttachmentKind,
+        name: String,
+        data: Data = Data(),
+        mimeType: String = "image/jpeg",
+        text: String = "",
+        createdAt: Date = .now,
+        updatedAt: Date? = nil
+    ) {
+        self.id = id
+        self.messageId = messageId
+        self.kind = kind.rawValue
+        self.name = name
+        self.data = data
+        self.mimeType = mimeType
+        self.text = text
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt ?? createdAt
+    }
+
+    public static let databaseTableName = "attachment"
+}
+
+// MARK: - Aggregate + wire format
+
+/// A message paired with its attachments (pre-ordered). This is the in-memory
+/// shape the UI renders and the wire format is derived from — the records
+/// themselves no longer carry their children.
+public struct ChatMessage: Identifiable, Equatable, Sendable {
+    public var message: Message
+    /// Attachments in stable chronological order.
+    public var attachments: [Attachment]
+
+    public var id: UUID { message.id }
+
+    public init(message: Message, attachments: [Attachment] = []) {
+        self.message = message
+        self.attachments = attachments
     }
 
     /// The wire body for this message. Plain text unless the message carries
     /// attachments; image attachments become `image_url` parts and text files
     /// are inlined as additional text (so non-vision models still get them).
     public func wireContent() -> WireContent {
-        let ordered = orderedAttachments
-        let images = ordered.filter { $0.kind == AttachmentKind.image.rawValue }
-        let files = ordered.filter { $0.kind == AttachmentKind.text.rawValue }
-        guard !images.isEmpty || !files.isEmpty else { return .text(content) }
+        let images = attachments.filter { $0.kind == AttachmentKind.image.rawValue }
+        let files = attachments.filter { $0.kind == AttachmentKind.text.rawValue }
+        guard !images.isEmpty || !files.isEmpty else { return .text(message.content) }
 
         var textBlocks: [String] = []
-        if !content.isEmpty { textBlocks.append(content) }
+        if !message.content.isEmpty { textBlocks.append(message.content) }
         for file in files {
             textBlocks.append("Attached file \"\(file.name)\":\n\(file.text)")
         }
@@ -106,51 +174,11 @@ public final class Message {
     }
 }
 
-/// Kinds of message attachment. Images ride along as vision input; text files
-/// are extracted to plain text on-device and inlined into the prompt.
-public enum AttachmentKind: String, Sendable {
-    case image
-    case text
-}
-
-@Model
-public final class Attachment {
-    @Attribute(.unique) public var id: UUID
-    /// `AttachmentKind` raw value.
-    public var kind: String
-    /// Display label — the source filename, or a synthesized name for photos.
-    public var name: String
-    /// Image bytes (for `.image`); empty for text files.
-    @Attribute(.externalStorage) public var data: Data
-    /// MIME type of `data` (for `.image`), e.g. `image/jpeg`.
-    public var mimeType: String
-    /// Extracted text (for `.text`); empty for images.
-    public var text: String
-    public var createdAt: Date
-    public var message: Message?
-
-    public init(
-        id: UUID = UUID(),
-        kind: AttachmentKind,
-        name: String,
-        data: Data = Data(),
-        mimeType: String = "image/jpeg",
-        text: String = "",
-        createdAt: Date = .now
-    ) {
-        self.id = id
-        self.kind = kind.rawValue
-        self.name = name
-        self.data = data
-        self.mimeType = mimeType
-        self.text = text
-        self.createdAt = createdAt
-    }
-}
-
-public enum PhantasmSchema {
-    /// All persisted model types — pass to `ModelContainer`.
-    public static var models: [any PersistentModel.Type] {
-        [Conversation.self, Message.self, Attachment.self]
+public extension Array where Element == ChatMessage {
+    /// Full history mapped to the wire format (stateless server, XR-2). Only
+    /// completed messages with text or attachments are sent.
+    func wireHistory() -> [WireMessage] {
+        filter { $0.message.isComplete && !($0.message.content.isEmpty && $0.attachments.isEmpty) }
+            .map { WireMessage(role: $0.message.role, content: $0.wireContent()) }
     }
 }
