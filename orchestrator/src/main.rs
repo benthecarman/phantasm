@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding {}", cfg.bind_addr))?;
     info!(addr = %cfg.bind_addr, "phantasm orchestrator listening");
+    notify_systemd_ready();
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -60,6 +61,21 @@ fn init_tracing(format: LogFormat) {
         LogFormat::Text => registry.with(tracing_subscriber::fmt::layer()).init(),
     }
 }
+
+/// Tell systemd we've bound and are ready to serve. No-op unless launched by a
+/// `Type=notify` unit (i.e. `$NOTIFY_SOCKET` is set), so dev/Docker runs are
+/// unaffected. Lets `systemctl start` block until we're actually listening and
+/// orders dependent units after us. Graceful SIGTERM drain is already handled by
+/// `shutdown_signal`, which pairs with the unit's `TimeoutStopSec`.
+#[cfg(unix)]
+fn notify_systemd_ready() {
+    if let Err(e) = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]) {
+        tracing::debug!(error = %e, "sd_notify READY skipped (not under systemd?)");
+    }
+}
+
+#[cfg(not(unix))]
+fn notify_systemd_ready() {}
 
 async fn shutdown_signal() {
     let ctrl_c = async {

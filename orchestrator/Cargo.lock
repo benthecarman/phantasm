@@ -1081,6 +1081,7 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "schemars",
+ "sd-notify",
  "secrecy",
  "serde",
  "serde_json",
@@ -1535,6 +1536,15 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn",
+]
+
+[[package]]
+name = "sd-notify"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b943eadf71d8b69e661330cb0e2656e31040acf21ee7708e2c238a0ec6af2bf4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

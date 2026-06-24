@@ -1,0 +1,70 @@
+# Phantasm orchestrator — systemd unit (bare-metal / non-Docker deploy).
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin phantasm
+#   sudo install -m 0755 target/release/phantasm-orchestrator /usr/local/bin/
+#   sudo install -d -m 0755 /etc/phantasm /opt/phantasm/workflows
+#   sudo cp orchestrator/.env.example /etc/phantasm/orchestrator.env  # then edit
+#   sudo chown root:phantasm /etc/phantasm/orchestrator.env && sudo chmod 0640 /etc/phantasm/orchestrator.env
+#   sudo cp orchestrator/workflows/*.json /opt/phantasm/workflows/    # if using image gen
+#   sudo cp orchestrator/deploy/phantasm-orchestrator.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now phantasm-orchestrator
+#
+# Logs: journalctl -u phantasm-orchestrator -f
+
+[Unit]
+Description=Phantasm orchestrator (self-hosted OpenAI-compatible AI proxy)
+Documentation=https://github.com/benthecarman/phantasm
+Wants=network-online.target
+After=network-online.target
+# Ollama usually runs as its own service on the same host; order after it when
+# present. Harmless if ollama.service does not exist.
+After=ollama.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+# Dedicated unprivileged service account (see install steps above).
+User=phantasm
+Group=phantasm
+
+# All config is env-driven (NFR-O4). Keep secrets out of the unit file: this
+# file is `KEY=value` lines — .env.example is already in that format.
+EnvironmentFile=/etc/phantasm/orchestrator.env
+ExecStart=/usr/local/bin/phantasm-orchestrator
+
+Restart=on-failure
+RestartSec=2
+# Allow in-flight streaming turns to drain on SIGTERM before SIGKILL. Pairs with
+# the orchestrator's graceful-shutdown handler.
+TimeoutStopSec=30
+
+# ---- Sandboxing / hardening ----
+# The orchestrator never writes to disk (it only reads its workflow JSON), so it
+# can run against a read-only filesystem.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Bound resource use a little; tune for your host.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

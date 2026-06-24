@@ -64,6 +64,29 @@ Enable tools with the env toggles in `.env.example`
 (`TOOL_WEB_SEARCH`, `BRAVE_API_KEY`, `TOOL_IMAGE_GEN`, `COMFYUI_WORKFLOW_JSON`).
 Optional full-page search fetching: build with `--features page_fetch`.
 
+### systemd (bare metal)
+
+For a non-Docker host, [`deploy/phantasm-orchestrator.service`](deploy/phantasm-orchestrator.service)
+is a hardened `Type=notify` unit (sandboxed, runs as a dedicated `phantasm`
+user, drains in-flight turns on stop). Build, then follow the install header in
+the file:
+
+```sh
+cargo build --release
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin phantasm
+sudo install -m 0755 target/release/phantasm-orchestrator /usr/local/bin/
+sudo install -d -m 0755 /etc/phantasm
+sudo cp .env.example /etc/phantasm/orchestrator.env   # then edit PHANTASM_AUTH_TOKEN
+sudo chown root:phantasm /etc/phantasm/orchestrator.env && sudo chmod 0640 /etc/phantasm/orchestrator.env
+sudo cp deploy/phantasm-orchestrator.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now phantasm-orchestrator
+journalctl -u phantasm-orchestrator -f
+```
+
+The orchestrator emits `READY=1` once it's listening, so `systemctl start`
+blocks until the endpoint is actually up. `.env.example` is already in the
+`KEY=value` format systemd's `EnvironmentFile` expects.
+
 ## Configuration
 
 Everything is environment-driven — see [`.env.example`](.env.example) for the

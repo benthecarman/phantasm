@@ -35,6 +35,11 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 url = { version = "2", features = ["serde"] }
 
+# systemd readiness/`Type=notify` integration. Pure-Rust (no libsystemd link),
+# unix-only; a no-op unless `$NOTIFY_SOCKET` is set, so dev/Docker are unaffected.
+[target.'cfg(unix)'.dependencies]
+sd-notify = "0.4"
+
 [features]
 default = []
 # Enables optional bounded full-page fetching for web search (off by default;
