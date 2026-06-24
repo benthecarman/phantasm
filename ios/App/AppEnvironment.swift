@@ -32,6 +32,10 @@ final class AppEnvironment {
         // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
         database = try! AppDatabase.makeShared()
         profiles = profileStore.load()
+        // Keychain tokens outlive an app uninstall but the UserDefaults profile
+        // list does not, so a reinstall can strand tokens with no owning
+        // profile. Reconcile the two on launch.
+        keychain.deleteTokens(notIn: Set(profiles.map(\.id)))
         activeProfileID = profileStore.activeProfileID ?? profiles.first?.id
         // Lazily refresh capabilities for the active backend on launch; the
         // picker is seeded from the cache (see `availableModels`) in the meantime.
