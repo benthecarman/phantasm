@@ -26,6 +26,9 @@ final class AppEnvironment {
         let store = profileStore
         profiles = store.load()
         activeProfileID = store.activeProfileID ?? profiles.first?.id
+        // Lazily refresh capabilities for the active backend on launch; the
+        // picker is seeded from the cache (see `availableModels`) in the meantime.
+        Task { await refreshCapabilities() }
     }
 
     var activeProfile: BackendProfile? {
@@ -36,10 +39,16 @@ final class AppEnvironment {
         activeProfile.flatMap { keychain.token(for: $0.id) }
     }
 
-    /// Models to offer in the picker for the active backend.
+    /// Models to offer in the picker for the active backend. Prefers the live
+    /// probe result, falls back to the per-backend cache (so the full list shows
+    /// instantly on launch, before the probe completes), then the default model.
     var availableModels: [String] {
         let advertised = backendMode.models
         if !advertised.isEmpty { return advertised }
+        if let id = activeProfileID {
+            let cached = profileStore.cachedModels(for: id)
+            if !cached.isEmpty { return cached }
+        }
         if let m = activeProfile?.defaultModel, !m.isEmpty { return [m] }
         return []
     }
@@ -64,6 +73,7 @@ final class AppEnvironment {
     func delete(_ profile: BackendProfile) {
         profiles.removeAll { $0.id == profile.id }
         try? keychain.delete(for: profile.id)
+        profileStore.clearCachedModels(for: profile.id)
         profileStore.save(profiles)
         if activeProfileID == profile.id {
             setActive(profiles.first?.id)
@@ -86,5 +96,10 @@ final class AppEnvironment {
         isProbing = true
         backendMode = await capabilitiesClient.probe(base: base, token: token)
         isProbing = false
+        // Cache the discovered model list so it's available instantly next launch.
+        let models = backendMode.models
+        if !models.isEmpty {
+            profileStore.cacheModels(models, for: profile.id)
+        }
     }
 }

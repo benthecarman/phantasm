@@ -26,6 +26,7 @@ public final class ProfileStore: @unchecked Sendable {
     private let defaults: UserDefaults
     private let listKey = "phantasm.profiles"
     private let activeKey = "phantasm.activeProfileID"
+    private let modelsKey = "phantasm.cachedModels"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -51,5 +52,27 @@ public final class ProfileStore: @unchecked Sendable {
             return UUID(uuidString: s)
         }
         set { defaults.set(newValue?.uuidString, forKey: activeKey) }
+    }
+
+    // MARK: - Per-profile model cache
+
+    /// The last-known model list for a backend, so the picker is populated
+    /// instantly on launch while a fresh probe runs in the background. Keyed by
+    /// profile id; non-secret, so it lives alongside the profile list.
+    public func cachedModels(for id: UUID) -> [String] {
+        let all = defaults.dictionary(forKey: modelsKey) as? [String: [String]] ?? [:]
+        return all[id.uuidString] ?? []
+    }
+
+    public func cacheModels(_ models: [String], for id: UUID) {
+        var all = defaults.dictionary(forKey: modelsKey) as? [String: [String]] ?? [:]
+        all[id.uuidString] = models
+        defaults.set(all, forKey: modelsKey)
+    }
+
+    public func clearCachedModels(for id: UUID) {
+        guard var all = defaults.dictionary(forKey: modelsKey) as? [String: [String]] else { return }
+        all[id.uuidString] = nil
+        defaults.set(all, forKey: modelsKey)
     }
 }
