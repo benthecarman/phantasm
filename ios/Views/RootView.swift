@@ -119,9 +119,13 @@ struct RootView: View {
     // MARK: Actions
 
     private func makeNewChat() -> Conversation {
+        // Leave `modelID` unset so the composer falls through to the active
+        // backend's `env.preferredModel` (ChatView.currentModelID). Baking the
+        // default in here would freeze it, so switching backends wouldn't update
+        // the composer's model. The resolved model is persisted on first send.
         Conversation(
             title: "New Chat",
-            modelID: env.preferredModel,
+            modelID: nil,
             profileID: env.activeProfileID
         )
     }
