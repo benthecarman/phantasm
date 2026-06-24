@@ -12,12 +12,15 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Backends") {
+                Section {
                     ForEach(env.profiles) { profile in
                         Button {
-                            editing = profile
+                            env.setActive(profile.id)
                         } label: {
                             HStack {
+                                Image(systemName: profile.id == env.activeProfileID
+                                    ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(profile.id == env.activeProfileID ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                                 VStack(alignment: .leading) {
                                     Text(profile.name).foregroundStyle(.primary)
                                     Text(profile.baseURLString)
@@ -25,24 +28,28 @@ struct SettingsView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 Spacer()
-                                if profile.id == env.activeProfileID {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(.tint)
+                                Button {
+                                    editing = profile
+                                } label: {
+                                    Image(systemName: "info.circle")
                                 }
+                                .buttonStyle(.borderless)
                             }
                         }
                         .swipeActions {
                             Button(role: .destructive) { env.delete(profile) } label: {
                                 Label("Delete", systemImage: "trash")
                             }
-                            if profile.id != env.activeProfileID {
-                                Button { env.setActive(profile.id) } label: {
-                                    Label("Activate", systemImage: "checkmark")
-                                }
-                                .tint(.green)
+                            Button { editing = profile } label: {
+                                Label("Edit", systemImage: "pencil")
                             }
+                            .tint(.blue)
                         }
                     }
+                } header: {
+                    Text("Backends")
+                } footer: {
+                    Text("Tap to use a backend. Tap the ⓘ to edit its connection or default model.")
                 }
 
                 Section {
