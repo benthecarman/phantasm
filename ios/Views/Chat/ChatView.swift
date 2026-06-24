@@ -13,6 +13,8 @@ struct ChatView: View {
     @State private var vm = ChatViewModel()
     @State private var input = ""
     @FocusState private var composerFocused: Bool
+    /// Picked once per chat (the view is rebuilt per conversation via `.id`).
+    @State private var greeting = GreetingPrompts.random()
 
     private var isEmpty: Bool { conversation.orderedMessages.isEmpty && !vm.isStreaming }
 
@@ -54,14 +56,17 @@ struct ChatView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 18) {
             Spacer()
-            Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 44))
-                .foregroundStyle(.secondary)
-            Text("What can I help with?")
+            Image("Logo")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 88, height: 88)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            Text(greeting)
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
             Spacer()
         }
         .frame(maxWidth: .infinity)
