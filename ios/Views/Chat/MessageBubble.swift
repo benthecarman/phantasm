@@ -35,13 +35,24 @@ struct MessageBubble: View {
                 }
             } else {
                 MarkdownMessageView(text: content)
-                    .conditionalContextMenu(canRegenerate) {
-                        Button(action: onRegenerate) {
-                            Label("Regenerate", systemImage: "arrow.clockwise")
+                    .contextMenu {
+                        copyButton
+                        if canRegenerate {
+                            Button(action: onRegenerate) {
+                                Label("Regenerate", systemImage: "arrow.clockwise")
+                            }
                         }
                     }
             }
             if !isUser { Spacer(minLength: 40) }
+        }
+    }
+
+    private var copyButton: some View {
+        Button {
+            UIPasteboard.general.string = content
+        } label: {
+            Label("Copy", systemImage: "doc.on.doc")
         }
     }
 
@@ -56,9 +67,12 @@ struct MessageBubble: View {
                     .padding(10)
                     .background(Color.accentColor.opacity(0.15))
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .conditionalContextMenu(canEdit) {
-                        Button(action: onBeginEdit) {
-                            Label("Edit", systemImage: "pencil")
+                    .contextMenu {
+                        copyButton
+                        if canEdit {
+                            Button(action: onBeginEdit) {
+                                Label("Edit", systemImage: "pencil")
+                            }
                         }
                     }
             }
@@ -112,21 +126,6 @@ struct StreamingBubble: View {
                 }
             }
             Spacer(minLength: 40)
-        }
-    }
-}
-
-private extension View {
-    /// Attach a context menu only when `enabled`; otherwise leave the view as-is
-    /// so an idle long-press doesn't surface an empty menu.
-    @ViewBuilder
-    func conditionalContextMenu<Items: View>(
-        _ enabled: Bool, @ViewBuilder items: () -> Items
-    ) -> some View {
-        if enabled {
-            contextMenu(menuItems: items)
-        } else {
-            self
         }
     }
 }
