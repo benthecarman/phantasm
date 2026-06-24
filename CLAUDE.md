@@ -39,6 +39,14 @@ After adding/removing source files you **must** re-run `xcodegen generate` (the
 `.xcodeproj` is generated and git-ignored). Sources are globbed from `App/`,
 `Views/`, `ViewModels/`.
 
+**Git hooks** (one-time, per clone):
+```sh
+git config core.hooksPath .githooks   # enable the tracked pre-commit hook
+```
+The pre-commit hook runs `cargo fmt --all --check` when any `orchestrator/**.rs`
+is staged (check-only — it never rewrites your tree; format and re-stage if it
+fails). `core.hooksPath` is local config, so each clone must run this once.
+
 ## Architecture — things that aren't obvious from the code
 
 - **Upstream Ollama uses the native `/api/chat` (NDJSON), not the OpenAI-compat

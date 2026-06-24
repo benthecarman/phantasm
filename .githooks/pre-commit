@@ -1,0 +1,14 @@
+#!/bin/sh
+# Keep the Rust orchestrator cargo-fmt clean. Runs only when Rust files are
+# staged, so iOS-only commits aren't slowed down. Checks (never rewrites) the
+# tree — if it fails, format and re-stage yourself so nothing lands unreviewed.
+
+staged_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '^orchestrator/.*\.rs$')
+[ -z "$staged_rs" ] && exit 0
+
+if ! ( cd orchestrator && cargo fmt --all --check ) ; then
+    echo
+    echo "✗ cargo fmt check failed — the orchestrator isn't formatted."
+    echo "  Fix:  (cd orchestrator && cargo fmt)  then  git add -u  and commit again."
+    exit 1
+fi
