@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::error::AppError;
 use crate::openai::types::ChatMessage;
+use crate::openai::OpenAICompatibleClient;
 
 /// One delta from a streaming final-answer pass.
 #[derive(Debug, Clone)]
@@ -41,4 +42,60 @@ pub trait ChatBackend: Send + Sync + Clone + 'static {
         messages: &[ChatMessage],
         options: &Map<String, Value>,
     ) -> impl std::future::Future<Output = Result<DeltaStream, AppError>> + Send;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamKind {
+    NativeOllama,
+    OpenAICompatible,
+}
+
+#[derive(Clone)]
+pub enum UpstreamChatBackend {
+    NativeOllama(OllamaClient),
+    OpenAICompatible(OpenAICompatibleClient),
+}
+
+impl UpstreamChatBackend {
+    pub fn kind(&self) -> UpstreamKind {
+        match self {
+            UpstreamChatBackend::NativeOllama(_) => UpstreamKind::NativeOllama,
+            UpstreamChatBackend::OpenAICompatible(_) => UpstreamKind::OpenAICompatible,
+        }
+    }
+}
+
+impl ChatBackend for UpstreamChatBackend {
+    async fn chat_once(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        options: &Map<String, Value>,
+    ) -> Result<ChatMessage, AppError> {
+        match self {
+            UpstreamChatBackend::NativeOllama(client) => {
+                client.chat_once(model, messages, tools, options).await
+            }
+            UpstreamChatBackend::OpenAICompatible(client) => {
+                client.chat_once(model, messages, tools, options).await
+            }
+        }
+    }
+
+    async fn chat_stream(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &Map<String, Value>,
+    ) -> Result<DeltaStream, AppError> {
+        match self {
+            UpstreamChatBackend::NativeOllama(client) => {
+                client.chat_stream(model, messages, options).await
+            }
+            UpstreamChatBackend::OpenAICompatible(client) => {
+                client.chat_stream(model, messages, options).await
+            }
+        }
+    }
 }

@@ -6,15 +6,15 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
-use crate::ollama::OllamaClient;
+use crate::ollama::UpstreamChatBackend;
 
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub http: reqwest::Client,
-    pub ollama: OllamaClient,
-    /// Bounds simultaneous in-flight Ollama generations (NFR-O2 downstream limit).
-    pub ollama_sem: Arc<Semaphore>,
+    pub upstream: UpstreamChatBackend,
+    /// Bounds simultaneous in-flight upstream generations (NFR-O2 downstream limit).
+    pub upstream_sem: Arc<Semaphore>,
     pub capabilities: Arc<CapabilitySnapshot>,
 }
 

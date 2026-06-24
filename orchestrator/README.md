@@ -13,12 +13,13 @@ orchestrator, a bare Ollama instance, or OpenAI itself — unchanged.
 
 ```
 iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ Ollama
+                             │      └─or OpenAI-compatible /v1
                              │
                              ├── Brave Search  (web_search tool)
                              └── ComfyUI       (image_generation tool)
 ```
 
-- **Plain turns** are a near-passthrough: one streaming `/api/chat` call,
+- **Plain turns** are a near-passthrough: one upstream streaming chat call,
   transcoded chunk-for-chunk to OpenAI SSE.
 - **Tool turns** run the standard function-calling loop *upstream* (orchestrator
   ↔ Ollama). The client only sees the final streamed answer, plus optional
@@ -26,9 +27,10 @@ iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ O
 - Generated **images** are embedded in the answer as markdown
   `![generated](data:image/png;base64,…)`.
 
-> **Why the native Ollama API?** Ollama's OpenAI-compat endpoint silently drops
-> `tool_calls` when streaming, so we use the native `/api/chat` (reliable
-> streaming + tools) upstream while presenting OpenAI to the client.
+> **Upstream detection.** At startup the orchestrator probes `OLLAMA_BASE_URL`.
+> If `/api/tags` is present, it uses native Ollama `/api/chat`; otherwise, if
+> `/v1/models` is present, it uses an OpenAI-compatible upstream. Set
+> `UPSTREAM_API_KEY` when that upstream needs bearer auth.
 
 ## Endpoints
 
@@ -70,7 +72,7 @@ full annotated list.
 ## Tests
 
 ```sh
-cargo test                    # 14 unit + 4 integration, no real backends needed
+cargo test                    # 20 unit + 6 integration, no real backends needed
 cargo clippy --all-targets    # lints
 ```
 

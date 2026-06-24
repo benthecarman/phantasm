@@ -22,6 +22,7 @@ pub struct Config {
 
     // Ollama (upstream model host)
     pub ollama_base: Url,
+    pub upstream_api_key: Option<String>,
     pub default_model: String,
     /// Models advertised in /v1/capabilities. Empty => probe `/api/tags` at startup.
     pub models: Vec<String>,
@@ -69,6 +70,9 @@ impl Config {
         }
 
         let ollama_base = parse_url("OLLAMA_BASE_URL", "http://localhost:11434")?;
+        let upstream_api_key = std::env::var("UPSTREAM_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let default_model = env_or("OLLAMA_DEFAULT_MODEL", "llama3.1");
         let models = csv("OLLAMA_MODELS");
 
@@ -88,6 +92,7 @@ impl Config {
             bind_addr,
             auth_token,
             ollama_base,
+            upstream_api_key,
             default_model,
             models,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
@@ -179,6 +184,7 @@ pub mod tests_support {
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             auth_token: "test-token".into(),
             ollama_base: "http://localhost:11434".parse().unwrap(),
+            upstream_api_key: None,
             default_model: "m".into(),
             models: vec![],
             max_tool_iters: 5,

@@ -19,29 +19,70 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::ollama::OllamaClient;
+use crate::ollama::{OllamaClient, UpstreamChatBackend, UpstreamKind};
+use crate::openai::OpenAICompatibleClient;
 use crate::state::{CapabilitySnapshot, ToolFlags};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const OLLAMA_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone)]
+pub struct UpstreamDetection {
+    pub kind: UpstreamKind,
+    pub models: Vec<String>,
+}
+
+/// Detect which upstream chat API is exposed by `OLLAMA_BASE_URL`.
+///
+/// Native Ollama is preferred because it has the tool-call behavior this
+/// orchestrator was built around. If `/api/tags` is unavailable, fall back to
+/// OpenAI-compatible `/v1/models`.
+pub async fn detect_upstream(cfg: &Config, http: &reqwest::Client) -> UpstreamDetection {
+    let probe_ollama = OllamaClient::new(http.clone(), cfg.ollama_base.clone());
+    if let Ok(Ok(models)) = tokio::time::timeout(PROBE_TIMEOUT, probe_ollama.list_models()).await {
+        return UpstreamDetection {
+            kind: UpstreamKind::NativeOllama,
+            models,
+        };
+    }
+
+    if let Ok(Ok(models)) = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        OpenAICompatibleClient::list_models(
+            http,
+            &cfg.ollama_base,
+            cfg.upstream_api_key.as_deref(),
+        ),
+    )
+    .await
+    {
+        return UpstreamDetection {
+            kind: UpstreamKind::OpenAICompatible,
+            models,
+        };
+    }
+
+    warn!("could not detect upstream type; defaulting to native Ollama mode");
+    UpstreamDetection {
+        kind: UpstreamKind::NativeOllama,
+        models: Vec::new(),
+    }
+}
+
 /// Compute the capabilities manifest from config + bounded startup probes (FR-O1).
 pub async fn probe_capabilities(
     cfg: &Config,
-    ollama: &OllamaClient,
     http: &reqwest::Client,
+    detected_models: &[String],
 ) -> CapabilitySnapshot {
     let models = if !cfg.models.is_empty() {
         cfg.models.clone()
+    } else if !detected_models.is_empty() {
+        detected_models.to_vec()
     } else {
-        match tokio::time::timeout(PROBE_TIMEOUT, ollama.list_models()).await {
-            Ok(Ok(m)) => m,
-            _ => {
-                warn!("could not list Ollama models at startup; advertising none");
-                Vec::new()
-            }
-        }
+        warn!("could not list upstream models at startup; advertising none");
+        Vec::new()
     };
 
     let web_search = cfg.web_search_usable();
@@ -71,7 +112,11 @@ pub async fn probe_reachable(http: &reqwest::Client, base: &str, path: &str) -> 
 }
 
 /// Build `AppState` from a loaded config (shared by `main` and tests).
-pub fn build_state(cfg: Arc<Config>, capabilities: Arc<CapabilitySnapshot>) -> state::AppState {
+pub fn build_state(
+    cfg: Arc<Config>,
+    capabilities: Arc<CapabilitySnapshot>,
+    upstream_kind: UpstreamKind,
+) -> state::AppState {
     let http = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         // Per-read only: streaming responses may run indefinitely as long as
@@ -79,12 +124,20 @@ pub fn build_state(cfg: Arc<Config>, capabilities: Arc<CapabilitySnapshot>) -> s
         .read_timeout(OLLAMA_READ_TIMEOUT)
         .build()
         .expect("building HTTP client");
-    let ollama = OllamaClient::new(http.clone(), cfg.ollama_base.clone());
+    let upstream = match upstream_kind {
+        UpstreamKind::NativeOllama => UpstreamChatBackend::NativeOllama(OllamaClient::new(
+            http.clone(),
+            cfg.ollama_base.clone(),
+        )),
+        UpstreamKind::OpenAICompatible => UpstreamChatBackend::OpenAICompatible(
+            OpenAICompatibleClient::new(&cfg.ollama_base, cfg.upstream_api_key.as_deref()),
+        ),
+    };
     state::AppState {
-        ollama_sem: Arc::new(tokio::sync::Semaphore::new(cfg.ollama_concurrency)),
+        upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.ollama_concurrency)),
         cfg,
         http,
-        ollama,
+        upstream,
         capabilities,
     }
 }

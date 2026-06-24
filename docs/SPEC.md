@@ -125,7 +125,8 @@ MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel
 
 - Single OpenAI-compatible SSE endpoint; tools server-side; only non-standard
   element is the `x_`-prefixed `x_status` field.
-- Upstream Ollama via **native `/api/chat`** (OpenAI-compat drops streamed
-  tool_calls).
+- Upstream native Ollama via **`/api/chat`** when available (Ollama
+  OpenAI-compat drops streamed tool_calls), with OpenAI-compatible `/v1`
+  fallback for non-Ollama model hosts.
 - Image return format: base64 data-URI markdown for MVP.
 - Ship one default ComfyUI workflow, overridable via config.

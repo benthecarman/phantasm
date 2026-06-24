@@ -3,9 +3,12 @@
 
 use std::sync::Arc;
 
+use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
 use phantasm_orchestrator::config::{Config, LogFormat};
+use phantasm_orchestrator::ollama::UpstreamKind;
 use phantasm_orchestrator::routes;
 use phantasm_orchestrator::state::{CapabilitySnapshot, ToolFlags};
 
@@ -43,11 +46,43 @@ fn mock_ollama() -> Router {
         )
 }
 
+/// A mock OpenAI-compatible backend: no `/api/tags`, yes `/v1/models` and
+/// `/v1/chat/completions`.
+fn mock_openai_compatible() -> Router {
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<serde_json::Value>| async move {
+                let streaming = body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                if streaming {
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
+                                data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
+                                data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                                data: [DONE]\n\n";
+                    ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
+                } else {
+                    axum::Json(serde_json::json!({
+                        "choices": [{
+                            "message": { "role": "assistant", "content": "Hello world" },
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { axum::Json(serde_json::json!({"data":[{"id":"m"}]})) }),
+        )
+}
+
 fn test_config(ollama_base: &str) -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: TOKEN.into(),
         ollama_base: ollama_base.parse().unwrap(),
+        upstream_api_key: None,
         default_model: "m".into(),
         models: vec!["m".into()],
         max_tool_iters: 5,
@@ -73,6 +108,10 @@ fn test_config(ollama_base: &str) -> Config {
 }
 
 async fn spawn_orchestrator(ollama_base: &str) -> String {
+    spawn_orchestrator_with_kind(ollama_base, UpstreamKind::NativeOllama).await
+}
+
+async fn spawn_orchestrator_with_kind(ollama_base: &str, upstream_kind: UpstreamKind) -> String {
     let cfg = Arc::new(test_config(ollama_base));
     let capabilities = Arc::new(CapabilitySnapshot {
         version: "test".into(),
@@ -84,8 +123,18 @@ async fn spawn_orchestrator(ollama_base: &str) -> String {
         },
         streaming: "sse",
     });
-    let state = phantasm_orchestrator::build_state(cfg, capabilities);
+    let state = phantasm_orchestrator::build_state(cfg, capabilities, upstream_kind);
     spawn(routes::router(state)).await
+}
+
+#[tokio::test]
+async fn detects_openai_compatible_upstream_when_tags_absent() {
+    let openai = spawn(mock_openai_compatible()).await;
+    let cfg = test_config(&openai);
+    let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
+
+    assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(detection.models, ["m".to_string()]);
 }
 
 #[tokio::test]
@@ -130,6 +179,44 @@ async fn plain_chat_streams_tokens() {
     }
     assert_eq!(content, "Hello world");
     assert!(saw_finish, "expected a finish_reason:stop chunk");
+    assert!(saw_done, "expected a [DONE] sentinel");
+}
+
+#[tokio::test]
+async fn openai_compatible_upstream_streams_tokens() {
+    let openai = spawn(mock_openai_compatible()).await;
+    let base = spawn_orchestrator_with_kind(&openai, UpstreamKind::OpenAICompatible).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    let mut content = String::new();
+    let mut saw_done = false;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            saw_done = true;
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+    }
+    assert_eq!(content, "Hello world");
     assert!(saw_done, "expected a [DONE] sentinel");
 }
 

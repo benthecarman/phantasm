@@ -5,9 +5,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use phantasm_orchestrator::config::{Config, LogFormat};
-use phantasm_orchestrator::ollama::OllamaClient;
 use phantasm_orchestrator::state::AppState;
-use phantasm_orchestrator::{build_state, probe_capabilities, routes};
+use phantasm_orchestrator::{build_state, detect_upstream, probe_capabilities, routes};
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -24,17 +23,17 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(2))
         .build()
         .context("building HTTP client")?;
-    let probe_ollama = OllamaClient::new(probe_http.clone(), cfg.ollama_base.clone());
-
-    let capabilities = Arc::new(probe_capabilities(&cfg, &probe_ollama, &probe_http).await);
+    let upstream = detect_upstream(&cfg, &probe_http).await;
+    let capabilities = Arc::new(probe_capabilities(&cfg, &probe_http, &upstream.models).await);
     info!(
+        upstream = ?upstream.kind,
         models = capabilities.models.len(),
         web_search = capabilities.tools.web_search,
         image_generation = capabilities.tools.image_generation,
         "capabilities resolved"
     );
 
-    let state: AppState = build_state(cfg.clone(), capabilities);
+    let state: AppState = build_state(cfg.clone(), capabilities, upstream.kind);
     let app = routes::router(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)

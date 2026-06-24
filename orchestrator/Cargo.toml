@@ -16,6 +16,9 @@ axum = { version = "0.8", features = ["json"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+async-openai = { version = "0.41.1", default-features = false, features = ["byot", "chat-completion", "rustls"] }
+reqwest13 = { package = "reqwest", version = "0.13.4", default-features = false, features = ["rustls"] }
+secrecy = "0.10"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 async-stream = "0.3"

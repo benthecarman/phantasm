@@ -23,10 +23,10 @@ pub enum AppError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
-    #[error("upstream Ollama is unreachable: {0}")]
+    #[error("upstream model host is unreachable: {0}")]
     OllamaUnreachable(String),
 
-    #[error("upstream Ollama returned an error: {0}")]
+    #[error("upstream model host returned an error: {0}")]
     OllamaError(String),
 
     #[error("internal error: {0}")]
