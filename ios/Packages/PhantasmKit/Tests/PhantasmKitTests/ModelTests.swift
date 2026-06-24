@@ -33,6 +33,54 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertNil(caps.visionModels)
     }
 
+    // MARK: - Per-chat tool selection (x_tools)
+
+    private func encodedKeys(_ request: ChatRequest) throws -> [String: Any] {
+        let data = try Wire.encoder().encode(request)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testChatRequestOmitsXToolsWhenNil() throws {
+        let request = ChatRequest(model: "m", messages: [WireMessage(role: "user", content: "hi")])
+        let json = try encodedKeys(request)
+        XCTAssertNil(json["x_tools"], "nil selection must keep the request standard")
+    }
+
+    func testChatRequestEncodesXToolsAsSnakeCaseArray() throws {
+        let request = ChatRequest(
+            model: "m",
+            messages: [WireMessage(role: "user", content: "hi")],
+            xTools: [ToolName.webSearch]
+        )
+        let json = try encodedKeys(request)
+        XCTAssertEqual(json["x_tools"] as? [String], ["web_search"])
+    }
+
+    func testRequestedToolNamesNilWithoutManifest() {
+        let convo = Conversation()
+        XCTAssertNil(convo.requestedToolNames(supporting: nil))
+    }
+
+    func testRequestedToolNamesIntersectsBackendAndChatToggles() {
+        // Backend offers both; chat disabled image gen -> only web search requested.
+        let tools = Capabilities.Tools(webSearch: true, imageGeneration: true)
+        let convo = Conversation(webSearchEnabled: true, imageGenerationEnabled: false)
+        XCTAssertEqual(convo.requestedToolNames(supporting: tools), ["web_search"])
+    }
+
+    func testRequestedToolNamesDropsUnsupportedTool() {
+        // Chat wants image gen but backend doesn't offer it -> excluded.
+        let tools = Capabilities.Tools(webSearch: true, imageGeneration: false)
+        let convo = Conversation(webSearchEnabled: true, imageGenerationEnabled: true)
+        XCTAssertEqual(convo.requestedToolNames(supporting: tools), ["web_search"])
+    }
+
+    func testRequestedToolNamesEmptyWhenAllDisabled() {
+        let tools = Capabilities.Tools(webSearch: true, imageGeneration: true)
+        let convo = Conversation(webSearchEnabled: false, imageGenerationEnabled: false)
+        XCTAssertEqual(convo.requestedToolNames(supporting: tools), [])
+    }
+
     func testPlainChatModeHasNoToolsButCarriesModels() {
         let mode = BackendMode.plainChatOnly(models: ["qwen2.5:7b", "bwen:8b"])
         XCTAssertFalse(mode.showsTools)

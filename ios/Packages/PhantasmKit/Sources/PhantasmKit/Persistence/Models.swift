@@ -25,6 +25,12 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     public var deletedAt: Date?
     public var modelID: String?
     public var profileID: UUID?
+    /// Whether this chat wants the server's web-search tool offered (when the
+    /// backend supports it). Defaults on, so behavior matches a tools-enabled
+    /// backend out of the box; the composer's tool selector flips it per chat.
+    public var webSearchEnabled: Bool
+    /// Whether this chat wants the server's image-generation tool offered.
+    public var imageGenerationEnabled: Bool
 
     public init(
         id: UUID = UUID(),
@@ -33,7 +39,9 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         updatedAt: Date? = nil,
         deletedAt: Date? = nil,
         modelID: String? = nil,
-        profileID: UUID? = nil
+        profileID: UUID? = nil,
+        webSearchEnabled: Bool = true,
+        imageGenerationEnabled: Bool = true
     ) {
         self.id = id
         self.title = title
@@ -42,9 +50,25 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         self.deletedAt = deletedAt
         self.modelID = modelID
         self.profileID = profileID
+        self.webSearchEnabled = webSearchEnabled
+        self.imageGenerationEnabled = imageGenerationEnabled
     }
 
     public static let databaseTableName = "conversation"
+}
+
+public extension Conversation {
+    /// Names of the tools this chat wants offered this turn, intersected against
+    /// what the backend advertises (`capabilities.tools`). Returns `nil` when the
+    /// backend exposes no tool manifest, so the caller omits `x_tools` entirely
+    /// and keeps the request standard; otherwise the (possibly empty) selection.
+    func requestedToolNames(supporting tools: Capabilities.Tools?) -> [String]? {
+        guard let tools else { return nil }
+        var names: [String] = []
+        if tools.webSearch, webSearchEnabled { names.append(ToolName.webSearch) }
+        if tools.imageGeneration, imageGenerationEnabled { names.append(ToolName.imageGeneration) }
+        return names
+    }
 }
 
 public struct Message: Identifiable, Codable, Equatable, Sendable,

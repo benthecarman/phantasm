@@ -27,6 +27,28 @@ use crate::openai::types::ChatMessage;
 use crate::orchestrator::tools::ToolExecutor;
 use crate::orchestrator::TurnEvent;
 
+/// Narrow a set of tool schemas to those the client asked for this turn.
+///
+/// `enabled` is the request's `x_tools` field: `None` => keep every schema
+/// (older clients that don't select tools), `Some(list)` => keep only schemas
+/// whose function name appears in the list (an empty list keeps none). The
+/// schemas themselves already reflect what the server can actually run, so this
+/// is purely a per-request narrowing — it can never add a tool.
+pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec<Value> {
+    let Some(allow) = enabled else {
+        return schemas;
+    };
+    schemas
+        .into_iter()
+        .filter(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| allow.iter().any(|a| a == name))
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn<B, T>(
     cfg: Arc<Config>,
@@ -36,6 +58,7 @@ pub async fn run_turn<B, T>(
     mut messages: Vec<ChatMessage>,
     model: String,
     options: Map<String, Value>,
+    enabled_tools: Option<Vec<String>>,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
 ) where
@@ -66,7 +89,7 @@ pub async fn run_turn<B, T>(
         return;
     }
 
-    let schemas = tools.schemas();
+    let schemas = select_schemas(tools.schemas(), &enabled_tools);
 
     // Plain fast path: no tools to offer => one streaming call.
     if schemas.is_empty() {
@@ -355,6 +378,7 @@ mod tests {
             vec![assistant("hi")],
             "m".into(),
             Map::new(),
+            None,
             tx,
             CancellationToken::new(),
         )
@@ -390,6 +414,7 @@ mod tests {
             vec![assistant("hi")],
             "m".into(),
             Map::new(),
+            None,
             tx,
             CancellationToken::new(),
         )
@@ -429,6 +454,7 @@ mod tests {
             vec![assistant("hi")],
             "m".into(),
             Map::new(),
+            None,
             tx,
             CancellationToken::new(),
         )
@@ -461,11 +487,71 @@ mod tests {
             vec![assistant("hi")],
             "m".into(),
             Map::new(),
+            None,
             tx,
             cancel,
         )
         .await;
         let events = drain(rx).await;
         assert!(collect_text(&events).is_empty(), "no tokens after cancel");
+    }
+
+    fn named_schema(name: &str) -> Value {
+        serde_json::json!({ "type": "function", "function": { "name": name } })
+    }
+
+    #[test]
+    fn select_schemas_keeps_all_when_unset() {
+        let schemas = vec![named_schema("web_search"), named_schema("image_generation")];
+        assert_eq!(select_schemas(schemas.clone(), &None), schemas);
+    }
+
+    #[test]
+    fn select_schemas_filters_to_requested_names() {
+        let schemas = vec![named_schema("web_search"), named_schema("image_generation")];
+        let kept = select_schemas(schemas, &Some(vec!["web_search".into()]));
+        assert_eq!(kept, vec![named_schema("web_search")]);
+    }
+
+    #[test]
+    fn select_schemas_empty_list_keeps_none() {
+        let schemas = vec![named_schema("web_search")];
+        assert!(select_schemas(schemas, &Some(vec![])).is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_tool_selection_takes_plain_fast_path() {
+        // Tools are configured, but the client opted out via `x_tools: []` — the
+        // turn must skip tool resolution entirely (no chat_once) and just stream.
+        let backend = ScriptedBackend {
+            once: Arc::new(Mutex::new(vec![assistant_calling("web_search")])),
+            once_calls: Arc::new(Mutex::new(0)),
+            final_tokens: Arc::new(vec!["hi".into()]),
+        };
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![named_schema("web_search")]),
+            executed: Arc::new(Mutex::new(vec![])),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            Some(vec![]),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let events = drain(rx).await;
+        assert_eq!(collect_text(&events), "hi");
+        assert_eq!(
+            *backend.once_calls.lock().unwrap(),
+            0,
+            "empty selection => fast path, no tool resolution"
+        );
     }
 }

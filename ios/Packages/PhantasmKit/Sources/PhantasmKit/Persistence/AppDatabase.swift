@@ -86,6 +86,16 @@ public final class AppDatabase: Sendable {
                 t.column("title")
             }
         }
+
+        // Per-chat tool selection (web search / image generation). Existing chats
+        // default on, matching the prior always-offered behavior on tool-enabled
+        // backends; the composer's tool selector flips them per chat.
+        migrator.registerMigration("v2_per_chat_tools") { db in
+            try db.alter(table: "conversation") { t in
+                t.add(column: "webSearchEnabled", .boolean).notNull().defaults(to: true)
+                t.add(column: "imageGenerationEnabled", .boolean).notNull().defaults(to: true)
+            }
+        }
         return migrator
     }
 }
@@ -125,6 +135,17 @@ extension AppDatabase: ChatStore {
             if let title { convo.title = title }
             if let modelID { convo.modelID = modelID }
             if let updatedAt { convo.updatedAt = updatedAt }
+            try convo.update(db)
+        }
+    }
+
+    public func setConversationTools(
+        id: UUID, webSearchEnabled: Bool, imageGenerationEnabled: Bool
+    ) async throws {
+        try await dbWriter.write { db in
+            guard var convo = try Conversation.fetchOne(db, key: id) else { return }
+            convo.webSearchEnabled = webSearchEnabled
+            convo.imageGenerationEnabled = imageGenerationEnabled
             try convo.update(db)
         }
     }

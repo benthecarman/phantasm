@@ -97,6 +97,17 @@ standard OpenAI function-calling:
 4. Once Ollama returns a final assistant message, the orchestrator streams *that*
    back to the app as ordinary SSE chunks.
 
+**Per-request tool selection (additive).** The app MAY include an `x_tools`
+field on the request — a JSON array of tool names it wants offered this turn
+(e.g. `["web_search"]`). Following the `x_`-prefix convention, standard clients
+and backends ignore it. Semantics: field **absent** → the server offers every
+configured tool (older clients keep working); **present** → the server offers
+only the named tools, always intersected with what is actually configured (a
+client can never enable a tool the deployment lacks); an **empty array** → no
+tools (plain chat). Tools remain server-side and invisible otherwise; this only
+lets the client scope which of the advertised (`/v1/capabilities`) tools apply
+to a given conversation.
+
 Consequences:
 
 - **Images** are embedded in the assistant message as markdown

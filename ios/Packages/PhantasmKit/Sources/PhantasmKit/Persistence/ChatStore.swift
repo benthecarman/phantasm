@@ -51,6 +51,14 @@ public protocol ChatStore: Sendable {
         id: UUID, title: String?, modelID: String?, updatedAt: Date?
     ) async throws
 
+    /// Persist a conversation's per-chat tool selection (web search / image
+    /// generation). Does not bump `updatedAt`, so toggling tools doesn't reorder
+    /// the history. A no-op if the conversation doesn't exist yet (an unsent draft
+    /// carries its selection into the first send instead).
+    func setConversationTools(
+        id: UUID, webSearchEnabled: Bool, imageGenerationEnabled: Bool
+    ) async throws
+
     /// Edit a previously sent message in place and truncate the conversation
     /// after it: replaces the message's content (FTS stays in sync via triggers),
     /// keeps its attachments, and hard-deletes every later message + its

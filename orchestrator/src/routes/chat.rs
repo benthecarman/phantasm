@@ -39,6 +39,7 @@ pub async fn chat_completions(
         model,
         stream,
         messages,
+        enabled_tools,
         extra: options,
         ..
     } = req;
@@ -60,7 +61,10 @@ pub async fn chat_completions(
         // Per-turn structured logging (NFR-O7). Message content is never logged
         // unless explicitly enabled.
         let turn_id = uuid::Uuid::new_v4().simple().to_string();
-        let tools_offered = tools.schemas().len();
+        // Count what's actually offered after the client's per-request selection,
+        // so the log reflects the real tool surface for this turn.
+        let tools_offered =
+            crate::orchestrator::turn::select_schemas(tools.schemas(), &enabled_tools).len();
         let log_model = model.clone();
         if cfg.log_content {
             tracing::debug!(turn_id, messages = ?messages, "turn content");
@@ -70,7 +74,16 @@ pub async fn chat_completions(
             let started = std::time::Instant::now();
             tracing::info!(turn_id, model = %log_model, stream, tools_offered, "turn started");
             run_turn(
-                cfg, backend, tools, sem, messages, model, options, tx, cancel,
+                cfg,
+                backend,
+                tools,
+                sem,
+                messages,
+                model,
+                options,
+                enabled_tools,
+                tx,
+                cancel,
             )
             .await;
             tracing::info!(

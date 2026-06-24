@@ -53,6 +53,12 @@ struct ChatView: View {
         env.supportsVision(currentModelID)
     }
 
+    /// The server tools the active backend advertises, or nil if it exposes no
+    /// tool manifest (raw Ollama / generic OpenAI) — then the tool selector hides.
+    private var backendTools: Capabilities.Tools? {
+        env.backendMode.capabilities?.tools
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -71,6 +77,16 @@ struct ChatView: View {
                     modelName: currentModelName,
                     modelSelection: modelBinding,
                     allowsImageAttachments: allowsImageAttachments,
+                    supportsWebSearch: backendTools?.webSearch ?? false,
+                    supportsImageGeneration: backendTools?.imageGeneration ?? false,
+                    webSearchEnabled: Binding(
+                        get: { vm.webSearchEnabled },
+                        set: { vm.setWebSearchEnabled($0) }
+                    ),
+                    imageGenerationEnabled: Binding(
+                        get: { vm.imageGenerationEnabled },
+                        set: { vm.setImageGenerationEnabled($0) }
+                    ),
                     onSend: send,
                     onStop: { vm.stop() }
                 )
@@ -234,6 +250,12 @@ struct ComposerView: View {
     /// Whether the selected model can accept images (vision). Files are always
     /// allowed; only the Photos option is gated.
     let allowsImageAttachments: Bool
+    /// Which server tools the backend advertises (spec §2.1). The tool selector
+    /// only offers a toggle for a tool the backend actually supports.
+    let supportsWebSearch: Bool
+    let supportsImageGeneration: Bool
+    let webSearchEnabled: Binding<Bool>
+    let imageGenerationEnabled: Binding<Bool>
     let onSend: () -> Void
     let onStop: () -> Void
 
@@ -265,6 +287,7 @@ struct ComposerView: View {
             HStack(spacing: 8) {
                 addButton
                 modelPicker
+                toolPicker
                 Spacer(minLength: 8)
                 control
             }
@@ -375,6 +398,47 @@ struct ComposerView: View {
                 .padding(.vertical, 7)
                 .background(Color.primary.opacity(0.06), in: Capsule())
             }
+        }
+    }
+
+    /// Per-chat server-tool selector (spec §2.3). Only shown when the backend
+    /// advertises at least one tool; only the supported tools get a toggle. The
+    /// pill shows the active tools' icons so the state reads at a glance.
+    @ViewBuilder
+    private var toolPicker: some View {
+        if supportsWebSearch || supportsImageGeneration {
+            let webOn = supportsWebSearch && webSearchEnabled.wrappedValue
+            let imageOn = supportsImageGeneration && imageGenerationEnabled.wrappedValue
+            let anyOn = webOn || imageOn
+            Menu {
+                if supportsWebSearch {
+                    Toggle(isOn: webSearchEnabled) {
+                        Label("Web search", systemImage: "globe")
+                    }
+                }
+                if supportsImageGeneration {
+                    Toggle(isOn: imageGenerationEnabled) {
+                        Label("Image generation", systemImage: "photo")
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    if webOn { Image(systemName: "globe") }
+                    if imageOn { Image(systemName: "photo") }
+                    if !anyOn { Image(systemName: "wand.and.stars") }
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(anyOn ? Color.accentColor : Color.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(
+                    (anyOn ? Color.accentColor : Color.primary).opacity(0.06),
+                    in: Capsule()
+                )
+            }
+            .accessibilityLabel("Tools")
         }
     }
 

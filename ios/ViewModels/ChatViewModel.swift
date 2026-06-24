@@ -34,6 +34,35 @@ final class ChatViewModel {
     /// The model the composer should display / preselect for this conversation.
     var selectedModel: String? { conversation?.modelID }
 
+    /// Per-chat tool selection for the composer's tool menu. Default to on so a
+    /// fresh draft mirrors a tools-enabled backend's out-of-the-box behavior.
+    var webSearchEnabled: Bool { conversation?.webSearchEnabled ?? true }
+    var imageGenerationEnabled: Bool { conversation?.imageGenerationEnabled ?? true }
+
+    func setWebSearchEnabled(_ on: Bool) {
+        setTools(webSearch: on, imageGeneration: imageGenerationEnabled)
+    }
+
+    func setImageGenerationEnabled(_ on: Bool) {
+        setTools(webSearch: webSearchEnabled, imageGeneration: on)
+    }
+
+    /// Update the conversation's tool selection and persist it. For an unsent
+    /// draft the store write is a no-op and the selection rides along on the
+    /// first send (the draft is inserted whole), mirroring `setModel`.
+    private func setTools(webSearch: Bool, imageGeneration: Bool) {
+        guard var conversation else { return }
+        conversation.webSearchEnabled = webSearch
+        conversation.imageGenerationEnabled = imageGeneration
+        self.conversation = conversation
+        let id = conversation.id
+        Task { [store] in
+            try? await store?.setConversationTools(
+                id: id, webSearchEnabled: webSearch, imageGenerationEnabled: imageGeneration
+            )
+        }
+    }
+
     var canSend: Bool {
         // The token is optional for direct no-auth backends such as local Ollama.
         guard let env, env.activeProfile?.baseURL != nil else { return false }
@@ -221,7 +250,16 @@ final class ChatViewModel {
             finish(error: .modelError("Could not load the conversation history."))
             return
         }
-        let request = ChatRequest(model: model, messages: detail.wireHistory(), stream: true)
+        // Scope which server tools this turn may use (spec §2.3). Omitted entirely
+        // for backends with no tool manifest, keeping those requests standard.
+        let request = ChatRequest(
+            model: model,
+            messages: detail.wireHistory(),
+            stream: true,
+            xTools: detail.conversation.requestedToolNames(
+                supporting: env.backendMode.capabilities?.tools
+            )
+        )
         let stream = env.backendMode.usesOllamaNativeChat
             ? env.ollamaChatClient.stream(request, base: base, token: token)
             : env.chatClient.stream(request, base: base, token: token)

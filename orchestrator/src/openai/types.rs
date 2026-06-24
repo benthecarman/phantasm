@@ -15,6 +15,14 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
+    /// Additive, non-standard request field (spec §2.3 `x_`-prefix convention):
+    /// the subset of server tools the client wants offered this turn, by name
+    /// (e.g. `["web_search"]`). `None` (field absent) => offer every usable tool,
+    /// keeping older clients working. An empty list => offer none (plain chat).
+    /// The server always intersects this with what is actually configured, so a
+    /// client can never enable a tool the deployment lacks.
+    #[serde(default, rename = "x_tools")]
+    pub enabled_tools: Option<Vec<String>>,
     /// Any other OpenAI sampling parameters (temperature, top_p, …) passed through to Ollama.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,

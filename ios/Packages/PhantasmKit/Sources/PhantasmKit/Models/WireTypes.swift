@@ -11,17 +11,24 @@ public struct ChatRequest: Encodable, Sendable {
     public var messages: [WireMessage]
     public var stream: Bool
     public var reasoningEffort: String?
+    /// Per-request tool selection (spec §2.3): the names of the server tools to
+    /// offer this turn, encoded as the additive `x_tools` field. `nil` omits the
+    /// field entirely (server offers all configured tools — and keeps plain-chat
+    /// requests byte-for-byte standard); an empty array requests plain chat.
+    public var xTools: [String]?
 
     public init(
         model: String,
         messages: [WireMessage],
         stream: Bool = true,
-        reasoningEffort: String? = "none"
+        reasoningEffort: String? = "none",
+        xTools: [String]? = nil
     ) {
         self.model = model
         self.messages = messages
         self.stream = stream
         self.reasoningEffort = reasoningEffort
+        self.xTools = xTools
     }
 }
 
@@ -188,6 +195,14 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         self.tools = tools
         self.streaming = streaming
     }
+}
+
+/// Canonical server tool names, shared by the `x_tools` request field and the
+/// per-conversation toggles. These MUST match the orchestrator's tool schema
+/// names (`orchestrator/src/tools/*`).
+public enum ToolName {
+    public static let webSearch = "web_search"
+    public static let imageGeneration = "image_generation"
 }
 
 /// How the backend can be used after a capability probe (spec §2.1, FR-A2).
