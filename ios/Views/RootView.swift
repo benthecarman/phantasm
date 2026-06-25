@@ -10,6 +10,10 @@ struct RootView: View {
     /// The displayed conversation. A new chat is an in-memory draft (a value with
     /// a fresh id) that isn't written to the store until its first message is sent.
     @State private var selection: Conversation?
+    /// The chat created at cold launch. Only this one auto-raises the keyboard;
+    /// new chats started mid-session do not (the auto-focus is "open the app and
+    /// start typing", not "every empty chat grabs the keyboard").
+    @State private var initialChatID: UUID?
     @State private var showSettings = false
     @State private var isDrawerOpen = false
     /// Live drag translation while the user is swiping the drawer.
@@ -31,7 +35,11 @@ struct RootView: View {
             SettingsView(onHistoryCleared: { startNewChat() })
         }
         .task {
-            if selection == nil { selection = makeNewChat() }
+            if selection == nil {
+                let chat = makeNewChat()
+                initialChatID = chat.id
+                selection = chat
+            }
         }
     }
 
@@ -42,6 +50,7 @@ struct RootView: View {
         if let selection {
             ChatView(
                 conversation: selection,
+                autoFocusComposer: selection.id == initialChatID,
                 onOpenHistory: { openDrawer() },
                 onNewChat: { startNewChat() }
             )

@@ -5,6 +5,9 @@ import SwiftUI
 
 struct ChatView: View {
     let conversation: Conversation
+    /// Auto-raise the keyboard when this chat first appears empty. Only the
+    /// cold-launch chat sets this; mid-session new chats leave the keyboard down.
+    var autoFocusComposer: Bool = false
     /// Reveal the history drawer (FR-A: chat is the root, history slides over).
     var onOpenHistory: () -> Void = {}
     /// Start a fresh chat from the composer toolbar.
@@ -27,10 +30,12 @@ struct ChatView: View {
 
     init(
         conversation: Conversation,
+        autoFocusComposer: Bool = false,
         onOpenHistory: @escaping () -> Void = {},
         onNewChat: @escaping () -> Void = {}
     ) {
         self.conversation = conversation
+        self.autoFocusComposer = autoFocusComposer
         self.onOpenHistory = onOpenHistory
         self.onNewChat = onNewChat
         _messages = Query(MessagesRequest(conversationId: conversation.id))
@@ -104,8 +109,9 @@ struct ChatView: View {
         }
         .task(id: conversation.id) {
             vm.configure(env: env, store: env.store, conversation: conversation)
-            // Claude-style: drop the user straight into the composer on a new chat.
-            if isEmpty { composerFocused = true }
+            // Claude-style: drop the user straight into the composer on cold launch.
+            // Mid-session new/empty chats leave the keyboard down (less aggressive).
+            if isEmpty && autoFocusComposer { composerFocused = true }
         }
         .alert("Error", isPresented: Binding(
             get: { vm.errorMessage != nil },
@@ -133,7 +139,8 @@ struct ChatView: View {
         }
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
-        .onTapGesture { composerFocused = true }
+        // Tap to toggle the keyboard: raise it to start typing, tap off to dismiss.
+        .onTapGesture { composerFocused.toggle() }
     }
 
     private var messageList: some View {
@@ -160,6 +167,11 @@ struct ChatView: View {
                 }
                 .padding()
             }
+            // Tap or drag the transcript to dismiss the keyboard (tapping "off"
+            // the composer). The tap is simultaneous so message-bubble buttons
+            // still fire; the drag gives the iOS-standard swipe-down dismissal.
+            .scrollDismissesKeyboard(.interactively)
+            .simultaneousGesture(TapGesture().onEnded { composerFocused = false })
             // During streaming, tokens arrive many-per-second; an animated scroll
             // per token stacks overlapping animations and janks. Follow the tail
             // without animation while streaming, and animate the discrete jumps
