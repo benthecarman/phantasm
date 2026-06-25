@@ -66,12 +66,17 @@ struct ChatView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
+            Group {
                 if isEmpty {
                     emptyState
                 } else {
                     messageList
                 }
+            }
+            // Float the composer over the transcript so messages scroll behind it
+            // (FR-A "flows over text"), rather than sitting in its own reserved
+            // strip with the page background filling the gap behind the keyboard.
+            .safeAreaInset(edge: .bottom) {
                 ComposerView(
                     input: $input,
                     attachments: $attachments,
@@ -315,7 +320,12 @@ struct ComposerView: View {
                 .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
         )
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.top, 8)
+        // Sit a little above the keyboard when it's open, but drop closer to the
+        // bottom edge when it's dismissed (the home-indicator inset is enough
+        // breathing room there). Animate so it tracks the keyboard transition.
+        .padding(.bottom, focus.wrappedValue ? 8 : 0)
+        .animation(.easeInOut(duration: 0.25), value: focus.wrappedValue)
         .photosPicker(
             isPresented: $showPhotoPicker,
             selection: $photoItems,
