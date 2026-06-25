@@ -305,9 +305,9 @@ final class ChatViewModel {
             model: model,
             messages: detail.wireHistory(),
             stream: true,
-            reasoningEffort: env.thinkingEnabled(for: model)
-                ? ReasoningEffort.enabledDefault
-                : ReasoningEffort.disabled,
+            reasoningEffort: detail.conversation.reasoningEffort(
+                thinkingEnabled: env.thinkingEnabled(for: model)
+            ),
             xTools: detail.conversation.requestedToolNames(
                 supporting: env.backendMode.capabilities?.tools
             ),

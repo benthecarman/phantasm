@@ -74,6 +74,14 @@ public extension Conversation {
         if tools.imageGeneration, imageGenerationEnabled { names.append(ToolName.imageGeneration) }
         return names
     }
+
+    /// Deep Research is an explicit slow/thorough turn mode, so it opts the
+    /// request into thinking for that turn without changing the saved preference.
+    func reasoningEffort(thinkingEnabled: Bool) -> String {
+        deepResearchEnabled || thinkingEnabled
+            ? ReasoningEffort.enabledDefault
+            : ReasoningEffort.disabled
+    }
 }
 
 public struct Message: Identifiable, Codable, Equatable, Sendable,

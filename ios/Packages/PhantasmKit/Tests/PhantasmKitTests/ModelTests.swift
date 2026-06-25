@@ -97,6 +97,28 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(convo.requestedToolNames(supporting: tools), [])
     }
 
+    func testReasoningEffortUsesSavedThinkingPreference() {
+        let convo = Conversation(deepResearchEnabled: false)
+
+        XCTAssertEqual(
+            convo.reasoningEffort(thinkingEnabled: true),
+            ReasoningEffort.enabledDefault
+        )
+        XCTAssertEqual(
+            convo.reasoningEffort(thinkingEnabled: false),
+            ReasoningEffort.disabled
+        )
+    }
+
+    func testDeepResearchForcesReasoningForThatTurn() {
+        let convo = Conversation(deepResearchEnabled: true)
+
+        XCTAssertEqual(
+            convo.reasoningEffort(thinkingEnabled: false),
+            ReasoningEffort.enabledDefault
+        )
+    }
+
     func testPlainChatModeHasNoToolsButCarriesModels() {
         let mode = BackendMode.plainChatOnly(models: ["qwen2.5:7b", "bwen:8b"])
         XCTAssertFalse(mode.showsTools)
