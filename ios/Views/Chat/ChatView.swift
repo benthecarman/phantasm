@@ -4,6 +4,7 @@ import SwiftUI
 
 struct ChatView: View {
     let conversation: Conversation
+    let vm: ChatViewModel
     /// Auto-raise the keyboard when this chat first appears empty. Only the
     /// cold-launch chat sets this; mid-session new chats leave the keyboard down.
     var autoFocusComposer: Bool = false
@@ -13,9 +14,9 @@ struct ChatView: View {
     var onNewChat: () -> Void = {}
 
     @Environment(AppEnvironment.self) private var env
+    @Environment(\.scenePhase) private var scenePhase
     /// Reactive history for this conversation (drives the list + empty state).
     @Query<MessagesRequest> private var messages: [ChatMessage]
-    @State private var vm = ChatViewModel()
     @State private var input = ""
     @State private var attachments: [PendingAttachment] = []
     /// The user message being edited inline, if any (FR-A: edit a previous message).
@@ -28,18 +29,24 @@ struct ChatView: View {
 
     init(
         conversation: Conversation,
+        viewModel: ChatViewModel,
         autoFocusComposer: Bool = false,
         onOpenHistory: @escaping () -> Void = {},
         onNewChat: @escaping () -> Void = {}
     ) {
         self.conversation = conversation
+        self.vm = viewModel
         self.autoFocusComposer = autoFocusComposer
         self.onOpenHistory = onOpenHistory
         self.onNewChat = onNewChat
         _messages = Query(MessagesRequest(conversationId: conversation.id))
     }
 
-    private var isEmpty: Bool { messages.isEmpty && !vm.hasAssistantPreview }
+    private var visibleMessages: [ChatMessage] {
+        messages.filter { $0.message.isComplete }
+    }
+
+    private var isEmpty: Bool { visibleMessages.isEmpty && !vm.hasAssistantPreview }
 
     /// The model selected for this conversation (VM-owned once configured).
     private var currentModelID: String? {
@@ -124,10 +131,18 @@ struct ChatView: View {
             }
         }
         .task(id: conversation.id) {
-            vm.configure(env: env, store: env.store, conversation: conversation)
+            vm.configure(
+                env: env,
+                store: env.store,
+                conversation: conversation,
+                sceneIsActive: scenePhase == .active
+            )
             // Claude-style: drop the user straight into the composer on cold launch.
             // Mid-session new/empty chats leave the keyboard down (less aggressive).
             if isEmpty && autoFocusComposer { composerFocused = true }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            vm.setSceneActive(phase == .active)
         }
         .alert("Error", isPresented: Binding(
             get: { vm.errorMessage != nil },
@@ -164,7 +179,7 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
-                    ForEach(messages) { message in
+                    ForEach(visibleMessages) { message in
                         MessageBubble(
                             message: message,
                             isEditing: editingMessageID == message.id,
@@ -199,7 +214,7 @@ struct ChatView: View {
             // (new committed message, first appear).
             .onChange(of: vm.streamingText) { _, _ in scrollToBottom(proxy, animated: false) }
             .onChange(of: vm.streamingReasoning) { _, _ in scrollToBottom(proxy, animated: false) }
-            .onChange(of: messages.map(\.id)) { _, _ in
+            .onChange(of: messages) { _, _ in
                 vm.reconcileAssistantPreview(with: messages)
                 scrollToBottom(proxy)
             }

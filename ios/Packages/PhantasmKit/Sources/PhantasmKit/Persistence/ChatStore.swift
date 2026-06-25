@@ -45,6 +45,20 @@ public protocol ChatStore: Sendable {
     /// Persist one message and its attachments in a single transaction.
     func insertMessage(_ message: Message, attachments: [Attachment]) async throws
 
+    /// Replace a message's streamed body and completion flag. Used to create a
+    /// durable pending assistant row at turn start, then complete that same row
+    /// once the buffered stream finishes.
+    func updateMessage(
+        id: UUID,
+        content: String,
+        reasoning: String,
+        isComplete: Bool
+    ) async throws
+
+    /// Remove one message and its attachments. A no-op if the message no longer
+    /// exists.
+    func deleteMessage(id: UUID) async throws
+
     /// Update a conversation's mutable fields. A `nil` argument leaves that field
     /// unchanged (including `updatedAt`, so a title-only edit need not reorder).
     func updateConversation(

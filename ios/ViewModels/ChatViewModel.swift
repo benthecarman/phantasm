@@ -1,6 +1,8 @@
 import Foundation
 import Observation
 import PhantasmKit
+import UIKit
+import UserNotifications
 
 /// Drives one conversation: sends turns, accumulates streamed tokens in memory,
 /// and commits a single complete assistant message when the turn ends
@@ -25,12 +27,103 @@ final class ChatViewModel {
     /// new chat this is an in-memory draft that isn't written until the first send.
     private var conversation: Conversation?
     private var task: Task<Void, Never>?
+    private var pendingAssistantMessageID: UUID?
     private var pendingAssistantPreviewMessageID: UUID?
+    private var isSceneActive = true
+    private var suspendedByScene = false
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
-    func configure(env: AppEnvironment, store: ChatStore, conversation: Conversation) {
+    private enum EmptyPendingDisposition {
+        case delete
+        case keepForRecovery
+    }
+
+    func configure(
+        env: AppEnvironment,
+        store: ChatStore,
+        conversation: Conversation,
+        sceneIsActive: Bool
+    ) {
         self.env = env
         self.store = store
         self.conversation = conversation
+        isSceneActive = sceneIsActive
+        if sceneIsActive {
+            recoverPendingTurnIfNeeded()
+        }
+    }
+
+    func setSceneActive(_ active: Bool) {
+        guard isSceneActive != active else {
+            if active { recoverPendingTurnIfNeeded() }
+            return
+        }
+        isSceneActive = active
+        if active {
+            endBackgroundStreamingTask()
+            recoverPendingTurnIfNeeded()
+        } else if isStreaming {
+            beginBackgroundStreamingTaskIfNeeded()
+        }
+    }
+
+    private func beginBackgroundStreamingTaskIfNeeded() {
+        guard backgroundTaskID == .invalid else { return }
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(
+            withName: "Chat response"
+        ) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.expireBackgroundStreamingTask()
+            }
+        }
+    }
+
+    private func expireBackgroundStreamingTask() {
+        guard backgroundTaskID != .invalid else { return }
+        suspendedByScene = true
+        task?.cancel()
+        endBackgroundStreamingTask()
+    }
+
+    private func endBackgroundStreamingTask() {
+        guard backgroundTaskID != .invalid else { return }
+        let id = backgroundTaskID
+        backgroundTaskID = .invalid
+        UIApplication.shared.endBackgroundTask(id)
+    }
+
+    private func requestNotificationAuthorizationIfNeeded() async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        guard settings.authorizationStatus == .notDetermined else { return }
+        _ = try? await center.requestAuthorization(options: [.alert, .sound])
+    }
+
+    private func scheduleBackgroundCompletionNotification() async {
+        guard !isSceneActive else { return }
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        let isAuthorized: Bool
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            isAuthorized = true
+        case .notDetermined:
+            isAuthorized = (try? await center.requestAuthorization(options: [.alert, .sound])) == true
+        case .denied:
+            isAuthorized = false
+        @unknown default:
+            isAuthorized = false
+        }
+        guard isAuthorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Phantasm"
+        content.body = "Your response is ready."
+        content.sound = .default
+
+        let id = conversation.map { "chat-response-\($0.id.uuidString)" } ?? UUID().uuidString
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        try? await center.add(request)
     }
 
     /// The model the composer should display / preselect for this conversation.
@@ -100,12 +193,16 @@ final class ChatViewModel {
     func shouldShowAssistantPreview(alongside messages: [ChatMessage]) -> Bool {
         guard hasAssistantPreview else { return false }
         guard let pendingAssistantPreviewMessageID else { return true }
-        return !messages.contains { $0.id == pendingAssistantPreviewMessageID }
+        return !messages.contains {
+            $0.id == pendingAssistantPreviewMessageID && $0.message.isComplete
+        }
     }
 
     func reconcileAssistantPreview(with messages: [ChatMessage]) {
         guard let pendingAssistantPreviewMessageID,
-              messages.contains(where: { $0.id == pendingAssistantPreviewMessageID })
+              messages.contains(where: {
+                  $0.id == pendingAssistantPreviewMessageID && $0.message.isComplete
+              })
         else { return }
         self.pendingAssistantPreviewMessageID = nil
         streamingText = ""
@@ -159,8 +256,11 @@ final class ChatViewModel {
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
+        pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
+        suspendedByScene = false
         errorMessage = nil
+        Task { await requestNotificationAuthorizationIfNeeded() }
 
         let snapshot = conversation
         task = Task { [weak self] in
@@ -197,8 +297,13 @@ final class ChatViewModel {
                 modelID: model, updatedAt: conversation.updatedAt
             )
             try await store.insertMessage(userMessage, attachments: attachments)
+            guard await insertPendingAssistantMessage(
+                conversationId: conversation.id,
+                store: store
+            ) != nil else { return }
+            try Task.checkCancellation()
         } catch {
-            finish(error: AppError.from(error))
+            finishAfterStreamFailure(error)
             return
         }
 
@@ -239,13 +344,22 @@ final class ChatViewModel {
         @MainActor
         func task(_ mutate: @escaping @Sendable (ChatStore) async throws -> Void) {
             vm.task = Task { [weak vm] in
+                guard let vm else { return }
                 do {
                     try await mutate(store)
                 } catch {
-                    vm?.finish(error: AppError.from(error))
+                    vm.finish(error: AppError.from(error))
                     return
                 }
-                await vm?.streamReply(
+                guard await vm.insertPendingAssistantMessage(
+                    conversationId: convoID,
+                    store: store
+                ) != nil else { return }
+                if Task.isCancelled {
+                    vm.finishAfterStreamFailure(CancellationError())
+                    return
+                }
+                await vm.streamReply(
                     conversationId: convoID, model: model,
                     base: base, token: token, env: env, store: store
                 )
@@ -273,8 +387,11 @@ final class ChatViewModel {
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
+        pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
+        suspendedByScene = false
         errorMessage = nil
+        Task { await requestNotificationAuthorizationIfNeeded() }
 
         return TurnContext(
             vm: self, convoID: conversation.id, model: model,
@@ -331,20 +448,102 @@ final class ChatViewModel {
                 }
             }
             let emptyResponse = streamingText.isEmpty
-            finish(
-                error: emptyResponse
-                    ? .modelError("The stream completed without any assistant text.")
-                    : nil
+            if emptyResponse && (!isSceneActive || suspendedByScene) {
+                suspendedByScene = false
+                finish(error: nil, emptyPendingDisposition: .keepForRecovery)
+            } else {
+                finish(
+                    error: emptyResponse
+                        ? .modelError("The stream completed without any assistant text.")
+                        : nil
+                )
+            }
+        } catch {
+            finishAfterStreamFailure(error)
+        }
+    }
+
+    func recoverPendingTurnIfNeeded() {
+        guard !isStreaming, isSceneActive else { return }
+        Task { [weak self] in
+            await self?.recoverPendingTurn()
+        }
+    }
+
+    private func recoverPendingTurn() async {
+        guard !isStreaming, isSceneActive,
+              let env, let store, let conversation,
+              let base = env.activeProfile?.baseURL else { return }
+        guard let detail = try? await store.conversationDetail(id: conversation.id),
+              let pending = detail.messages.last,
+              pending.message.role == "assistant",
+              !pending.message.isComplete else { return }
+        let previous = detail.messages.dropLast().last
+        guard previous?.message.role == "user",
+              previous?.message.isComplete == true else { return }
+        guard let model = env.backendMode.resolvedChatModel(
+            conversationModel: detail.conversation.modelID,
+            defaultModel: env.preferredModel
+        ) else { return }
+
+        isStreaming = true
+        streamingText = pending.message.content
+        streamingReasoning = pending.message.reasoning
+        statusText = nil
+        pendingAssistantMessageID = pending.id
+        pendingAssistantPreviewMessageID = nil
+        errorMessage = nil
+
+        task = Task { [weak self] in
+            await self?.streamReply(
+                conversationId: conversation.id,
+                model: model,
+                base: base,
+                token: env.activeToken ?? "",
+                env: env,
+                store: store
             )
+        }
+    }
+
+    private func finishAfterStreamFailure(_ error: Error) {
+        guard isStreaming else { return }
+        let appError = AppError.from(error)
+        let shouldRecover = appError == .cancelled || !isSceneActive || suspendedByScene
+        suspendedByScene = false
+        finish(
+            error: shouldRecover ? nil : appError,
+            emptyPendingDisposition: shouldRecover ? .keepForRecovery : .delete
+        )
+        if shouldRecover, isSceneActive {
+            recoverPendingTurnIfNeeded()
+        }
+    }
+
+    private func insertPendingAssistantMessage(
+        conversationId: UUID,
+        store: ChatStore
+    ) async -> UUID? {
+        let assistant = Message(
+            conversationId: conversationId,
+            role: "assistant",
+            content: "",
+            isComplete: false
+        )
+        do {
+            try await store.insertMessage(assistant, attachments: [])
+            pendingAssistantMessageID = assistant.id
+            return assistant.id
         } catch {
             finish(error: AppError.from(error))
+            return nil
         }
     }
 
     /// Stop button (FR-A9): abort the SSE connection; keep whatever streamed.
     func stop() {
         task?.cancel()
-        finish(error: nil)
+        finish(error: nil, emptyPendingDisposition: .delete)
     }
 
     func setModel(_ model: String) {
@@ -360,36 +559,89 @@ final class ChatViewModel {
         }
     }
 
-    private func finish(error: AppError?) {
+    private func finish(
+        error: AppError?,
+        emptyPendingDisposition: EmptyPendingDisposition = .delete
+    ) {
         guard isStreaming else { return }
         isStreaming = false
         statusText = nil
         task = nil
+        if emptyPendingDisposition != .keepForRecovery {
+            suspendedByScene = false
+        }
 
         // Commit any streamed text as one complete assistant message.
         let committed = streamingText
         let committedReasoning = streamingReasoning
-        if let store, let conversation, !committed.isEmpty {
-            let assistant = Message(
-                conversationId: conversation.id, role: "assistant",
-                content: committed, reasoning: committedReasoning, isComplete: true
-            )
-            pendingAssistantPreviewMessageID = assistant.id
-            Task { [weak self] in
-                do {
-                    try await store.insertMessage(assistant, attachments: [])
-                    try await store.updateConversation(
-                        id: conversation.id, title: nil, modelID: nil, updatedAt: .now
-                    )
-                    await self?.maybeGenerateTitle()
-                } catch {
-                    self?.handleAssistantCommitFailure(messageID: assistant.id, error: error)
-                }
-            }
-        } else {
+        let pendingID = pendingAssistantMessageID
+        pendingAssistantMessageID = nil
+        let shouldKeepPendingForRecovery = pendingID != nil
+            && emptyPendingDisposition == .keepForRecovery
+        let shouldNotifyWhenCommitted = !isSceneActive && error == nil
+
+        if shouldKeepPendingForRecovery {
             streamingText = ""
             streamingReasoning = ""
             pendingAssistantPreviewMessageID = nil
+            endBackgroundStreamingTask()
+        } else if let store, let conversation, !committed.isEmpty {
+            if let pendingID {
+                pendingAssistantPreviewMessageID = pendingID
+                Task { [weak self] in
+                    do {
+                        try await store.updateMessage(
+                            id: pendingID,
+                            content: committed,
+                            reasoning: committedReasoning,
+                            isComplete: true
+                        )
+                        try await store.updateConversation(
+                            id: conversation.id, title: nil, modelID: nil, updatedAt: .now
+                        )
+                        if shouldNotifyWhenCommitted {
+                            await self?.scheduleBackgroundCompletionNotification()
+                        } else {
+                            await self?.maybeGenerateTitle()
+                        }
+                        self?.endBackgroundStreamingTask()
+                    } catch {
+                        self?.handleAssistantCommitFailure(messageID: pendingID, error: error)
+                        self?.endBackgroundStreamingTask()
+                    }
+                }
+            } else {
+                let assistant = Message(
+                    conversationId: conversation.id, role: "assistant",
+                    content: committed, reasoning: committedReasoning, isComplete: true
+                )
+                pendingAssistantPreviewMessageID = assistant.id
+                Task { [weak self] in
+                    do {
+                        try await store.insertMessage(assistant, attachments: [])
+                        try await store.updateConversation(
+                            id: conversation.id, title: nil, modelID: nil, updatedAt: .now
+                        )
+                        if shouldNotifyWhenCommitted {
+                            await self?.scheduleBackgroundCompletionNotification()
+                        } else {
+                            await self?.maybeGenerateTitle()
+                        }
+                        self?.endBackgroundStreamingTask()
+                    } catch {
+                        self?.handleAssistantCommitFailure(messageID: assistant.id, error: error)
+                        self?.endBackgroundStreamingTask()
+                    }
+                }
+            }
+        } else {
+            if let store, let pendingID, emptyPendingDisposition == .delete {
+                Task { try? await store.deleteMessage(id: pendingID) }
+            }
+            streamingText = ""
+            streamingReasoning = ""
+            pendingAssistantPreviewMessageID = nil
+            endBackgroundStreamingTask()
         }
 
         if let error, error != .cancelled {

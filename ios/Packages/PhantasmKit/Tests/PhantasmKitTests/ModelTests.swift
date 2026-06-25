@@ -380,6 +380,37 @@ final class PersistenceTests: XCTestCase {
         ])
     }
 
+    func testPendingAssistantMessageCompletesInPlace() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let pending = Message(
+            conversationId: convo.id,
+            role: "assistant",
+            content: "",
+            isComplete: false
+        )
+        try await store.insertMessage(pending, attachments: [])
+
+        var detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.messages.count, 1)
+        XCTAssertEqual(detail?.wireHistory(), [])
+
+        try await store.updateMessage(
+            id: pending.id,
+            content: "final answer",
+            reasoning: "hidden plan",
+            isComplete: true
+        )
+
+        detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.messages.count, 1)
+        XCTAssertEqual(detail?.messages.first?.message.content, "final answer")
+        XCTAssertEqual(detail?.messages.first?.message.reasoning, "hidden plan")
+        XCTAssertEqual(detail?.messages.first?.message.isComplete, true)
+        XCTAssertEqual(detail?.wireHistory(), [WireMessage(role: "assistant", content: "final answer")])
+    }
+
     func testReasoningIsPersistedButExcludedFromWireHistory() async throws {
         let store = try AppDatabase.empty()
         let convo = Conversation(title: "T")

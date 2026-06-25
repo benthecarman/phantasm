@@ -16,6 +16,7 @@ struct RootView: View {
     @State private var initialChatID: UUID?
     @State private var showSettings = false
     @State private var isDrawerOpen = false
+    @State private var chatViewModels = ChatViewModelCache()
     /// Live drag translation while the user is swiping the drawer.
     @State private var dragOffset: CGFloat = 0
 
@@ -50,6 +51,7 @@ struct RootView: View {
         if let selection {
             ChatView(
                 conversation: selection,
+                viewModel: chatViewModels.viewModel(for: selection.id),
                 autoFocusComposer: selection.id == initialChatID,
                 onOpenHistory: { openDrawer() },
                 onNewChat: { startNewChat() }
@@ -157,5 +159,17 @@ struct RootView: View {
     private func closeDrawer() {
         dragOffset = 0
         isDrawerOpen = false
+    }
+}
+
+@MainActor
+private final class ChatViewModelCache {
+    private var models: [UUID: ChatViewModel] = [:]
+
+    func viewModel(for id: UUID) -> ChatViewModel {
+        if let model = models[id] { return model }
+        let model = ChatViewModel()
+        models[id] = model
+        return model
     }
 }

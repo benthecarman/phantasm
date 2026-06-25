@@ -143,6 +143,28 @@ extension AppDatabase: ChatStore {
         }
     }
 
+    public func updateMessage(
+        id: UUID,
+        content: String,
+        reasoning: String,
+        isComplete: Bool
+    ) async throws {
+        try await dbWriter.write { db in
+            guard var message = try Message.fetchOne(db, key: id) else { return }
+            message.content = content
+            message.reasoning = reasoning
+            message.isComplete = isComplete
+            message.updatedAt = Date()
+            try message.update(db)
+        }
+    }
+
+    public func deleteMessage(id: UUID) async throws {
+        try await dbWriter.write { db in
+            _ = try Message.deleteOne(db, key: id)
+        }
+    }
+
     public func updateConversation(
         id: UUID, title: String?, modelID: String?, updatedAt: Date?
     ) async throws {
