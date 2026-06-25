@@ -77,6 +77,9 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            // Pull to re-probe the active backend, picking up tools toggled on
+            // server-side (web search / image generation) without a relaunch.
+            .refreshable { await env.refreshCapabilities() }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
