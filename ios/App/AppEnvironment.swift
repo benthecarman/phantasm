@@ -62,10 +62,14 @@ final class AppEnvironment {
     var availableModels: [String] {
         var models = discoveredModels
         if let defaultModel = activeDefaultModel, !models.contains(defaultModel) {
-            models.insert(defaultModel, at: 0)
+            models.append(defaultModel)
         }
-        return models
+        return models.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
+
+    /// The active profile's configured default model, if any. Surfaced so the
+    /// model picker can badge it.
+    var defaultModelID: String? { activeDefaultModel }
 
     /// The model to preselect for new chats and unsent conversations.
     var preferredModel: String? {

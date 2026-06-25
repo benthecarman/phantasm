@@ -93,6 +93,7 @@ struct ChatView: View {
                     modelSelection: modelBinding,
                     visionModels: env.visionModels,
                     toolModels: env.toolModels,
+                    defaultModel: env.defaultModelID,
                     allowsImageAttachments: allowsImageAttachments,
                     supportsWebSearch: backendTools?.webSearch ?? false,
                     supportsImageGeneration: backendTools?.imageGeneration ?? false,
@@ -276,6 +277,8 @@ struct ComposerView: View {
     /// this backend, so the badge is omitted rather than shown as unsupported).
     let visionModels: Set<String>?
     let toolModels: Set<String>?
+    /// The configured default model, badged in the picker.
+    let defaultModel: String?
     /// Whether the selected model can accept images (vision). Files are always
     /// allowed; only the Photos option is gated.
     let allowsImageAttachments: Bool
@@ -354,7 +357,8 @@ struct ComposerView: View {
                 models: availableModels,
                 selection: modelSelection,
                 visionModels: visionModels,
-                toolModels: toolModels
+                toolModels: toolModels,
+                defaultModel: defaultModel
             )
         }
     }

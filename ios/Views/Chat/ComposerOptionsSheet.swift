@@ -212,6 +212,8 @@ struct ModelPickerSheet: View {
     /// corresponding badge is omitted (rather than implying the model lacks it).
     let visionModels: Set<String>?
     let toolModels: Set<String>?
+    /// The configured default model, badged so it's identifiable in the list.
+    let defaultModel: String?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -250,25 +252,27 @@ struct ModelPickerSheet: View {
 
     @ViewBuilder
     private func capabilityBadges(for model: String) -> some View {
+        let isDefault = model == defaultModel
         let isVision = visionModels?.contains(model) == true
         let isTools = toolModels?.contains(model) == true
-        if isVision || isTools {
+        if isDefault || isVision || isTools {
             HStack(spacing: 6) {
+                if isDefault { badge("Default", systemImage: "star.fill", tint: .accentColor) }
                 if isVision { badge("Vision", systemImage: "eye") }
                 if isTools { badge("Tools", systemImage: "wrench.and.screwdriver") }
             }
         }
     }
 
-    private func badge(_ text: String, systemImage: String) -> some View {
+    private func badge(_ text: String, systemImage: String, tint: Color = .secondary) -> some View {
         HStack(spacing: 3) {
             Image(systemName: systemImage)
             Text(text)
         }
         .font(.caption2.weight(.medium))
-        .foregroundStyle(.secondary)
+        .foregroundStyle(tint)
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
-        .background(Color.primary.opacity(0.06), in: Capsule())
+        .background(tint.opacity(0.12), in: Capsule())
     }
 }
