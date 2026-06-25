@@ -34,9 +34,12 @@ pub fn schema() -> Value {
         .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
     tool_envelope(
         "image_edit",
-        "Edit the image the user provided by following an instruction (e.g. \
-         'add a hat', 'make it look like winter'). Operates on the user's most \
-         recent attached image; the edited image is shown to the user.",
+        "Edit an existing image by following an instruction (e.g. 'add a hat', \
+         'make it look like winter'). Operates on the most recent image in the \
+         conversation — whether the user attached it or it was generated \
+         earlier — so use this (not image_generation) when the user asks to \
+         change or modify a picture already in the chat. The edited image is \
+         shown to the user.",
         params,
     )
 }
@@ -55,11 +58,11 @@ pub async fn run(
         Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
     };
 
-    // Edit the most recent image the user supplied this turn.
+    // Edit the most recent image in the conversation (attached or generated).
     let Some(input_b64) = ctx.input_images.last() else {
         return error_outcome(
             call_id,
-            "no image provided to edit; ask the user to attach one".into(),
+            "no image to edit; ask the user to attach or generate one".into(),
         );
     };
 

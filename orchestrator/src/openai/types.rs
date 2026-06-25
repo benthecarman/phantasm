@@ -111,19 +111,47 @@ impl MessageContent {
 
     /// Borrowing variant of [`Self::into_text_and_images`] that yields just the
     /// base64 image payloads (data-URI prefixes stripped), leaving the message
-    /// intact. Used to surface a user's attached images to the tool loop.
+    /// intact. Used to surface images to the edit tool — both a user's attached
+    /// `image_url` parts and images embedded as `data:` URIs in text (e.g. the
+    /// `![generated](data:…)` markdown the image tools emit into an assistant
+    /// answer), so the model can edit something generated earlier. Document
+    /// order is preserved so callers can treat the last entry as most recent.
     pub fn image_payloads(&self) -> Vec<String> {
         match self {
-            MessageContent::Text(_) => Vec::new(),
+            MessageContent::Text(s) => embedded_data_uri_payloads(s),
             MessageContent::Parts(parts) => parts
                 .iter()
-                .filter_map(|p| match p {
-                    ContentPart::ImageUrl { image_url } => Some(strip_data_uri(&image_url.url)),
-                    ContentPart::Text { .. } => None,
+                .flat_map(|p| match p {
+                    ContentPart::ImageUrl { image_url } => vec![strip_data_uri(&image_url.url)],
+                    ContentPart::Text { text } => embedded_data_uri_payloads(text),
                 })
                 .collect(),
         }
     }
+}
+
+/// Pull the base64 payload out of every `data:<mime>;base64,<payload>` URI
+/// embedded in free text (in markdown order). Used to recover images the image
+/// tools wrote into an assistant message as `![…](data:…)` markdown.
+fn embedded_data_uri_payloads(text: &str) -> Vec<String> {
+    const MARKER: &str = ";base64,";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(idx) = rest.find(MARKER) {
+        let after = &rest[idx + MARKER.len()..];
+        let end = after
+            .find(|c: char| !is_base64_char(c))
+            .unwrap_or(after.len());
+        if end > 0 {
+            out.push(after[..end].to_string());
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+fn is_base64_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')
 }
 
 /// Strip a `data:<mime>;base64,` prefix, yielding the raw base64 payload. A bare
@@ -165,6 +193,30 @@ mod tests {
     fn bare_url_is_not_stripped() {
         assert_eq!(strip_data_uri("https://x/y.png"), "https://x/y.png");
         assert_eq!(strip_data_uri("data:image/jpeg;base64,ZZZ"), "ZZZ");
+    }
+
+    #[test]
+    fn text_content_yields_embedded_generated_images() {
+        // The markdown the image tools emit into an assistant answer.
+        let c = MessageContent::Text(
+            "Here you go!\n\n![generated](data:image/png;base64,R0lGODlh)".into(),
+        );
+        assert_eq!(c.image_payloads(), vec!["R0lGODlh".to_string()]);
+    }
+
+    #[test]
+    fn embedded_extractor_handles_multiple_and_terminators() {
+        let payloads = embedded_data_uri_payloads(
+            "a ![x](data:image/png;base64,AAA) b ![y](data:image/jpeg;base64,BBB==) c",
+        );
+        assert_eq!(payloads, vec!["AAA".to_string(), "BBB==".to_string()]);
+    }
+
+    #[test]
+    fn plain_text_has_no_images() {
+        assert!(MessageContent::Text("just words".into())
+            .image_payloads()
+            .is_empty());
     }
 }
 

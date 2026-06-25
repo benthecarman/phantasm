@@ -167,14 +167,15 @@ pub async fn run_turn<B, T>(
     stream_final(&backend, &model, &messages, &options, appends, &tx, &cancel).await;
 }
 
-/// Collect the image payloads from the most recent user message that carries
-/// any (most recent last). Used so the edit tool can act on "the image I just
-/// sent" without the model having to thread it through tool arguments.
+/// Collect the image payloads from the most recent message that carries any —
+/// whether the user attached it (`image_url` part) or the assistant generated
+/// it earlier (embedded `data:` URI), most recent last. Lets the edit tool act
+/// on "the image we were just looking at" without the model having to thread it
+/// through tool arguments.
 fn latest_input_images(messages: &[ChatMessage]) -> Vec<String> {
     messages
         .iter()
         .rev()
-        .filter(|m| m.role == "user")
         .find_map(|m| {
             let images = m
                 .content
@@ -258,7 +259,7 @@ async fn stream_final<B: ChatBackend>(
 mod tests {
     use super::*;
     use crate::ollama::{DeltaStream, StreamDelta};
-    use crate::openai::types::{FunctionCall, MessageContent, RawArguments, ToolCall};
+    use crate::openai::types::{ContentPart, FunctionCall, MessageContent, RawArguments, ToolCall};
     use crate::orchestrator::tools::ToolOutcome;
     use std::sync::Mutex;
 
@@ -280,6 +281,51 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    fn user(content: MessageContent) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn user_with_image(b64: &str) -> ChatMessage {
+        user(MessageContent::Parts(vec![ContentPart::ImageUrl {
+            image_url: crate::openai::types::ImageUrl {
+                url: format!("data:image/jpeg;base64,{b64}"),
+            },
+        }]))
+    }
+
+    #[test]
+    fn latest_input_images_finds_generated_image_in_assistant_message() {
+        // gen-then-edit: the image lives in the assistant message as markdown,
+        // and the trailing user turn has no attachment.
+        let history = vec![
+            user(MessageContent::Text("draw a cat".into())),
+            assistant("here you go ![generated](data:image/png;base64,GENGEN)"),
+            user(MessageContent::Text("make it night".into())),
+        ];
+        assert_eq!(latest_input_images(&history), vec!["GENGEN".to_string()]);
+    }
+
+    #[test]
+    fn latest_input_images_prefers_most_recent_across_roles() {
+        let history = vec![
+            assistant("![generated](data:image/png;base64,OLD)"),
+            user_with_image("NEW"),
+        ];
+        assert_eq!(latest_input_images(&history), vec!["NEW".to_string()]);
+    }
+
+    #[test]
+    fn latest_input_images_empty_when_no_image_anywhere() {
+        let history = vec![user(MessageContent::Text("hi".into())), assistant("hello")];
+        assert!(latest_input_images(&history).is_empty());
     }
 
     fn assistant_calling(tool: &str) -> ChatMessage {
