@@ -11,8 +11,8 @@ use super::{ChatBackend, DeltaStream, StreamDelta};
 use crate::error::AppError;
 use crate::openai::types::ChatMessage;
 
-/// Keep models resident across turns for KV-cache reuse (NFR-O8).
-const KEEP_ALIVE: &str = "30m";
+/// Explicit residency hint for the opt-in warm preload path.
+const WARM_KEEP_ALIVE: &str = "30m";
 const REASONING_EFFORT_NONE: &str = "none";
 
 #[derive(Clone)]
@@ -39,6 +39,7 @@ impl OllamaClient {
         tools: &[Value],
         options: &Map<String, Value>,
         stream: bool,
+        keep_alive: Option<&str>,
     ) -> OllamaChatRequest {
         let mut options = options.clone();
         let think = extract_thinking_control(&mut options);
@@ -57,7 +58,7 @@ impl OllamaClient {
             } else {
                 Some(Value::Object(options))
             },
-            keep_alive: Some(KEEP_ALIVE.to_string()),
+            keep_alive: keep_alive.map(str::to_string),
         }
     }
 
@@ -94,6 +95,27 @@ impl OllamaClient {
             .map_err(|e| AppError::OllamaError(e.to_string()))?;
         Ok(show.capabilities)
     }
+
+    /// Best-effort model preload used only by `POST /v1/warm`.
+    pub async fn warm_model(&self, model: &str) -> Result<(), AppError> {
+        let url = self.endpoint("/api/chat")?;
+        let body = self.build_request(model, &[], &[], &Map::new(), false, Some(WARM_KEEP_ALIVE));
+        let resp = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+        }
+
+        Ok(())
+    }
 }
 
 impl ChatBackend for OllamaClient {
@@ -105,7 +127,7 @@ impl ChatBackend for OllamaClient {
         options: &Map<String, Value>,
     ) -> Result<ChatMessage, AppError> {
         let url = self.endpoint("/api/chat")?;
-        let body = self.build_request(model, messages, tools, options, false);
+        let body = self.build_request(model, messages, tools, options, false, None);
         let resp = self
             .http
             .post(url)
@@ -134,7 +156,7 @@ impl ChatBackend for OllamaClient {
         options: &Map<String, Value>,
     ) -> Result<DeltaStream, AppError> {
         let url = self.endpoint("/api/chat")?;
-        let body = self.build_request(model, messages, &[], options, true);
+        let body = self.build_request(model, messages, &[], options, true, None);
         let resp = self
             .http
             .post(url)

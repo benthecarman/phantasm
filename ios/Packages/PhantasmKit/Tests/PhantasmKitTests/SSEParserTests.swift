@@ -158,7 +158,7 @@ final class OllamaNativeChatClientTests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(json["think"] as? Bool, false)
         XCTAssertEqual(json["stream"] as? Bool, true)
-        XCTAssertEqual(json["keep_alive"] as? String, "30m")
+        XCTAssertNil(json["keep_alive"])
     }
 
     func testNativeClientStreamsThinkingWhenEnabled() async throws {

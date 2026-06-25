@@ -21,7 +21,8 @@ pub struct OllamaChatRequest {
     pub think: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Value>,
-    /// Keep the model resident across turns so KV cache is reused (NFR-O8).
+    /// Optional residency hint. Normal chat omits this so Ollama chooses its
+    /// default; explicit warm preloads set it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_alive: Option<String>,
 }

@@ -29,8 +29,7 @@ public struct OllamaNativeChatClient: ChatClienting {
                     let stream = try client.chatStream(
                         model: model,
                         messages: request.messages.map(\.ollamaMessage),
-                        think: request.ollamaThink,
-                        keepAlive: .minutes(30)
+                        think: request.ollamaThink
                     )
 
                     for try await chunk in stream {

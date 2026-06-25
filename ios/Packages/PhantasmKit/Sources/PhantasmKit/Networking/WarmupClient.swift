@@ -7,7 +7,7 @@ import Foundation
 /// - `.full`: hits the orchestrator's `POST /v1/warm` (which loads upstream
 ///   Ollama when applicable, no-op otherwise).
 /// - `.ollamaNative`: issues a native `/api/chat` "load" (empty messages →
-///   model resident, zero tokens) with the same `keep_alive` the chat path uses.
+///   model resident, zero tokens) with an explicit warm-only `keep_alive`.
 /// - `.plainChatOnly`: skipped — a generic/hosted OpenAI endpoint has no free
 ///   preload and warming it could cost tokens.
 public struct WarmupClient: Sendable {

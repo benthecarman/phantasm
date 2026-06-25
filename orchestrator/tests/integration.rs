@@ -11,8 +11,10 @@ use phantasm_orchestrator::config::{Config, LogFormat};
 use phantasm_orchestrator::ollama::UpstreamKind;
 use phantasm_orchestrator::routes;
 use phantasm_orchestrator::state::{CapabilitySnapshot, ToolFlags};
+use tokio::sync::Mutex;
 
 const TOKEN: &str = "test-token";
+type RecordedRequests = Arc<Mutex<Vec<serde_json::Value>>>;
 
 /// Spawn an HTTP server on an ephemeral port; return its base URL.
 async fn spawn(app: Router) -> String {
@@ -27,16 +29,30 @@ async fn spawn(app: Router) -> String {
 /// A mock Ollama that returns a two-token streaming `/api/chat` response and a
 /// one-model `/api/tags`.
 fn mock_ollama() -> Router {
+    mock_ollama_with_recorder(None)
+}
+
+fn mock_ollama_recording(requests: RecordedRequests) -> Router {
+    mock_ollama_with_recorder(Some(requests))
+}
+
+fn mock_ollama_with_recorder(requests: Option<RecordedRequests>) -> Router {
     Router::new()
         .route(
             "/api/chat",
-            post(|body: axum::extract::Json<serde_json::Value>| async move {
-                let streaming = body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-                if streaming {
-                    "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n\
-                     {\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\"}\n"
-                } else {
-                    "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello world\"},\"done\":true}"
+            post(move |body: axum::extract::Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    let streaming = body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if let Some(requests) = requests {
+                        requests.lock().await.push(body.0.clone());
+                    }
+                    if streaming {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n\
+                         {\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+                    } else {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello world\"},\"done\":true}"
+                    }
                 }
             }),
         )
@@ -194,6 +210,30 @@ async fn plain_chat_streams_tokens() {
 }
 
 #[tokio::test]
+async fn regular_native_chat_omits_keep_alive() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ollama = spawn(mock_ollama_recording(requests.clone())).await;
+    let base = spawn_orchestrator(&ollama).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].get("keep_alive").is_none());
+}
+
+#[tokio::test]
 async fn openai_compatible_upstream_streams_tokens() {
     let openai = spawn(mock_openai_compatible()).await;
     let base = spawn_orchestrator_with_kind(&openai, UpstreamKind::OpenAICompatible).await;
@@ -256,7 +296,8 @@ async fn non_streaming_returns_completion() {
 
 #[tokio::test]
 async fn warm_loads_native_ollama_model() {
-    let ollama = spawn(mock_ollama()).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ollama = spawn(mock_ollama_recording(requests.clone())).await;
     let base = spawn_orchestrator(&ollama).await;
 
     let resp = reqwest::Client::new()
@@ -271,6 +312,14 @@ async fn warm_loads_native_ollama_model() {
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["warmed"], true);
     assert_eq!(v["model"], "m");
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].get("keep_alive").and_then(|v| v.as_str()),
+        Some("30m")
+    );
+    assert_eq!(requests[0]["messages"], serde_json::json!([]));
 }
 
 #[tokio::test]

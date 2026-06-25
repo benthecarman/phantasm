@@ -87,12 +87,13 @@ This keeps the orchestrator a drop-in OpenAI server. Conventions:
 
 `POST /v1/warm` with `{ "model": "…" }` (model optional → server default).
 Best-effort preload so the first turn skips cold-start; the app calls it on
-launch and on model switch. For a native-Ollama upstream the server issues a
-no-message "load" (model resident via `keep_alive`, zero tokens); for any other
-upstream it is a no-op. Returns `{ "warmed": bool, "model": "…" }` and MUST NOT
-error the caller — a bare Ollama (no orchestrator) simply lacks this route, and
-the app degrades to a native `/api/chat` load instead. Plain OpenAI-compatible
-backends are not warmed (no free preload).
+launch and on model switch when auto-warm is enabled. For a native-Ollama
+upstream the server issues a no-message "load" (model resident via a warm-only
+`keep_alive`, zero tokens); for any other upstream it is a no-op. Returns
+`{ "warmed": bool, "model": "…" }` and MUST NOT error the caller — a bare Ollama
+(no orchestrator) simply lacks this route, and the app degrades to a native
+`/api/chat` load instead. Plain OpenAI-compatible backends are not warmed (no
+free preload).
 
 ### 2.3 Tools are server-side and invisible to the app
 
