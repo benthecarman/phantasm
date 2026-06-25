@@ -401,6 +401,7 @@ final class ChatViewModel {
         guard pendingAssistantPreviewMessageID == messageID else { return }
         pendingAssistantPreviewMessageID = nil
         streamingText = ""
+        streamingReasoning = ""
         errorMessage = AppError.from(error).userMessage
     }
 
