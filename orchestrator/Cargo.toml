@@ -46,6 +46,13 @@ default = []
 # snippet-first remains the default path). No extra deps — uses reqwest + a
 # minimal HTML-to-text pass.
 page_fetch = []
+# Opt-in HTTP response compression. Turns on reqwest's gzip handling so it
+# negotiates Accept-Encoding itself and auto-decompresses responses. Off by
+# default: snippet responses are a few KB and RTT-bound, so compression buys no
+# latency there and only adds a decompress step. The real win is the
+# `page_fetch` path (full HTML pages), so pair it with that. Requires that we
+# never hand-set Accept-Encoding (doing so disables reqwest's auto-decompress).
+gzip = ["reqwest/gzip"]
 
 [dev-dependencies]
 wiremock = "0.6"

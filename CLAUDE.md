@@ -24,7 +24,7 @@ independently — change it deliberately, on both sides.
 cargo test                      # 14 unit + 4 integration (mock Ollama, no real backends)
 cargo clippy --all-targets      # keep clean — CI-equivalent gate
 cargo fmt                       # before committing
-cargo build --features page_fetch   # the one optional feature must also build
+cargo build --features page_fetch,gzip   # optional features must also build
 PHANTASM_AUTH_TOKEN=dev cargo run    # local run (needs Ollama at OLLAMA_BASE_URL)
 ```
 
