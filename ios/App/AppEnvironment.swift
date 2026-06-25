@@ -27,6 +27,10 @@ final class AppEnvironment {
     /// this backend (e.g. a generic OpenAI endpoint), so images are allowed
     /// optimistically rather than hidden.
     var visionModels: Set<String>?
+    /// Models known to support tool/function calling. `nil` means it's
+    /// undetectable for this backend, so tools are allowed optimistically. The
+    /// server tools also require the backend to advertise them (`backendMode`).
+    var toolModels: Set<String>?
 
     init() {
         // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
@@ -134,23 +138,28 @@ final class AppEnvironment {
         if !models.isEmpty {
             profileStore.cacheModels(models, for: profile.id)
         }
-        await refreshVisionModels(base: base, token: token)
+        await refreshModelCapabilities(base: base, token: token)
         warmActiveModel(base: base, token: token)
     }
 
-    /// Resolve which models accept images for the current backend: from the
-    /// orchestrator manifest when present, by probing Ollama `/api/show` for a
-    /// bare native backend, and unknown (optimistic) for generic OpenAI.
-    private func refreshVisionModels(base: URL, token: String) async {
+    /// Resolve which models accept images / can drive tools for the current
+    /// backend: from the orchestrator manifest when present, by probing Ollama
+    /// `/api/show` for a bare native backend, and unknown (optimistic) for
+    /// generic OpenAI. Server tools require the orchestrator, so `toolModels` is
+    /// only meaningful in `.full` mode — the other modes leave it unknown.
+    private func refreshModelCapabilities(base: URL, token: String) async {
         switch backendMode {
         case .full(let caps):
             visionModels = caps.visionModels.map(Set.init)
+            toolModels = caps.toolModels.map(Set.init)
         case .ollamaNative(let models):
             visionModels = await capabilitiesClient.fetchOllamaVisionModels(
                 base: base, token: token, models: models
             )
+            toolModels = nil
         case .plainChatOnly:
             visionModels = nil
+            toolModels = nil
         }
     }
 
@@ -160,6 +169,15 @@ final class AppEnvironment {
         guard let visionModels else { return true }
         guard let model else { return false }
         return visionModels.contains(model)
+    }
+
+    /// Whether `model` can drive server tools (function calling). Unknown backends
+    /// return `true` (optimistic). Note this only gates *which* model can use a
+    /// tool — the backend must also advertise the tool (see `backendMode`).
+    func supportsTools(_ model: String?) -> Bool {
+        guard let toolModels else { return true }
+        guard let model else { return false }
+        return toolModels.contains(model)
     }
 
     /// Kick off a best-effort preload of the model new chats will use, so the

@@ -85,15 +85,15 @@ pub async fn probe_capabilities(
         Vec::new()
     };
 
-    // Vision is only knowable for native Ollama (via `/api/show`). For an
-    // OpenAI-compatible upstream we can't tell, so we advertise none and the app
-    // treats image support as unknown (optimistic).
-    let vision_models = match upstream.kind {
+    // Per-model vision + tool support is only knowable for native Ollama (via
+    // `/api/show`). For an OpenAI-compatible upstream we can't tell, so we
+    // advertise none and the app treats both as unknown (optimistic).
+    let (vision_models, tool_models) = match upstream.kind {
         UpstreamKind::NativeOllama => {
             let client = OllamaClient::new(http.clone(), cfg.ollama_base.clone());
-            detect_vision_models(&client, &models).await
+            detect_model_capabilities(&client, &models).await
         }
-        UpstreamKind::OpenAICompatible => Vec::new(),
+        UpstreamKind::OpenAICompatible => (Vec::new(), Vec::new()),
     };
 
     let web_search = cfg.web_search_usable();
@@ -108,6 +108,7 @@ pub async fn probe_capabilities(
         chat: true,
         models,
         vision_models,
+        tool_models,
         tools: ToolFlags {
             web_search,
             image_generation,
@@ -116,20 +117,35 @@ pub async fn probe_capabilities(
     }
 }
 
-/// Probe each model's `/api/show` capabilities concurrently (best-effort, short
-/// timeout) and return those declaring `"vision"`.
-async fn detect_vision_models(client: &OllamaClient, models: &[String]) -> Vec<String> {
+/// Probe each model's `/api/show` capabilities once (concurrent, best-effort,
+/// short timeout) and partition them into `(vision, tools)` — the models that
+/// declare `"vision"` and those that declare `"tools"` (a model can be in both).
+async fn detect_model_capabilities(
+    client: &OllamaClient,
+    models: &[String],
+) -> (Vec<String>, Vec<String>) {
     let checks = models.iter().map(|model| async move {
         match tokio::time::timeout(PROBE_TIMEOUT, client.model_capabilities(model)).await {
-            Ok(Ok(caps)) if caps.iter().any(|c| c == "vision") => Some(model.clone()),
-            _ => None,
+            Ok(Ok(caps)) => {
+                let vision = caps.iter().any(|c| c == "vision");
+                let tools = caps.iter().any(|c| c == "tools");
+                (vision, tools)
+            }
+            _ => (false, false),
         }
     });
-    futures_util::future::join_all(checks)
-        .await
-        .into_iter()
-        .flatten()
-        .collect()
+    let results = futures_util::future::join_all(checks).await;
+    let mut vision_models = Vec::new();
+    let mut tool_models = Vec::new();
+    for (model, (vision, tools)) in models.iter().zip(results) {
+        if vision {
+            vision_models.push(model.clone());
+        }
+        if tools {
+            tool_models.push(model.clone());
+        }
+    }
+    (vision_models, tool_models)
 }
 
 /// Cheap reachability check with a short timeout; failures are non-fatal.

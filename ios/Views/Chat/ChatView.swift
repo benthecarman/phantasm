@@ -1,6 +1,5 @@
 import GRDBQuery
 import PhantasmKit
-import PhotosUI
 import SwiftUI
 
 struct ChatView: View {
@@ -58,6 +57,12 @@ struct ChatView: View {
         env.supportsVision(currentModelID)
     }
 
+    /// Whether the selected model can drive server tools (function calling). A
+    /// tool also needs the backend to advertise it; this only gates the model.
+    private var modelSupportsTools: Bool {
+        env.supportsTools(currentModelID)
+    }
+
     /// The server tools the active backend advertises, or nil if it exposes no
     /// tool manifest (raw Ollama / generic OpenAI) — then the tool selector hides.
     private var backendTools: Capabilities.Tools? {
@@ -86,9 +91,12 @@ struct ChatView: View {
                     availableModels: env.availableModels,
                     modelName: currentModelName,
                     modelSelection: modelBinding,
+                    visionModels: env.visionModels,
+                    toolModels: env.toolModels,
                     allowsImageAttachments: allowsImageAttachments,
                     supportsWebSearch: backendTools?.webSearch ?? false,
                     supportsImageGeneration: backendTools?.imageGeneration ?? false,
+                    modelSupportsTools: modelSupportsTools,
                     webSearchEnabled: Binding(
                         get: { vm.webSearchEnabled },
                         set: { vm.setWebSearchEnabled($0) }
@@ -264,21 +272,26 @@ struct ComposerView: View {
     let availableModels: [String]
     let modelName: String
     let modelSelection: Binding<String>
+    /// Per-model capability sets for the model picker (nil ⇒ undetectable for
+    /// this backend, so the badge is omitted rather than shown as unsupported).
+    let visionModels: Set<String>?
+    let toolModels: Set<String>?
     /// Whether the selected model can accept images (vision). Files are always
     /// allowed; only the Photos option is gated.
     let allowsImageAttachments: Bool
-    /// Which server tools the backend advertises (spec §2.1). The tool selector
-    /// only offers a toggle for a tool the backend actually supports.
+    /// Which server tools the backend advertises (spec §2.1). A tool is only
+    /// usable when the backend advertises it *and* the model can drive tools.
     let supportsWebSearch: Bool
     let supportsImageGeneration: Bool
+    /// Whether the selected model supports tool/function calling.
+    let modelSupportsTools: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
     let onSend: () -> Void
     let onStop: () -> Void
 
-    @State private var photoItems: [PhotosPickerItem] = []
-    @State private var showPhotoPicker = false
-    @State private var showFileImporter = false
+    @State private var showOptions = false
+    @State private var showModelPicker = false
 
     private var trimmed: String {
         input.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -304,7 +317,6 @@ struct ComposerView: View {
             HStack(spacing: 8) {
                 addButton
                 modelPicker
-                toolPicker
                 Spacer(minLength: 8)
                 control
             }
@@ -326,18 +338,25 @@ struct ComposerView: View {
         // breathing room there). Animate so it tracks the keyboard transition.
         .padding(.bottom, focus.wrappedValue ? 8 : 0)
         .animation(.easeInOut(duration: 0.25), value: focus.wrappedValue)
-        .photosPicker(
-            isPresented: $showPhotoPicker,
-            selection: $photoItems,
-            maxSelectionCount: 6,
-            matching: .images
-        )
-        .onChange(of: photoItems) { _, items in loadPhotos(items) }
-        .fileImporter(
-            isPresented: $showFileImporter,
-            allowedContentTypes: AttachmentLoader.importableTypes,
-            allowsMultipleSelection: true
-        ) { result in loadFiles(result) }
+        .sheet(isPresented: $showOptions) {
+            ComposerOptionsSheet(
+                attachments: $attachments,
+                allowsImageAttachments: allowsImageAttachments,
+                supportsWebSearch: supportsWebSearch,
+                supportsImageGeneration: supportsImageGeneration,
+                modelSupportsTools: modelSupportsTools,
+                webSearchEnabled: webSearchEnabled,
+                imageGenerationEnabled: imageGenerationEnabled
+            )
+        }
+        .sheet(isPresented: $showModelPicker) {
+            ModelPickerSheet(
+                models: availableModels,
+                selection: modelSelection,
+                visionModels: visionModels,
+                toolModels: toolModels
+            )
+        }
     }
 
     private var attachmentStrip: some View {
@@ -353,26 +372,11 @@ struct ComposerView: View {
         }
     }
 
+    /// Opens the "+" options sheet (attachments, tools, model). Tinted when any
+    /// staged attachment or active tool means the sheet holds live state.
     private var addButton: some View {
-        Menu {
-            Button {
-                showPhotoPicker = true
-            } label: {
-                // Always listed so the option is discoverable, but visually
-                // disabled — and with a badged icon — when the selected model
-                // can't accept images (vision).
-                Label(
-                    "Photos",
-                    systemImage: allowsImageAttachments
-                        ? "photo" : "photo.badge.exclamationmark"
-                )
-            }
-            .disabled(!allowsImageAttachments)
-            Button {
-                showFileImporter = true
-            } label: {
-                Label("Files", systemImage: "doc")
-            }
+        Button {
+            showOptions = true
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 17, weight: .semibold))
@@ -381,37 +385,17 @@ struct ComposerView: View {
                 .background(Color.primary.opacity(0.06), in: Circle())
         }
         .disabled(isStreaming)
-        .accessibilityLabel("Add attachment")
+        .accessibilityLabel("Add attachment or tools")
     }
 
-    private func loadPhotos(_ items: [PhotosPickerItem]) {
-        guard !items.isEmpty else { return }
-        Task {
-            var loaded: [PendingAttachment] = []
-            for item in items {
-                if let attachment = await AttachmentLoader.image(from: item) {
-                    loaded.append(attachment)
-                }
-            }
-            await MainActor.run {
-                attachments.append(contentsOf: loaded)
-                photoItems = []
-            }
-        }
-    }
-
-    private func loadFiles(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result else { return }
-        attachments.append(contentsOf: urls.compactMap(AttachmentLoader.file))
-    }
-
+    /// Model selector pill (FR-A): a capsule showing the active model that opens
+    /// a sheet to switch (matching the "+" options sheet). Hidden when the
+    /// backend advertises no models.
     @ViewBuilder
     private var modelPicker: some View {
         if !availableModels.isEmpty {
-            Menu {
-                Picker("Model", selection: modelSelection) {
-                    ForEach(availableModels, id: \.self) { Text($0).tag($0) }
-                }
+            Button {
+                showModelPicker = true
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "cpu")
@@ -426,47 +410,8 @@ struct ComposerView: View {
                 .padding(.vertical, 7)
                 .background(Color.primary.opacity(0.06), in: Capsule())
             }
-        }
-    }
-
-    /// Per-chat server-tool selector (spec §2.3). Only shown when the backend
-    /// advertises at least one tool; only the supported tools get a toggle. The
-    /// pill shows the active tools' icons so the state reads at a glance.
-    @ViewBuilder
-    private var toolPicker: some View {
-        if supportsWebSearch || supportsImageGeneration {
-            let webOn = supportsWebSearch && webSearchEnabled.wrappedValue
-            let imageOn = supportsImageGeneration && imageGenerationEnabled.wrappedValue
-            let anyOn = webOn || imageOn
-            Menu {
-                if supportsWebSearch {
-                    Toggle(isOn: webSearchEnabled) {
-                        Label("Web search", systemImage: "globe")
-                    }
-                }
-                if supportsImageGeneration {
-                    Toggle(isOn: imageGenerationEnabled) {
-                        Label("Image generation", systemImage: "photo")
-                    }
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    if webOn { Image(systemName: "globe") }
-                    if imageOn { Image(systemName: "photo") }
-                    if !anyOn { Image(systemName: "wand.and.stars") }
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
-                }
-                .font(.caption.weight(.medium))
-                .foregroundStyle(anyOn ? Color.accentColor : Color.secondary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(
-                    (anyOn ? Color.accentColor : Color.primary).opacity(0.06),
-                    in: Capsule()
-                )
-            }
-            .accessibilityLabel("Tools")
+            .disabled(isStreaming)
+            .accessibilityLabel("Model")
         }
     }
 

@@ -44,6 +44,7 @@ targets:
         CFBundleDisplayName: Phantasm
         UILaunchScreen: {}
         NSPhotoLibraryAddUsageDescription: "Phantasm saves generated images to your photo library when you choose to save them."
+        NSCameraUsageDescription: "Phantasm uses the camera so you can take a photo to attach to a message."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown

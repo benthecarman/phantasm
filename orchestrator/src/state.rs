@@ -73,6 +73,13 @@ pub struct CapabilitySnapshot {
     /// (e.g. an OpenAI-compatible upstream that doesn't advertise vision).
     #[serde(default)]
     pub vision_models: Vec<String>,
+    /// Subset of `models` that support tool/function calling (probed via Ollama
+    /// `/api/show`). The server tools in `tools` can only be driven by a model in
+    /// this list, so the app gates the web-search / image-generation toggles on
+    /// both. Empty when undetectable (e.g. an OpenAI-compatible upstream) — the
+    /// app then treats tool support as unknown (optimistic).
+    #[serde(default)]
+    pub tool_models: Vec<String>,
     pub tools: ToolFlags,
     pub streaming: &'static str,
 }

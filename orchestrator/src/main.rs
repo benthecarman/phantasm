@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         upstream = ?upstream.kind,
         models = capabilities.models.len(),
         vision_models = capabilities.vision_models.len(),
+        tool_models = capabilities.tool_models.len(),
         web_search = capabilities.tools.web_search,
         image_generation = capabilities.tools.image_generation,
         "capabilities resolved"

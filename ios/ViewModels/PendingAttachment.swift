@@ -49,6 +49,20 @@ enum AttachmentLoader {
         )
     }
 
+    /// Builds an attachment from an image captured with the camera (already a
+    /// `UIImage`, so no async `Transferable` load is needed).
+    static func image(from original: UIImage) -> PendingAttachment? {
+        let scaled = downscale(original)
+        guard let jpeg = scaled.jpegData(compressionQuality: jpegQuality) else { return nil }
+        return PendingAttachment(
+            kind: .image,
+            name: "Photo",
+            imageData: jpeg,
+            mimeType: "image/jpeg",
+            thumbnail: scaled
+        )
+    }
+
     static func file(at url: URL) -> PendingAttachment? {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }

@@ -177,6 +177,10 @@ public struct Capabilities: Decodable, Sendable, Equatable {
     /// Subset of `models` that accept image input. `nil` when the manifest omits
     /// the field (older orchestrator) — vision is then treated as unknown.
     public let visionModels: [String]?
+    /// Subset of `models` that support tool/function calling. The server tools
+    /// can only be driven by a model in this list, so tool toggles gate on both.
+    /// `nil` when the manifest omits the field — tool support is then unknown.
+    public let toolModels: [String]?
     public let tools: Tools?
     public let streaming: String?
 
@@ -185,6 +189,7 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         chat: Bool,
         models: [String],
         visionModels: [String]? = nil,
+        toolModels: [String]? = nil,
         tools: Tools?,
         streaming: String?
     ) {
@@ -192,6 +197,7 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         self.chat = chat
         self.models = models
         self.visionModels = visionModels
+        self.toolModels = toolModels
         self.tools = tools
         self.streaming = streaming
     }

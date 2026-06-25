@@ -35,6 +35,8 @@ image generation on top of plain inference.
   "version": "0.1.0",
   "chat": true,
   "models": ["llama3.3:70b", "qwen2.5:14b"],
+  "vision_models": ["llama3.3:70b"],
+  "tool_models": ["qwen2.5:14b"],
   "tools": { "web_search": true, "image_generation": true },
   "streaming": "sse"
 }
@@ -43,6 +45,13 @@ image generation on top of plain inference.
 A bare Ollama won't serve this route; the app MUST treat 404/connection failure
 as "plain chat only" and degrade gracefully. The `tools` block is advisory — it
 only tells the app whether to *show* affordances. The app never executes tools.
+
+`vision_models` and `tool_models` are subsets of `models` reporting which models
+accept image input and which can drive tool/function calls (probed server-side
+via Ollama `/api/show`; both optional, omitted/empty ⇒ the app treats that
+capability as unknown and allows it optimistically). Because the server tools
+are invoked by the model, a tool is usable only when `tools` advertises it **and**
+the chosen model is in `tool_models` — the app gates the per-tool toggles on both.
 
 ### 2.2 Chat (single OpenAI-compatible endpoint)
 
