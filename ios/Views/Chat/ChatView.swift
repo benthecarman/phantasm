@@ -355,13 +355,19 @@ struct ComposerView: View {
 
     private var addButton: some View {
         Menu {
-            if allowsImageAttachments {
-                Button {
-                    showPhotoPicker = true
-                } label: {
-                    Label("Photos", systemImage: "photo")
-                }
+            Button {
+                showPhotoPicker = true
+            } label: {
+                // Always listed so the option is discoverable, but visually
+                // disabled — and with a badged icon — when the selected model
+                // can't accept images (vision).
+                Label(
+                    "Photos",
+                    systemImage: allowsImageAttachments
+                        ? "photo" : "photo.badge.exclamationmark"
+                )
             }
+            .disabled(!allowsImageAttachments)
             Button {
                 showFileImporter = true
             } label: {
