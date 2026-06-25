@@ -214,12 +214,14 @@ struct ChatView: View {
             }
             .accessibilityLabel("Chat history")
         }
-        ToolbarItem(placement: .topBarTrailing) {
-            Button(action: onNewChat) {
-                Image(systemName: "square.and.pencil")
+        if !isEmpty {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: onNewChat) {
+                    Image(systemName: "square.and.pencil")
+                }
+                .accessibilityLabel("New chat")
+                .disabled(env.activeProfile == nil)
             }
-            .accessibilityLabel("New chat")
-            .disabled(env.activeProfile == nil)
         }
     }
 
