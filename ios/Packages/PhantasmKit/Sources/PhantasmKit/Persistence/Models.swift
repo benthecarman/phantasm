@@ -77,10 +77,10 @@ public extension Conversation {
 
     /// Deep Research is an explicit slow/thorough turn mode, so it opts the
     /// request into thinking for that turn without changing the saved preference.
-    func reasoningEffort(thinkingEnabled: Bool) -> String {
+    func reasoningEffort(thinkingEnabled: Bool, disabledEffort: String?) -> String? {
         deepResearchEnabled || thinkingEnabled
             ? ReasoningEffort.enabledDefault
-            : ReasoningEffort.disabled
+            : disabledEffort
     }
 }
 

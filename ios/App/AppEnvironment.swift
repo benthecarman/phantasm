@@ -215,6 +215,23 @@ final class AppEnvironment {
         return thinkingPreferences[profileID.uuidString]?[model] ?? false
     }
 
+    func disabledReasoningEffortForCurrentBackend() -> String? {
+        disabledReasoningEffort
+    }
+
+    private var disabledReasoningEffort: String? {
+        // `reasoning_effort: "none"` is useful for the orchestrator and native
+        // Ollama path, where it suppresses thinking tokens. Generic OpenAI-
+        // compatible endpoints may reject unsupported request fields, so omit the
+        // no-op value in plain-chat mode.
+        switch backendMode {
+        case .full, .ollamaNative:
+            return ReasoningEffort.disabled
+        case .plainChatOnly:
+            return nil
+        }
+    }
+
     func setThinkingEnabled(_ enabled: Bool, for model: String?) {
         guard let profileID = activeProfileID,
               let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),

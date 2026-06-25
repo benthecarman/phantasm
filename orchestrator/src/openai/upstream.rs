@@ -18,6 +18,8 @@ use crate::error::AppError;
 use crate::ollama::{ChatBackend, DeltaStream, StreamDelta};
 use crate::openai::types::{ChatMessage, MessageContent};
 
+const REASONING_EFFORT_NONE: &str = "none";
+
 #[derive(Clone)]
 pub struct OpenAICompatibleClient {
     client: Client<OptionalAuthConfig>,
@@ -69,6 +71,7 @@ impl OpenAICompatibleClient {
         stream: bool,
     ) -> Value {
         let mut body = options.clone();
+        remove_noop_reasoning_suppression(&mut body);
         body.insert("model".into(), Value::String(model.to_string()));
         body.insert("messages".into(), json!(messages));
         body.insert("stream".into(), Value::Bool(stream));
@@ -76,6 +79,26 @@ impl OpenAICompatibleClient {
             body.insert("tools".into(), Value::Array(tools.to_vec()));
         }
         Value::Object(body)
+    }
+}
+
+fn remove_noop_reasoning_suppression(options: &mut Map<String, Value>) {
+    if options
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some_and(|effort| effort.eq_ignore_ascii_case(REASONING_EFFORT_NONE))
+    {
+        options.remove("reasoning_effort");
+    }
+
+    let nested_none = options
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .is_some_and(|effort| effort.eq_ignore_ascii_case(REASONING_EFFORT_NONE));
+    if nested_none {
+        options.remove("reasoning");
     }
 }
 
@@ -306,5 +329,27 @@ mod tests {
         let delta = delta_from_openai_chunk(&finish);
         assert!(delta.done);
         assert_eq!(delta.done_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn build_request_drops_noop_reasoning_suppression() {
+        let mut options = Map::new();
+        options.insert("reasoning_effort".into(), Value::String("none".into()));
+        options.insert("temperature".into(), json!(0.2));
+
+        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true);
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], json!(0.2));
+    }
+
+    #[test]
+    fn build_request_preserves_enabled_reasoning_effort() {
+        let mut options = Map::new();
+        options.insert("reasoning_effort".into(), Value::String("medium".into()));
+
+        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true);
+
+        assert_eq!(body["reasoning_effort"], "medium");
     }
 }

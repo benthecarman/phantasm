@@ -306,7 +306,8 @@ final class ChatViewModel {
             messages: detail.wireHistory(),
             stream: true,
             reasoningEffort: detail.conversation.reasoningEffort(
-                thinkingEnabled: env.thinkingEnabled(for: model)
+                thinkingEnabled: env.thinkingEnabled(for: model),
+                disabledEffort: env.disabledReasoningEffortForCurrentBackend()
             ),
             xTools: detail.conversation.requestedToolNames(
                 supporting: env.backendMode.capabilities?.tools
@@ -430,7 +431,7 @@ final class ChatViewModel {
             model: model,
             messages: history + [WireMessage(role: "user", content: Self.titlePrompt)],
             stream: true,
-            reasoningEffort: ReasoningEffort.disabled
+            reasoningEffort: env.disabledReasoningEffortForCurrentBackend()
         )
 
         guard let raw = try? await client.complete(request, base: base, token: token) else { return }

@@ -31,7 +31,7 @@ public struct ChatRequest: Encodable, Sendable {
         model: String,
         messages: [WireMessage],
         stream: Bool = true,
-        reasoningEffort: String? = ReasoningEffort.disabled,
+        reasoningEffort: String? = nil,
         xTools: [String]? = nil,
         xResearch: Bool? = nil
     ) {

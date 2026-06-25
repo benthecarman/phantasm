@@ -101,12 +101,15 @@ final class CapabilityDecodeTests: XCTestCase {
         let convo = Conversation(deepResearchEnabled: false)
 
         XCTAssertEqual(
-            convo.reasoningEffort(thinkingEnabled: true),
+            convo.reasoningEffort(thinkingEnabled: true, disabledEffort: ReasoningEffort.disabled),
             ReasoningEffort.enabledDefault
         )
         XCTAssertEqual(
-            convo.reasoningEffort(thinkingEnabled: false),
+            convo.reasoningEffort(thinkingEnabled: false, disabledEffort: ReasoningEffort.disabled),
             ReasoningEffort.disabled
+        )
+        XCTAssertNil(
+            convo.reasoningEffort(thinkingEnabled: false, disabledEffort: nil)
         )
     }
 
@@ -114,7 +117,7 @@ final class CapabilityDecodeTests: XCTestCase {
         let convo = Conversation(deepResearchEnabled: true)
 
         XCTAssertEqual(
-            convo.reasoningEffort(thinkingEnabled: false),
+            convo.reasoningEffort(thinkingEnabled: false, disabledEffort: nil),
             ReasoningEffort.enabledDefault
         )
     }
@@ -191,7 +194,7 @@ final class CapabilityDecodeTests: XCTestCase {
 }
 
 final class ChatRequestEncodingTests: XCTestCase {
-    func testReasoningEffortDefaultsToNone() throws {
+    func testReasoningEffortIsOmittedByDefault() throws {
         let req = ChatRequest(
             model: "chat-model",
             messages: [WireMessage(role: "user", content: "hi")]
@@ -199,8 +202,20 @@ final class ChatRequestEncodingTests: XCTestCase {
         let data = try Wire.encoder().encode(req)
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
-        XCTAssertEqual(json["reasoning_effort"] as? String, ReasoningEffort.disabled)
+        XCTAssertNil(json["reasoning_effort"])
         XCTAssertEqual(json["stream"] as? Bool, true)
+    }
+
+    func testReasoningEffortCanDisableThinking() throws {
+        let req = ChatRequest(
+            model: "chat-model",
+            messages: [WireMessage(role: "user", content: "hi")],
+            reasoningEffort: ReasoningEffort.disabled
+        )
+        let data = try Wire.encoder().encode(req)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["reasoning_effort"] as? String, ReasoningEffort.disabled)
     }
 
     func testReasoningEffortCanEnableThinking() throws {

@@ -143,7 +143,8 @@ final class OllamaNativeChatClientTests: XCTestCase {
     func testNativeClientStreamsOllamaChatAndDisablesThinking() async throws {
         let request = ChatRequest(
             model: "native-model",
-            messages: [WireMessage(role: "user", content: "hi")]
+            messages: [WireMessage(role: "user", content: "hi")],
+            reasoningEffort: ReasoningEffort.disabled
         )
         let stream = OllamaNativeChatClient(session: session())
             .stream(request, base: URL(string: "https://backend.example")!, token: "")
