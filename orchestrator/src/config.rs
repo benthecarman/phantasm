@@ -54,6 +54,9 @@ pub struct Config {
     /// Models advertised in /v1/capabilities. Empty => probe `/api/tags` at startup.
     pub models: Vec<String>,
     pub max_tool_iters: u8,
+    /// Tool-loop cap for Deep Research turns (`x_research`). Larger than
+    /// `max_tool_iters` so research can run several search/reflect rounds.
+    pub max_research_iters: u8,
     pub ollama_concurrency: usize,
 
     // Web search tool (Brave)
@@ -135,6 +138,7 @@ impl Config {
             default_model,
             models,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
+            max_research_iters: env_parse("MAX_RESEARCH_ITERS", 6u8),
             ollama_concurrency: env_parse("OLLAMA_MAX_CONCURRENCY", 4usize).max(1),
             web_search_enabled,
             brave_base,
@@ -261,6 +265,7 @@ pub mod tests_support {
             default_model: "m".into(),
             models: vec![],
             max_tool_iters: 5,
+            max_research_iters: 6,
             ollama_concurrency: 4,
             web_search_enabled: false,
             brave_base: "https://api.search.brave.com".parse().unwrap(),

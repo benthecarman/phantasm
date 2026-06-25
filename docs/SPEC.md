@@ -117,6 +117,18 @@ tools (plain chat). Tools remain server-side and invisible otherwise; this only
 lets the client scope which of the advertised (`/v1/capabilities`) tools apply
 to a given conversation.
 
+**Deep Research mode (additive).** The app MAY include an `x_research: true`
+field to run the turn in Deep Research mode. Following the `x_`-prefix
+convention, standard clients and backends ignore it; **absent/false** is an
+ordinary turn. When set, the orchestrator injects a research system prompt,
+offers only `web_search` (forcing full-page fetching regardless of the
+operator's `SEARCH_FETCH_PAGES` gate), and runs a larger tool-loop budget
+(`MAX_RESEARCH_ITERS`) so the model can decompose the question, search across
+several rounds, and synthesize a single cited answer. The result still streams
+back as ordinary assistant markdown (inline `[n]` citations + a sources list),
+so a standard client renders it with no special handling. Deep Research depends
+on `web_search` being configured; the app gates its toggle on that capability.
+
 Consequences:
 
 - **Images** are embedded in the assistant message as markdown

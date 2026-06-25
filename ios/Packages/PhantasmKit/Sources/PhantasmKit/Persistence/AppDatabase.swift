@@ -96,6 +96,14 @@ public final class AppDatabase: Sendable {
                 t.add(column: "imageGenerationEnabled", .boolean).notNull().defaults(to: true)
             }
         }
+
+        // Per-chat Deep Research mode (x_research). Off by default — it's a
+        // slower, deliberate mode the user opts into per chat.
+        migrator.registerMigration("v3_deep_research") { db in
+            try db.alter(table: "conversation") { t in
+                t.add(column: "deepResearchEnabled", .boolean).notNull().defaults(to: false)
+            }
+        }
         return migrator
     }
 }
@@ -140,12 +148,13 @@ extension AppDatabase: ChatStore {
     }
 
     public func setConversationTools(
-        id: UUID, webSearchEnabled: Bool, imageGenerationEnabled: Bool
+        id: UUID, webSearchEnabled: Bool, imageGenerationEnabled: Bool, deepResearchEnabled: Bool
     ) async throws {
         try await dbWriter.write { db in
             guard var convo = try Conversation.fetchOne(db, key: id) else { return }
             convo.webSearchEnabled = webSearchEnabled
             convo.imageGenerationEnabled = imageGenerationEnabled
+            convo.deepResearchEnabled = deepResearchEnabled
             try convo.update(db)
         }
     }

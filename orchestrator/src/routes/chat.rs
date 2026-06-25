@@ -40,6 +40,7 @@ pub async fn chat_completions(
         stream,
         messages,
         enabled_tools,
+        research,
         extra: options,
         ..
     } = req;
@@ -72,7 +73,7 @@ pub async fn chat_completions(
 
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            tracing::info!(turn_id, model = %log_model, stream, tools_offered, "turn started");
+            tracing::info!(turn_id, model = %log_model, stream, tools_offered, research, "turn started");
             run_turn(
                 cfg,
                 backend,
@@ -82,6 +83,7 @@ pub async fn chat_completions(
                 model,
                 options,
                 enabled_tools,
+                research,
                 tx,
                 cancel,
             )

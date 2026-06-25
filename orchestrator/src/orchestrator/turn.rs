@@ -60,6 +60,24 @@ pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec
         .collect()
 }
 
+/// System prompt injected for Deep Research turns (`x_research`). Drives the
+/// decompose → reason-before-search → reflect → synthesize-with-citations loop.
+const RESEARCH_SYSTEM_PROMPT: &str = "\
+You are operating in Deep Research mode: the user wants a thorough, well-sourced \
+answer, not a quick reply. Work in this order:\n\
+1. Decompose the question into 3-5 focused sub-questions that together fully \
+answer it. State them briefly before you start searching.\n\
+2. Before each web_search call, say in one sentence what you are looking for and \
+why.\n\
+3. Use web_search to investigate the sub-questions, reading the returned pages.\n\
+4. After each round of results, assess what is still missing and search again if \
+needed. Don't stop until you can answer well, but don't run redundant searches.\n\
+5. When you have enough, write one synthesized answer that directly answers the \
+original question. Support claims with inline citations like [1], [2] that refer \
+to the sources you actually used, and end with a numbered \"Sources\" list of \
+those URLs.\n\
+Cite only sources you genuinely used. Prefer recent, primary sources.";
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn<B, T>(
     cfg: Arc<Config>,
@@ -70,6 +88,7 @@ pub async fn run_turn<B, T>(
     model: String,
     options: Map<String, Value>,
     enabled_tools: Option<Vec<String>>,
+    research: bool,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
 ) where
@@ -100,7 +119,17 @@ pub async fn run_turn<B, T>(
         return;
     }
 
-    let schemas = select_schemas(tools.schemas(), &enabled_tools);
+    // Research mode offers only web_search (it's a focused search loop) and
+    // prepends the research system prompt; otherwise honor the client's per-turn
+    // tool selection.
+    let schemas = if research {
+        select_schemas(tools.schemas(), &Some(vec!["web_search".to_string()]))
+    } else {
+        select_schemas(tools.schemas(), &enabled_tools)
+    };
+    if research {
+        messages.insert(0, ChatMessage::system(RESEARCH_SYSTEM_PROMPT));
+    }
 
     // Plain fast path: no tools to offer => one streaming call.
     if schemas.is_empty() {
@@ -120,9 +149,15 @@ pub async fn run_turn<B, T>(
     let mut appends: Vec<String> = Vec::new();
     let ctx = TurnContext {
         input_images: latest_input_images(&messages),
+        research,
     };
 
-    for _ in 0..cfg.max_tool_iters {
+    let max_iters = if research {
+        cfg.max_research_iters
+    } else {
+        cfg.max_tool_iters
+    };
+    for _ in 0..max_iters {
         if cancel.is_cancelled() {
             return;
         }
@@ -271,6 +306,19 @@ mod tests {
         once: Arc<Mutex<Vec<ChatMessage>>>,
         once_calls: Arc<Mutex<usize>>,
         final_tokens: Arc<Vec<String>>,
+        // Messages seen by the most recent chat_once call (for assertions).
+        seen: Arc<Mutex<Vec<ChatMessage>>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(once: Vec<ChatMessage>, final_tokens: Vec<String>) -> Self {
+            ScriptedBackend {
+                once: Arc::new(Mutex::new(once)),
+                once_calls: Arc::new(Mutex::new(0)),
+                final_tokens: Arc::new(final_tokens),
+                seen: Arc::new(Mutex::new(vec![])),
+            }
+        }
     }
 
     fn assistant(content: &str) -> ChatMessage {
@@ -354,6 +402,7 @@ mod tests {
             _options: &Map<String, Value>,
         ) -> Result<ChatMessage, crate::error::AppError> {
             *self.once_calls.lock().unwrap() += 1;
+            *self.seen.lock().unwrap() = _messages.to_vec();
             let mut q = self.once.lock().unwrap();
             Ok(if q.is_empty() {
                 assistant("done")
@@ -428,6 +477,13 @@ mod tests {
         Arc::new(c)
     }
 
+    fn cfg_research(tool_iters: u8, research_iters: u8) -> Arc<Config> {
+        let mut c = crate::config::tests_support::minimal();
+        c.max_tool_iters = tool_iters;
+        c.max_research_iters = research_iters;
+        Arc::new(c)
+    }
+
     fn collect_text(events: &[TurnEvent]) -> String {
         events
             .iter()
@@ -440,11 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn fast_path_streams_without_tool_calls() {
-        let backend = ScriptedBackend {
-            once: Arc::new(Mutex::new(vec![])),
-            once_calls: Arc::new(Mutex::new(0)),
-            final_tokens: Arc::new(vec!["Hel".into(), "lo".into()]),
-        };
+        let backend = ScriptedBackend::new(vec![], vec!["Hel".into(), "lo".into()]);
         let tools = ScriptedTools {
             schemas: Arc::new(vec![]), // no tools -> fast path
             executed: Arc::new(Mutex::new(vec![])),
@@ -459,6 +511,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -475,11 +528,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_then_recall_then_stream() {
-        let backend = ScriptedBackend {
-            once: Arc::new(Mutex::new(vec![assistant_calling("web_search")])),
-            once_calls: Arc::new(Mutex::new(0)),
-            final_tokens: Arc::new(vec!["answer".into()]),
-        };
+        let backend =
+            ScriptedBackend::new(vec![assistant_calling("web_search")], vec!["answer".into()]);
         let executed = Arc::new(Mutex::new(vec![]));
         let tools = ScriptedTools {
             schemas: Arc::new(vec![serde_json::json!({"type":"function"})]),
@@ -495,6 +545,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -515,11 +566,7 @@ mod tests {
         let infinite = std::iter::repeat_with(|| assistant_calling("web_search"))
             .take(100)
             .collect::<Vec<_>>();
-        let backend = ScriptedBackend {
-            once: Arc::new(Mutex::new(infinite)),
-            once_calls: Arc::new(Mutex::new(0)),
-            final_tokens: Arc::new(vec!["capped".into()]),
-        };
+        let backend = ScriptedBackend::new(infinite, vec!["capped".into()]);
         let executed = Arc::new(Mutex::new(vec![]));
         let tools = ScriptedTools {
             schemas: Arc::new(vec![serde_json::json!({"type":"function"})]),
@@ -535,6 +582,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -546,12 +594,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_halts_before_streaming() {
-        let backend = ScriptedBackend {
-            once: Arc::new(Mutex::new(vec![])),
-            once_calls: Arc::new(Mutex::new(0)),
-            final_tokens: Arc::new(vec!["nope".into()]),
+    async fn research_mode_injects_prompt_and_uses_research_cap() {
+        // Model keeps searching forever; the research cap (not max_tool_iters)
+        // must bound the loop, and the research system prompt must be prepended.
+        let infinite = std::iter::repeat_with(|| assistant_calling("web_search"))
+            .take(100)
+            .collect::<Vec<_>>();
+        let backend = ScriptedBackend::new(infinite, vec!["report".into()]);
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![
+                named_schema("web_search"),
+                named_schema("image_generation"),
+            ]),
+            executed: executed.clone(),
         };
+        let (tx, rx) = mpsc::channel(256);
+        run_turn(
+            cfg_research(2, 4), // tool cap 2, research cap 4
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![user(MessageContent::Text("compare X and Y".into()))],
+            "m".into(),
+            Map::new(),
+            None,
+            true, // research mode
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let _ = drain(rx).await;
+        // Research uses its own (larger) cap, not max_tool_iters (2).
+        assert_eq!(*backend.once_calls.lock().unwrap(), 4);
+        // The research system prompt is prepended as the first message.
+        let seen = backend.seen.lock().unwrap();
+        assert_eq!(seen.first().map(|m| m.role.as_str()), Some("system"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_halts_before_streaming() {
+        let backend = ScriptedBackend::new(vec![], vec!["nope".into()]);
         let tools = ScriptedTools {
             schemas: Arc::new(vec![]),
             executed: Arc::new(Mutex::new(vec![])),
@@ -568,6 +651,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            false,
             tx,
             cancel,
         )
@@ -603,11 +687,8 @@ mod tests {
     async fn empty_tool_selection_takes_plain_fast_path() {
         // Tools are configured, but the client opted out via `x_tools: []` — the
         // turn must skip tool resolution entirely (no chat_once) and just stream.
-        let backend = ScriptedBackend {
-            once: Arc::new(Mutex::new(vec![assistant_calling("web_search")])),
-            once_calls: Arc::new(Mutex::new(0)),
-            final_tokens: Arc::new(vec!["hi".into()]),
-        };
+        let backend =
+            ScriptedBackend::new(vec![assistant_calling("web_search")], vec!["hi".into()]);
         let tools = ScriptedTools {
             schemas: Arc::new(vec![named_schema("web_search")]),
             executed: Arc::new(Mutex::new(vec![])),
@@ -622,6 +703,7 @@ mod tests {
             "m".into(),
             Map::new(),
             Some(vec![]),
+            false,
             tx,
             CancellationToken::new(),
         )

@@ -38,27 +38,37 @@ final class ChatViewModel {
     /// fresh draft mirrors a tools-enabled backend's out-of-the-box behavior.
     var webSearchEnabled: Bool { conversation?.webSearchEnabled ?? true }
     var imageGenerationEnabled: Bool { conversation?.imageGenerationEnabled ?? true }
+    /// Deep Research is off by default — a deliberate, slower mode.
+    var deepResearchEnabled: Bool { conversation?.deepResearchEnabled ?? false }
 
     func setWebSearchEnabled(_ on: Bool) {
-        setTools(webSearch: on, imageGeneration: imageGenerationEnabled)
+        setTools(webSearch: on, imageGeneration: imageGenerationEnabled, deepResearch: deepResearchEnabled)
     }
 
     func setImageGenerationEnabled(_ on: Bool) {
-        setTools(webSearch: webSearchEnabled, imageGeneration: on)
+        setTools(webSearch: webSearchEnabled, imageGeneration: on, deepResearch: deepResearchEnabled)
     }
 
-    /// Update the conversation's tool selection and persist it. For an unsent
-    /// draft the store write is a no-op and the selection rides along on the
-    /// first send (the draft is inserted whole), mirroring `setModel`.
-    private func setTools(webSearch: Bool, imageGeneration: Bool) {
+    func setDeepResearchEnabled(_ on: Bool) {
+        setTools(webSearch: webSearchEnabled, imageGeneration: imageGenerationEnabled, deepResearch: on)
+    }
+
+    /// Update the conversation's tool/research selection and persist it. For an
+    /// unsent draft the store write is a no-op and the selection rides along on
+    /// the first send (the draft is inserted whole), mirroring `setModel`.
+    private func setTools(webSearch: Bool, imageGeneration: Bool, deepResearch: Bool) {
         guard var conversation else { return }
         conversation.webSearchEnabled = webSearch
         conversation.imageGenerationEnabled = imageGeneration
+        conversation.deepResearchEnabled = deepResearch
         self.conversation = conversation
         let id = conversation.id
         Task { [store] in
             try? await store?.setConversationTools(
-                id: id, webSearchEnabled: webSearch, imageGenerationEnabled: imageGeneration
+                id: id,
+                webSearchEnabled: webSearch,
+                imageGenerationEnabled: imageGeneration,
+                deepResearchEnabled: deepResearch
             )
         }
     }
@@ -252,13 +262,16 @@ final class ChatViewModel {
         }
         // Scope which server tools this turn may use (spec §2.3). Omitted entirely
         // for backends with no tool manifest, keeping those requests standard.
+        // Deep Research rides the additive `x_research` flag (server forces its
+        // own search loop); `nil` when off keeps the request standard.
         let request = ChatRequest(
             model: model,
             messages: detail.wireHistory(),
             stream: true,
             xTools: detail.conversation.requestedToolNames(
                 supporting: env.backendMode.capabilities?.tools
-            )
+            ),
+            xResearch: detail.conversation.deepResearchEnabled ? true : nil
         )
         let stream = env.backendMode.usesOllamaNativeChat
             ? env.ollamaChatClient.stream(request, base: base, token: token)

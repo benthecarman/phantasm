@@ -31,6 +31,10 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     public var webSearchEnabled: Bool
     /// Whether this chat wants the server's image-generation tool offered.
     public var imageGenerationEnabled: Bool
+    /// Whether this chat runs in Deep Research mode (`x_research`). Off by
+    /// default — it's a slower, deliberate mode the user opts into per chat; the
+    /// composer's research toggle flips it.
+    public var deepResearchEnabled: Bool
 
     public init(
         id: UUID = UUID(),
@@ -41,7 +45,8 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         modelID: String? = nil,
         profileID: UUID? = nil,
         webSearchEnabled: Bool = true,
-        imageGenerationEnabled: Bool = true
+        imageGenerationEnabled: Bool = true,
+        deepResearchEnabled: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -52,6 +57,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         self.profileID = profileID
         self.webSearchEnabled = webSearchEnabled
         self.imageGenerationEnabled = imageGenerationEnabled
+        self.deepResearchEnabled = deepResearchEnabled
     }
 
     public static let databaseTableName = "conversation"

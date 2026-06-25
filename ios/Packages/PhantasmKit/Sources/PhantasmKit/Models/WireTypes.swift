@@ -16,19 +16,26 @@ public struct ChatRequest: Encodable, Sendable {
     /// field entirely (server offers all configured tools — and keeps plain-chat
     /// requests byte-for-byte standard); an empty array requests plain chat.
     public var xTools: [String]?
+    /// Deep Research mode (spec §2.3): when `true`, encoded as the additive
+    /// `x_research` field so the orchestrator runs its server-side research loop
+    /// (decompose → search across several rounds → synthesize with citations).
+    /// `nil` omits the field, keeping ordinary requests standard.
+    public var xResearch: Bool?
 
     public init(
         model: String,
         messages: [WireMessage],
         stream: Bool = true,
         reasoningEffort: String? = "none",
-        xTools: [String]? = nil
+        xTools: [String]? = nil,
+        xResearch: Bool? = nil
     ) {
         self.model = model
         self.messages = messages
         self.stream = stream
         self.reasoningEffort = reasoningEffort
         self.xTools = xTools
+        self.xResearch = xResearch
     }
 }
 

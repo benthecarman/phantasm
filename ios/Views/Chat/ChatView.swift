@@ -106,6 +106,10 @@ struct ChatView: View {
                         get: { vm.imageGenerationEnabled },
                         set: { vm.setImageGenerationEnabled($0) }
                     ),
+                    deepResearchEnabled: Binding(
+                        get: { vm.deepResearchEnabled },
+                        set: { vm.setDeepResearchEnabled($0) }
+                    ),
                     onSend: send,
                     onStop: { vm.stop() }
                 )
@@ -290,6 +294,7 @@ struct ComposerView: View {
     let modelSupportsTools: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
+    let deepResearchEnabled: Binding<Bool>
     let onSend: () -> Void
     let onStop: () -> Void
 
@@ -349,7 +354,8 @@ struct ComposerView: View {
                 supportsImageGeneration: supportsImageGeneration,
                 modelSupportsTools: modelSupportsTools,
                 webSearchEnabled: webSearchEnabled,
-                imageGenerationEnabled: imageGenerationEnabled
+                imageGenerationEnabled: imageGenerationEnabled,
+                deepResearchEnabled: deepResearchEnabled
             )
         }
         .sheet(isPresented: $showModelPicker) {

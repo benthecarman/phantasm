@@ -23,6 +23,13 @@ pub struct ChatRequest {
     /// client can never enable a tool the deployment lacks.
     #[serde(default, rename = "x_tools")]
     pub enabled_tools: Option<Vec<String>>,
+    /// Additive, non-standard request field (spec §2.3 `x_`-prefix convention):
+    /// run this turn in Deep Research mode. The server then injects a research
+    /// system prompt, offers only `web_search` (forcing full-page fetching
+    /// regardless of `SEARCH_FETCH_PAGES`), and uses a larger iteration budget.
+    /// Absent/false => an ordinary turn. Standard clients omit it entirely.
+    #[serde(default, rename = "x_research")]
+    pub research: bool,
     /// Any other OpenAI sampling parameters (temperature, top_p, …) passed through to Ollama.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -42,6 +49,16 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        ChatMessage {
+            role: "system".into(),
+            content: Some(MessageContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
     pub fn tool_result(
         tool_call_id: impl Into<String>,
         name: impl Into<String>,

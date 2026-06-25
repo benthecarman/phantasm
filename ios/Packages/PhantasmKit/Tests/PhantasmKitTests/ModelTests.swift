@@ -56,6 +56,22 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(json["x_tools"] as? [String], ["web_search"])
     }
 
+    func testChatRequestOmitsXResearchWhenNil() throws {
+        let request = ChatRequest(model: "m", messages: [WireMessage(role: "user", content: "hi")])
+        let json = try encodedKeys(request)
+        XCTAssertNil(json["x_research"], "research off must keep the request standard")
+    }
+
+    func testChatRequestEncodesXResearchWhenOn() throws {
+        let request = ChatRequest(
+            model: "m",
+            messages: [WireMessage(role: "user", content: "hi")],
+            xResearch: true
+        )
+        let json = try encodedKeys(request)
+        XCTAssertEqual(json["x_research"] as? Bool, true)
+    }
+
     func testRequestedToolNamesNilWithoutManifest() {
         let convo = Conversation()
         XCTAssertNil(convo.requestedToolNames(supporting: nil))

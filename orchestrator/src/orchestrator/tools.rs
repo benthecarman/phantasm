@@ -24,12 +24,14 @@ pub struct ToolOutcome {
     pub append_to_answer: Option<String>,
 }
 
-/// Per-turn inputs a tool may need beyond its own arguments. Currently the
-/// images the user attached this turn (most recent last), so the edit tool can
-/// operate on "the image I just sent" without the app naming it explicitly.
+/// Per-turn inputs a tool may need beyond its own arguments: the images the user
+/// attached this turn (most recent last), so the edit tool can operate on "the
+/// image I just sent" without the app naming it explicitly; and whether this is a
+/// Deep Research turn, which forces `web_search` to fetch full pages.
 #[derive(Clone, Default)]
 pub struct TurnContext {
     pub input_images: Vec<String>,
+    pub research: bool,
 }
 
 pub trait ToolExecutor: Send + Sync + Clone + 'static {
@@ -86,7 +88,7 @@ impl ToolExecutor for ToolRegistry {
 
         match name {
             "web_search" if self.cfg.web_search_usable() => {
-                web_search::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
+                web_search::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
             }
             "image_generation" if self.cfg.image_gen_usable() => {
                 image_gen::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await

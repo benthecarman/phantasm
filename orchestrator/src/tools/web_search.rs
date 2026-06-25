@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
-use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
+use crate::orchestrator::tools::{tool_envelope, ToolOutcome, TurnContext};
 use crate::orchestrator::TurnEvent;
 
 const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -100,6 +100,7 @@ pub async fn run(
     http: &reqwest::Client,
     call: &ToolCall,
     call_id: &str,
+    ctx: &TurnContext,
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
@@ -110,7 +111,10 @@ pub async fn run(
         }
     };
 
-    let status = if matches!(args.depth, SearchDepth::Thorough) {
+    // Deep Research forces full-page reads regardless of the depth arg or the
+    // global gate — the user explicitly opted into the expensive path.
+    let thorough = ctx.research || matches!(args.depth, SearchDepth::Thorough);
+    let status = if thorough {
         "searching the web (reading pages)…"
     } else {
         "searching the web…"
@@ -118,7 +122,7 @@ pub async fn run(
     let _ = tx.send(TurnEvent::Status(status.into())).await;
 
     let result = tokio::select! {
-        r = do_search(cfg, http, &args) => r,
+        r = do_search(cfg, http, &args, ctx.research) => r,
         _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
     };
 
@@ -155,6 +159,7 @@ async fn do_search(
     cfg: &Config,
     http: &reqwest::Client,
     args: &WebSearchArgs,
+    research: bool,
 ) -> Result<String, String> {
     let token = cfg
         .brave_token
@@ -199,11 +204,14 @@ async fn do_search(
 
     let results: Vec<BraveResult> = results.into_iter().take(count).collect();
 
-    let extracts = if cfg.search_fetch_pages && matches!(args.depth, SearchDepth::Thorough) {
-        fetch_pages(cfg, http, &results).await
-    } else {
-        Vec::new()
-    };
+    // Research forces page fetching even when the global gate is off; otherwise
+    // it's the gated, model-chosen `depth="thorough"` path.
+    let extracts =
+        if research || (cfg.search_fetch_pages && matches!(args.depth, SearchDepth::Thorough)) {
+            fetch_pages(cfg, http, &results).await
+        } else {
+            Vec::new()
+        };
 
     Ok(format_snippets(
         &args.query,

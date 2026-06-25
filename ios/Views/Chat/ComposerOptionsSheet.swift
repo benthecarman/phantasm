@@ -21,6 +21,9 @@ struct ComposerOptionsSheet: View {
     let modelSupportsTools: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
+    /// Deep Research mode. Needs the same backing as web search (it's a server
+    /// search loop) plus a tool-capable model.
+    let deepResearchEnabled: Binding<Bool>
 
     @Environment(\.dismiss) private var dismiss
     @State private var photoItems: [PhotosPickerItem] = []
@@ -70,6 +73,23 @@ struct ComposerOptionsSheet: View {
                         systemImage: "wand.and.stars",
                         backendSupports: supportsImageGeneration,
                         isOn: imageGenerationEnabled
+                    )
+                }
+
+                Section {
+                    toolRow(
+                        "Deep research",
+                        systemImage: "text.magnifyingglass",
+                        backendSupports: supportsWebSearch,
+                        isOn: deepResearchEnabled
+                    )
+                } header: {
+                    Text("Research")
+                } footer: {
+                    Text(
+                        "Breaks your question into parts, searches the web across "
+                            + "several rounds, and writes a cited answer. Much slower "
+                            + "than a normal reply."
                     )
                 }
             }

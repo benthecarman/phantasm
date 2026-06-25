@@ -86,6 +86,7 @@ fn test_config(ollama_base: &str) -> Config {
         default_model: "m".into(),
         models: vec!["m".into()],
         max_tool_iters: 5,
+        max_research_iters: 6,
         ollama_concurrency: 4,
         web_search_enabled: false,
         brave_base: "https://api.search.brave.com".parse().unwrap(),
