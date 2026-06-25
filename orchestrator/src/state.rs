@@ -1,12 +1,19 @@
 //! Shared application state, cheaply cloneable (`Arc` internals).
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::Config;
 use crate::ollama::UpstreamChatBackend;
+
+/// How long a probed capabilities snapshot is served before the next request
+/// triggers a fresh upstream re-probe. Bounds probe load (and concurrent
+/// probes are deduped under the cache lock) while letting newly-pulled models
+/// surface without a server restart.
+pub const CAPABILITIES_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -15,7 +22,43 @@ pub struct AppState {
     pub upstream: UpstreamChatBackend,
     /// Bounds simultaneous in-flight upstream generations (NFR-O2 downstream limit).
     pub upstream_sem: Arc<Semaphore>,
-    pub capabilities: Arc<CapabilitySnapshot>,
+    pub capabilities: CapabilitiesCache,
+}
+
+/// TTL-cached capabilities snapshot. Seeded at startup, then refreshed lazily
+/// on the first `/v1/capabilities` request after the TTL lapses (see
+/// `routes::capabilities`). The lock is held across the re-probe so concurrent
+/// requests share one probe instead of stampeding the upstream.
+#[derive(Clone)]
+pub struct CapabilitiesCache(Arc<Mutex<CacheEntry>>);
+
+struct CacheEntry {
+    snapshot: Arc<CapabilitySnapshot>,
+    refreshed_at: Instant,
+}
+
+impl CapabilitiesCache {
+    pub fn new(snapshot: Arc<CapabilitySnapshot>) -> Self {
+        CapabilitiesCache(Arc::new(Mutex::new(CacheEntry {
+            snapshot,
+            refreshed_at: Instant::now(),
+        })))
+    }
+
+    /// Return the cached snapshot, re-probing first if it is older than `ttl`.
+    /// `refresh` is only awaited (and the upstream only touched) on a miss.
+    pub async fn get_or_refresh<F, Fut>(&self, ttl: Duration, refresh: F) -> Arc<CapabilitySnapshot>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = CapabilitySnapshot>,
+    {
+        let mut entry = self.0.lock().await;
+        if entry.refreshed_at.elapsed() >= ttl {
+            entry.snapshot = Arc::new(refresh().await);
+            entry.refreshed_at = Instant::now();
+        }
+        entry.snapshot.clone()
+    }
 }
 
 /// What `/v1/capabilities` reports — computed once at startup from config +

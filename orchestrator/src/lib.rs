@@ -148,6 +148,7 @@ pub fn build_state(
     capabilities: Arc<CapabilitySnapshot>,
     upstream_kind: UpstreamKind,
 ) -> state::AppState {
+    let capabilities = state::CapabilitiesCache::new(capabilities);
     let http = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         // Per-read only: streaming responses may run indefinitely as long as
