@@ -91,10 +91,9 @@ struct SettingsView: View {
             .sheet(isPresented: $isCreating) {
                 ProfileEditView(profile: nil)
             }
-            .confirmationDialog(
-                "Delete all chat history?",
+            .alert(
+                "Confirm",
                 isPresented: $isConfirmingDeleteAll,
-                titleVisibility: .visible
             ) {
                 Button("Delete All", role: .destructive) {
                     let store = env.store
@@ -105,7 +104,7 @@ struct SettingsView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This permanently removes every conversation from this device and can't be undone.")
+                Text("Are you sure you want to delete all chat history?")
             }
         }
     }
