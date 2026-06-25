@@ -144,11 +144,10 @@ struct ChatView: View {
     private var emptyState: some View {
         VStack(spacing: 18) {
             Spacer()
-            Image("Logo")
+            Image("MasksLogo")
                 .resizable()
                 .scaledToFit()
-                .frame(width: 88, height: 88)
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .frame(width: 112, height: 96)
             Text(greeting)
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.secondary)
