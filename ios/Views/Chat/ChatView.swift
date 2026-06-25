@@ -41,7 +41,7 @@ struct ChatView: View {
         _liveConversation = Query(ConversationRequest(id: conversation.id))
     }
 
-    private var isEmpty: Bool { messages.isEmpty && !vm.isStreaming }
+    private var isEmpty: Bool { messages.isEmpty && !vm.hasAssistantPreview }
 
     /// The conversation title to display: the live (possibly auto-named) row when
     /// persisted, falling back to the in-memory draft.
@@ -178,7 +178,7 @@ struct ChatView: View {
                             onRegenerate: { vm.regenerate(messageID: message.id) }
                         )
                     }
-                    if vm.isStreaming {
+                    if vm.shouldShowAssistantPreview(alongside: messages) {
                         StreamingBubble(text: vm.streamingText, status: vm.statusText)
                     }
                     Color.clear.frame(height: 1).id(bottomID)
@@ -195,8 +195,14 @@ struct ChatView: View {
             // without animation while streaming, and animate the discrete jumps
             // (new committed message, first appear).
             .onChange(of: vm.streamingText) { _, _ in scrollToBottom(proxy, animated: false) }
-            .onChange(of: messages.count) { _, _ in scrollToBottom(proxy) }
-            .onAppear { scrollToBottom(proxy) }
+            .onChange(of: messages.map(\.id)) { _, _ in
+                vm.reconcileAssistantPreview(with: messages)
+                scrollToBottom(proxy)
+            }
+            .onAppear {
+                vm.reconcileAssistantPreview(with: messages)
+                scrollToBottom(proxy)
+            }
         }
     }
 

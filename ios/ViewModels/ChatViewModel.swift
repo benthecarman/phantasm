@@ -24,6 +24,7 @@ final class ChatViewModel {
     /// new chat this is an in-memory draft that isn't written until the first send.
     private var conversation: Conversation?
     private var task: Task<Void, Never>?
+    private var pendingAssistantPreviewMessageID: UUID?
 
     func configure(env: AppEnvironment, store: ChatStore, conversation: Conversation) {
         self.env = env
@@ -79,6 +80,24 @@ final class ChatViewModel {
         return !isStreaming
     }
 
+    var hasAssistantPreview: Bool {
+        isStreaming || !(statusText?.isEmpty ?? true) || !streamingText.isEmpty
+    }
+
+    func shouldShowAssistantPreview(alongside messages: [ChatMessage]) -> Bool {
+        guard hasAssistantPreview else { return false }
+        guard let pendingAssistantPreviewMessageID else { return true }
+        return !messages.contains { $0.id == pendingAssistantPreviewMessageID }
+    }
+
+    func reconcileAssistantPreview(with messages: [ChatMessage]) {
+        guard let pendingAssistantPreviewMessageID,
+              messages.contains(where: { $0.id == pendingAssistantPreviewMessageID })
+        else { return }
+        self.pendingAssistantPreviewMessageID = nil
+        streamingText = ""
+    }
+
     func send(_ rawText: String, attachments: [PendingAttachment] = []) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!text.isEmpty || !attachments.isEmpty), canSend,
@@ -125,6 +144,7 @@ final class ChatViewModel {
         isStreaming = true
         streamingText = ""
         statusText = nil
+        pendingAssistantPreviewMessageID = nil
         errorMessage = nil
 
         let snapshot = conversation
@@ -237,6 +257,7 @@ final class ChatViewModel {
         isStreaming = true
         streamingText = ""
         statusText = nil
+        pendingAssistantPreviewMessageID = nil
         errorMessage = nil
 
         return TurnContext(
@@ -325,24 +346,38 @@ final class ChatViewModel {
 
         // Commit any streamed text as one complete assistant message.
         let committed = streamingText
-        streamingText = ""
         if let store, let conversation, !committed.isEmpty {
             let assistant = Message(
                 conversationId: conversation.id, role: "assistant",
                 content: committed, isComplete: true
             )
+            pendingAssistantPreviewMessageID = assistant.id
             Task { [weak self] in
-                try? await store.insertMessage(assistant, attachments: [])
-                try? await store.updateConversation(
-                    id: conversation.id, title: nil, modelID: nil, updatedAt: .now
-                )
-                await self?.maybeGenerateTitle()
+                do {
+                    try await store.insertMessage(assistant, attachments: [])
+                    try await store.updateConversation(
+                        id: conversation.id, title: nil, modelID: nil, updatedAt: .now
+                    )
+                    await self?.maybeGenerateTitle()
+                } catch {
+                    self?.handleAssistantCommitFailure(messageID: assistant.id, error: error)
+                }
             }
+        } else {
+            streamingText = ""
+            pendingAssistantPreviewMessageID = nil
         }
 
         if let error, error != .cancelled {
             errorMessage = error.userMessage
         }
+    }
+
+    private func handleAssistantCommitFailure(messageID: UUID, error: Error) {
+        guard pendingAssistantPreviewMessageID == messageID else { return }
+        pendingAssistantPreviewMessageID = nil
+        streamingText = ""
+        errorMessage = AppError.from(error).userMessage
     }
 
     /// After the very first assistant reply, replace the first-message placeholder

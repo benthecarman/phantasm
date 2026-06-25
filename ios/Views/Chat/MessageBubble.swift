@@ -106,8 +106,8 @@ struct MessageBubble: View {
     }
 }
 
-/// The in-progress assistant turn: plain text while streaming (no markdown
-/// re-parse per token, NFR-A4) plus the current `x_status` line (FR-A8).
+/// The in-progress assistant turn: live markdown while streaming, plus the
+/// current `x_status` line (FR-A8).
 struct StreamingBubble: View {
     let text: String
     let status: String?
@@ -121,8 +121,7 @@ struct StreamingBubble: View {
                 if text.isEmpty && (status == nil) {
                     ProgressView()
                 } else if !text.isEmpty {
-                    Text(text)
-                        .textSelection(.enabled)
+                    MarkdownMessageView(text: text)
                 }
             }
             Spacer(minLength: 40)
