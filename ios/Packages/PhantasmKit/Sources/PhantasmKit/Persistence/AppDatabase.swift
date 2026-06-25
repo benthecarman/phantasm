@@ -104,6 +104,14 @@ public final class AppDatabase: Sendable {
                 t.add(column: "deepResearchEnabled", .boolean).notNull().defaults(to: false)
             }
         }
+
+        // Per-assistant-message reasoning text. Existing rows migrate to no stored
+        // reasoning; the Thinking toggle itself is stored per model in UserDefaults.
+        migrator.registerMigration("v4_thinking") { db in
+            try db.alter(table: "message") { t in
+                t.add(column: "reasoning", .text).notNull().defaults(to: "")
+            }
+        }
         return migrator
     }
 }
@@ -147,8 +155,11 @@ extension AppDatabase: ChatStore {
         }
     }
 
-    public func setConversationTools(
-        id: UUID, webSearchEnabled: Bool, imageGenerationEnabled: Bool, deepResearchEnabled: Bool
+    public func setConversationOptions(
+        id: UUID,
+        webSearchEnabled: Bool,
+        imageGenerationEnabled: Bool,
+        deepResearchEnabled: Bool
     ) async throws {
         try await dbWriter.write { db in
             guard var convo = try Conversation.fetchOne(db, key: id) else { return }

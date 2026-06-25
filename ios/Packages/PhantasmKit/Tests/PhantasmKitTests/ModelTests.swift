@@ -177,8 +177,20 @@ final class ChatRequestEncodingTests: XCTestCase {
         let data = try Wire.encoder().encode(req)
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
-        XCTAssertEqual(json["reasoning_effort"] as? String, "none")
+        XCTAssertEqual(json["reasoning_effort"] as? String, ReasoningEffort.disabled)
         XCTAssertEqual(json["stream"] as? Bool, true)
+    }
+
+    func testReasoningEffortCanEnableThinking() throws {
+        let req = ChatRequest(
+            model: "chat-model",
+            messages: [WireMessage(role: "user", content: "hi")],
+            reasoningEffort: ReasoningEffort.enabledDefault
+        )
+        let data = try Wire.encoder().encode(req)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["reasoning_effort"] as? String, ReasoningEffort.enabledDefault)
     }
 }
 
@@ -329,6 +341,26 @@ final class PersistenceTests: XCTestCase {
             WireMessage(role: "user", content: "hi"),
             WireMessage(role: "assistant", content: "hello"),
         ])
+    }
+
+    func testReasoningIsPersistedButExcludedFromWireHistory() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        try await store.insertMessage(
+            Message(
+                conversationId: convo.id,
+                role: "assistant",
+                content: "answer",
+                reasoning: "hidden plan"
+            ),
+            attachments: []
+        )
+
+        let detail = try await store.conversationDetail(id: convo.id)
+
+        XCTAssertEqual(detail?.messages.first?.message.reasoning, "hidden plan")
+        XCTAssertEqual(detail?.wireHistory(), [WireMessage(role: "assistant", content: "answer")])
     }
 
     func testDeleteTombstonesConversationAndHardDeletesChildren() async throws {

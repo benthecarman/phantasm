@@ -110,6 +110,10 @@ struct ChatView: View {
                         get: { vm.deepResearchEnabled },
                         set: { vm.setDeepResearchEnabled($0) }
                     ),
+                    thinkingEnabled: Binding(
+                        get: { env.thinkingEnabled(for: currentModelID) },
+                        set: { env.setThinkingEnabled($0, for: currentModelID) }
+                    ),
                     onSend: send,
                     onStop: { vm.stop() }
                 )
@@ -178,7 +182,11 @@ struct ChatView: View {
                         )
                     }
                     if vm.shouldShowAssistantPreview(alongside: messages) {
-                        StreamingBubble(text: vm.streamingText, status: vm.statusText)
+                        StreamingBubble(
+                            text: vm.streamingText,
+                            reasoning: vm.streamingReasoning,
+                            status: vm.statusText
+                        )
                     }
                     Color.clear.frame(height: 1).id(bottomID)
                 }
@@ -194,6 +202,7 @@ struct ChatView: View {
             // without animation while streaming, and animate the discrete jumps
             // (new committed message, first appear).
             .onChange(of: vm.streamingText) { _, _ in scrollToBottom(proxy, animated: false) }
+            .onChange(of: vm.streamingReasoning) { _, _ in scrollToBottom(proxy, animated: false) }
             .onChange(of: messages.map(\.id)) { _, _ in
                 vm.reconcileAssistantPreview(with: messages)
                 scrollToBottom(proxy)
@@ -302,6 +311,7 @@ struct ComposerView: View {
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
     let deepResearchEnabled: Binding<Bool>
+    let thinkingEnabled: Binding<Bool>
     let onSend: () -> Void
     let onStop: () -> Void
 
@@ -362,7 +372,8 @@ struct ComposerView: View {
                 modelSupportsTools: modelSupportsTools,
                 webSearchEnabled: webSearchEnabled,
                 imageGenerationEnabled: imageGenerationEnabled,
-                deepResearchEnabled: deepResearchEnabled
+                deepResearchEnabled: deepResearchEnabled,
+                thinkingEnabled: thinkingEnabled
             )
         }
         .sheet(isPresented: $showModelPicker) {
@@ -389,8 +400,7 @@ struct ComposerView: View {
         }
     }
 
-    /// Opens the "+" options sheet (attachments, tools, model). Tinted when any
-    /// staged attachment or active tool means the sheet holds live state.
+    /// Opens the "+" options sheet (attachments, tools, model).
     private var addButton: some View {
         Button {
             showOptions = true
@@ -402,7 +412,7 @@ struct ComposerView: View {
                 .background(Color.primary.opacity(0.06), in: Circle())
         }
         .disabled(isStreaming)
-        .accessibilityLabel("Add attachment or tools")
+        .accessibilityLabel("Add attachment or options")
     }
 
     /// Model selector pill (FR-A): a capsule showing the active model that opens

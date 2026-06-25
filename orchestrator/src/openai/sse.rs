@@ -43,10 +43,20 @@ impl ChunkFactory {
         let chunk = self.base(
             vec![ChunkChoice {
                 index: 0,
-                delta: Delta {
-                    role: None,
-                    content: Some(content.to_string()),
-                },
+                delta: Delta::content(content),
+                finish_reason: None,
+            }],
+            None,
+        );
+        to_event(&chunk)
+    }
+
+    /// A model thinking/reasoning delta.
+    pub fn reasoning(&self, reasoning: &str) -> Event {
+        let chunk = self.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::reasoning(reasoning),
                 finish_reason: None,
             }],
             None,
@@ -59,10 +69,7 @@ impl ChunkFactory {
         let chunk = self.base(
             vec![ChunkChoice {
                 index: 0,
-                delta: Delta {
-                    role: Some("assistant".into()),
-                    content: None,
-                },
+                delta: Delta::role("assistant"),
                 finish_reason: None,
             }],
             None,
@@ -133,10 +140,7 @@ mod tests {
         let chunk = f.base(
             vec![ChunkChoice {
                 index: 0,
-                delta: Delta {
-                    role: None,
-                    content: Some("hi".into()),
-                },
+                delta: Delta::content("hi"),
                 finish_reason: None,
             }],
             None,
@@ -162,6 +166,21 @@ mod tests {
         let v = chunk_json(&chunk);
         assert_eq!(v["x_status"], "searching the web…");
         assert!(v["choices"][0]["delta"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reasoning_chunk_carries_reasoning_delta() {
+        let f = ChunkFactory::new("llama3.1");
+        let chunk = f.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::reasoning("plan"),
+                finish_reason: None,
+            }],
+            None,
+        );
+        let v = chunk_json(&chunk);
+        assert_eq!(v["choices"][0]["delta"]["reasoning"], "plan");
     }
 
     #[test]

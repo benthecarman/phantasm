@@ -34,8 +34,9 @@ private func stripDataPrefix(_ line: String) -> String? {
 
 /// A domain event consumed by the chat UI.
 public enum ChatStreamEvent: Sendable, Equatable {
-    case token(String)   // append delta.content
-    case status(String)  // x_status -> progress UI (FR-A8)
+    case token(String)      // append delta.content
+    case reasoning(String)  // append model thinking/reasoning deltas
+    case status(String)     // x_status -> progress UI (FR-A8)
     case done
 }
 
@@ -51,7 +52,6 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
     AsyncThrowingStream { continuation in
         let task = Task {
             var dataBuffer: [String] = []
-            var didYieldThinkingStatus = false
 
             func flush() -> Bool {
                 // Returns true if the stream should end (decoded a finish).
@@ -64,11 +64,9 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                 if let status = chunk.xStatus {
                     continuation.yield(.status(status))
                 }
-                if let reasoning = chunk.choices.first?.delta.reasoning,
-                   !reasoning.isEmpty,
-                   !didYieldThinkingStatus {
-                    didYieldThinkingStatus = true
-                    continuation.yield(.status("Thinking..."))
+                if let reasoning = chunk.choices.first?.delta.reasoningText,
+                   !reasoning.isEmpty {
+                    continuation.yield(.reasoning(reasoning))
                 }
                 if let content = chunk.choices.first?.delta.content, !content.isEmpty {
                     continuation.yield(.token(content))

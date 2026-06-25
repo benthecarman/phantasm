@@ -257,6 +257,14 @@ async fn stream_final<B: ChatBackend>(
         };
         match next {
             Some(Ok(delta)) => {
+                if !delta.reasoning.is_empty()
+                    && tx
+                        .send(TurnEvent::Reasoning(delta.reasoning))
+                        .await
+                        .is_err()
+                {
+                    return; // client gone
+                }
                 if !delta.content.is_empty()
                     && tx.send(TurnEvent::Token(delta.content)).await.is_err()
                 {
@@ -421,11 +429,11 @@ mod tests {
             let s = async_stream::stream! {
                 for (i, t) in tokens.iter().enumerate() {
                     let last = i + 1 == tokens.len();
-                    yield Ok(StreamDelta {
-                        content: t.clone(),
-                        done: last,
-                        done_reason: if last { Some("stop".into()) } else { None },
-                    });
+                    yield Ok(StreamDelta::content(
+                        t.clone(),
+                        last,
+                        if last { Some("stop".into()) } else { None },
+                    ));
                 }
             };
             Ok(Box::pin(s))

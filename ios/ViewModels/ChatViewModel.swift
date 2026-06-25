@@ -15,6 +15,7 @@ import PhantasmKit
 final class ChatViewModel {
     private(set) var isStreaming = false
     private(set) var streamingText = ""
+    private(set) var streamingReasoning = ""
     private(set) var statusText: String?
     var errorMessage: String?
 
@@ -43,15 +44,27 @@ final class ChatViewModel {
     var deepResearchEnabled: Bool { conversation?.deepResearchEnabled ?? false }
 
     func setWebSearchEnabled(_ on: Bool) {
-        setTools(webSearch: on, imageGeneration: imageGenerationEnabled, deepResearch: deepResearchEnabled)
+        setTools(
+            webSearch: on,
+            imageGeneration: imageGenerationEnabled,
+            deepResearch: deepResearchEnabled
+        )
     }
 
     func setImageGenerationEnabled(_ on: Bool) {
-        setTools(webSearch: webSearchEnabled, imageGeneration: on, deepResearch: deepResearchEnabled)
+        setTools(
+            webSearch: webSearchEnabled,
+            imageGeneration: on,
+            deepResearch: deepResearchEnabled
+        )
     }
 
     func setDeepResearchEnabled(_ on: Bool) {
-        setTools(webSearch: webSearchEnabled, imageGeneration: imageGenerationEnabled, deepResearch: on)
+        setTools(
+            webSearch: webSearchEnabled,
+            imageGeneration: imageGenerationEnabled,
+            deepResearch: on
+        )
     }
 
     /// Update the conversation's tool/research selection and persist it. For an
@@ -65,7 +78,7 @@ final class ChatViewModel {
         self.conversation = conversation
         let id = conversation.id
         Task { [store] in
-            try? await store?.setConversationTools(
+            try? await store?.setConversationOptions(
                 id: id,
                 webSearchEnabled: webSearch,
                 imageGenerationEnabled: imageGeneration,
@@ -81,7 +94,7 @@ final class ChatViewModel {
     }
 
     var hasAssistantPreview: Bool {
-        isStreaming || !(statusText?.isEmpty ?? true) || !streamingText.isEmpty
+        isStreaming || !(statusText?.isEmpty ?? true) || !streamingText.isEmpty || !streamingReasoning.isEmpty
     }
 
     func shouldShowAssistantPreview(alongside messages: [ChatMessage]) -> Bool {
@@ -96,6 +109,7 @@ final class ChatViewModel {
         else { return }
         self.pendingAssistantPreviewMessageID = nil
         streamingText = ""
+        streamingReasoning = ""
     }
 
     func send(_ rawText: String, attachments: [PendingAttachment] = []) {
@@ -143,6 +157,7 @@ final class ChatViewModel {
 
         isStreaming = true
         streamingText = ""
+        streamingReasoning = ""
         statusText = nil
         pendingAssistantPreviewMessageID = nil
         errorMessage = nil
@@ -256,6 +271,7 @@ final class ChatViewModel {
 
         isStreaming = true
         streamingText = ""
+        streamingReasoning = ""
         statusText = nil
         pendingAssistantPreviewMessageID = nil
         errorMessage = nil
@@ -289,6 +305,9 @@ final class ChatViewModel {
             model: model,
             messages: detail.wireHistory(),
             stream: true,
+            reasoningEffort: env.thinkingEnabled(for: model)
+                ? ReasoningEffort.enabledDefault
+                : ReasoningEffort.disabled,
             xTools: detail.conversation.requestedToolNames(
                 supporting: env.backendMode.capabilities?.tools
             ),
@@ -304,6 +323,8 @@ final class ChatViewModel {
                 case .token(let t):
                     statusText = nil
                     streamingText += t
+                case .reasoning(let r):
+                    streamingReasoning += r
                 case .status(let s): statusText = s
                 case .done: break
                 }
@@ -346,10 +367,11 @@ final class ChatViewModel {
 
         // Commit any streamed text as one complete assistant message.
         let committed = streamingText
+        let committedReasoning = streamingReasoning
         if let store, let conversation, !committed.isEmpty {
             let assistant = Message(
                 conversationId: conversation.id, role: "assistant",
-                content: committed, isComplete: true
+                content: committed, reasoning: committedReasoning, isComplete: true
             )
             pendingAssistantPreviewMessageID = assistant.id
             Task { [weak self] in
@@ -365,6 +387,7 @@ final class ChatViewModel {
             }
         } else {
             streamingText = ""
+            streamingReasoning = ""
             pendingAssistantPreviewMessageID = nil
         }
 
@@ -407,7 +430,7 @@ final class ChatViewModel {
             model: model,
             messages: history + [WireMessage(role: "user", content: Self.titlePrompt)],
             stream: true,
-            reasoningEffort: "none"
+            reasoningEffort: ReasoningEffort.disabled
         )
 
         guard let raw = try? await client.complete(request, base: base, token: token) else { return }

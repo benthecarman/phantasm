@@ -29,18 +29,15 @@ public struct OllamaNativeChatClient: ChatClienting {
                     let stream = try client.chatStream(
                         model: model,
                         messages: request.messages.map(\.ollamaMessage),
-                        think: request.reasoningEffort?.caseInsensitiveCompare("none") == .orderedSame ? false : nil,
+                        think: request.ollamaThink,
                         keepAlive: .minutes(30)
                     )
 
-                    var didYieldThinkingStatus = false
                     for try await chunk in stream {
                         try Task.checkCancellation()
                         if let thinking = chunk.message.thinking,
-                           !thinking.isEmpty,
-                           !didYieldThinkingStatus {
-                            didYieldThinkingStatus = true
-                            continuation.yield(.status("Thinking..."))
+                           !thinking.isEmpty {
+                            continuation.yield(.reasoning(thinking))
                         }
                         if !chunk.message.content.isEmpty {
                             continuation.yield(.token(chunk.message.content))
@@ -98,5 +95,12 @@ private extension WireMessage {
         default:
             return .user(text, images: attachedImages)
         }
+    }
+}
+
+private extension ChatRequest {
+    var ollamaThink: Bool? {
+        guard let reasoningEffort else { return nil }
+        return reasoningEffort.caseInsensitiveCompare(ReasoningEffort.disabled) == .orderedSame ? false : true
     }
 }

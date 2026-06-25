@@ -50,3 +50,46 @@ final class ProfileStoreTests: XCTestCase {
         XCTAssertEqual(reopened.cachedModels(for: id), ["persisted"])
     }
 }
+
+final class ModelPreferenceStoreTests: XCTestCase {
+    private var defaults: UserDefaults!
+    private var store: ModelPreferenceStore!
+
+    override func setUp() {
+        super.setUp()
+        defaults = UserDefaults(suiteName: "phantasm.tests.\(UUID().uuidString)")
+        store = ModelPreferenceStore(defaults: defaults)
+    }
+
+    func testThinkingPreferenceDefaultsOffAndIsPerProfileAndModel() {
+        let a = UUID(), b = UUID()
+
+        XCTAssertFalse(store.thinkingEnabled(for: "qwen3", profileID: a))
+
+        store.setThinkingEnabled(true, for: "qwen3", profileID: a)
+
+        XCTAssertTrue(store.thinkingEnabled(for: "qwen3", profileID: a))
+        XCTAssertFalse(store.thinkingEnabled(for: "llama", profileID: a))
+        XCTAssertFalse(store.thinkingEnabled(for: "qwen3", profileID: b))
+    }
+
+    func testThinkingPreferencePersistsAcrossStoreInstances() {
+        let id = UUID()
+        store.setThinkingEnabled(true, for: "qwen3", profileID: id)
+
+        let reopened = ModelPreferenceStore(defaults: defaults)
+
+        XCTAssertTrue(reopened.thinkingEnabled(for: "qwen3", profileID: id))
+    }
+
+    func testClearThinkingPreferencesRemovesOnlyThatProfile() {
+        let a = UUID(), b = UUID()
+        store.setThinkingEnabled(true, for: "qwen3", profileID: a)
+        store.setThinkingEnabled(true, for: "qwen3", profileID: b)
+
+        store.clearThinkingPreferences(for: a)
+
+        XCTAssertFalse(store.thinkingEnabled(for: "qwen3", profileID: a))
+        XCTAssertTrue(store.thinkingEnabled(for: "qwen3", profileID: b))
+    }
+}

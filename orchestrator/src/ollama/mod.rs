@@ -14,8 +14,29 @@ use crate::openai::OpenAICompatibleClient;
 #[derive(Debug, Clone)]
 pub struct StreamDelta {
     pub content: String,
+    pub reasoning: String,
     pub done: bool,
     pub done_reason: Option<String>,
+}
+
+impl StreamDelta {
+    pub fn new(
+        content: impl Into<String>,
+        reasoning: impl Into<String>,
+        done: bool,
+        done_reason: Option<String>,
+    ) -> Self {
+        StreamDelta {
+            content: content.into(),
+            reasoning: reasoning.into(),
+            done,
+            done_reason,
+        }
+    }
+
+    pub fn content(content: impl Into<String>, done: bool, done_reason: Option<String>) -> Self {
+        Self::new(content, "", done, done_reason)
+    }
 }
 
 /// A boxed stream of final-answer deltas (the streaming chat result).

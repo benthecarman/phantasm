@@ -31,6 +31,8 @@ pub struct OllamaMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// Base64 image payloads for multimodal turns (vision models). Native Ollama
     /// carries images per-message here rather than inline in `content`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +102,7 @@ impl OllamaMessage {
         OllamaMessage {
             role: m.role.clone(),
             content,
+            thinking: None,
             images: if images.is_empty() {
                 None
             } else {

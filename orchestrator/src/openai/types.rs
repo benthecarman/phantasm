@@ -307,4 +307,32 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+}
+
+impl Delta {
+    pub fn role(role: impl Into<String>) -> Self {
+        Delta {
+            role: Some(role.into()),
+            content: None,
+            reasoning: None,
+        }
+    }
+
+    pub fn content(content: impl Into<String>) -> Self {
+        Delta {
+            role: None,
+            content: Some(content.into()),
+            reasoning: None,
+        }
+    }
+
+    pub fn reasoning(reasoning: impl Into<String>) -> Self {
+        Delta {
+            role: None,
+            content: None,
+            reasoning: Some(reasoning.into()),
+        }
+    }
 }

@@ -79,14 +79,29 @@ final class SSEParserTests: XCTestCase {
             "data: [DONE]",
         ]
         let events = try await collect(chatEventStream(lines: linesStream(lines)))
-        XCTAssertEqual(events, [.status("Thinking..."), .token("answer"), .done])
+        XCTAssertEqual(events, [.reasoning("Thinking"), .token("answer"), .done])
+    }
+
+    func testReasoningContentAliasSurfacesReasoning() async throws {
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Plan\"}}]}",
+            "",
+            "data: [DONE]",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        XCTAssertEqual(events, [.reasoning("Plan"), .done])
     }
 }
 
 final class OllamaNativeChatClientTests: XCTestCase {
-    final class NativeProtocol: URLProtocol {
-        nonisolated(unsafe) static var lastPath: String?
-        nonisolated(unsafe) static var lastBody: Data?
+        final class NativeProtocol: URLProtocol {
+            nonisolated(unsafe) static var lastPath: String?
+            nonisolated(unsafe) static var lastBody: Data?
+            nonisolated(unsafe) static var responseBody = """
+            {"model":"native-model","created_at":"2026-06-24T07:17:27.100196506Z","message":{"role":"assistant","content":"hi"},"done":false}
+            {"model":"native-model","created_at":"2026-06-24T07:17:27.112648860Z","message":{"role":"assistant","content":""},"done":true}
+
+            """
 
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -100,13 +115,8 @@ final class OllamaNativeChatClientTests: XCTestCase {
                 httpVersion: nil,
                 headerFields: ["Content-Type": "application/x-ndjson"]
             )!
-            let body = """
-            {"model":"native-model","created_at":"2026-06-24T07:17:27.100196506Z","message":{"role":"assistant","content":"hi"},"done":false}
-            {"model":"native-model","created_at":"2026-06-24T07:17:27.112648860Z","message":{"role":"assistant","content":""},"done":true}
-
-            """
             client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data(body.utf8))
+            client?.urlProtocol(self, didLoad: Data(Self.responseBody.utf8))
             client?.urlProtocolDidFinishLoading(self)
         }
 
@@ -123,6 +133,11 @@ final class OllamaNativeChatClientTests: XCTestCase {
         super.setUp()
         NativeProtocol.lastPath = nil
         NativeProtocol.lastBody = nil
+        NativeProtocol.responseBody = """
+        {"model":"native-model","created_at":"2026-06-24T07:17:27.100196506Z","message":{"role":"assistant","content":"hi"},"done":false}
+        {"model":"native-model","created_at":"2026-06-24T07:17:27.112648860Z","message":{"role":"assistant","content":""},"done":true}
+
+        """
     }
 
     func testNativeClientStreamsOllamaChatAndDisablesThinking() async throws {
@@ -143,6 +158,28 @@ final class OllamaNativeChatClientTests: XCTestCase {
         XCTAssertEqual(json["think"] as? Bool, false)
         XCTAssertEqual(json["stream"] as? Bool, true)
         XCTAssertEqual(json["keep_alive"] as? String, "30m")
+    }
+
+    func testNativeClientStreamsThinkingWhenEnabled() async throws {
+        NativeProtocol.responseBody = """
+        {"model":"native-model","created_at":"2026-06-24T07:17:27.100196506Z","message":{"role":"assistant","content":"","thinking":"plan"},"done":false}
+        {"model":"native-model","created_at":"2026-06-24T07:17:27.112648860Z","message":{"role":"assistant","content":"hi"},"done":true}
+
+        """
+        let request = ChatRequest(
+            model: "native-model",
+            messages: [WireMessage(role: "user", content: "hi")],
+            reasoningEffort: ReasoningEffort.enabledDefault
+        )
+        let stream = OllamaNativeChatClient(session: session())
+            .stream(request, base: URL(string: "https://backend.example")!, token: "")
+
+        let events = try await collect(stream)
+
+        XCTAssertEqual(events, [.reasoning("plan"), .token("hi"), .done])
+        let data = try XCTUnwrap(NativeProtocol.lastBody)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["think"] as? Bool, true)
     }
 }
 

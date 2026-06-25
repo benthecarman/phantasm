@@ -34,15 +34,22 @@ struct MessageBubble: View {
                     userBubble
                 }
             } else {
-                MarkdownMessageView(text: content)
-                    .contextMenu {
-                        copyButton
-                        if canRegenerate {
-                            Button(action: onRegenerate) {
-                                Label("Regenerate", systemImage: "arrow.clockwise")
-                            }
-                        }
+                VStack(alignment: .leading, spacing: 8) {
+                    if !message.message.reasoning.isEmpty {
+                        ThinkingDisclosure(text: message.message.reasoning)
                     }
+                    if !content.isEmpty {
+                        MarkdownMessageView(text: content)
+                            .contextMenu {
+                                copyButton
+                                if canRegenerate {
+                                    Button(action: onRegenerate) {
+                                        Label("Regenerate", systemImage: "arrow.clockwise")
+                                    }
+                                }
+                            }
+                    }
+                }
             }
             if !isUser { Spacer(minLength: 40) }
         }
@@ -110,6 +117,7 @@ struct MessageBubble: View {
 /// current `x_status` line (FR-A8).
 struct StreamingBubble: View {
     let text: String
+    let reasoning: String
     let status: String?
 
     var body: some View {
@@ -118,7 +126,10 @@ struct StreamingBubble: View {
                 if let status, !status.isEmpty {
                     StatusPill(text: status)
                 }
-                if text.isEmpty && (status == nil) {
+                if !reasoning.isEmpty {
+                    ThinkingDisclosure(text: reasoning)
+                }
+                if text.isEmpty && reasoning.isEmpty && (status == nil) {
                     ProgressView()
                 } else if !text.isEmpty {
                     MarkdownMessageView(text: text)
@@ -126,5 +137,31 @@ struct StreamingBubble: View {
             }
             Spacer(minLength: 40)
         }
+    }
+}
+
+struct ThinkingDisclosure: View {
+    let text: String
+    @State private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 6)
+        } label: {
+            Label("Thinking", systemImage: "brain.head.profile")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        )
     }
 }

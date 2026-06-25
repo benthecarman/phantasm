@@ -129,6 +129,14 @@ back as ordinary assistant markdown (inline `[n]` citations + a sources list),
 so a standard client renders it with no special handling. Deep Research depends
 on `web_search` being configured; the app gates its toggle on that capability.
 
+**Thinking mode.** The app MAY include `reasoning_effort` on the request.
+`"none"` asks the backend to suppress thinking/reasoning (the default app
+behavior); a supported value such as `"medium"` allows backends that expose
+reasoning to emit it. When reasoning is streamed, the server/app normalize it to
+`delta.reasoning`; clients SHOULD keep it separate from assistant `content` and
+hide it unless the user expands it. The app remembers the on/off preference per
+backend profile and model.
+
 Consequences:
 
 - **Images** are embedded in the assistant message as markdown

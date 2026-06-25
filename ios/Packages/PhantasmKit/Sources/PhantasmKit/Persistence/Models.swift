@@ -35,7 +35,6 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     /// default — it's a slower, deliberate mode the user opts into per chat; the
     /// composer's research toggle flips it.
     public var deepResearchEnabled: Bool
-
     public init(
         id: UUID = UUID(),
         title: String = "New Chat",
@@ -84,6 +83,10 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
     public var conversationId: UUID
     public var role: String
     public var content: String
+    /// Optional model thinking/reasoning associated with an assistant response.
+    /// Kept separate from `content` so it is hidden by default and excluded from
+    /// future prompts.
+    public var reasoning: String
     public var createdAt: Date
     public var updatedAt: Date
     /// `false` while streaming; flipped to `true` once the turn finishes.
@@ -94,6 +97,7 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         conversationId: UUID,
         role: String,
         content: String,
+        reasoning: String = "",
         createdAt: Date = .now,
         updatedAt: Date? = nil,
         isComplete: Bool = true
@@ -102,6 +106,7 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         self.conversationId = conversationId
         self.role = role
         self.content = content
+        self.reasoning = reasoning
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.isComplete = isComplete

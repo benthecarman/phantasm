@@ -188,21 +188,25 @@ fn delta_from_openai_chunk(chunk: &Value) -> StreamDelta {
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first());
-    let content = choice
-        .and_then(|choice| choice.get("delta"))
+    let delta = choice.and_then(|choice| choice.get("delta"));
+    let content = delta
         .and_then(|delta| delta.get("content"))
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or_default();
+    let reasoning = delta.and_then(reasoning_from_delta).unwrap_or_default();
     let done_reason = choice
         .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    StreamDelta {
-        content,
-        done: done_reason.is_some(),
-        done_reason,
-    }
+    StreamDelta::new(content, reasoning, done_reason.is_some(), done_reason)
+}
+
+fn reasoning_from_delta(delta: &Value) -> Option<&str> {
+    delta
+        .get("reasoning")
+        .or_else(|| delta.get("reasoning_content"))
+        .or_else(|| delta.get("thinking"))
+        .and_then(Value::as_str)
 }
 
 fn chat_message_from_openai(value: &Value) -> Result<ChatMessage, AppError> {
@@ -281,7 +285,17 @@ mod tests {
         });
         let delta = delta_from_openai_chunk(&chunk);
         assert_eq!(delta.content, "hi");
+        assert_eq!(delta.reasoning, "");
         assert!(!delta.done);
+
+        let chunk = json!({
+            "choices": [{
+                "delta": { "reasoning_content": "plan" },
+                "finish_reason": null
+            }]
+        });
+        let delta = delta_from_openai_chunk(&chunk);
+        assert_eq!(delta.reasoning, "plan");
 
         let finish = json!({
             "choices": [{

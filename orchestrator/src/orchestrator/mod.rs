@@ -10,6 +10,8 @@ pub use turn::run_turn;
 pub enum TurnEvent {
     /// Progress heartbeat, surfaced to the app via the additive `x_status` field.
     Status(String),
+    /// A token of model thinking/reasoning, hidden by default in the app.
+    Reasoning(String),
     /// A token of the final assistant answer.
     Token(String),
     /// The turn finished; carries the OpenAI `finish_reason`.

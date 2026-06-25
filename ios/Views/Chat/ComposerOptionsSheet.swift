@@ -24,6 +24,8 @@ struct ComposerOptionsSheet: View {
     /// Deep Research mode. Needs the same backing as web search (it's a server
     /// search loop) plus a tool-capable model.
     let deepResearchEnabled: Binding<Bool>
+    /// Whether the backend should be allowed to emit thinking/reasoning deltas.
+    let thinkingEnabled: Binding<Bool>
 
     @Environment(\.dismiss) private var dismiss
     @State private var photoItems: [PhotosPickerItem] = []
@@ -59,6 +61,14 @@ struct ComposerOptionsSheet: View {
                         enabled: true,
                         disabledReason: ""
                     ) { showFileImporter = true }
+                }
+
+                Section("Response") {
+                    optionRow(
+                        "Thinking",
+                        systemImage: "brain.head.profile",
+                        isOn: thinkingEnabled
+                    )
                 }
 
                 Section("Tools") {
@@ -184,6 +194,17 @@ struct ComposerOptionsSheet: View {
                 }
             }
             .disabled(!available)
+        }
+    }
+
+    private func optionRow(
+        _ title: String,
+        systemImage: String,
+        isOn: Binding<Bool>
+    ) -> some View {
+        HStack(spacing: 12) {
+            icon(systemImage, tint: .accentColor)
+            Toggle(title, isOn: isOn)
         }
     }
 

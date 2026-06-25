@@ -6,6 +6,11 @@ import Foundation
 /// and reads streamed `delta.content`. The only non-standard element is the
 /// additive `x_status` field used for progress (§2.3).
 
+public enum ReasoningEffort {
+    public static let disabled = "none"
+    public static let enabledDefault = "medium"
+}
+
 public struct ChatRequest: Encodable, Sendable {
     public var model: String
     public var messages: [WireMessage]
@@ -26,7 +31,7 @@ public struct ChatRequest: Encodable, Sendable {
         model: String,
         messages: [WireMessage],
         stream: Bool = true,
-        reasoningEffort: String? = "none",
+        reasoningEffort: String? = ReasoningEffort.disabled,
         xTools: [String]? = nil,
         xResearch: Bool? = nil
     ) {
@@ -159,12 +164,22 @@ public struct ChatChunk: Decodable, Sendable {
         public struct Delta: Decodable, Sendable {
             public let content: String?
             public let reasoning: String?
+            public let reasoningContent: String?
+            public let thinking: String?
         }
         public let delta: Delta
         public let finishReason: String?
     }
     public let choices: [Choice]
     public let xStatus: String?
+}
+
+public extension ChatChunk.Choice.Delta {
+    /// Different OpenAI-compatible backends use different names for streamed
+    /// reasoning. Normalize them before the UI sees the event.
+    var reasoningText: String? {
+        reasoning ?? reasoningContent ?? thinking
+    }
 }
 
 /// The capabilities manifest (spec §2.1).

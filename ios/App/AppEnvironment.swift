@@ -13,6 +13,7 @@ final class AppEnvironment {
     let database: AppDatabase
     var store: ChatStore { database }
     let profileStore = ProfileStore()
+    let modelPreferenceStore = ModelPreferenceStore()
     let keychain = KeychainStore()
     let chatClient = ChatClient()
     let ollamaChatClient = OllamaNativeChatClient()
@@ -31,11 +32,14 @@ final class AppEnvironment {
     /// undetectable for this backend, so tools are allowed optimistically. The
     /// server tools also require the backend to advertise them (`backendMode`).
     var toolModels: Set<String>?
+    /// Observable cache over persisted per-profile, per-model Thinking preferences.
+    private var thinkingPreferences: [String: [String: Bool]]
 
     init() {
         // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
         database = try! AppDatabase.makeShared()
         profiles = profileStore.load()
+        thinkingPreferences = modelPreferenceStore.loadThinkingPreferences()
         // Keychain tokens outlive an app uninstall but the UserDefaults profile
         // list does not, so a reinstall can strand tokens with no owning
         // profile. Reconcile the two on launch.
@@ -115,6 +119,8 @@ final class AppEnvironment {
         profiles.removeAll { $0.id == profile.id }
         try? keychain.delete(for: profile.id)
         profileStore.clearCachedModels(for: profile.id)
+        thinkingPreferences[profile.id.uuidString] = nil
+        modelPreferenceStore.saveThinkingPreferences(thinkingPreferences)
         profileStore.save(profiles)
         if activeProfileID == profile.id {
             setActive(profiles.first?.id)
@@ -182,6 +188,23 @@ final class AppEnvironment {
         guard let toolModels else { return true }
         guard let model else { return false }
         return toolModels.contains(model)
+    }
+
+    func thinkingEnabled(for model: String?) -> Bool {
+        guard let profileID = activeProfileID,
+              let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else { return false }
+        return thinkingPreferences[profileID.uuidString]?[model] ?? false
+    }
+
+    func setThinkingEnabled(_ enabled: Bool, for model: String?) {
+        guard let profileID = activeProfileID,
+              let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else { return }
+        var byModel = thinkingPreferences[profileID.uuidString] ?? [:]
+        byModel[model] = enabled
+        thinkingPreferences[profileID.uuidString] = byModel
+        modelPreferenceStore.saveThinkingPreferences(thinkingPreferences)
     }
 
     /// Kick off a best-effort preload of the model new chats will use, so the

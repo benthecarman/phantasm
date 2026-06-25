@@ -13,6 +13,7 @@ use crate::openai::types::ChatMessage;
 
 /// Keep models resident across turns for KV-cache reuse (NFR-O8).
 const KEEP_ALIVE: &str = "30m";
+const REASONING_EFFORT_NONE: &str = "none";
 
 #[derive(Clone)]
 pub struct OllamaClient {
@@ -189,21 +190,20 @@ where
 }
 
 fn delta_from(chunk: OllamaChatChunk) -> StreamDelta {
-    let content = chunk.message.and_then(|m| m.content).unwrap_or_default();
-    StreamDelta {
-        content,
-        done: chunk.done,
-        done_reason: chunk.done_reason,
-    }
+    let message = chunk.message.unwrap_or_default();
+    StreamDelta::new(
+        message.content.unwrap_or_default(),
+        message.thinking.unwrap_or_default(),
+        chunk.done,
+        chunk.done_reason,
+    )
 }
 
 fn extract_thinking_control(options: &mut Map<String, Value>) -> Option<bool> {
-    if matches!(
-        options.get("reasoning_effort").and_then(Value::as_str),
-        Some(s) if s.eq_ignore_ascii_case("none")
-    ) {
+    if let Some(reasoning_effort) = options.get("reasoning_effort").and_then(Value::as_str) {
+        let think = !reasoning_effort.eq_ignore_ascii_case(REASONING_EFFORT_NONE);
         options.remove("reasoning_effort");
-        return Some(false);
+        return Some(think);
     }
 
     let reasoning_effort = options
@@ -212,9 +212,10 @@ fn extract_thinking_control(options: &mut Map<String, Value>) -> Option<bool> {
         .and_then(|reasoning| reasoning.get("effort"))
         .and_then(Value::as_str);
 
-    if matches!(reasoning_effort, Some(s) if s.eq_ignore_ascii_case("none")) {
+    if let Some(reasoning_effort) = reasoning_effort {
+        let think = !reasoning_effort.eq_ignore_ascii_case(REASONING_EFFORT_NONE);
         options.remove("reasoning");
-        return Some(false);
+        return Some(think);
     }
 
     None
@@ -238,10 +239,30 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_value_maps_to_think_true() {
+        let mut options = Map::from_iter([
+            ("reasoning_effort".into(), Value::String("medium".into())),
+            ("temperature".into(), json!(0.2)),
+        ]);
+
+        assert_eq!(extract_thinking_control(&mut options), Some(true));
+        assert!(!options.contains_key("reasoning_effort"));
+        assert_eq!(options.get("temperature"), Some(&json!(0.2)));
+    }
+
+    #[test]
     fn nested_reasoning_none_maps_to_think_false() {
         let mut options = Map::from_iter([("reasoning".into(), json!({ "effort": "none" }))]);
 
         assert_eq!(extract_thinking_control(&mut options), Some(false));
+        assert!(!options.contains_key("reasoning"));
+    }
+
+    #[test]
+    fn nested_reasoning_value_maps_to_think_true() {
+        let mut options = Map::from_iter([("reasoning".into(), json!({ "effort": "medium" }))]);
+
+        assert_eq!(extract_thinking_control(&mut options), Some(true));
         assert!(!options.contains_key("reasoning"));
     }
 }
