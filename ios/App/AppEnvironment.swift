@@ -34,6 +34,7 @@ final class AppEnvironment {
     var toolModels: Set<String>?
     /// Observable cache over persisted per-profile, per-model Thinking preferences.
     private var thinkingPreferences: [String: [String: Bool]]
+    private var capabilityRefreshGeneration = 0
 
     init() {
         // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
@@ -134,22 +135,37 @@ final class AppEnvironment {
     }
 
     func refreshCapabilities() async {
+        capabilityRefreshGeneration += 1
+        let generation = capabilityRefreshGeneration
         guard let profile = activeProfile,
               let base = profile.baseURL else {
             backendMode = .plainChatOnly(models: [])
+            visionModels = nil
+            toolModels = nil
+            isProbing = false
             return
         }
         isProbing = true
-        let token = keychain.token(for: profile.id) ?? ""
-        backendMode = await capabilitiesClient.probe(base: base, token: token)
+        let profileID = profile.id
+        let token = keychain.token(for: profileID) ?? ""
+        let mode = await capabilitiesClient.probe(base: base, token: token)
+        guard isCurrentCapabilityRefresh(generation, profileID: profileID) else { return }
+        backendMode = mode
         isProbing = false
         // Cache the discovered model list so it's available instantly next launch.
-        let models = backendMode.models
+        let models = mode.models
         if !models.isEmpty {
-            profileStore.cacheModels(models, for: profile.id)
+            profileStore.cacheModels(models, for: profileID)
         }
-        await refreshModelCapabilities(base: base, token: token)
+        let modelCapabilities = await modelCapabilities(for: mode, base: base, token: token)
+        guard isCurrentCapabilityRefresh(generation, profileID: profileID) else { return }
+        visionModels = modelCapabilities.vision
+        toolModels = modelCapabilities.tools
         warmActiveModel(base: base, token: token)
+    }
+
+    private func isCurrentCapabilityRefresh(_ generation: Int, profileID: UUID) -> Bool {
+        generation == capabilityRefreshGeneration && activeProfileID == profileID
     }
 
     /// Resolve which models accept images / can drive tools for the current
@@ -157,19 +173,21 @@ final class AppEnvironment {
     /// `/api/show` for a bare native backend, and unknown (optimistic) for
     /// generic OpenAI. Server tools require the orchestrator, so `toolModels` is
     /// only meaningful in `.full` mode — the other modes leave it unknown.
-    private func refreshModelCapabilities(base: URL, token: String) async {
-        switch backendMode {
+    private func modelCapabilities(
+        for mode: BackendMode,
+        base: URL,
+        token: String
+    ) async -> (vision: Set<String>?, tools: Set<String>?) {
+        switch mode {
         case .full(let caps):
-            visionModels = caps.visionModels.map(Set.init)
-            toolModels = caps.toolModels.map(Set.init)
+            return (caps.visionModels.map(Set.init), caps.toolModels.map(Set.init))
         case .ollamaNative(let models):
-            visionModels = await capabilitiesClient.fetchOllamaVisionModels(
+            let vision = await capabilitiesClient.fetchOllamaVisionModels(
                 base: base, token: token, models: models
             )
-            toolModels = nil
+            return (vision, nil)
         case .plainChatOnly:
-            visionModels = nil
-            toolModels = nil
+            return (nil, nil)
         }
     }
 
