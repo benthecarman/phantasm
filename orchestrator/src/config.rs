@@ -62,12 +62,10 @@ pub struct Config {
     pub brave_token: Option<String>,
     pub search_max_results: usize,
     pub search_context_char_cap: usize,
-    // Read only when the `page_fetch` feature is compiled in.
-    #[cfg_attr(not(feature = "page_fetch"), allow(dead_code))]
+    // Thorough (full-page-fetch) search: runtime gate + fetch bounds. The model
+    // opts in per query via `depth="thorough"`; this only permits it.
     pub search_fetch_pages: bool,
-    #[cfg_attr(not(feature = "page_fetch"), allow(dead_code))]
     pub search_fetch_concurrency: usize,
-    #[cfg_attr(not(feature = "page_fetch"), allow(dead_code))]
     pub search_fetch_timeout_ms: u64,
 
     // Image tools (ComfyUI). Generation and editing are independent tools, each
@@ -173,6 +171,13 @@ impl Config {
     /// Whether the web-search tool can actually run (toggle on + key present).
     pub fn web_search_usable(&self) -> bool {
         self.web_search_enabled && self.brave_token.is_some()
+    }
+
+    /// Whether the model may request a `depth="thorough"` (full-page-fetch)
+    /// search. Gated by the `SEARCH_FETCH_PAGES` runtime flag; when off, the
+    /// `depth` parameter is never offered and every search stays snippet-only.
+    pub fn search_thorough_usable(&self) -> bool {
+        self.search_fetch_pages
     }
 
     /// Whether the image-generation tool can run: toggle on + a workflow and a

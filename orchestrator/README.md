@@ -63,7 +63,8 @@ PHANTASM_AUTH_TOKEN=dev-secret OLLAMA_BASE_URL=http://localhost:11434 \
 Enable tools with the env toggles in `.env.example` (`TOOL_WEB_SEARCH` +
 `BRAVE_API_KEY`; `TOOL_IMAGE_GEN` + `COMFYUI_GEN_WORKFLOW`; `TOOL_IMAGE_EDIT` +
 `COMFYUI_EDIT_WORKFLOW`).
-Optional full-page search fetching: build with `--features page_fetch`.
+Thorough (full-page-fetch) search: set `SEARCH_FETCH_PAGES=true`; the model then
+opts into `depth="thorough"` per query, leaving simple lookups snippet-fast.
 
 ### systemd (bare metal)
 

@@ -63,7 +63,7 @@ impl ToolExecutor for ToolRegistry {
     fn schemas(&self) -> Vec<Value> {
         let mut out = Vec::new();
         if self.cfg.web_search_usable() {
-            out.push(web_search::schema());
+            out.push(web_search::schema(self.cfg.search_thorough_usable()));
         }
         if self.cfg.image_gen_usable() {
             out.push(image_gen::schema());

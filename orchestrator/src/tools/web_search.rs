@@ -2,9 +2,12 @@
 //!
 //! **Snippet-first:** by default we return result titles + descriptions as the
 //! tool output and never fetch result pages — snippets answer a large fraction
-//! of queries and this keeps search turns ~1-2s. Optional page fetching is
-//! gated behind the `page_fetch` cargo feature *and* the `SEARCH_FETCH_PAGES`
-//! runtime flag, is bounded-concurrent with a hard per-URL timeout, and drops
+//! of queries and this keeps search turns ~1-2s. Full-page fetching is the
+//! `depth="thorough"` path, chosen by the *model* per query (not a global
+//! switch): it's only offered when the `SEARCH_FETCH_PAGES` runtime gate permits
+//! it. Even then the model defaults to `quick`, so a simple "price of bitcoin"
+//! query stays fast and only research/comparison queries pay the fetch cost.
+//! Fetching is bounded-concurrent with a hard per-URL timeout and drops
 //! stragglers. We never embed/chunk/RAG fresh results.
 
 use schemars::JsonSchema;
@@ -20,6 +23,20 @@ use crate::orchestrator::TurnEvent;
 
 const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How deep a search goes. `Quick` returns Brave's titles + snippets and is the
+/// default; `Thorough` additionally fetches and extracts the full result pages.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchDepth {
+    /// Titles + snippets only. Fast — use for facts, prices, definitions, and
+    /// anything a one-line answer covers.
+    #[default]
+    Quick,
+    /// Also fetch and extract full page text. Slower — use for comparisons,
+    /// multi-source synthesis, or when snippets are clearly insufficient.
+    Thorough,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WebSearchArgs {
     /// The search query.
@@ -27,16 +44,33 @@ pub struct WebSearchArgs {
     /// Maximum number of results to consider (optional).
     #[serde(default)]
     pub count: Option<u8>,
+    /// Search depth (optional; defaults to "quick"). Only set "thorough" when
+    /// snippets won't suffice — it is noticeably slower.
+    #[serde(default)]
+    pub depth: SearchDepth,
 }
 
-pub fn schema() -> serde_json::Value {
-    let params = serde_json::to_value(schemars::schema_for!(WebSearchArgs))
+/// Build the tool schema. When `thorough` is false (feature off or runtime gate
+/// disabled) the `depth` parameter is omitted entirely, so the model is never
+/// told about a path it can't take and always gets the fast snippet behavior.
+pub fn schema(thorough: bool) -> serde_json::Value {
+    let mut params = serde_json::to_value(schemars::schema_for!(WebSearchArgs))
         .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
-    tool_envelope(
-        "web_search",
-        "Search the web for current information. Returns titles and snippets.",
-        params,
-    )
+    if !thorough {
+        if let Some(props) = params.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            props.remove("depth");
+        }
+    }
+    let description = if thorough {
+        "Search the web for current information. Returns titles and snippets. \
+         Set depth=\"thorough\" to also fetch full page text — slower, so use it \
+         only for comparisons, multi-source synthesis, or when snippets are \
+         clearly insufficient; leave it \"quick\" (the default) for simple facts, \
+         prices, and definitions."
+    } else {
+        "Search the web for current information. Returns titles and snippets."
+    };
+    tool_envelope("web_search", description, params)
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,9 +110,12 @@ pub async fn run(
         }
     };
 
-    let _ = tx
-        .send(TurnEvent::Status("searching the web…".into()))
-        .await;
+    let status = if matches!(args.depth, SearchDepth::Thorough) {
+        "searching the web (reading pages)…"
+    } else {
+        "searching the web…"
+    };
+    let _ = tx.send(TurnEvent::Status(status.into())).await;
 
     let result = tokio::select! {
         r = do_search(cfg, http, &args) => r,
@@ -162,14 +199,11 @@ async fn do_search(
 
     let results: Vec<BraveResult> = results.into_iter().take(count).collect();
 
-    #[cfg(feature = "page_fetch")]
-    let extracts = if cfg.search_fetch_pages {
+    let extracts = if cfg.search_fetch_pages && matches!(args.depth, SearchDepth::Thorough) {
         fetch_pages(cfg, http, &results).await
     } else {
         Vec::new()
     };
-    #[cfg(not(feature = "page_fetch"))]
-    let extracts: Vec<Option<String>> = Vec::new();
 
     Ok(format_snippets(
         &args.query,
@@ -216,7 +250,6 @@ fn truncate_at_char_boundary(out: &mut String, cap: usize) {
     out.truncate(end);
 }
 
-#[cfg(feature = "page_fetch")]
 async fn fetch_pages(
     cfg: &Config,
     http: &reqwest::Client,
@@ -251,7 +284,6 @@ async fn fetch_pages(
 }
 
 /// Minimal HTML-to-text: strip tags and collapse whitespace, then truncate.
-#[cfg(feature = "page_fetch")]
 fn html_to_text(html: &str, cap: usize) -> String {
     let mut text = String::new();
     let mut in_tag = false;
@@ -307,9 +339,47 @@ mod tests {
 
     #[test]
     fn schema_is_a_function_tool() {
-        let s = schema();
+        let s = schema(false);
         assert_eq!(s["type"], "function");
         assert_eq!(s["function"]["name"], "web_search");
         assert!(s["function"]["parameters"]["properties"]["query"].is_object());
+    }
+
+    #[test]
+    fn depth_param_is_gated_on_thorough_availability() {
+        // Off: the model is never told about `depth`, so every search stays quick.
+        let off = schema(false);
+        assert!(off["function"]["parameters"]["properties"]["depth"].is_null());
+        assert!(!off["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("thorough"));
+
+        // On: `depth` is advertised with the quick/thorough enum.
+        let on = schema(true);
+        let depth = &on["function"]["parameters"]["properties"]["depth"];
+        assert!(depth.is_object());
+        assert!(on["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("thorough"));
+    }
+
+    #[test]
+    fn depth_defaults_to_quick_when_absent() {
+        let args: WebSearchArgs = serde_json::from_value(serde_json::json!({
+            "query": "price of bitcoin"
+        }))
+        .unwrap();
+        assert_eq!(args.depth, SearchDepth::Quick);
+    }
+
+    #[test]
+    fn depth_parses_thorough() {
+        let args: WebSearchArgs = serde_json::from_value(serde_json::json!({
+            "query": "compare frameworks", "depth": "thorough"
+        }))
+        .unwrap();
+        assert_eq!(args.depth, SearchDepth::Thorough);
     }
 }

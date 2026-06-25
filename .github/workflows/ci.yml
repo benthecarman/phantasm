@@ -30,8 +30,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
-      - name: Build (page_fetch feature)
-        run: cargo build --features page_fetch
+      - name: Build (gzip feature)
+        run: cargo build --features gzip
 
   ios:
     name: iOS (PhantasmKit + app build)
