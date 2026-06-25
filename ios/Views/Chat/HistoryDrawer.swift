@@ -22,16 +22,17 @@ struct HistoryDrawer: View {
         VStack(spacing: 0) {
             header
             searchField
-            Divider()
             list
-            Divider()
             footer
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color(.secondarySystemBackground))
         .overlay(alignment: .trailing) {
             // A hairline on the edge that faces the chat so the drawer reads as a
             // distinct surface instead of bleeding into the content behind it.
-            Divider()
+            Rectangle()
+                .fill(Color(.separator))
+                .frame(width: 0.5)
         }
     }
 
