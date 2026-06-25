@@ -271,24 +271,38 @@ async fn fetch_pages(
     // Map over owned `String`s (not `&BraveResult`) and move an owned client
     // clone (cheap — `reqwest::Client` is `Arc` inside) into each future, so the
     // bounded-concurrency stream carries no borrow lifetime (avoids an HRTB error).
+    // Pair each fetch with its original index because `buffer_unordered` completes
+    // by response time, while snippets must stay aligned with Brave's result order.
     let urls: Vec<String> = results.iter().map(|r| r.url.clone()).collect();
-    let futures = urls.into_iter().map(|url| {
+    let futures = urls.into_iter().enumerate().map(|(idx, url)| {
         let http = http.clone();
         async move {
-            match tokio::time::timeout(timeout, http.get(&url).send()).await {
+            let extract = match tokio::time::timeout(timeout, http.get(&url).send()).await {
                 Ok(Ok(resp)) => match tokio::time::timeout(timeout, resp.text()).await {
                     Ok(Ok(html)) => Some(html_to_text(&html, per_extract_cap)),
                     _ => None,
                 },
                 _ => None, // timed out or errored — drop this straggler
-            }
+            };
+            (idx, extract)
         }
     });
 
-    stream::iter(futures)
+    let fetched = stream::iter(futures)
         .buffer_unordered(cfg.search_fetch_concurrency)
         .collect()
-        .await
+        .await;
+    restore_extract_order(results.len(), fetched)
+}
+
+fn restore_extract_order(len: usize, fetched: Vec<(usize, Option<String>)>) -> Vec<Option<String>> {
+    let mut extracts = vec![None; len];
+    for (idx, extract) in fetched {
+        if idx < len {
+            extracts[idx] = extract;
+        }
+    }
+    extracts
 }
 
 /// Minimal HTML-to-text: strip tags and collapse whitespace, then truncate.
@@ -389,5 +403,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(args.depth, SearchDepth::Thorough);
+    }
+
+    #[test]
+    fn fetched_page_extracts_are_restored_to_result_order() {
+        let extracts = restore_extract_order(
+            3,
+            vec![
+                (2, Some("third".into())),
+                (0, Some("first".into())),
+                (1, None),
+            ],
+        );
+        assert_eq!(
+            extracts,
+            vec![Some("first".into()), None, Some("third".into())]
+        );
     }
 }
