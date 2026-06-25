@@ -91,6 +91,10 @@ pub async fn run(
             append_to_answer: None,
         },
         Err(detail) => {
+            // The detail never contains message content (NFR-O7) — only the
+            // backend failure cause — so log it so operators can diagnose
+            // "web search unavailable" instead of it vanishing silently.
+            tracing::warn!(error = %detail, "web_search failed");
             let _ = tx
                 .send(TurnEvent::Status("web search unavailable".into()))
                 .await;

@@ -71,6 +71,10 @@ pub async fn run(
             append_to_answer: Some(format!("![generated]({data_uri})")),
         },
         Err(detail) => {
+            // The detail never contains message content (NFR-O7) — only the
+            // backend failure cause — so log it so operators can diagnose
+            // "image generation unavailable" instead of it vanishing silently.
+            tracing::warn!(error = %detail, "image_generation failed");
             let _ = tx
                 .send(TurnEvent::Status("image generation unavailable".into()))
                 .await;
