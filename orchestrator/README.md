@@ -60,8 +60,9 @@ PHANTASM_AUTH_TOKEN=dev-secret OLLAMA_BASE_URL=http://localhost:11434 \
   cargo run
 ```
 
-Enable tools with the env toggles in `.env.example`
-(`TOOL_WEB_SEARCH`, `BRAVE_API_KEY`, `TOOL_IMAGE_GEN`, `COMFYUI_WORKFLOW_JSON`).
+Enable tools with the env toggles in `.env.example` (`TOOL_WEB_SEARCH` +
+`BRAVE_API_KEY`; `TOOL_IMAGE_GEN` + `COMFYUI_GEN_WORKFLOW`; `TOOL_IMAGE_EDIT` +
+`COMFYUI_EDIT_WORKFLOW`).
 Optional full-page search fetching: build with `--features page_fetch`.
 
 ### systemd (bare metal)

@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::TurnEvent;
-use crate::tools::{image_gen, web_search};
+use crate::tools::{image_edit, image_gen, web_search};
 
 /// Result of executing one tool call: the `tool`-role message to feed back to
 /// the model, plus optional markdown to append to the final answer (used by
@@ -22,6 +22,14 @@ use crate::tools::{image_gen, web_search};
 pub struct ToolOutcome {
     pub message: ChatMessage,
     pub append_to_answer: Option<String>,
+}
+
+/// Per-turn inputs a tool may need beyond its own arguments. Currently the
+/// images the user attached this turn (most recent last), so the edit tool can
+/// operate on "the image I just sent" without the app naming it explicitly.
+#[derive(Clone, Default)]
+pub struct TurnContext {
+    pub input_images: Vec<String>,
 }
 
 pub trait ToolExecutor: Send + Sync + Clone + 'static {
@@ -33,6 +41,7 @@ pub trait ToolExecutor: Send + Sync + Clone + 'static {
     fn execute(
         &self,
         call: &ToolCall,
+        ctx: &TurnContext,
         tx: mpsc::Sender<TurnEvent>,
         cancel: CancellationToken,
     ) -> impl Future<Output = ToolOutcome> + Send;
@@ -59,12 +68,16 @@ impl ToolExecutor for ToolRegistry {
         if self.cfg.image_gen_usable() {
             out.push(image_gen::schema());
         }
+        if self.cfg.image_edit_usable() {
+            out.push(image_edit::schema());
+        }
         out
     }
 
     async fn execute(
         &self,
         call: &ToolCall,
+        ctx: &TurnContext,
         tx: mpsc::Sender<TurnEvent>,
         cancel: CancellationToken,
     ) -> ToolOutcome {
@@ -77,6 +90,9 @@ impl ToolExecutor for ToolRegistry {
             }
             "image_generation" if self.cfg.image_gen_usable() => {
                 image_gen::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
+            }
+            "image_edit" if self.cfg.image_edit_usable() => {
+                image_edit::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
             }
             other => {
                 // Unknown / disabled tool: tell the model so it can recover.

@@ -97,7 +97,10 @@ pub async fn probe_capabilities(
     };
 
     let web_search = cfg.web_search_usable();
-    let image_generation = cfg.image_gen_usable()
+    // One app-facing "image generation" capability covers both server tools
+    // (generation + editing); editing rides under it (tools are invisible to
+    // the app). Advertise it when either is usable and ComfyUI is reachable.
+    let image_generation = (cfg.image_gen_usable() || cfg.image_edit_usable())
         && probe_reachable(http, cfg.comfy_base.as_str(), "/system_stats").await;
 
     CapabilitySnapshot {

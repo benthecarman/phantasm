@@ -24,8 +24,19 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::ollama::ChatBackend;
 use crate::openai::types::ChatMessage;
-use crate::orchestrator::tools::ToolExecutor;
+use crate::orchestrator::tools::{ToolExecutor, TurnContext};
 use crate::orchestrator::TurnEvent;
+
+/// Map an internal server tool name to the app-facing capability that gates it.
+/// Most tools map to themselves; `image_edit` rides under the `image_generation`
+/// capability so the app needs no separate toggle (tools are invisible to the
+/// app — the app's `x_tools` only ever names `image_generation`).
+fn capability_name(tool: &str) -> &str {
+    match tool {
+        "image_edit" => "image_generation",
+        other => other,
+    }
+}
 
 /// Narrow a set of tool schemas to those the client asked for this turn.
 ///
@@ -44,7 +55,7 @@ pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec
             s.get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
-                .is_some_and(|name| allow.iter().any(|a| a == name))
+                .is_some_and(|name| allow.iter().any(|a| a == capability_name(name)))
         })
         .collect()
 }
@@ -107,6 +118,9 @@ pub async fn run_turn<B, T>(
     }
 
     let mut appends: Vec<String> = Vec::new();
+    let ctx = TurnContext {
+        input_images: latest_input_images(&messages),
+    };
 
     for _ in 0..cfg.max_tool_iters {
         if cancel.is_cancelled() {
@@ -138,7 +152,7 @@ pub async fn run_turn<B, T>(
                     if cancel.is_cancelled() {
                         return;
                     }
-                    let outcome = tools.execute(call, tx.clone(), cancel.clone()).await;
+                    let outcome = tools.execute(call, &ctx, tx.clone(), cancel.clone()).await;
                     messages.push(outcome.message);
                     if let Some(extra) = outcome.append_to_answer {
                         appends.push(extra);
@@ -151,6 +165,25 @@ pub async fn run_turn<B, T>(
     // Iteration cap reached — stream whatever the model gives now (no tools).
     let _ = tx.send(TurnEvent::Status("finishing up…".into())).await;
     stream_final(&backend, &model, &messages, &options, appends, &tx, &cancel).await;
+}
+
+/// Collect the image payloads from the most recent user message that carries
+/// any (most recent last). Used so the edit tool can act on "the image I just
+/// sent" without the model having to thread it through tool arguments.
+fn latest_input_images(messages: &[ChatMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "user")
+        .find_map(|m| {
+            let images = m
+                .content
+                .as_ref()
+                .map(|c| c.image_payloads())
+                .unwrap_or_default();
+            (!images.is_empty()).then_some(images)
+        })
+        .unwrap_or_default()
 }
 
 /// Issue a streaming call (without tools) and relay tokens, then append any
@@ -319,6 +352,7 @@ mod tests {
         async fn execute(
             &self,
             call: &ToolCall,
+            _ctx: &TurnContext,
             _tx: mpsc::Sender<TurnEvent>,
             _cancel: CancellationToken,
         ) -> ToolOutcome {

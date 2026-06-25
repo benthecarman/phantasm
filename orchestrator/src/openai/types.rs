@@ -108,6 +108,22 @@ impl MessageContent {
             }
         }
     }
+
+    /// Borrowing variant of [`Self::into_text_and_images`] that yields just the
+    /// base64 image payloads (data-URI prefixes stripped), leaving the message
+    /// intact. Used to surface a user's attached images to the tool loop.
+    pub fn image_payloads(&self) -> Vec<String> {
+        match self {
+            MessageContent::Text(_) => Vec::new(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::ImageUrl { image_url } => Some(strip_data_uri(&image_url.url)),
+                    ContentPart::Text { .. } => None,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Strip a `data:<mime>;base64,` prefix, yielding the raw base64 payload. A bare

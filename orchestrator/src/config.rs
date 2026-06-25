@@ -15,6 +15,33 @@ pub enum LogFormat {
     Text,
 }
 
+/// A `<node>.<key>` reference into an API-format ComfyUI workflow: which node ID
+/// receives an injected input, and under which input key. Different workflows
+/// expose the same logical input on different nodes/keys (e.g. seed lives on
+/// `25.noise_seed` for FHDR but `7.seed` for Krea), so every injection target is
+/// configured this way rather than hardcoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeInput {
+    pub node: String,
+    pub key: String,
+}
+
+impl NodeInput {
+    /// Parse `"<node>.<key>"` (e.g. `"25.noise_seed"`). Splits on the first `.`;
+    /// node IDs are numeric and keys are identifiers, so there is no ambiguity.
+    /// Returns `None` for blank or malformed values.
+    pub fn parse(raw: &str) -> Option<NodeInput> {
+        let (node, key) = raw.trim().split_once('.')?;
+        if node.is_empty() || key.is_empty() {
+            return None;
+        }
+        Some(NodeInput {
+            node: node.to_string(),
+            key: key.to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -43,17 +70,30 @@ pub struct Config {
     #[cfg_attr(not(feature = "page_fetch"), allow(dead_code))]
     pub search_fetch_timeout_ms: u64,
 
-    // Image generation tool (ComfyUI)
+    // Image tools (ComfyUI). Generation and editing are independent tools, each
+    // backed by its own API-format workflow and gated by its own toggle.
     pub image_gen_enabled: bool,
+    pub image_edit_enabled: bool,
     pub comfy_base: Url,
-    pub comfy_workflow_path: Option<PathBuf>,
-    pub comfy_prompt_node: String,
-    pub comfy_negative_node: Option<String>,
-    pub comfy_seed_node: Option<String>,
     pub comfy_timeout_s: u64,
     /// Max bytes accepted from ComfyUI's `/view` for a single image. Guards
     /// against a misconfigured/4K output stalling or bloating the turn.
     pub comfy_max_image_bytes: usize,
+
+    // Generation workflow + its input-node mappings (`<node>.<key>`).
+    pub comfy_gen_workflow: Option<PathBuf>,
+    pub comfy_gen_prompt: Option<NodeInput>,
+    pub comfy_gen_negative: Option<NodeInput>,
+    pub comfy_gen_width: Option<NodeInput>,
+    pub comfy_gen_height: Option<NodeInput>,
+    pub comfy_gen_seed: Option<NodeInput>,
+
+    // Edit workflow + its input-node mappings. `comfy_edit_image` is the
+    // `LoadImage` node that receives the user's uploaded image.
+    pub comfy_edit_workflow: Option<PathBuf>,
+    pub comfy_edit_prompt: Option<NodeInput>,
+    pub comfy_edit_image: Option<NodeInput>,
+    pub comfy_edit_seed: Option<NodeInput>,
 
     // Logging
     pub log_format: LogFormat,
@@ -86,10 +126,8 @@ impl Config {
             .filter(|s| !s.is_empty());
 
         let image_gen_enabled = env_bool("TOOL_IMAGE_GEN", false);
+        let image_edit_enabled = env_bool("TOOL_IMAGE_EDIT", false);
         let comfy_base = parse_url("COMFYUI_BASE_URL", "http://localhost:8188")?;
-        let comfy_workflow_path = std::env::var("COMFYUI_WORKFLOW_JSON")
-            .ok()
-            .map(PathBuf::from);
 
         Ok(Config {
             bind_addr,
@@ -109,17 +147,20 @@ impl Config {
             search_fetch_concurrency: env_parse("SEARCH_FETCH_CONCURRENCY", 3usize).max(1),
             search_fetch_timeout_ms: env_parse("SEARCH_FETCH_TIMEOUT_MS", 1500u64),
             image_gen_enabled,
+            image_edit_enabled,
             comfy_base,
-            comfy_workflow_path,
-            comfy_prompt_node: env_or("COMFYUI_PROMPT_NODE", "6"),
-            comfy_negative_node: std::env::var("COMFYUI_NEGATIVE_NODE")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            comfy_seed_node: std::env::var("COMFYUI_SEED_NODE")
-                .ok()
-                .filter(|s| !s.is_empty()),
             comfy_timeout_s: env_parse("COMFYUI_TIMEOUT_S", 120u64),
             comfy_max_image_bytes: env_parse("COMFYUI_MAX_IMAGE_BYTES", 16 * 1024 * 1024),
+            comfy_gen_workflow: env_path("COMFYUI_GEN_WORKFLOW"),
+            comfy_gen_prompt: env_node("COMFYUI_GEN_PROMPT"),
+            comfy_gen_negative: env_node("COMFYUI_GEN_NEGATIVE"),
+            comfy_gen_width: env_node("COMFYUI_GEN_WIDTH"),
+            comfy_gen_height: env_node("COMFYUI_GEN_HEIGHT"),
+            comfy_gen_seed: env_node("COMFYUI_GEN_SEED"),
+            comfy_edit_workflow: env_path("COMFYUI_EDIT_WORKFLOW"),
+            comfy_edit_prompt: env_node("COMFYUI_EDIT_PROMPT"),
+            comfy_edit_image: env_node("COMFYUI_EDIT_IMAGE"),
+            comfy_edit_seed: env_node("COMFYUI_EDIT_SEED"),
             log_format: if env_or("LOG_FORMAT", "text").eq_ignore_ascii_case("json") {
                 LogFormat::Json
             } else {
@@ -134,9 +175,21 @@ impl Config {
         self.web_search_enabled && self.brave_token.is_some()
     }
 
-    /// Whether the image-gen tool can actually run (toggle on + a workflow configured).
+    /// Whether the image-generation tool can run: toggle on + a workflow and a
+    /// prompt-injection node configured (without those it could never run).
     pub fn image_gen_usable(&self) -> bool {
-        self.image_gen_enabled && self.comfy_workflow_path.is_some()
+        self.image_gen_enabled
+            && self.comfy_gen_workflow.is_some()
+            && self.comfy_gen_prompt.is_some()
+    }
+
+    /// Whether the image-edit tool can run: toggle on + workflow + prompt node +
+    /// the `LoadImage` node that receives the user's uploaded image.
+    pub fn image_edit_usable(&self) -> bool {
+        self.image_edit_enabled
+            && self.comfy_edit_workflow.is_some()
+            && self.comfy_edit_prompt.is_some()
+            && self.comfy_edit_image.is_some()
     }
 }
 
@@ -159,6 +212,17 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_node(key: &str) -> Option<NodeInput> {
+    std::env::var(key).ok().and_then(|v| NodeInput::parse(&v))
 }
 
 fn csv(key: &str) -> Vec<String> {
@@ -202,15 +266,44 @@ pub mod tests_support {
             search_fetch_concurrency: 3,
             search_fetch_timeout_ms: 1500,
             image_gen_enabled: false,
+            image_edit_enabled: false,
             comfy_base: "http://localhost:8188".parse().unwrap(),
-            comfy_workflow_path: None,
-            comfy_prompt_node: "6".into(),
-            comfy_negative_node: None,
-            comfy_seed_node: None,
             comfy_timeout_s: 120,
             comfy_max_image_bytes: 16 * 1024 * 1024,
+            comfy_gen_workflow: None,
+            comfy_gen_prompt: None,
+            comfy_gen_negative: None,
+            comfy_gen_width: None,
+            comfy_gen_height: None,
+            comfy_gen_seed: None,
+            comfy_edit_workflow: None,
+            comfy_edit_prompt: None,
+            comfy_edit_image: None,
+            comfy_edit_seed: None,
             log_format: LogFormat::Text,
             log_content: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NodeInput;
+
+    #[test]
+    fn node_input_parses_node_and_key() {
+        let n = NodeInput::parse("25.noise_seed").unwrap();
+        assert_eq!(n.node, "25");
+        assert_eq!(n.key, "noise_seed");
+        // Only the first dot splits; keys never contain one but be explicit.
+        assert_eq!(NodeInput::parse(" 6.text ").unwrap().key, "text");
+    }
+
+    #[test]
+    fn node_input_rejects_blank_or_malformed() {
+        assert!(NodeInput::parse("").is_none());
+        assert!(NodeInput::parse("6").is_none());
+        assert!(NodeInput::parse(".text").is_none());
+        assert!(NodeInput::parse("6.").is_none());
     }
 }
