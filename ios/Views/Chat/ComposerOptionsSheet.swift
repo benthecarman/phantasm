@@ -236,10 +236,17 @@ struct ComposerOptionsSheet: View {
 
     private func loadFiles(_ result: Result<[URL], Error>) {
         guard case .success(let urls) = result else { return }
-        let loaded = urls.compactMap(AttachmentLoader.file)
-        guard !loaded.isEmpty else { return }
-        attachments.append(contentsOf: loaded)
-        dismiss()
+        Task {
+            var loaded: [PendingAttachment] = []
+            for url in urls {
+                if let attachment = await AttachmentLoader.file(at: url) {
+                    loaded.append(attachment)
+                }
+            }
+            guard !loaded.isEmpty else { return }
+            attachments.append(contentsOf: loaded)
+            dismiss()
+        }
     }
 }
 

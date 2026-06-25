@@ -35,6 +35,11 @@ enum AttachmentLoader {
         .plainText, .text, .pdf, .json, .commaSeparatedText, .sourceCode, .yaml, .xml, .rtf,
     ]
 
+    private struct FilePayload: Sendable {
+        let name: String
+        let text: String
+    }
+
     static func image(from item: PhotosPickerItem) async -> PendingAttachment? {
         guard let data = try? await item.loadTransferable(type: Data.self),
               let original = UIImage(data: data) else { return nil }
@@ -63,7 +68,14 @@ enum AttachmentLoader {
         )
     }
 
-    static func file(at url: URL) -> PendingAttachment? {
+    static func file(at url: URL) async -> PendingAttachment? {
+        guard let payload = await Task.detached(priority: .userInitiated, operation: {
+            filePayload(at: url)
+        }).value else { return nil }
+        return PendingAttachment(kind: .text, name: payload.name, text: payload.text)
+    }
+
+    private static func filePayload(at url: URL) -> FilePayload? {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
@@ -80,7 +92,7 @@ enum AttachmentLoader {
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        return PendingAttachment(kind: .text, name: name, text: String(trimmed.prefix(maxFileCharacters)))
+        return FilePayload(name: name, text: String(trimmed.prefix(maxFileCharacters)))
     }
 
     private static func downscale(_ image: UIImage) -> UIImage {
