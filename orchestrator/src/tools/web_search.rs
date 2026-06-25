@@ -139,7 +139,10 @@ async fn do_search(
         .get(url)
         .query(&[("q", args.query.as_str()), ("count", &count.to_string())])
         .header("Accept", "application/json")
-        .header("Accept-Encoding", "gzip")
+        // Don't hand-set Accept-Encoding: reqwest only auto-decompresses a
+        // response when *it* negotiated the encoding (via its `gzip` feature),
+        // which we don't enable. Setting it manually yields raw gzip bytes that
+        // `.json()` can't parse ("error decoding response body").
         .header("X-Subscription-Token", token)
         .timeout(SEARCH_REQUEST_TIMEOUT)
         .send()
