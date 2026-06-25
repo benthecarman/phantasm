@@ -15,8 +15,6 @@ struct ChatView: View {
     @Environment(AppEnvironment.self) private var env
     /// Reactive history for this conversation (drives the list + empty state).
     @Query<MessagesRequest> private var messages: [ChatMessage]
-    /// The live conversation row, for the (auto-generated) title; nil for a draft.
-    @Query<ConversationRequest> private var liveConversation: Conversation?
     @State private var vm = ChatViewModel()
     @State private var input = ""
     @State private var attachments: [PendingAttachment] = []
@@ -26,6 +24,7 @@ struct ChatView: View {
     @FocusState private var composerFocused: Bool
     /// Picked once per chat (the view is rebuilt per conversation via `.id`).
     @State private var greeting = GreetingPrompts.random()
+    @Namespace private var logoNamespace
 
     init(
         conversation: Conversation,
@@ -38,14 +37,9 @@ struct ChatView: View {
         self.onOpenHistory = onOpenHistory
         self.onNewChat = onNewChat
         _messages = Query(MessagesRequest(conversationId: conversation.id))
-        _liveConversation = Query(ConversationRequest(id: conversation.id))
     }
 
     private var isEmpty: Bool { messages.isEmpty && !vm.hasAssistantPreview }
-
-    /// The conversation title to display: the live (possibly auto-named) row when
-    /// persisted, falling back to the in-memory draft.
-    private var title: String { liveConversation?.title ?? conversation.title }
 
     /// The model selected for this conversation (VM-owned once configured).
     private var currentModelID: String? {
@@ -118,7 +112,7 @@ struct ChatView: View {
                     onStop: { vm.stop() }
                 )
             }
-            .navigationTitle(isEmpty ? "" : title)
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
             .onChange(of: allowsImageAttachments) { _, allowed in
@@ -152,6 +146,8 @@ struct ChatView: View {
                 .resizable()
                 .scaledToFit()
                 .frame(width: 112, height: 96)
+                .matchedGeometryEffect(id: "masks-logo", in: logoNamespace)
+                .accessibilityLabel("Phantasm")
             Text(greeting)
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.secondary)
@@ -216,6 +212,16 @@ struct ChatView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        if !isEmpty {
+            ToolbarItem(placement: .principal) {
+                Image("MasksLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 38, height: 32)
+                    .matchedGeometryEffect(id: "masks-logo", in: logoNamespace)
+                    .accessibilityLabel("Phantasm")
+            }
+        }
         ToolbarItem(placement: .topBarLeading) {
             Button(action: onOpenHistory) {
                 Image(systemName: "line.3.horizontal")
@@ -257,12 +263,19 @@ struct ChatView: View {
     }
 
     private func send() {
+        let animateLogo = isEmpty
         let text = input
         let pending = attachments
         input = ""
         attachments = []
         composerFocused = false
-        vm.send(text, attachments: pending)
+        if animateLogo {
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+                vm.send(text, attachments: pending)
+            }
+        } else {
+            vm.send(text, attachments: pending)
+        }
     }
 
     private func beginEditing(_ message: ChatMessage) {
