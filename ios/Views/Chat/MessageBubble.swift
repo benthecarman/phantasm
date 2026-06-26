@@ -49,6 +49,7 @@ struct MessageBubble: View {
                                 }
                             }
                     }
+                    timestamp
                 }
             }
             if !isUser { Spacer(minLength: 40) }
@@ -83,7 +84,21 @@ struct MessageBubble: View {
                         }
                     }
             }
+            timestamp
         }
+    }
+
+    private var timestamp: some View {
+        Text(message.message.createdAt, format: .dateTime.hour().minute())
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .accessibilityLabel(
+                Text(
+                    message.message.createdAt,
+                    format: .dateTime.weekday(.wide).month(.wide).day().year().hour().minute()
+                )
+            )
     }
 
     /// Inline editor shown in place of a user bubble: edit the text and re-ask,
@@ -108,6 +123,7 @@ struct MessageBubble: View {
             }
             .font(.callout)
             .controlSize(.small)
+            timestamp
         }
         .onAppear { editorFocused = true }
     }
@@ -119,6 +135,7 @@ struct StreamingBubble: View {
     let text: String
     let reasoning: String
     let status: String?
+    @State private var startedAt = Date.now
 
     var body: some View {
         HStack {
@@ -134,9 +151,23 @@ struct StreamingBubble: View {
                 } else if !text.isEmpty {
                     MarkdownMessageView(text: text)
                 }
+                timestamp
             }
             Spacer(minLength: 40)
         }
+    }
+
+    private var timestamp: some View {
+        Text(startedAt, format: .dateTime.hour().minute())
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .accessibilityLabel(
+                Text(
+                    startedAt,
+                    format: .dateTime.weekday(.wide).month(.wide).day().year().hour().minute()
+                )
+            )
     }
 }
 
