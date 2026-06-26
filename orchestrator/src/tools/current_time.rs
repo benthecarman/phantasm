@@ -1,6 +1,6 @@
 //! Current date/time tool. Purely local and stateless.
 
-use chrono::{FixedOffset, SecondsFormat, Utc};
+use chrono::{DateTime, FixedOffset, SecondsFormat, TimeZone, Utc};
 use chrono_tz::Tz;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -59,13 +59,17 @@ fn format_time(timezone: Option<&str>) -> Result<String, String> {
     let utc = now.to_rfc3339_opts(SecondsFormat::Secs, true);
 
     if requested.eq_ignore_ascii_case("utc") || requested.is_empty() {
-        return Ok(format!("Current time:\ntimezone: UTC\niso8601: {utc}"));
+        return Ok(format!(
+            "Current time:\ntimezone: UTC\nclock: {}\niso8601: {utc}",
+            clock_12h(&now)
+        ));
     }
 
     if let Ok(tz) = requested.parse::<Tz>() {
         let local = now.with_timezone(&tz);
         return Ok(format!(
-            "Current time:\ntimezone: {requested}\niso8601: {}\nutc: {utc}",
+            "Current time:\ntimezone: {requested}\nclock: {}\niso8601: {}\nutc: {utc}",
+            clock_12h(&local),
             local.to_rfc3339_opts(SecondsFormat::Secs, true)
         ));
     }
@@ -73,7 +77,8 @@ fn format_time(timezone: Option<&str>) -> Result<String, String> {
     if let Some(offset) = parse_offset(requested) {
         let local = now.with_timezone(&offset);
         return Ok(format!(
-            "Current time:\ntimezone: UTC{requested}\niso8601: {}\nutc: {utc}",
+            "Current time:\ntimezone: UTC{requested}\nclock: {}\niso8601: {}\nutc: {utc}",
+            clock_12h(&local),
             local.to_rfc3339_opts(SecondsFormat::Secs, true)
         ));
     }
@@ -81,6 +86,14 @@ fn format_time(timezone: Option<&str>) -> Result<String, String> {
     Err(format!(
         "unknown timezone `{requested}`; use UTC, an IANA timezone like America/Chicago, or an offset like -05:00"
     ))
+}
+
+/// Human-readable 12-hour clock, e.g. "Friday, June 26, 2026 at 3:07:42 PM".
+fn clock_12h<Tz: TimeZone>(dt: &DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    dt.format("%A, %B %-d, %Y at %-I:%M:%S %p").to_string()
 }
 
 fn parse_offset(raw: &str) -> Option<FixedOffset> {
@@ -126,5 +139,8 @@ mod tests {
         let out = format_time(Some("America/Chicago")).unwrap();
         assert!(out.contains("timezone: America/Chicago"));
         assert!(out.contains("utc: "));
+        assert!(out.contains("clock: "));
+        // 12-hour clock always carries an AM/PM marker.
+        assert!(out.contains(" AM") || out.contains(" PM"));
     }
 }
