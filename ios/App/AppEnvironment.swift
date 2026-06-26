@@ -47,7 +47,7 @@ final class AppEnvironment {
         database = try! AppDatabase.makeShared()
         let models = SpeechModels()
         speechModels = models
-        speechSynthesizer = SpeechSynthesizer(models: models, voicePrefs: voicePreferenceStore)
+        speechSynthesizer = SpeechSynthesizer(voicePrefs: voicePreferenceStore)
         dictationController = DictationController(models: models)
         profiles = profileStore.load()
         thinkingPreferences = modelPreferenceStore.loadThinkingPreferences()

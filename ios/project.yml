@@ -21,9 +21,9 @@ packages:
   GRDBQuery:
     url: https://github.com/groue/GRDBQuery
     from: "0.11.0"
-  # On-device speech AI (Apple Neural Engine). One MIT package gives both
-  # WhisperKit (speech-to-text) and TTSKit (Qwen3-TTS text-to-speech). Models
-  # download at first use; TTSKit requires iOS 18.
+  # On-device dictation (speech-to-text) via WhisperKit, which downloads its
+  # model at first use. Read-aloud uses the system AVSpeechSynthesizer, so no
+  # TTS model/package is needed.
   ArgmaxOSS:
     url: https://github.com/argmaxinc/argmax-oss-swift
     from: "1.0.0"
@@ -46,8 +46,6 @@ targets:
         product: GRDBQuery
       - package: ArgmaxOSS
         product: WhisperKit
-      - package: ArgmaxOSS
-        product: TTSKit
     info:
       path: App/Info.plist
       properties:

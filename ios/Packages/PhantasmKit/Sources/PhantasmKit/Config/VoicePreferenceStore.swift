@@ -8,7 +8,7 @@ import Foundation
 public final class VoicePreferenceStore: @unchecked Sendable {
     private let defaults: UserDefaults
     private let autoSpeakKey = "phantasm.voice.autoSpeak"
-    private let instructionKey = "phantasm.voice.instruction"
+    private let voiceIdentifierKey = "phantasm.voice.identifier"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -21,14 +21,16 @@ public final class VoicePreferenceStore: @unchecked Sendable {
         set { defaults.set(newValue, forKey: autoSpeakKey) }
     }
 
-    /// Optional Qwen3-TTS instruction (e.g. "read calmly"). `nil`/empty means the
-    /// model's default delivery.
-    public var instruction: String? {
+    /// The chosen system speech-voice identifier (an `AVSpeechSynthesisVoice`
+    /// identifier). `nil` means "automatic" — pick the best installed voice for
+    /// the current language. Stored as a plain string so this type stays free of
+    /// any AVFoundation dependency (keeps `PhantasmKit` host-testable).
+    public var voiceIdentifier: String? {
         get {
-            let s = defaults.string(forKey: instructionKey)?
+            let s = defaults.string(forKey: voiceIdentifierKey)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return (s?.isEmpty ?? true) ? nil : s
         }
-        set { defaults.set(newValue, forKey: instructionKey) }
+        set { defaults.set(newValue, forKey: voiceIdentifierKey) }
     }
 }

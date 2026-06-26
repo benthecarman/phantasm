@@ -1,21 +1,21 @@
 import Foundation
 import Observation
-import TTSKit
 import WhisperKit
 
-/// Owns the on-device speech pipelines (WhisperKit for dictation, TTSKit /
-/// Qwen3-TTS for read-aloud) and tracks their load state for the UI.
+/// Owns the on-device dictation pipeline (WhisperKit for speech-to-text) and
+/// tracks its load state for the UI. Read-aloud (TTS) uses the system
+/// `AVSpeechSynthesizer` directly (see `SpeechSynthesizer`) and needs no model.
 ///
-/// Both models are *downloaded at first use* (not bundled) and cached on disk by
-/// the Argmax SDK, so construction is async and can take a while the first time
-/// (and needs network). We build each lazily, cache the instance, and coalesce
+/// The model is *downloaded at first use* (not bundled) and cached on disk by the
+/// Argmax SDK, so construction is async and can take a while the first time (and
+/// needs network). We build it lazily, cache the instance, and coalesce
 /// concurrent callers onto a single in-flight load.
 @MainActor
 @Observable
 final class SpeechModels {
-    /// Coarse readiness for a pipeline. The first load includes a model download;
-    /// we don't surface a byte-level fraction (the SDK's auto-download path
-    /// doesn't expose one cleanly), just "preparing".
+    /// Coarse readiness for the pipeline. The first load includes a model
+    /// download; we don't surface a byte-level fraction (the SDK's auto-download
+    /// path doesn't expose one cleanly), just "preparing".
     enum Status: Equatable {
         case notLoaded
         case preparing
@@ -24,14 +24,8 @@ final class SpeechModels {
     }
 
     private(set) var sttStatus: Status = .notLoaded
-    private(set) var ttsStatus: Status = .notLoaded
-
-    /// The loaded TTS instance, once ready — used by `SpeechSynthesizer` to stop
-    /// playback synchronously without re-awaiting the loader.
-    private(set) var loadedTTS: TTSKit?
 
     private var whisperTask: Task<WhisperKit, Error>?
-    private var ttsTask: Task<TTSKit, Error>?
 
     /// Lazily build (downloading on first use) and cache the WhisperKit pipeline.
     func whisper() async throws -> WhisperKit {
@@ -60,30 +54,10 @@ final class SpeechModels {
         }
     }
 
-    /// Lazily build (downloading the default Qwen3-TTS 0.6B model on first use)
-    /// and cache the TTSKit pipeline.
-    func tts() async throws -> TTSKit {
-        if let ttsTask { return try await ttsTask.value }
-        ttsStatus = .preparing
-        let task = Task { try await TTSKit() }
-        ttsTask = task
-        do {
-            let kit = try await task.value
-            loadedTTS = kit
-            ttsStatus = .ready
-            return kit
-        } catch {
-            ttsTask = nil
-            ttsStatus = .failed(Self.message(for: error))
-            throw error
-        }
-    }
-
-    /// Begin loading both pipelines in the background (e.g. from Settings) so the
-    /// first dictation / read-aloud isn't gated on a cold download.
+    /// Begin loading the dictation pipeline in the background (e.g. from Settings)
+    /// so the first dictation isn't gated on a cold download.
     func prepareAll() {
         Task { _ = try? await whisper() }
-        Task { _ = try? await tts() }
     }
 
     private static func message(for error: Error) -> String {

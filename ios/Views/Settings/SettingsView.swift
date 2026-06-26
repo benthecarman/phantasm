@@ -15,18 +15,6 @@ struct SettingsView: View {
     @State private var isCreating = false
     @State private var isConfirmingDeleteAll = false
 
-    /// Combined status of the on-device speech models for the Settings row, in a
-    /// single pass so the label and the download affordance can't disagree.
-    private var voiceModelState: (statusText: String, needsDownload: Bool) {
-        switch (env.speechModels.sttStatus, env.speechModels.ttsStatus) {
-        case (.ready, .ready): return ("Ready", false)
-        case (.failed, _), (_, .failed): return ("Failed", true)
-        case (.preparing, _), (_, .preparing): return ("Preparing…", false)
-        case (.notLoaded, .notLoaded): return ("Not downloaded", true)
-        default: return ("Not downloaded", false)
-        }
-    }
-
     var body: some View {
         NavigationStack {
             List {
@@ -79,26 +67,13 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Toggle("Auto-speak responses", isOn: Binding(
-                        get: { env.voicePreferenceStore.autoSpeak },
-                        set: { env.voicePreferenceStore.autoSpeak = $0 }
-                    ))
-                    HStack {
-                        Text("Voice models")
-                        Spacer()
-                        Text(voiceModelState.statusText).foregroundStyle(.secondary)
+                    NavigationLink {
+                        VoiceSettingsView()
+                    } label: {
+                        Label("Voice", systemImage: "waveform")
                     }
-                    if voiceModelState.needsDownload {
-                        Button {
-                            env.speechModels.prepareAll()
-                        } label: {
-                            Label("Download voice models", systemImage: "arrow.down.circle")
-                        }
-                    }
-                } header: {
-                    Text("Voice")
                 } footer: {
-                    Text("Dictation and read-aloud run entirely on-device. The speech models download once on first use, then work offline. Auto-speak reads each reply aloud when it finishes.")
+                    Text("Read-aloud voice, auto-speak, and dictation.")
                 }
 
                 Section {

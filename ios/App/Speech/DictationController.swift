@@ -56,8 +56,14 @@ final class DictationController {
             guard gen == generation, isRecording else { return }
 
             let processor = AudioProcessor()
+            // Starting the engine activates the audio session and installs a tap
+            // — blocking work that must not run on the main actor. Confined to a
+            // detached task; `processor` is only ever touched off-main from here.
+            nonisolated(unsafe) let p = processor
             do {
-                try processor.startRecordingLive(callback: nil)
+                try await Task.detached(priority: .userInitiated) {
+                    try p.startRecordingLive(callback: nil)
+                }.value
             } catch {
                 if gen == generation {
                     isRecording = false
@@ -67,7 +73,7 @@ final class DictationController {
             }
             // The user may have released during the permission prompt.
             guard gen == generation, isRecording else {
-                processor.stopRecording()
+                Task.detached { p.stopRecording() }
                 return
             }
             self.audioProcessor = processor
@@ -87,8 +93,12 @@ final class DictationController {
         isTranscribing = true
 
         Task {
-            processor.stopRecording()
-            let samples = Array(processor.audioSamples)
+            // Tearing down the engine off-main too (same reason as start()).
+            nonisolated(unsafe) let p = processor
+            let samples: [Float] = await Task.detached {
+                p.stopRecording()
+                return Array(p.audioSamples)
+            }.value
             // Need ~0.4s of audio to be worth transcribing.
             guard samples.count > WhisperKit.sampleRate / 2 else {
                 if gen == generation { isTranscribing = false }
@@ -121,7 +131,10 @@ final class DictationController {
         let processor = audioProcessor
         audioProcessor = nil
         generation += 1 // invalidate any in-flight transcription
-        processor?.stopRecording()
+        if let processor {
+            nonisolated(unsafe) let p = processor
+            Task.detached { p.stopRecording() }
+        }
     }
 
     /// Called by the composer once it has consumed `result`.
