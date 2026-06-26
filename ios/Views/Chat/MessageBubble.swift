@@ -19,6 +19,7 @@ struct MessageBubble: View {
     var onCancelEdit: () -> Void = {}
     var onRegenerate: () -> Void = {}
 
+    @Environment(AppEnvironment.self) private var env
     @FocusState private var editorFocused: Bool
 
     private var isUser: Bool { message.message.role == "user" }
@@ -42,6 +43,7 @@ struct MessageBubble: View {
                         MarkdownMessageView(text: content)
                             .contextMenu {
                                 copyButton
+                                speakButton
                                 if canRegenerate {
                                     Button(action: onRegenerate) {
                                         Label("Regenerate", systemImage: "arrow.clockwise")
@@ -61,6 +63,21 @@ struct MessageBubble: View {
             UIPasteboard.general.string = content
         } label: {
             Label("Copy", systemImage: "doc.on.doc")
+        }
+    }
+
+    /// Read this assistant message aloud on-device (TTS), or stop if it's already
+    /// speaking. Markdown/images are reduced to plain prose before synthesis.
+    private var speakButton: some View {
+        let isSpeaking = env.speechSynthesizer.speakingMessageID == message.message.id
+        return Button {
+            env.speechSynthesizer.toggle(content, messageID: message.message.id)
+        } label: {
+            if isSpeaking {
+                Label("Stop", systemImage: "stop.fill")
+            } else {
+                Label("Speak", systemImage: "speaker.wave.2")
+            }
         }
     }
 

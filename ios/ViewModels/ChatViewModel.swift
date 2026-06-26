@@ -594,6 +594,10 @@ final class ChatViewModel {
         let shouldKeepPendingForRecovery = pendingID != nil
             && emptyPendingDisposition == .keepForRecovery
         let shouldNotifyWhenCommitted = !isSceneActive && error == nil
+        // Read the reply aloud when the user opted into auto-speak — but only for
+        // a clean, foreground completion (don't blast audio in the background).
+        let shouldAutoSpeak = error == nil && isSceneActive
+            && !committed.isEmpty && env?.voicePreferenceStore.autoSpeak == true
 
         if shouldKeepPendingForRecovery {
             streamingText = ""
@@ -603,6 +607,7 @@ final class ChatViewModel {
         } else if let store, let conversation, !committed.isEmpty {
             if let pendingID {
                 pendingAssistantPreviewMessageID = pendingID
+                if shouldAutoSpeak { env?.speechSynthesizer.speak(committed, messageID: pendingID) }
                 Task { [weak self] in
                     do {
                         try await store.updateMessage(
@@ -631,6 +636,7 @@ final class ChatViewModel {
                     content: committed, reasoning: committedReasoning, isComplete: true
                 )
                 pendingAssistantPreviewMessageID = assistant.id
+                if shouldAutoSpeak { env?.speechSynthesizer.speak(committed, messageID: assistant.id) }
                 Task { [weak self] in
                     do {
                         try await store.insertMessage(assistant, attachments: [])

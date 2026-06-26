@@ -1,6 +1,7 @@
 import GRDBQuery
 import PhantasmKit
 import SwiftUI
+import UIKit
 
 struct ChatView: View {
     let conversation: Conversation
@@ -89,6 +90,7 @@ struct ChatView: View {
                     isStreaming: vm.isStreaming,
                     canSend: vm.canSend,
                     focus: $composerFocused,
+                    dictation: env.dictationController,
                     availableModels: env.availableModels,
                     modelName: currentModelName,
                     modelSelection: modelBinding,
@@ -282,6 +284,7 @@ struct ChatView: View {
     }
 
     private func send() {
+        env.dictationController.stop()
         let animateLogo = isEmpty
         let text = input
         let pending = attachments
@@ -322,6 +325,9 @@ struct ComposerView: View {
     let isStreaming: Bool
     let canSend: Bool
     var focus: FocusState<Bool>.Binding
+    /// On-device dictation; the mic button drives it and its transcript is
+    /// mirrored into `input`.
+    let dictation: DictationController
     let availableModels: [String]
     let modelName: String
     let modelSelection: Binding<String>
@@ -349,6 +355,15 @@ struct ComposerView: View {
 
     @State private var showOptions = false
     @State private var showModelPicker = false
+    /// The composer text captured when dictation starts, so the live transcript
+    /// is appended to (not overwriting) what the user already typed.
+    @State private var dictationBase = ""
+    /// Recording was latched hands-free (slid up past the lock threshold).
+    @State private var dictationLocked = false
+    /// 0…1 progress of the slide-up-to-lock and slide-to-cancel gestures, for
+    /// animating the hint affordances.
+    @State private var dictationLockProgress: CGFloat = 0
+    @State private var dictationCancelProgress: CGFloat = 0
 
     private var trimmed: String {
         input.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -363,6 +378,15 @@ struct ComposerView: View {
                 attachmentStrip
             }
 
+            if let error = dictation.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 10)
+            }
+
             TextField("Message", text: $input, axis: .vertical)
                 .lineLimit(1...8)
                 .focused(focus)
@@ -372,13 +396,48 @@ struct ComposerView: View {
                 .submitLabel(.return)
 
             HStack(spacing: 8) {
-                addButton
-                modelPicker
-                Spacer(minLength: 8)
-                control
+                if dictation.isRecording && dictationLocked {
+                    // Hands-free: tap to discard or stop.
+                    cancelRecordingButton
+                    RecordingIndicator()
+                    Spacer(minLength: 8)
+                    recordingStopButton
+                } else {
+                    // Idle + held-recording share this row so the mic's UIKit
+                    // gesture view is never torn down mid-press.
+                    addButton.opacity(dictation.isRecording ? 0 : 1)
+                    modelPicker.opacity(dictation.isRecording ? 0 : 1)
+                    Spacer(minLength: 8)
+                    control
+                }
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 8)
+            .animation(.easeInOut(duration: 0.2), value: dictation.isRecording)
+            .animation(.easeInOut(duration: 0.2), value: dictationLocked)
+        }
+        // Slide-to-lock and slide-to-cancel affordances, shown while holding.
+        .overlay(alignment: .bottomTrailing) {
+            if dictation.isRecording && !dictationLocked {
+                lockHint.padding(.trailing, 13).offset(y: -52).transition(.opacity)
+            }
+        }
+        .overlay(alignment: .bottomLeading) {
+            if dictation.isRecording && !dictationLocked {
+                cancelHint.padding(.leading, 18).padding(.bottom, 16).transition(.opacity)
+            }
+        }
+        .onChange(of: dictation.result) { _, result in
+            guard let result, !result.isEmpty else { return }
+            input = dictationBase.isEmpty ? result : dictationBase + " " + result
+            dictation.clearResult()
+        }
+        .onChange(of: dictation.isRecording) { _, recording in
+            if !recording {
+                dictationLocked = false
+                dictationLockProgress = 0
+                dictationCancelProgress = 0
+            }
         }
         .background(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
@@ -474,28 +533,257 @@ struct ComposerView: View {
         }
     }
 
+    /// The bottom-trailing control. While idle or holding-to-record it's the mic
+    /// (a UIKit-gesture-backed button, Signal-style); otherwise stop or send.
     @ViewBuilder
     private var control: some View {
         if isStreaming {
-            Button(action: onStop) {
-                Image(systemName: "stop.fill")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.background)
-                    .frame(width: 34, height: 34)
-                    .background(Color.red, in: Circle())
-            }
-            .accessibilityLabel("Stop")
+            stopButton
+        } else if dictation.isTranscribing {
+            ProgressView()
+                .frame(width: 34, height: 34)
+                .accessibilityLabel("Transcribing")
+        } else if sendEnabled && !dictation.isRecording {
+            sendButton
         } else {
-            Button(action: onSend) {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(.background)
-                    .frame(width: 34, height: 34)
-                    .background(sendEnabled ? Color.accentColor : Color.secondary.opacity(0.4), in: Circle())
+            micButton
+        }
+    }
+
+    private var stopButton: some View {
+        Button(action: onStop) {
+            controlIcon("stop.fill", background: Color.red)
+        }
+        .accessibilityLabel("Stop")
+    }
+
+    private var sendButton: some View {
+        Button(action: onSend) {
+            controlIcon("arrow.up", background: Color.accentColor)
+        }
+        .accessibilityLabel("Send")
+    }
+
+    /// Hold-to-talk mic (Signal-style). A UIKit `UILongPressGestureRecognizer`
+    /// drives it — unlike a SwiftUI gesture it survives the composer re-rendering
+    /// as the transcript streams in. Hold to record, release to keep the result,
+    /// slide up to lock hands-free, slide sideways to cancel.
+    private var micButton: some View {
+        controlIcon("mic", background: dictation.isRecording ? Color.red : Color.accentColor)
+            .scaleEffect(dictation.isRecording ? 1.1 : 1)
+            .animation(.easeOut(duration: 0.15), value: dictation.isRecording)
+            .overlay {
+                HoldToRecordGesture(
+                    onStart: beginHeldRecording,
+                    onChange: { lock, cancel in
+                        dictationLockProgress = lock
+                        dictationCancelProgress = cancel
+                    },
+                    onLock: lockRecording,
+                    onCancel: cancelHeldRecording,
+                    onComplete: completeHeldRecording
+                )
             }
-            .disabled(!sendEnabled)
-            .animation(.easeOut(duration: 0.15), value: sendEnabled)
-            .accessibilityLabel("Send")
+            .accessibilityLabel("Hold to dictate")
+            .accessibilityHint("Hold to record, slide up to lock, slide sideways to cancel")
+    }
+
+    // MARK: Dictation gesture handlers
+
+    private func beginHeldRecording() {
+        dictationBase = trimmed
+        dictationLockProgress = 0
+        dictationCancelProgress = 0
+        dictation.start()
+    }
+
+    private func lockRecording() {
+        dictationLocked = true
+        dictationLockProgress = 1
+        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+    }
+
+    /// Release while held → stop and transcribe; the result lands in the composer.
+    private func completeHeldRecording() {
+        dictation.stop()
+    }
+
+    /// Slide-to-cancel → stop and discard, no transcription.
+    private func cancelHeldRecording() {
+        dictation.cancel()
+    }
+
+    /// "Slide up to lock" affordance shown above the mic while holding; fills in
+    /// as the slide approaches the lock threshold.
+    private var lockHint: some View {
+        VStack(spacing: 3) {
+            Image(systemName: "lock.fill")
+            Image(systemName: "chevron.up")
+        }
+        .font(.system(size: 11, weight: .bold))
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 9)
+        .background(.thinMaterial, in: Capsule())
+        .opacity(0.55 + 0.45 * dictationLockProgress)
+        .scaleEffect(1 + 0.15 * dictationLockProgress)
+        .offset(y: -10 * dictationLockProgress)
+    }
+
+    private var cancelHint: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "chevron.compact.left")
+            Text("Slide to cancel")
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(.secondary)
+        .opacity(1 - dictationCancelProgress)
+    }
+
+    // MARK: Recording bar (shown in place of the normal controls once locked)
+
+    /// Stop recording and keep the transcript in the composer for review/sending.
+    private var recordingStopButton: some View {
+        Button { dictation.stop() } label: {
+            controlIcon("stop.fill", background: Color.red)
+        }
+        .accessibilityLabel("Stop dictation")
+    }
+
+    /// Discard the recording — no transcription.
+    private var cancelRecordingButton: some View {
+        Button {
+            dictation.cancel()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 34, height: 34)
+                .background(Color.primary.opacity(0.06), in: Circle())
+        }
+        .accessibilityLabel("Cancel dictation")
+    }
+
+    private func controlIcon(_ systemName: String, background: some ShapeStyle) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 17, weight: .bold))
+            .foregroundStyle(.background)
+            .frame(width: 34, height: 34)
+            .background(background, in: Circle())
+    }
+}
+
+/// The pulsing red dot + "Listening…" shown while recording is locked. Owns its
+/// own pulse state so it stays out of the composer's state surface.
+private struct RecordingIndicator: View {
+    @State private var pulse = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 9, height: 9)
+                .opacity(pulse ? 0.25 : 1)
+                .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: pulse)
+            Text("Listening…")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
+        .onAppear { pulse = true }
+    }
+}
+
+/// A transparent overlay hosting a UIKit `UILongPressGestureRecognizer`
+/// (`minimumPressDuration = 0`) that powers Signal-style hold-to-record. UIKit
+/// recognizers live on a persistent `UIView`, so — unlike a SwiftUI gesture —
+/// they aren't cancelled when the composer re-renders as the transcript streams
+/// in. The state machine mirrors Signal's `handleVoiceMemoLongPress`.
+private struct HoldToRecordGesture: UIViewRepresentable {
+    var onStart: () -> Void
+    /// Reports slide progress as (lock 0…1, cancel 0…1) for the hint affordances.
+    var onChange: (CGFloat, CGFloat) -> Void
+    var onLock: () -> Void
+    var onCancel: () -> Void
+    var onComplete: () -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        let recognizer = UILongPressGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handle(_:))
+        )
+        recognizer.minimumPressDuration = 0
+        view.addGestureRecognizer(recognizer)
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.owner = self
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(owner: self) }
+
+    final class Coordinator: NSObject {
+        var owner: HoldToRecordGesture
+
+        private enum Phase { case idle, held, locked }
+        private var phase: Phase = .idle
+        private var start: CGPoint = .zero
+
+        // Thresholds match Signal: a 20pt deadzone then 80pt of travel to lock
+        // (slide up); 100pt sideways to cancel.
+        private let lockDeadzone: CGFloat = 20
+        private let lockTravel: CGFloat = 80
+        private let cancelTravel: CGFloat = 100
+
+        init(owner: HoldToRecordGesture) { self.owner = owner }
+
+        @objc func handle(_ gesture: UILongPressGestureRecognizer) {
+            guard let view = gesture.view else { return }
+            switch gesture.state {
+            case .began:
+                phase = .held
+                start = gesture.location(in: view)
+                owner.onStart()
+
+            case .changed:
+                guard phase == .held else { return }
+                let location = gesture.location(in: view)
+                let up = start.y - location.y
+                let sideways = abs(start.x - location.x)
+
+                let lock = max(min((up - lockDeadzone) / lockTravel, 1), 0)
+                let cancel = max(min(sideways / cancelTravel, 1), 0)
+
+                if lock >= 1 {
+                    phase = .locked
+                    owner.onLock()
+                    return
+                }
+                if cancel >= 1 {
+                    phase = .idle
+                    owner.onCancel()
+                    return
+                }
+                owner.onChange(lock, cancel)
+
+            case .ended:
+                if phase == .held {
+                    phase = .idle
+                    owner.onComplete()
+                }
+                // Locked: keep recording; the on-screen stop/cancel take over.
+
+            case .cancelled, .failed:
+                if phase == .held {
+                    phase = .idle
+                    owner.onCancel()
+                }
+
+            default:
+                break
+            }
         }
     }
 }
