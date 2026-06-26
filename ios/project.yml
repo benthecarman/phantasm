@@ -2,7 +2,7 @@ name: Phantasm
 options:
   bundleIdPrefix: com.phantasm
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "18.0"
   createIntermediateGroups: true
 settings:
   base:
@@ -21,11 +21,17 @@ packages:
   GRDBQuery:
     url: https://github.com/groue/GRDBQuery
     from: "0.11.0"
+  # On-device speech AI (Apple Neural Engine). One MIT package gives both
+  # WhisperKit (speech-to-text) and TTSKit (Qwen3-TTS text-to-speech). Models
+  # download at first use; TTSKit requires iOS 18.
+  ArgmaxOSS:
+    url: https://github.com/argmaxinc/argmax-oss-swift
+    from: "1.0.0"
 targets:
   Phantasm:
     type: application
     platform: iOS
-    deploymentTarget: "17.0"
+    deploymentTarget: "18.0"
     sources:
       - path: App
       - path: Views
@@ -38,6 +44,10 @@ targets:
         product: GRDB
       - package: GRDBQuery
         product: GRDBQuery
+      - package: ArgmaxOSS
+        product: WhisperKit
+      - package: ArgmaxOSS
+        product: TTSKit
     info:
       path: App/Info.plist
       properties:
@@ -45,6 +55,7 @@ targets:
         UILaunchScreen: {}
         NSPhotoLibraryAddUsageDescription: "Phantasm saves generated images to your photo library when you choose to save them."
         NSCameraUsageDescription: "Phantasm uses the camera so you can take a photo to attach to a message."
+        NSMicrophoneUsageDescription: "Phantasm uses the microphone so you can dictate messages. Audio is transcribed on-device and never leaves your phone."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown

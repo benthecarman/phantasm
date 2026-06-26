@@ -14,7 +14,13 @@ final class AppEnvironment {
     var store: ChatStore { database }
     let profileStore = ProfileStore()
     let modelPreferenceStore = ModelPreferenceStore()
+    let voicePreferenceStore = VoicePreferenceStore()
     let keychain = KeychainStore()
+    /// On-device speech: shared model lifecycle plus the dictation (STT) and
+    /// read-aloud (TTS) controllers. Models download lazily on first use.
+    let speechModels: SpeechModels
+    let speechSynthesizer: SpeechSynthesizer
+    let dictationController: DictationController
     let chatClient = ChatClient()
     let ollamaChatClient = OllamaNativeChatClient()
     let capabilitiesClient = CapabilitiesClient()
@@ -39,6 +45,10 @@ final class AppEnvironment {
     init() {
         // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
         database = try! AppDatabase.makeShared()
+        let models = SpeechModels()
+        speechModels = models
+        speechSynthesizer = SpeechSynthesizer(models: models, voicePrefs: voicePreferenceStore)
+        dictationController = DictationController(models: models)
         profiles = profileStore.load()
         thinkingPreferences = modelPreferenceStore.loadThinkingPreferences()
         // Keychain tokens outlive an app uninstall but the UserDefaults profile
