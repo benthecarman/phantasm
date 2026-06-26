@@ -103,8 +103,14 @@ struct HistoryDrawer: View {
                 .listRowBackground(
                     result.conversation.id == selection?.id ? Color.accentColor.opacity(0.12) : Color.clear
                 )
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        deleteConversation(result.conversation)
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
             }
-            .onDelete(perform: deleteConversations)
         }
         .listStyle(.plain)
         // Let the drawer's surface show through the list instead of the list's own
@@ -149,9 +155,13 @@ struct HistoryDrawer: View {
         }
     }
 
-    private func deleteConversations(_ offsets: IndexSet) {
-        let ids = offsets.map { results[$0].conversation.id }
-        if ids.contains(where: { $0 == selection?.id }) { onNewChat() }
+    private func deleteConversation(_ conversation: Conversation) {
+        deleteConversations(ids: [conversation.id])
+    }
+
+    private func deleteConversations(ids: [UUID]) {
+        guard !ids.isEmpty else { return }
+        if let selectionID = selection?.id, ids.contains(selectionID) { onNewChat() }
         let store = env.store
         Task {
             for id in ids {
