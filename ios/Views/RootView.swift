@@ -6,6 +6,7 @@ import SwiftUI
 /// user pulls in from the leading edge or the toolbar button.
 struct RootView: View {
     @Environment(AppEnvironment.self) private var env
+    @Environment(\.scenePhase) private var scenePhase
 
     /// The displayed conversation. A new chat is an in-memory draft (a value with
     /// a fresh id) that isn't written to the store until its first message is sent.
@@ -34,6 +35,9 @@ struct RootView: View {
         .animation(.interactiveSpring(response: 0.35, dampingFraction: 0.85), value: isDrawerOpen)
         .sheet(isPresented: $showSettings) {
             SettingsView(onHistoryCleared: { startNewChat() })
+        }
+        .onChange(of: scenePhase) { _, phase in
+            chatViewModels.setSceneActive(phase == .active)
         }
         .task {
             if selection == nil {
@@ -171,5 +175,11 @@ private final class ChatViewModelCache {
         let model = ChatViewModel()
         models[id] = model
         return model
+    }
+
+    func setSceneActive(_ active: Bool) {
+        for model in models.values {
+            model.setSceneActive(active)
+        }
     }
 }

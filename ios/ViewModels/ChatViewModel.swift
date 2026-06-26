@@ -30,6 +30,7 @@ final class ChatViewModel {
     private var pendingAssistantMessageID: UUID?
     private var pendingAssistantPreviewMessageID: UUID?
     private var isSceneActive = true
+    private var isViewVisible = false
     private var suspendedByScene = false
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
@@ -48,7 +49,18 @@ final class ChatViewModel {
         self.store = store
         self.conversation = conversation
         isSceneActive = sceneIsActive
-        if sceneIsActive {
+        if sceneIsActive && isViewVisible {
+            recoverPendingTurnIfNeeded()
+        }
+    }
+
+    func setViewVisible(_ visible: Bool) {
+        guard isViewVisible != visible else {
+            if visible { recoverPendingTurnIfNeeded() }
+            return
+        }
+        isViewVisible = visible
+        if visible {
             recoverPendingTurnIfNeeded()
         }
     }
@@ -464,14 +476,14 @@ final class ChatViewModel {
     }
 
     func recoverPendingTurnIfNeeded() {
-        guard !isStreaming, isSceneActive else { return }
+        guard !isStreaming, isSceneActive, isViewVisible else { return }
         Task { [weak self] in
             await self?.recoverPendingTurn()
         }
     }
 
     private func recoverPendingTurn() async {
-        guard !isStreaming, isSceneActive,
+        guard !isStreaming, isSceneActive, isViewVisible,
               let env, let store, let conversation,
               let base = env.activeProfile?.baseURL else { return }
         guard let detail = try? await store.conversationDetail(id: conversation.id),
@@ -509,7 +521,10 @@ final class ChatViewModel {
     private func finishAfterStreamFailure(_ error: Error) {
         guard isStreaming else { return }
         let appError = AppError.from(error)
-        let shouldRecover = appError == .cancelled || !isSceneActive || suspendedByScene
+        let shouldRecover = appError == .cancelled
+            || !isSceneActive
+            || suspendedByScene
+            || !isViewVisible
         suspendedByScene = false
         finish(
             error: shouldRecover ? nil : appError,

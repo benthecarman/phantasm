@@ -131,6 +131,7 @@ struct ChatView: View {
             }
         }
         .task(id: conversation.id) {
+            vm.setViewVisible(true)
             vm.configure(
                 env: env,
                 store: env.store,
@@ -143,6 +144,9 @@ struct ChatView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             vm.setSceneActive(phase == .active)
+        }
+        .onDisappear {
+            vm.setViewVisible(false)
         }
         .alert("Error", isPresented: Binding(
             get: { vm.errorMessage != nil },
