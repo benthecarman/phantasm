@@ -375,8 +375,13 @@ async fn synthesize<B: ChatBackend>(
         return;
     }
 
-    // Verify path: draft non-streaming, check citations, emit the corrected
-    // answer as Token events.
+    // Verify path: draft the answer non-streaming (this copy is never shown to
+    // the user), then STREAM the citation-corrected rewrite so it arrives
+    // token-by-token like an ordinary turn instead of landing as one block. The
+    // verify call's output IS the final answer, so we relay it directly through
+    // the shared streaming path; like the non-verify branch it is a single
+    // upstream streaming call, and a backend failure surfaces as an Error event
+    // rather than silently falling back to the unverified draft.
     let draft = match chat_once_permit(backend, sem, model, &msgs, &[], options, cancel).await {
         Some(Ok(m)) => message_text(m).unwrap_or_default(),
         Some(Err(e)) => {
@@ -389,53 +394,32 @@ async fn synthesize<B: ChatBackend>(
     let _ = tx
         .send(TurnEvent::Status("checking citations…".into()))
         .await;
-    let final_answer = verify_citations(
-        backend, sem, model, preset, &draft, &sources, options, cancel,
-    )
-    .await
-    .unwrap_or(draft);
 
-    if cancel.is_cancelled() {
-        return;
-    }
-    if tx.send(TurnEvent::Token(final_answer)).await.is_err() {
-        return;
-    }
-    let _ = tx
-        .send(TurnEvent::Done {
-            reason: "stop".into(),
-        })
-        .await;
+    let verify_msgs = vec![
+        ChatMessage::system(preset.verify_prompt),
+        ChatMessage::user(verify_user_block(&sources, &draft)),
+    ];
+    let _permit = tokio::select! {
+        p = sem.clone().acquire_owned() => match p {
+            Ok(p) => p,
+            Err(_) => return,
+        },
+        _ = cancel.cancelled() => return,
+    };
+    stream_relay(backend, model, &verify_msgs, options, tx, cancel).await;
 }
 
-/// Stage 4: drop/repair `[n]` markers not backed by a real source. Returns the
-/// corrected answer, or `None` on cancel/backend error (caller keeps the draft).
-#[allow(clippy::too_many_arguments)]
-async fn verify_citations<B: ChatBackend>(
-    backend: &B,
-    sem: &Arc<Semaphore>,
-    model: &str,
-    preset: &ResearchPreset,
-    draft: &str,
-    sources: &[String],
-    options: &Map<String, Value>,
-    cancel: &CancellationToken,
-) -> Option<String> {
+/// The verify-pass user block: the valid numbered sources plus the draft to be
+/// citation-corrected. Stage 4 streams the model's rewrite of this as the final
+/// answer, dropping any `[n]` not backed by a listed source.
+fn verify_user_block(sources: &[String], draft: &str) -> String {
     let valid = sources
         .iter()
         .enumerate()
         .map(|(i, url)| format!("[{}] {url}", i + 1))
         .collect::<Vec<_>>()
         .join("\n");
-    let user_block = format!("Valid sources:\n{valid}\n\n----- DRAFT ANSWER -----\n{draft}");
-    let msgs = vec![
-        ChatMessage::system(preset.verify_prompt),
-        ChatMessage::user(&user_block),
-    ];
-    let resp = chat_once_permit(backend, sem, model, &msgs, &[], options, cancel).await?;
-    resp.ok()
-        .and_then(message_text)
-        .filter(|s| !s.trim().is_empty())
+    format!("Valid sources:\n{valid}\n\n----- DRAFT ANSWER -----\n{draft}")
 }
 
 // ---- plan / compression parsing -------------------------------------------
@@ -851,12 +835,22 @@ mod tests {
         async fn chat_stream(
             &self,
             _model: &str,
-            _messages: &[ChatMessage],
+            messages: &[ChatMessage],
             _options: &Map<String, Value>,
         ) -> Result<DeltaStream, crate::error::AppError> {
-            // Streaming synthesis (non-verify path) emits a fixed answer.
+            // Record the streamed context too (the verify pass now streams), so
+            // isolation/verify assertions can inspect what each lead stage saw.
+            self.seen.lock().unwrap().push(messages.to_vec());
+            // The verify pass streams its corrected answer; the non-verify
+            // synthesis streams a fixed answer. Route by system prompt, mirroring
+            // chat_once.
+            let reply = if Self::system_text(messages).contains(VERIFY_MARK) {
+                (*self.verify_reply).clone()
+            } else {
+                "SYNTH ANSWER".to_string()
+            };
             let s = async_stream::stream! {
-                yield Ok(StreamDelta::content("SYNTH ANSWER", true, Some("stop".into())));
+                yield Ok(StreamDelta::content(reply, true, Some("stop".into())));
             };
             Ok(Box::pin(s))
         }
