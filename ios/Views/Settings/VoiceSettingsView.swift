@@ -19,13 +19,15 @@ struct VoiceSettingsView: View {
     /// observe, so reading it directly in the binding wouldn't update the UI.
     @State private var selectedVoiceID: String?
 
-    /// Status of the on-device dictation model. Read-aloud needs no download.
-    private var dictationState: (statusText: String, needsDownload: Bool) {
-        switch env.speechModels.sttStatus {
-        case .ready: return ("Ready", false)
-        case .failed: return ("Failed", true)
-        case .preparing: return ("Preparing…", false)
-        case .notLoaded: return ("Not downloaded", true)
+    /// Readiness of on-device dictation. It uses the platform speech models, so
+    /// there's nothing to bundle or download from us; the status reflects the
+    /// last dictation attempt (permissions + language-model availability).
+    private var dictationStatusText: String {
+        switch env.dictationController.readyState {
+        case .ready: return "Ready"
+        case .failed: return "Unavailable"
+        case .preparing: return "Preparing…"
+        case .unknown: return "On-device"
         }
     }
 
@@ -89,21 +91,14 @@ struct VoiceSettingsView: View {
 
             Section {
                 HStack {
-                    Text("Dictation model")
+                    Text("Status")
                     Spacer()
-                    Text(dictationState.statusText).foregroundStyle(.secondary)
-                }
-                if dictationState.needsDownload {
-                    Button {
-                        env.speechModels.prepareAll()
-                    } label: {
-                        Label("Download dictation model", systemImage: "arrow.down.circle")
-                    }
+                    Text(dictationStatusText).foregroundStyle(.secondary)
                 }
             } header: {
                 Text("Dictation")
             } footer: {
-                Text("Dictation (microphone) runs on-device and downloads its model once on first use, then works offline.")
+                Text("Dictation (microphone) runs on-device using your device's built-in speech recognition. The first time, iOS may download a small language model; after that it works offline.")
             }
         }
         .navigationTitle("Voice")

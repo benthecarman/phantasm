@@ -16,9 +16,8 @@ final class AppEnvironment {
     let modelPreferenceStore = ModelPreferenceStore()
     let voicePreferenceStore = VoicePreferenceStore()
     let keychain = KeychainStore()
-    /// On-device speech: shared model lifecycle plus the dictation (STT) and
-    /// read-aloud (TTS) controllers. Models download lazily on first use.
-    let speechModels: SpeechModels
+    /// On-device speech: dictation (STT, via the platform speech models) and
+    /// read-aloud (TTS, via the system `AVSpeechSynthesizer`). No bundled models.
     let speechSynthesizer: SpeechSynthesizer
     let dictationController: DictationController
     let chatClient = ChatClient()
@@ -45,10 +44,8 @@ final class AppEnvironment {
     init() {
         // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
         database = try! AppDatabase.makeShared()
-        let models = SpeechModels()
-        speechModels = models
         speechSynthesizer = SpeechSynthesizer(voicePrefs: voicePreferenceStore)
-        dictationController = DictationController(models: models)
+        dictationController = DictationController()
         profiles = profileStore.load()
         thinkingPreferences = modelPreferenceStore.loadThinkingPreferences()
         // Keychain tokens outlive an app uninstall but the UserDefaults profile

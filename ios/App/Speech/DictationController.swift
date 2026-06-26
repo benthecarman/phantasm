@@ -1,151 +1,123 @@
 import Foundation
 import Observation
 import UIKit
-import WhisperKit
 
-/// Drives on-device dictation: captures microphone audio while the user holds
-/// the mic, then transcribes the whole recording once on stop.
+/// Drives on-device dictation: while the user holds the mic, a `DictationEngine`
+/// captures audio and transcribes it with the platform speech models (iOS 26
+/// `SpeechAnalyzer`, or `SFSpeechRecognizer` on older systems). On release we
+/// finalize and hand the composer the transcript.
 ///
-/// We deliberately do *not* use WhisperKit's realtime `AudioStreamTranscriber`:
-/// it only surfaces text after accumulating >1s buffers, drops the trailing
-/// audio on stop, and runs transcriptions on the shared decoder concurrently
-/// across sessions (which corrupts it after a few cycles). Capturing raw audio
-/// and running a single `transcribe` on stop is reliable and loses nothing.
+/// A fresh engine is created per recording session — the speech APIs are
+/// single-use per utterance, and this keeps each session's state isolated.
 @MainActor
 @Observable
 final class DictationController {
-    private let models: SpeechModels
+    /// Readiness of dictation (permissions + on-device model assets). Surfaced
+    /// in Settings so the user can grant access / fetch the language model ahead
+    /// of first use.
+    enum ReadyState: Equatable {
+        case unknown
+        case preparing
+        case ready
+        case failed(String)
+    }
 
     /// Capturing audio (the user is holding / locked-recording).
     private(set) var isRecording = false
-    /// Stopped; transcribing the captured audio.
+    /// Stopped; finalizing the transcript.
     private(set) var isTranscribing = false
-    /// The finished transcript. The composer applies it, then calls `clearResult`.
-    private(set) var result: String?
-    /// User-facing error (mic denied, model download failed, …); nil when fine.
+    /// The running transcript, updated live as the user speaks and replaced with
+    /// the finalized text on stop. Empty while idle and reset to empty on
+    /// start/cancel. The composer mirrors this into the text field.
+    private(set) var liveTranscript = ""
+    /// User-facing error (mic denied, language unsupported, …); nil when fine.
     private(set) var errorMessage: String?
+    /// Coarse readiness for the Settings screen.
+    private(set) var readyState: ReadyState = .unknown
 
-    private var audioProcessor: AudioProcessor?
+    /// The active session's engine, stored only once it has actually started.
+    private var engine: DictationEngine?
     /// Bumped each `start()`/`cancel()`; a session only applies its result while
     /// it's still the current generation.
     private var generation = 0
 
-    init(models: SpeechModels) {
-        self.models = models
-    }
-
     func start() {
         guard !isRecording else { return }
         errorMessage = nil
-        result = nil
+        liveTranscript = ""
         isTranscribing = false
         isRecording = true
+        readyState = .preparing
         generation += 1
         let gen = generation
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
 
         Task {
-            // Ask for the mic up front so the prompt can't pop mid-recording.
-            guard await AudioProcessor.requestRecordPermission() else {
-                if gen == generation {
-                    isRecording = false
-                    errorMessage = "Microphone access is needed for dictation. Enable it in Settings."
-                }
-                return
-            }
-            guard gen == generation, isRecording else { return }
-
-            let processor = AudioProcessor()
-            // Starting the engine activates the audio session and installs a tap
-            // — blocking work that must not run on the main actor. Confined to a
-            // detached task; `processor` is only ever touched off-main from here.
-            nonisolated(unsafe) let p = processor
+            let engine = makeDictationEngine()
             do {
-                try await Task.detached(priority: .userInitiated) {
-                    try p.startRecordingLive(callback: nil)
-                }.value
+                try await engine.start(onPartial: { [weak self] text in
+                    Task { @MainActor in
+                        guard let self, gen == self.generation else { return }
+                        self.liveTranscript = text
+                    }
+                })
             } catch {
+                await engine.cancel()
+                readyState = .failed(Self.message(for: error))
                 if gen == generation {
                     isRecording = false
                     errorMessage = Self.message(for: error)
                 }
                 return
             }
-            // The user may have released during the permission prompt.
+            // Permissions + language model are confirmed available.
+            readyState = .ready
+            // The user may have released (stop) or cancelled while we were
+            // starting up. Both run on the main actor, so by the time we resume
+            // here `isRecording`/`generation` reflect that — tear down if so.
             guard gen == generation, isRecording else {
-                Task.detached { p.stopRecording() }
+                await engine.cancel()
                 return
             }
-            self.audioProcessor = processor
-            // Warm the model while the user speaks so stop → text is quick.
-            Task { _ = try? await models.whisper() }
+            self.engine = engine
         }
     }
 
-    /// Stop and transcribe the captured audio.
+    /// Stop and finalize the captured audio into a transcript.
     func stop() {
         guard isRecording else { return }
         isRecording = false
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        guard let processor = audioProcessor else { return }
-        audioProcessor = nil
+        // If the engine hasn't finished starting yet, `engine` is nil; the
+        // in-flight start() sees `isRecording == false` and tears itself down.
+        guard let engine else { return }
+        self.engine = nil
         let gen = generation
         isTranscribing = true
 
         Task {
-            // Tearing down the engine off-main too (same reason as start()).
-            nonisolated(unsafe) let p = processor
-            let samples: [Float] = await Task.detached {
-                p.stopRecording()
-                return Array(p.audioSamples)
-            }.value
-            // Need ~0.4s of audio to be worth transcribing.
-            guard samples.count > WhisperKit.sampleRate / 2 else {
-                if gen == generation { isTranscribing = false }
-                return
-            }
-            do {
-                let whisper = try await models.whisper()
-                guard gen == generation else { return }
-                let results = try await whisper.transcribe(audioArray: samples)
-                guard gen == generation else { return }
-                let text = results.map(\.text).joined(separator: " ")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                isTranscribing = false
-                if !text.isEmpty { result = text }
-            } catch {
-                if gen == generation {
-                    isTranscribing = false
-                    errorMessage = Self.message(for: error)
-                }
-            }
+            let text = await engine.finishTranscript()
+            guard gen == generation else { return }
+            isTranscribing = false
+            if !text.isEmpty { liveTranscript = text }
         }
     }
 
-    /// Stop and discard — no transcription.
+    /// Stop and discard — no transcription. Clearing `liveTranscript` reverts the
+    /// live text the composer mirrored in while recording.
     func cancel() {
         guard isRecording else { return }
         isRecording = false
         isTranscribing = false
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        let processor = audioProcessor
-        audioProcessor = nil
-        generation += 1 // invalidate any in-flight transcription
-        if let processor {
-            nonisolated(unsafe) let p = processor
-            Task.detached { p.stopRecording() }
-        }
-    }
-
-    /// Called by the composer once it has consumed `result`.
-    func clearResult() {
-        result = nil
+        generation += 1 // invalidate any in-flight start/finish/partials
+        liveTranscript = ""
+        let engine = self.engine
+        self.engine = nil
+        if let engine { Task { await engine.cancel() } }
     }
 
     private static func message(for error: Error) -> String {
-        if (error as NSError).domain == NSURLErrorDomain {
-            return "Couldn't download the dictation model. Check your connection."
-        }
-        return error.localizedDescription
+        (error as? DictationError)?.errorDescription ?? error.localizedDescription
     }
 }

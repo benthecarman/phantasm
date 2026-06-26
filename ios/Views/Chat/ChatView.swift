@@ -427,10 +427,13 @@ struct ComposerView: View {
                 cancelHint.padding(.leading, 18).padding(.bottom, 16).transition(.opacity)
             }
         }
-        .onChange(of: dictation.result) { _, result in
-            guard let result, !result.isEmpty else { return }
-            input = dictationBase.isEmpty ? result : dictationBase + " " + result
-            dictation.clearResult()
+        .onChange(of: dictation.liveTranscript) { _, transcript in
+            // Mirror the live transcript into the composer, appended to whatever
+            // was already typed when dictation started. Empty transcript (start /
+            // cancel) reverts to that base text.
+            input = transcript.isEmpty
+                ? dictationBase
+                : (dictationBase.isEmpty ? transcript : dictationBase + " " + transcript)
         }
         .onChange(of: dictation.isRecording) { _, recording in
             if !recording {

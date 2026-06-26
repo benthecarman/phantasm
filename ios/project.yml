@@ -21,12 +21,6 @@ packages:
   GRDBQuery:
     url: https://github.com/groue/GRDBQuery
     from: "0.11.0"
-  # On-device dictation (speech-to-text) via WhisperKit, which downloads its
-  # model at first use. Read-aloud uses the system AVSpeechSynthesizer, so no
-  # TTS model/package is needed.
-  ArgmaxOSS:
-    url: https://github.com/argmaxinc/argmax-oss-swift
-    from: "1.0.0"
 targets:
   Phantasm:
     type: application
@@ -44,8 +38,6 @@ targets:
         product: GRDB
       - package: GRDBQuery
         product: GRDBQuery
-      - package: ArgmaxOSS
-        product: WhisperKit
     info:
       path: App/Info.plist
       properties:
@@ -54,6 +46,7 @@ targets:
         NSPhotoLibraryAddUsageDescription: "Phantasm saves generated images to your photo library when you choose to save them."
         NSCameraUsageDescription: "Phantasm uses the camera so you can take a photo to attach to a message."
         NSMicrophoneUsageDescription: "Phantasm uses the microphone so you can dictate messages. Audio is transcribed on-device and never leaves your phone."
+        NSSpeechRecognitionUsageDescription: "Phantasm uses speech recognition to transcribe your dictation. On supported devices this runs entirely on-device."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
