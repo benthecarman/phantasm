@@ -65,8 +65,9 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
 public extension Conversation {
     /// Names of the tools this chat wants offered this turn, intersected against
     /// what the backend advertises (`capabilities.tools`). Returns `nil` when the
-    /// backend exposes no tool manifest, so the caller omits `x_tools` entirely
-    /// and keeps the request standard; otherwise the (possibly empty) selection.
+    /// backend exposes no tool manifest, so the caller omits the `tools` selection
+    /// entirely and keeps the request standard; otherwise the (possibly empty)
+    /// selection, which the caller encodes as standard `tools`/`tool_choice`.
     func requestedToolNames(supporting tools: Capabilities.Tools?) -> [String]? {
         guard let tools else { return nil }
         var names: [String] = []

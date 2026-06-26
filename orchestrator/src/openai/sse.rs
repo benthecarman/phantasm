@@ -180,7 +180,7 @@ mod tests {
             None,
         );
         let v = chunk_json(&chunk);
-        assert_eq!(v["choices"][0]["delta"]["reasoning"], "plan");
+        assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "plan");
     }
 
     #[test]

@@ -46,6 +46,10 @@ A bare Ollama won't serve this route; the app MUST treat 404/connection failure
 as "plain chat only" and degrade gracefully. The `tools` block is advisory — it
 only tells the app whether to *show* affordances. The app never executes tools.
 
+The orchestrator also serves the standard `GET /v1/models` (OpenAI list shape)
+backed by the same probe, so any standard OpenAI client can discover models;
+`/v1/capabilities` is the Phantasm-aware superset the app prefers.
+
 `vision_models` and `tool_models` are subsets of `models` reporting which models
 accept image input and which can drive tool/function calls (probed server-side
 via Ollama `/api/show`; both optional, omitted/empty ⇒ the app treats that
@@ -107,16 +111,20 @@ standard OpenAI function-calling:
 4. Once Ollama returns a final assistant message, the orchestrator streams *that*
    back to the app as ordinary SSE chunks.
 
-**Per-request tool selection (additive).** The app MAY include an `x_tools`
-field on the request — a JSON array of tool names it wants offered this turn
-(e.g. `["web_search"]`). Following the `x_`-prefix convention, standard clients
-and backends ignore it. Semantics: field **absent** → the server offers every
-configured tool (older clients keep working); **present** → the server offers
-only the named tools, always intersected with what is actually configured (a
-client can never enable a tool the deployment lacks); an **empty array** → no
-tools (plain chat). Tools remain server-side and invisible otherwise; this only
-lets the client scope which of the advertised (`/v1/capabilities`) tools apply
-to a given conversation.
+**Per-request tool selection (standard OpenAI fields).** The app scopes which
+server tools a turn may use via the **standard** OpenAI `tools` / `tool_choice`
+request fields — no custom field. The `tools` array merely *names* the wanted
+tools, either as a function entry
+(`{"type":"function","function":{"name":"web_search"}}`) or the built-in
+shorthand (`{"type":"web_search"}`); the server fills in the real schema and
+intersects with what it has configured (a client can never enable a tool the
+deployment lacks). Semantics: `tools` **absent** → the server offers every
+configured tool (older clients keep working); **present** → only the named
+tools; an **empty array** or `tool_choice: "none"` → no tools (plain chat).
+Tools remain server-side and invisible otherwise; this only lets the client
+scope which of the advertised (`/v1/capabilities`) tools apply to a given
+conversation. Because selection rides standard fields, any OpenAI client can do
+it and a bare backend ignores it harmlessly.
 
 **Deep Research mode (additive).** The app MAY include an `x_research: true`
 field to run the turn in Deep Research mode. Following the `x_`-prefix
@@ -133,8 +141,10 @@ on `web_search` being configured; the app gates its toggle on that capability.
 **Thinking mode.** The app MAY include `reasoning_effort` on the request.
 `"none"` asks the backend to suppress thinking/reasoning (the default app
 behavior); a supported value such as `"medium"` allows backends that expose
-reasoning to emit it. When reasoning is streamed, the server/app normalize it to
-`delta.reasoning`; clients SHOULD keep it separate from assistant `content` and
+reasoning to emit it. When reasoning is streamed, the server emits it as
+`delta.reasoning_content` (the de-facto OpenAI-compat field name, so any standard
+client understands it); the app also accepts the `reasoning`/`thinking` aliases
+on input. Clients SHOULD keep it separate from assistant `content` and
 hide it unless the user expands it. The app remembers the on/off preference per
 backend profile and model.
 
@@ -198,8 +208,11 @@ MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel
 
 ## 8. Resolved decisions
 
-- Single OpenAI-compatible SSE endpoint; tools server-side; only non-standard
-  element is the `x_`-prefixed `x_status` field.
+- Single OpenAI-compatible SSE endpoint; tools server-side; the only
+  non-standard wire elements are the `x_`-prefixed `x_status` (progress) and
+  `x_research` (deep-research mode) fields. Tool selection rides standard
+  `tools`/`tool_choice`; streamed reasoning rides `delta.reasoning_content`;
+  `/v1/models` is served alongside `/v1/capabilities`.
 - Upstream native Ollama via **`/api/chat`** when available (Ollama
   OpenAI-compat drops streamed tool_calls), with OpenAI-compatible `/v1`
   fallback for non-Ollama model hosts.

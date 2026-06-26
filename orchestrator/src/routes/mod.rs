@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod chat;
+pub mod models;
 pub mod warm;
 
 use axum::routing::{get, post};
@@ -11,6 +12,7 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/capabilities", get(capabilities::capabilities))
+        .route("/v1/models", get(models::models))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/warm", post(warm::warm))
         .route_layer(middleware::from_fn_with_state(

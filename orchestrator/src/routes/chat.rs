@@ -32,6 +32,10 @@ pub async fn chat_completions(
         return AppError::BadRequest("`messages` must not be empty".into()).into_response();
     }
 
+    // Resolve the per-turn tool selection from the standard `tools`/`tool_choice`
+    // fields before we move the rest of the request apart.
+    let enabled_tools = req.tool_selection();
+
     // Per XR-2 the app resends full history each turn, including multi-MB base64
     // image data-URIs from prior turns — so move the heavy fields out of `req`
     // rather than cloning them.
@@ -39,7 +43,6 @@ pub async fn chat_completions(
         model,
         stream,
         messages,
-        enabled_tools,
         research,
         extra: options,
         ..

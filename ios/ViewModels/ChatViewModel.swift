@@ -438,7 +438,7 @@ final class ChatViewModel {
                 thinkingEnabled: env.thinkingEnabled(for: model),
                 disabledEffort: env.disabledReasoningEffortForCurrentBackend()
             ),
-            xTools: detail.conversation.requestedToolNames(
+            enabledTools: detail.conversation.requestedToolNames(
                 supporting: env.backendMode.capabilities?.tools
             ),
             xResearch: detail.conversation.deepResearchEnabled ? true : nil

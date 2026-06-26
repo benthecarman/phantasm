@@ -33,27 +33,44 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertNil(caps.visionModels)
     }
 
-    // MARK: - Per-chat tool selection (x_tools)
+    // MARK: - Per-chat tool selection (standard OpenAI tools/tool_choice)
 
     private func encodedKeys(_ request: ChatRequest) throws -> [String: Any] {
         let data = try Wire.encoder().encode(request)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
-    func testChatRequestOmitsXToolsWhenNil() throws {
+    func testChatRequestOmitsToolFieldsWhenNil() throws {
         let request = ChatRequest(model: "m", messages: [WireMessage(role: "user", content: "hi")])
         let json = try encodedKeys(request)
-        XCTAssertNil(json["x_tools"], "nil selection must keep the request standard")
+        XCTAssertNil(json["tools"], "nil selection must keep the request standard")
+        XCTAssertNil(json["tool_choice"], "nil selection must keep the request standard")
     }
 
-    func testChatRequestEncodesXToolsAsSnakeCaseArray() throws {
+    func testChatRequestEncodesSelectedToolsAsStandardArray() throws {
         let request = ChatRequest(
             model: "m",
             messages: [WireMessage(role: "user", content: "hi")],
-            xTools: [ToolName.webSearch]
+            enabledTools: [ToolName.webSearch]
         )
         let json = try encodedKeys(request)
-        XCTAssertEqual(json["x_tools"] as? [String], ["web_search"])
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(tools.first?["type"] as? String, "function")
+        let function = try XCTUnwrap(tools.first?["function"] as? [String: Any])
+        XCTAssertEqual(function["name"] as? String, "web_search")
+        XCTAssertNil(json["tool_choice"], "naming tools must not force tool_choice")
+    }
+
+    func testChatRequestEncodesEmptySelectionAsToolChoiceNone() throws {
+        let request = ChatRequest(
+            model: "m",
+            messages: [WireMessage(role: "user", content: "hi")],
+            enabledTools: []
+        )
+        let json = try encodedKeys(request)
+        XCTAssertEqual(json["tool_choice"] as? String, "none")
+        XCTAssertNil(json["tools"], "plain-chat selection sends only tool_choice:none")
     }
 
     func testChatRequestOmitsXResearchWhenNil() throws {

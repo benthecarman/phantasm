@@ -11,16 +11,35 @@ public enum ReasoningEffort {
     public static let enabledDefault = "medium"
 }
 
+/// One entry of the standard OpenAI `tools` array. We send it purely to *name*
+/// which server tool the orchestrator should offer this turn — the server owns
+/// the real schema.
+public struct ToolSpec: Encodable, Sendable {
+    public struct Function: Encodable, Sendable {
+        public var name: String
+    }
+    public var type: String
+    public var function: Function
+
+    public init(name: String) {
+        self.type = "function"
+        self.function = Function(name: name)
+    }
+}
+
 public struct ChatRequest: Encodable, Sendable {
     public var model: String
     public var messages: [WireMessage]
     public var stream: Bool
     public var reasoningEffort: String?
-    /// Per-request tool selection (spec §2.3): the names of the server tools to
-    /// offer this turn, encoded as the additive `x_tools` field. `nil` omits the
-    /// field entirely (server offers all configured tools — and keeps plain-chat
-    /// requests byte-for-byte standard); an empty array requests plain chat.
-    public var xTools: [String]?
+    /// Per-request tool selection via the **standard** OpenAI `tools` array
+    /// (spec §2.3): the names of the server tools to offer this turn. The server
+    /// fills in the real schemas and intersects with what it has configured. `nil`
+    /// omits the field (server offers all configured tools — and keeps plain-chat
+    /// requests byte-for-byte standard).
+    public var tools: [ToolSpec]?
+    /// Standard OpenAI `tool_choice`. Set to `"none"` to force plain chat.
+    public var toolChoice: String?
     /// Deep Research mode (spec §2.3): when `true`, encoded as the additive
     /// `x_research` field so the orchestrator runs its server-side research loop
     /// (decompose → search across several rounds → synthesize with citations).
@@ -32,14 +51,24 @@ public struct ChatRequest: Encodable, Sendable {
         messages: [WireMessage],
         stream: Bool = true,
         reasoningEffort: String? = nil,
-        xTools: [String]? = nil,
+        enabledTools: [String]? = nil,
         xResearch: Bool? = nil
     ) {
         self.model = model
         self.messages = messages
         self.stream = stream
         self.reasoningEffort = reasoningEffort
-        self.xTools = xTools
+        // Translate the per-turn selection into standard OpenAI fields:
+        //   nil    => omit both (server offers every configured tool)
+        //   []     => tool_choice:"none" (plain chat)
+        //   names  => tools:[…] entries the server narrows to
+        if let enabledTools {
+            if enabledTools.isEmpty {
+                self.toolChoice = "none"
+            } else {
+                self.tools = enabledTools.map(ToolSpec.init(name:))
+            }
+        }
         self.xResearch = xResearch
     }
 }

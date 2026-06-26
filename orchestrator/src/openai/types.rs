@@ -15,14 +15,21 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
-    /// Additive, non-standard request field (spec §2.3 `x_`-prefix convention):
-    /// the subset of server tools the client wants offered this turn, by name
-    /// (e.g. `["web_search"]`). `None` (field absent) => offer every usable tool,
-    /// keeping older clients working. An empty list => offer none (plain chat).
-    /// The server always intersects this with what is actually configured, so a
-    /// client can never enable a tool the deployment lacks.
-    #[serde(default, rename = "x_tools")]
-    pub enabled_tools: Option<Vec<String>>,
+    /// Standard OpenAI `tools` array — used here purely for per-turn tool
+    /// *selection by name* (spec §2.3). The client lists the server tools it wants
+    /// offered this turn, either as a function entry
+    /// (`{"type":"function","function":{"name":"web_search"}}`) or the built-in
+    /// shorthand (`{"type":"web_search"}`); the server fills in the real schemas
+    /// and intersects with what it actually has configured, so a client can never
+    /// enable a tool the deployment lacks. Field absent => offer every configured
+    /// tool (older clients keep working). See [`Self::tool_selection`].
+    #[serde(default)]
+    pub tools: Option<Vec<ToolSpec>>,
+    /// Standard OpenAI `tool_choice`. Only `"none"` is acted on — it forces plain
+    /// chat (no tools offered) regardless of `tools`; other values fall through to
+    /// the normal auto behavior.
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
     /// Additive, non-standard request field (spec §2.3 `x_`-prefix convention):
     /// run this turn in Deep Research mode. The server then injects a research
     /// system prompt, offers only `web_search` (forcing full-page fetching
@@ -33,6 +40,57 @@ pub struct ChatRequest {
     /// Any other OpenAI sampling parameters (temperature, top_p, …) passed through to Ollama.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
+}
+
+/// One entry of the standard OpenAI `tools` array. Modeled permissively because
+/// the orchestrator uses it only to *name* which configured server tool to
+/// offer — not to receive a schema (the server owns the schemas).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolSpec {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub function: Option<ToolSpecFunction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolSpecFunction {
+    pub name: String,
+}
+
+impl ToolSpec {
+    /// The server-tool name this entry selects: the function name for a standard
+    /// function tool, or the `type` itself for a built-in-tool entry such as
+    /// `{"type":"web_search"}`. `None` for an unnamed/`function`-typed-but-empty
+    /// entry, which the selection then simply ignores.
+    fn selected_name(&self) -> Option<String> {
+        if let Some(f) = &self.function {
+            return Some(f.name.clone());
+        }
+        match self.kind.as_deref() {
+            Some(kind) if kind != "function" => Some(kind.to_string()),
+            _ => None,
+        }
+    }
+}
+
+impl ChatRequest {
+    /// Resolve the per-turn tool selection from the standard `tools`/`tool_choice`
+    /// fields into the orchestrator's narrowing list. `None` => offer every
+    /// configured tool (field absent — older clients). `Some(list)` => offer only
+    /// those names (an empty list, or `tool_choice:"none"`, => plain chat).
+    ///
+    /// Names are intersected with the configured tools downstream
+    /// ([`select_schemas`](crate::orchestrator::turn::select_schemas)), so a
+    /// client can never add a tool the deployment lacks.
+    pub fn tool_selection(&self) -> Option<Vec<String>> {
+        if self.tool_choice.as_ref().and_then(Value::as_str) == Some("none") {
+            return Some(Vec::new());
+        }
+        self.tools
+            .as_ref()
+            .map(|list| list.iter().filter_map(ToolSpec::selected_name).collect())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +243,45 @@ fn strip_data_uri(url: &str) -> String {
 mod tests {
     use super::*;
 
+    fn req(json: &str) -> ChatRequest {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn tool_selection_absent_offers_all() {
+        let r = req(r#"{"messages":[]}"#);
+        assert_eq!(r.tool_selection(), None);
+    }
+
+    #[test]
+    fn tool_selection_empty_array_is_plain_chat() {
+        let r = req(r#"{"messages":[],"tools":[]}"#);
+        assert_eq!(r.tool_selection(), Some(vec![]));
+    }
+
+    #[test]
+    fn tool_selection_reads_function_names() {
+        let r = req(
+            r#"{"messages":[],"tools":[{"type":"function","function":{"name":"web_search"}}]}"#,
+        );
+        assert_eq!(r.tool_selection(), Some(vec!["web_search".to_string()]));
+    }
+
+    #[test]
+    fn tool_selection_reads_builtin_tool_type() {
+        // The OpenAI built-in-tool shorthand: the `type` itself names the tool.
+        let r = req(r#"{"messages":[],"tools":[{"type":"web_search"}]}"#);
+        assert_eq!(r.tool_selection(), Some(vec!["web_search".to_string()]));
+    }
+
+    #[test]
+    fn tool_choice_none_forces_plain_chat() {
+        let r = req(
+            r#"{"messages":[],"tool_choice":"none","tools":[{"type":"function","function":{"name":"web_search"}}]}"#,
+        );
+        assert_eq!(r.tool_selection(), Some(vec![]));
+    }
+
     #[test]
     fn plain_string_content_still_parses() {
         let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
@@ -307,8 +404,11 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Streamed model reasoning. Serialized as `reasoning_content` to match the
+    /// de-facto OpenAI-compat convention (DeepSeek/vLLM/OpenRouter), so any
+    /// standard client that understands reasoning renders it — not just our app.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
+    pub reasoning_content: Option<String>,
 }
 
 impl Delta {
@@ -316,7 +416,7 @@ impl Delta {
         Delta {
             role: Some(role.into()),
             content: None,
-            reasoning: None,
+            reasoning_content: None,
         }
     }
 
@@ -324,7 +424,7 @@ impl Delta {
         Delta {
             role: None,
             content: Some(content.into()),
-            reasoning: None,
+            reasoning_content: None,
         }
     }
 
@@ -332,7 +432,7 @@ impl Delta {
         Delta {
             role: None,
             content: None,
-            reasoning: Some(reasoning.into()),
+            reasoning_content: Some(reasoning.into()),
         }
     }
 }
