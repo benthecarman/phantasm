@@ -329,6 +329,56 @@ final class ChatRequestEncodingTests: XCTestCase {
 
         XCTAssertEqual(json["reasoning_effort"] as? String, ReasoningEffort.enabledDefault)
     }
+
+    func testAppToolsRideInToolsArrayWithFullSchema() throws {
+        // An app-hosted tool sends a full schema (parameters), which is what marks
+        // it app-side to the orchestrator. Server selectors stay name-only.
+        let req = ChatRequest(
+            model: "m",
+            messages: [WireMessage(role: "user", content: "hi")],
+            enabledTools: [ToolName.webSearch],
+            appTools: AppTools.all
+        )
+        let data = try Wire.encoder().encode(req)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        let functions = tools.compactMap { $0["function"] as? [String: Any] }
+
+        // The server selector is name-only.
+        let webSearch = try XCTUnwrap(functions.first { $0["name"] as? String == ToolName.webSearch })
+        XCTAssertNil(webSearch["parameters"])
+
+        // The app tool carries a full parameters schema.
+        let askUser = try XCTUnwrap(functions.first { $0["name"] as? String == ToolName.askUser })
+        let params = try XCTUnwrap(askUser["parameters"] as? [String: Any])
+        XCTAssertEqual(params["type"] as? String, "object")
+        let properties = try XCTUnwrap(params["properties"] as? [String: Any])
+        // The form carries a `questions` array; each item has question + options.
+        let questions = try XCTUnwrap(properties["questions"] as? [String: Any])
+        XCTAssertEqual(questions["type"] as? String, "array")
+        let item = try XCTUnwrap(questions["items"] as? [String: Any])
+        let itemProps = try XCTUnwrap(item["properties"] as? [String: Any])
+        XCTAssertNotNil(itemProps["question"])
+        XCTAssertNotNil(itemProps["options"])
+        XCTAssertNil(json["tool_choice"])
+    }
+
+    func testAppToolsOfferedEvenWhenServerToolsDisabled() throws {
+        // Disabling server tools ([] => would be tool_choice:none) must NOT
+        // suppress app tools when present.
+        let req = ChatRequest(
+            model: "m",
+            messages: [WireMessage(role: "user", content: "hi")],
+            enabledTools: [],
+            appTools: AppTools.all
+        )
+        let data = try Wire.encoder().encode(req)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(json["tool_choice"], "app tools present => not plain chat")
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual((tools[0]["function"] as? [String: Any])?["name"] as? String, ToolName.askUser)
+    }
 }
 
 final class CapabilityProbeTests: XCTestCase {
@@ -509,6 +559,102 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(detail?.messages.first?.message.reasoning, "hidden plan")
         XCTAssertEqual(detail?.messages.first?.message.isComplete, true)
         XCTAssertEqual(detail?.wireHistory(), [WireMessage(role: "assistant", content: "final answer")])
+    }
+
+    /// Build a JSON-encoded `[WireToolCall]` as the stream/persistence layer does.
+    private func encodedCalls(id: String, name: String, arguments: String) throws -> String {
+        let calls = [WireToolCall(
+            index: 0, id: id, type: "function",
+            function: WireToolCall.Function(name: name, arguments: arguments)
+        )]
+        return try XCTUnwrap(String(data: Wire.encoder().encode(calls), encoding: .utf8))
+    }
+
+    func testWireHistoryRoundTripsToolCallAndResult() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "user", content: "help me pick",
+                    createdAt: t0),
+            attachments: []
+        )
+        let json = try encodedCalls(
+            id: "call_1", name: ToolName.askUser,
+            arguments: #"{"question":"Which?","options":["A","B"]}"#
+        )
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "assistant", content: "",
+                    createdAt: t0.addingTimeInterval(1), isComplete: true, toolCalls: json),
+            attachments: []
+        )
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "tool", content: "A",
+                    createdAt: t0.addingTimeInterval(2), isComplete: true,
+                    toolCallId: "call_1", name: ToolName.askUser),
+            attachments: []
+        )
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        let wire = try XCTUnwrap(detail?.wireHistory())
+        XCTAssertEqual(wire.count, 3)
+        XCTAssertEqual(wire[0], WireMessage(role: "user", content: "help me pick"))
+        XCTAssertEqual(wire[1].role, "assistant")
+        XCTAssertEqual(wire[1].toolCalls?.first?.id, "call_1")
+        XCTAssertEqual(wire[1].toolCalls?.first?.function?.name, ToolName.askUser)
+        XCTAssertEqual(wire[2], WireMessage(toolResult: "call_1", name: ToolName.askUser, content: "A"))
+    }
+
+    func testWireHistorySynthesizesDismissedResultForUnansweredCall() async throws {
+        // An assistant tool_call with no following tool result must still be
+        // followed by a (synthetic) result so the history stays OpenAI-valid.
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let json = try encodedCalls(
+            id: "call_7", name: ToolName.askUser,
+            arguments: #"{"question":"Which?","options":["A","B"]}"#
+        )
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "assistant", content: "",
+                    createdAt: t0, isComplete: true, toolCalls: json),
+            attachments: []
+        )
+        // The user moved on with a normal message instead of answering.
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "user", content: "never mind",
+                    createdAt: t0.addingTimeInterval(1)),
+            attachments: []
+        )
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        let wire = try XCTUnwrap(detail?.wireHistory())
+        XCTAssertEqual(wire.count, 3)
+        XCTAssertEqual(wire[0].role, "assistant")
+        XCTAssertEqual(wire[1], WireMessage(toolResult: "call_7", name: ToolName.askUser, content: "(dismissed)"))
+        XCTAssertEqual(wire[2], WireMessage(role: "user", content: "never mind"))
+    }
+
+    func testCompleteToolCallMessageStoresCallsAndCompletes() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let pending = Message(conversationId: convo.id, role: "assistant", content: "",
+                              isComplete: false)
+        try await store.insertMessage(pending, attachments: [])
+
+        let json = try encodedCalls(
+            id: "call_1", name: ToolName.askUser,
+            arguments: #"{"question":"Q","options":["A","B"]}"#
+        )
+        try await store.completeToolCallMessage(id: pending.id, toolCalls: json)
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.messages.first?.message.isComplete, true)
+        XCTAssertEqual(detail?.messages.first?.message.toolCalls, json)
+        // It round-trips into wire history as an assistant tool_call (+ synthetic
+        // dismissed result, since nothing answered it).
+        XCTAssertEqual(detail?.wireHistory().first?.toolCalls?.first?.id, "call_1")
     }
 
     func testReasoningIsPersistedButExcludedFromWireHistory() async throws {

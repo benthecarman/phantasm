@@ -11,19 +11,82 @@ public enum ReasoningEffort {
     public static let enabledDefault = "medium"
 }
 
-/// One entry of the standard OpenAI `tools` array. We send it purely to *name*
-/// which server tool the orchestrator should offer this turn — the server owns
-/// the real schema.
+/// One entry of the standard OpenAI `tools` array. Two flavors:
+///   * **server-tool selector** — name only; the orchestrator owns the schema and
+///     executes the tool.
+///   * **app-hosted tool** — a full schema (description + parameters); the
+///     orchestrator forwards calls back to the app to execute. Its presence of
+///     `parameters` is what marks it app-side (orchestrator §2.3).
 public struct ToolSpec: Encodable, Sendable {
     public struct Function: Encodable, Sendable {
         public var name: String
+        public var description: String?
+        public var parameters: JSONValue?
     }
     public var type: String
     public var function: Function
 
+    /// A name-only server-tool selector.
     public init(name: String) {
         self.type = "function"
-        self.function = Function(name: name)
+        self.function = Function(name: name, description: nil, parameters: nil)
+    }
+
+    /// A full app-hosted tool definition the app will execute.
+    public init(name: String, description: String, parameters: JSONValue) {
+        self.type = "function"
+        self.function = Function(name: name, description: description, parameters: parameters)
+    }
+}
+
+/// A minimal JSON value, just enough to express an app tool's JSON-Schema
+/// `parameters` inline. Encodes through the shared snake_case encoder; all schema
+/// keys are already lowercase/underscored so they pass through unchanged.
+public indirect enum JSONValue: Encodable, Sendable, Equatable {
+    case string(String)
+    case bool(Bool)
+    case int(Int)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .string(let s): try c.encode(s)
+        case .bool(let b): try c.encode(b)
+        case .int(let i): try c.encode(i)
+        case .array(let a): try c.encode(a)
+        case .object(let o): try c.encode(o)
+        }
+    }
+}
+
+/// One streamed/persisted tool call (OpenAI shape). `arguments` is a JSON-encoded
+/// string. All fields optional so partial streaming fragments still decode.
+public struct WireToolCall: Codable, Sendable, Equatable {
+    public struct Function: Codable, Sendable, Equatable {
+        public var name: String?
+        public var arguments: String?
+        public init(name: String?, arguments: String?) {
+            self.name = name
+            self.arguments = arguments
+        }
+    }
+    public var index: Int?
+    public var id: String?
+    public var type: String?
+    public var function: Function?
+
+    public init(
+        index: Int? = nil,
+        id: String? = nil,
+        type: String? = "function",
+        function: Function?
+    ) {
+        self.index = index
+        self.id = id
+        self.type = type
+        self.function = function
     }
 }
 
@@ -46,22 +109,26 @@ public struct ChatRequest: Encodable, Sendable {
         messages: [WireMessage],
         stream: Bool = true,
         reasoningEffort: String? = nil,
-        enabledTools: [String]? = nil
+        enabledTools: [String]? = nil,
+        appTools: [ToolSpec] = []
     ) {
         self.model = model
         self.messages = messages
         self.stream = stream
         self.reasoningEffort = reasoningEffort
-        // Translate the per-turn selection into standard OpenAI fields:
-        //   nil    => omit both (server offers every configured tool)
-        //   []     => tool_choice:"none" (plain chat)
-        //   names  => tools:[…] entries the server narrows to
-        if let enabledTools {
-            if enabledTools.isEmpty {
-                self.toolChoice = "none"
-            } else {
-                self.tools = enabledTools.map(ToolSpec.init(name:))
-            }
+        // Translate the per-turn selection into standard OpenAI fields. Server
+        // tools ride as name-only selectors; app-hosted tools ride as full
+        // schemas the server forwards back to us. `tool_choice:"none"` only when
+        // there are truly no tools (server selection [] AND no app tools).
+        var specs: [ToolSpec] = []
+        if let enabledTools, !enabledTools.isEmpty {
+            specs += enabledTools.map(ToolSpec.init(name:))
+        }
+        specs += appTools
+        if !specs.isEmpty {
+            self.tools = specs
+        } else if enabledTools?.isEmpty == true {
+            self.toolChoice = "none"
         }
     }
 }
@@ -69,6 +136,13 @@ public struct ChatRequest: Encodable, Sendable {
 public struct WireMessage: Codable, Sendable, Equatable {
     public var role: String
     public var content: WireContent
+    /// Tool calls on an assistant message (forwarded app-tool calls re-sent in
+    /// history). Omitted when nil, so plain messages stay byte-for-byte standard.
+    public var toolCalls: [WireToolCall]?
+    /// The call this message answers (a `tool`-role result).
+    public var toolCallId: String?
+    /// The tool name (a `tool`-role result).
+    public var name: String?
 
     public init(role: String, content: String) {
         self.role = role
@@ -78,6 +152,21 @@ public struct WireMessage: Codable, Sendable, Equatable {
     public init(role: String, content: WireContent) {
         self.role = role
         self.content = content
+    }
+
+    /// An assistant message carrying forwarded tool calls (empty text body).
+    public init(assistantToolCalls: [WireToolCall]) {
+        self.role = "assistant"
+        self.content = .text("")
+        self.toolCalls = assistantToolCalls
+    }
+
+    /// A `tool`-role result answering a specific tool call.
+    public init(toolResult toolCallId: String, name: String, content: String) {
+        self.role = "tool"
+        self.content = .text(content)
+        self.toolCallId = toolCallId
+        self.name = name
     }
 }
 
@@ -188,6 +277,9 @@ public struct ChatChunk: Decodable, Sendable {
             public let reasoning: String?
             public let reasoningContent: String?
             public let thinking: String?
+            /// Forwarded app-hosted tool calls (the chunk that hands a call back
+            /// to the app). Absent on ordinary content/reasoning chunks.
+            public let toolCalls: [WireToolCall]?
         }
         public let delta: Delta
         public let finishReason: String?
@@ -274,6 +366,80 @@ public struct Capabilities: Decodable, Sendable, Equatable {
 public enum ToolName {
     public static let webSearch = "web_search"
     public static let imageGeneration = "image_generation"
+    /// App-hosted: the model asks the user a multiple-choice question. The app
+    /// owns this tool's schema and executes it (renders the prompt).
+    public static let askUser = "ask_user_input"
+}
+
+/// Tools the **app** hosts: it sends their full schemas each turn and executes
+/// any call the orchestrator forwards back. Adding a future app tool is just a
+/// new entry here plus a handler in the view model.
+public enum AppTools {
+    /// The `ask_user_input` multiple-choice tool definition.
+    public static let askUser = ToolSpec(
+        name: ToolName.askUser,
+        description: "Present tappable multiple-choice options to gather the user's "
+            + "preferences, constraints, or goals before advising — tapping beats "
+            + "typing on mobile. Use it for ELICITATION: open-ended requests where "
+            + "the right answer depends on facts only the user has (e.g. \"plan a "
+            + "workout\" -> ask goals, time, equipment).\n\n"
+            + "First check the conversation: if the answer is already stated or "
+            + "inferable, don't ask — proceed and state your assumption.\n\n"
+            + "Do NOT use when the user poses an A-or-B choice (they want your "
+            + "recommendation), is venting, asks your opinion, asks a plain factual "
+            + "question, wants prose feedback (e.g. \"review my code\"), or already "
+            + "gave a detailed constrained prompt.\n\n"
+            + "Add a short lead-in before the options. One question is best, three "
+            + "max; each with 2-4 short, mutually-exclusive options. After calling, "
+            + "your turn ends — the user's pick arrives as their next message, so "
+            + "don't keep writing.",
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "questions": .object([
+                    "type": .string("array"),
+                    "description": .string("1-3 questions to ask the user."),
+                    "minItems": .int(1),
+                    "maxItems": .int(3),
+                    "items": .object([
+                        "type": .string("object"),
+                        "properties": .object([
+                            "question": .object([
+                                "type": .string("string"),
+                                "description": .string("The question text shown to the user."),
+                            ]),
+                            "options": .object([
+                                "type": .string("array"),
+                                "description": .string(
+                                    "2-4 short, mutually exclusive option labels."),
+                                "minItems": .int(2),
+                                "maxItems": .int(4),
+                                "items": .object(["type": .string("string")]),
+                            ]),
+                            "type": .object([
+                                "type": .string("string"),
+                                "enum": .array([
+                                    .string("single_select"),
+                                    .string("multi_select"),
+                                    .string("rank_priorities"),
+                                ]),
+                                "default": .string("single_select"),
+                                "description": .string(
+                                    "Question type: 'single_select' to choose one "
+                                        + "option, 'multi_select' to choose one or more, "
+                                        + "'rank_priorities' for drag-and-drop ranking."),
+                            ]),
+                        ]),
+                        "required": .array([.string("question"), .string("options")]),
+                    ]),
+                ]),
+            ]),
+            "required": .array([.string("questions")]),
+        ])
+    )
+
+    /// Every app-hosted tool schema to advertise this turn.
+    public static let all: [ToolSpec] = [askUser]
 }
 
 /// How the backend can be used after a capability probe (spec §2.1, FR-A2).

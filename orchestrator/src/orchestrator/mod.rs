@@ -17,6 +17,10 @@ pub enum TurnEvent {
     Reasoning(String),
     /// A token of the final assistant answer.
     Token(String),
+    /// App-hosted tool calls handed back to the app to execute. Emitted in place
+    /// of a final answer and immediately followed by `Done { reason:
+    /// "tool_calls" }`; the app fulfills them and resumes the turn next request.
+    ToolCalls(Vec<crate::openai::types::ToolCall>),
     /// The turn finished; carries the OpenAI `finish_reason`.
     Done { reason: String },
     /// A terminal error after streaming began (cannot change HTTP status now).

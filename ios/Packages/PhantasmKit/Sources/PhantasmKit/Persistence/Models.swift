@@ -117,6 +117,14 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
     public var updatedAt: Date
     /// `false` while streaming; flipped to `true` once the turn finishes.
     public var isComplete: Bool
+    /// JSON-encoded `[WireToolCall]` for an assistant message that forwarded
+    /// app-hosted tool calls; nil otherwise. Re-sent in history so the model sees
+    /// its own call paired with the tool result (client-executed tools, §2.3).
+    public var toolCalls: String?
+    /// The call this message answers (a `tool`-role result).
+    public var toolCallId: String?
+    /// The tool name (a `tool`-role result), e.g. `ask_user`.
+    public var name: String?
 
     public init(
         id: UUID = UUID(),
@@ -126,7 +134,10 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         reasoning: String = "",
         createdAt: Date = .now,
         updatedAt: Date? = nil,
-        isComplete: Bool = true
+        isComplete: Bool = true,
+        toolCalls: String? = nil,
+        toolCallId: String? = nil,
+        name: String? = nil
     ) {
         self.id = id
         self.conversationId = conversationId
@@ -136,6 +147,9 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.isComplete = isComplete
+        self.toolCalls = toolCalls
+        self.toolCallId = toolCallId
+        self.name = name
     }
 
     public static let databaseTableName = "message"
@@ -237,9 +251,52 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
 
 public extension Array where Element == ChatMessage {
     /// Full history mapped to the wire format (stateless server, XR-2). Only
-    /// completed messages with text or attachments are sent.
+    /// completed messages are sent. Assistant messages that forwarded app-tool
+    /// calls and their `tool`-role results round-trip so the model sees the
+    /// call/result pair; every assistant tool_call is guaranteed to be followed
+    /// by a matching tool result (a synthetic "(dismissed)" one is inserted for
+    /// an unanswered call), keeping the history OpenAI-valid.
     func wireHistory() -> [WireMessage] {
-        filter { $0.message.isComplete && !($0.message.content.isEmpty && $0.attachments.isEmpty) }
-            .map { WireMessage(role: $0.message.role, content: $0.wireContent()) }
+        let completed = filter { $0.message.isComplete }
+        var out: [WireMessage] = []
+        for (index, item) in completed.enumerated() {
+            let m = item.message
+            if m.role == "tool", let toolCallId = m.toolCallId {
+                out.append(WireMessage(
+                    toolResult: toolCallId,
+                    name: m.name ?? ToolName.askUser,
+                    content: m.content
+                ))
+                continue
+            }
+            if let calls = decodeToolCalls(m.toolCalls), !calls.isEmpty {
+                out.append(WireMessage(assistantToolCalls: calls))
+                let nextIsResult = completed[safe: index + 1]?.message.role == "tool"
+                if !nextIsResult {
+                    for call in calls {
+                        out.append(WireMessage(
+                            toolResult: call.id ?? "",
+                            name: call.function?.name ?? ToolName.askUser,
+                            content: "(dismissed)"
+                        ))
+                    }
+                }
+                continue
+            }
+            guard !(m.content.isEmpty && item.attachments.isEmpty) else { continue }
+            out.append(WireMessage(role: m.role, content: item.wireContent()))
+        }
+        return out
+    }
+
+    private func decodeToolCalls(_ json: String?) -> [WireToolCall]? {
+        guard let json, let data = json.data(using: .utf8) else { return nil }
+        return try? Wire.decoder().decode([WireToolCall].self, from: data)
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }

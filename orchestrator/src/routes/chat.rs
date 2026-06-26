@@ -14,13 +14,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 use crate::openai::sse::{done_event, ChunkFactory};
-use crate::openai::types::ChatRequest;
+use crate::openai::types::{ChatRequest, ToolCall};
 use crate::orchestrator::{run_turn, TurnEvent};
 use crate::state::AppState;
 
@@ -32,9 +32,11 @@ pub async fn chat_completions(
         return AppError::BadRequest("`messages` must not be empty".into()).into_response();
     }
 
-    // Resolve the per-turn tool selection from the standard `tools`/`tool_choice`
-    // fields before we move the rest of the request apart.
+    // Resolve the per-turn tool selection and any app-hosted tool definitions
+    // from the standard `tools`/`tool_choice` fields before we move the rest of
+    // the request apart.
     let enabled_tools = req.tool_selection();
+    let app_tools = req.app_tools();
 
     // Per XR-2 the app resends full history each turn, including multi-MB base64
     // image data-URIs from prior turns — so move the heavy fields out of `req`
@@ -93,6 +95,7 @@ pub async fn chat_completions(
                 model,
                 options,
                 enabled_tools,
+                app_tools,
                 preset,
                 tx,
                 cancel,
@@ -132,6 +135,7 @@ fn stream_response(
                 TurnEvent::Status(s) => yield factory.status(&s),
                 TurnEvent::Reasoning(r) => yield factory.reasoning(&r),
                 TurnEvent::Token(t) => yield factory.token(&t),
+                TurnEvent::ToolCalls(calls) => yield factory.tool_calls(&calls),
                 TurnEvent::Error(e) => {
                     yield factory.status(&format!("error: {e}"));
                     yield factory.token(&format!("\n\n⚠️ {e}"));
@@ -157,10 +161,12 @@ fn stream_response(
 async fn collect_response(model: String, mut rx: mpsc::Receiver<TurnEvent>) -> Response {
     let mut content = String::new();
     let mut reason = "stop".to_string();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
 
     while let Some(ev) = rx.recv().await {
         match ev {
             TurnEvent::Token(t) => content.push_str(&t),
+            TurnEvent::ToolCalls(calls) => tool_calls = calls,
             TurnEvent::Done { reason: r } => {
                 reason = r;
                 break;
@@ -175,6 +181,13 @@ async fn collect_response(model: String, mut rx: mpsc::Receiver<TurnEvent>) -> R
         }
     }
 
+    // App-hosted tool calls => standard `tool_calls` message with null content.
+    let message = if tool_calls.is_empty() {
+        json!({ "role": "assistant", "content": content })
+    } else {
+        json!({ "role": "assistant", "content": Value::Null, "tool_calls": wire_tool_calls(&tool_calls) })
+    };
+
     let body = json!({
         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         "object": "chat.completion",
@@ -182,11 +195,31 @@ async fn collect_response(model: String, mut rx: mpsc::Receiver<TurnEvent>) -> R
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": content },
+            "message": message,
             "finish_reason": reason,
         }],
     });
     Json(body).into_response()
+}
+
+/// Render forwarded tool calls as the non-streaming OpenAI `tool_calls` array
+/// (`arguments` as a JSON string), sharing id-minting with the streaming path.
+fn wire_tool_calls(calls: &[ToolCall]) -> Value {
+    Value::Array(
+        calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": crate::openai::sse::ensure_call_id(c),
+                    "type": "function",
+                    "function": {
+                        "name": c.function.name,
+                        "arguments": c.function.arguments.to_json_string(),
+                    }
+                })
+            })
+            .collect(),
+    )
 }
 
 fn now_secs() -> i64 {

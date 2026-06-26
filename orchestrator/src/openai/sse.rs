@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::response::sse::Event;
 
-use super::types::{ChatChunk, ChunkChoice, Delta};
+use super::types::{ChatChunk, ChunkChoice, Delta, DeltaFunctionCall, DeltaToolCall, ToolCall};
 
 /// A turn-scoped builder so every chunk shares one `id`/`model`/`created`.
 #[derive(Clone)]
@@ -90,6 +90,34 @@ impl ChunkFactory {
         to_event(&chunk)
     }
 
+    /// A chunk handing app-hosted tool calls back to the app to execute
+    /// (standard OpenAI `delta.tool_calls`). Followed by a `finish("tool_calls")`
+    /// chunk and `[DONE]`.
+    pub fn tool_calls(&self, calls: &[ToolCall]) -> Event {
+        let deltas = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| DeltaToolCall {
+                index: i as u32,
+                id: Some(ensure_call_id(c)),
+                kind: "function",
+                function: DeltaFunctionCall {
+                    name: c.function.name.clone(),
+                    arguments: c.function.arguments.to_json_string(),
+                },
+            })
+            .collect();
+        let chunk = self.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::tool_calls(deltas),
+                finish_reason: None,
+            }],
+            None,
+        );
+        to_event(&chunk)
+    }
+
     /// The terminal chunk carrying `finish_reason`.
     pub fn finish(&self, reason: &str) -> Event {
         let chunk = self.base(
@@ -107,6 +135,15 @@ impl ChunkFactory {
 /// The literal `[DONE]` sentinel that ends an OpenAI SSE stream.
 pub fn done_event() -> Event {
     Event::default().data("[DONE]")
+}
+
+/// A tool call's id, minting one when the upstream omitted it. Shared by the
+/// streaming (`ChunkFactory::tool_calls`) and non-streaming response paths so the
+/// id the app echoes back as `tool_call_id` is generated the same way.
+pub fn ensure_call_id(call: &ToolCall) -> String {
+    call.id
+        .clone()
+        .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()))
 }
 
 fn to_event(chunk: &ChatChunk) -> Event {
@@ -181,6 +218,56 @@ mod tests {
         );
         let v = chunk_json(&chunk);
         assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "plan");
+    }
+
+    #[test]
+    fn tool_calls_chunk_serializes_openai_shape() {
+        let f = ChunkFactory::new("m");
+        let chunk = f.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::tool_calls(vec![DeltaToolCall {
+                    index: 0,
+                    id: Some("call_x".into()),
+                    kind: "function",
+                    function: DeltaFunctionCall {
+                        name: "ask_user".into(),
+                        arguments: "{\"a\":1}".into(),
+                    },
+                }]),
+                finish_reason: None,
+            }],
+            None,
+        );
+        let v = chunk_json(&chunk);
+        let tc = &v["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["index"], 0);
+        assert_eq!(tc["id"], "call_x");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "ask_user");
+        assert_eq!(
+            tc["function"]["arguments"], "{\"a\":1}",
+            "arguments is a JSON-encoded string, not an object"
+        );
+    }
+
+    #[test]
+    fn ensure_call_id_mints_when_absent() {
+        use super::super::types::{FunctionCall, RawArguments};
+        let with_id = ToolCall {
+            id: Some("call_keep".into()),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "t".into(),
+                arguments: RawArguments::Obj(serde_json::json!({})),
+            },
+        };
+        assert_eq!(ensure_call_id(&with_id), "call_keep");
+        let without = ToolCall {
+            id: None,
+            ..with_id
+        };
+        assert!(ensure_call_id(&without).starts_with("call_"));
     }
 
     #[test]

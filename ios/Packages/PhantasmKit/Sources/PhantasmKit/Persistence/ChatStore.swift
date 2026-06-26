@@ -55,6 +55,11 @@ public protocol ChatStore: Sendable {
         isComplete: Bool
     ) async throws
 
+    /// Finalize a pending assistant row as one that forwarded app-hosted tool
+    /// calls: store the JSON-encoded `[WireToolCall]` and mark it complete. Used
+    /// when a turn ends with the model calling an app tool (e.g. `ask_user`).
+    func completeToolCallMessage(id: UUID, toolCalls: String) async throws
+
     /// Remove one message and its attachments. A no-op if the message no longer
     /// exists.
     func deleteMessage(id: UUID) async throws

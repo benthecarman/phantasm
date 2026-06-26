@@ -101,7 +101,8 @@ advertised only when the actual Brave-backed `web_search` schema is usable.
 `POST /v1/chat/completions` with `"stream": true`. Standard OpenAI request/
 response shape and SSE token streaming. This is the **only** chat endpoint and
 MUST work against raw Ollama unchanged. No separate tool endpoint, no custom
-WebSocket protocol — tools are invisible to the app.
+WebSocket protocol — *server* tools are invisible to the app, while *app-hosted*
+tools ride standard OpenAI `tool_calls` (§2.3).
 
 ### 2.2b Message content & attachments (multimodal)
 
@@ -138,10 +139,10 @@ upstream the server issues a no-message "load" (model resident via a warm-only
 `/api/chat` load instead. Plain OpenAI-compatible backends are not warmed (no
 free preload).
 
-### 2.3 Tools are server-side and invisible to the app
+### 2.3 Tools: server-side (invisible) and app-hosted (forwarded)
 
-Tool execution happens entirely on the **orchestrator ↔ Ollama** hop using
-standard OpenAI function-calling:
+Most tool execution happens entirely on the **orchestrator ↔ Ollama** hop using
+standard OpenAI function-calling and is invisible to the app:
 
 1. App sends a normal request to the orchestrator.
 2. Orchestrator calls Ollama as an OpenAI client, passing the configured `tools`.
@@ -149,6 +150,28 @@ standard OpenAI function-calling:
    appends `tool`-role results, and re-calls — capped at N iterations.
 4. Once Ollama returns a final assistant message, the orchestrator streams *that*
    back to the app as ordinary SSE chunks.
+
+**App-hosted (client-executed) tools.** The app may also host its own tools —
+ones it executes itself by rendering UI (the first is `ask_user_input`, a
+multiple-choice prompt). It advertises them by sending **full** function schemas
+(name + description + `parameters`) in the standard `tools` array. The
+orchestrator merges these with its configured server tools and offers all to the
+model, but it does **not** execute an app tool: when the model calls one, the
+orchestrator streams that call back to the app as a standard `delta.tool_calls`
+chunk terminated by `finish_reason: "tool_calls"`, then ends the turn. The app
+fulfills the call, appends a `tool`-role result (with the matching
+`tool_call_id`) to its history, and the model resumes on the next request. This
+stays stateless (XR-2): the assistant `tool_calls` message and the `tool` result
+both live in the app's history and are re-sent; every assistant `tool_calls`
+message MUST be followed by a matching `tool` result (the app synthesizes a
+"(dismissed)" result for an unanswered call). `arguments` is a JSON-encoded
+string on the wire. Standard OpenAI clients that don't host the tool simply never
+send its schema, so it's never offered to them.
+
+**Classification + collisions.** A `tools` entry is app-hosted iff it carries a
+`function.parameters` schema; a name-only entry is a server-tool selector
+(below). On a name collision the **server** tool wins — the app's same-named
+entry is dropped and the call is executed server-side.
 
 **Per-request tool selection (standard OpenAI fields).** The app scopes which
 server tools a turn may use via the **standard** OpenAI `tools` / `tool_choice`

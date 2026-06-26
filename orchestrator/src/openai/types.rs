@@ -5,7 +5,7 @@
 //! don't model yet without us rejecting them.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Incoming `POST /v1/chat/completions` body.
 #[derive(Debug, Clone, Deserialize)]
@@ -15,14 +15,19 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
-    /// Standard OpenAI `tools` array — used here purely for per-turn tool
-    /// *selection by name* (spec §2.3). The client lists the server tools it wants
-    /// offered this turn, either as a function entry
-    /// (`{"type":"function","function":{"name":"web_search"}}`) or the built-in
-    /// shorthand (`{"type":"web_search"}`); the server fills in the real schemas
-    /// and intersects with what it actually has configured, so a client can never
-    /// enable a tool the deployment lacks. Field absent => offer every configured
-    /// tool (older clients keep working). See [`Self::tool_selection`].
+    /// Standard OpenAI `tools` array, used two ways (spec §2.3):
+    ///   * **Server-tool selection by name** — a *name-only* entry
+    ///     (`{"type":"function","function":{"name":"web_search"}}` or the built-in
+    ///     shorthand `{"type":"web_search"}`) selects a server-side tool the
+    ///     deployment hosts. See [`Self::tool_selection`].
+    ///   * **App-hosted tool definition** — an entry that carries a full
+    ///     `function.parameters` schema is a tool the *app* executes. The server
+    ///     offers it to the model and forwards any call back to the app rather
+    ///     than running it. See [`Self::app_tools`].
+    ///
+    /// On a name collision the server-side tool wins (the app entry is dropped),
+    /// resolved in the chat route. Field absent => offer every configured server
+    /// tool and no app tools.
     #[serde(default)]
     pub tools: Option<Vec<ToolSpec>>,
     /// Standard OpenAI `tool_choice`. Only `"none"` is acted on — it forces plain
@@ -35,9 +40,9 @@ pub struct ChatRequest {
     pub extra: serde_json::Map<String, Value>,
 }
 
-/// One entry of the standard OpenAI `tools` array. Modeled permissively because
-/// the orchestrator uses it only to *name* which configured server tool to
-/// offer — not to receive a schema (the server owns the schemas).
+/// One entry of the standard OpenAI `tools` array. A name-only entry selects a
+/// configured server tool; an entry carrying `function.parameters` defines an
+/// app-hosted tool (the app executes it).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolSpec {
     #[serde(rename = "type", default)]
@@ -49,6 +54,13 @@ pub struct ToolSpec {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolSpecFunction {
     pub name: String,
+    /// Present only for app-hosted tool definitions.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The JSON-Schema parameters. Its presence is what marks this entry as an
+    /// app-hosted tool (a server-tool selector is name-only).
+    #[serde(default)]
+    pub parameters: Option<Value>,
 }
 
 impl ToolSpec {
@@ -83,6 +95,34 @@ impl ChatRequest {
         self.tools
             .as_ref()
             .map(|list| list.iter().filter_map(ToolSpec::selected_name).collect())
+    }
+
+    /// App-hosted tool definitions from the `tools` array: every entry that
+    /// carries a `function.parameters` schema, rebuilt into the OpenAI tool
+    /// envelope offered to the model. `tool_choice:"none"` (or no `tools`) => no
+    /// app tools. Calls to these tools are forwarded to the app to execute; the
+    /// chat route drops any whose name collides with a configured server tool
+    /// (server wins).
+    pub fn app_tools(&self) -> Vec<Value> {
+        if self.tool_choice.as_ref().and_then(Value::as_str) == Some("none") {
+            return Vec::new();
+        }
+        let Some(list) = &self.tools else {
+            return Vec::new();
+        };
+        list.iter()
+            .filter_map(|spec| {
+                let f = spec.function.as_ref()?;
+                let parameters = f.parameters.clone()?;
+                let mut function = serde_json::Map::new();
+                function.insert("name".into(), Value::String(f.name.clone()));
+                if let Some(desc) = &f.description {
+                    function.insert("description".into(), Value::String(desc.clone()));
+                }
+                function.insert("parameters".into(), parameters);
+                Some(json!({ "type": "function", "function": Value::Object(function) }))
+            })
+            .collect()
     }
 }
 
@@ -286,6 +326,55 @@ mod tests {
     }
 
     #[test]
+    fn app_tools_extracts_only_schema_bearing_entries() {
+        // A name-only entry is a server-tool selector; an entry with `parameters`
+        // is an app-hosted tool definition.
+        let r = req(r#"{"messages":[],"tools":[
+                {"type":"function","function":{"name":"web_search"}},
+                {"type":"function","function":{"name":"ask_user","description":"ask","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}
+            ]}"#);
+        let app = r.app_tools();
+        assert_eq!(app.len(), 1, "only the schema-bearing entry is an app tool");
+        assert_eq!(app[0]["function"]["name"], "ask_user");
+        assert_eq!(app[0]["function"]["description"], "ask");
+        assert!(app[0]["function"]["parameters"]["properties"]["q"].is_object());
+        // The name-only selector is still surfaced via tool_selection (server side).
+        assert_eq!(
+            r.tool_selection(),
+            Some(vec!["web_search".to_string(), "ask_user".to_string()])
+        );
+    }
+
+    #[test]
+    fn app_tools_omits_description_when_absent() {
+        let r = req(
+            r#"{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"type":"object"}}}]}"#,
+        );
+        let app = r.app_tools();
+        assert!(app[0]["function"].get("description").is_none());
+    }
+
+    #[test]
+    fn app_tools_empty_when_tool_choice_none() {
+        let r = req(
+            r#"{"messages":[],"tool_choice":"none","tools":[{"type":"function","function":{"name":"ask_user","parameters":{"type":"object"}}}]}"#,
+        );
+        assert!(r.app_tools().is_empty());
+    }
+
+    #[test]
+    fn raw_arguments_to_json_string() {
+        assert_eq!(
+            RawArguments::Obj(serde_json::json!({"a":1})).to_json_string(),
+            "{\"a\":1}"
+        );
+        assert_eq!(
+            RawArguments::Str("{\"a\":1}".into()).to_json_string(),
+            "{\"a\":1}"
+        );
+    }
+
+    #[test]
     fn plain_string_content_still_parses() {
         let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
         assert!(matches!(m.content, Some(MessageContent::Text(ref s)) if s == "hi"));
@@ -375,6 +464,16 @@ impl RawArguments {
             RawArguments::Obj(v) => serde_json::from_value(v.clone()),
         }
     }
+
+    /// Render the arguments as the JSON-encoded *string* the OpenAI wire format
+    /// uses for `tool_calls[].function.arguments` (both in streaming deltas and
+    /// the non-streaming message), regardless of how they arrived.
+    pub fn to_json_string(&self) -> String {
+        match self {
+            RawArguments::Str(s) => s.clone(),
+            RawArguments::Obj(v) => serde_json::to_string(v).unwrap_or_else(|_| "{}".into()),
+        }
+    }
 }
 
 // ---- Streaming chunk emitted to the client ----
@@ -412,30 +511,56 @@ pub struct Delta {
     /// standard client that understands reasoning renders it — not just our app.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Forwarded app-hosted tool calls (standard OpenAI streaming shape). Present
+    /// only on the chunk that hands a tool call back to the app to execute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
 impl Delta {
     pub fn role(role: impl Into<String>) -> Self {
         Delta {
             role: Some(role.into()),
-            content: None,
-            reasoning_content: None,
+            ..Default::default()
         }
     }
 
     pub fn content(content: impl Into<String>) -> Self {
         Delta {
-            role: None,
             content: Some(content.into()),
-            reasoning_content: None,
+            ..Default::default()
         }
     }
 
     pub fn reasoning(reasoning: impl Into<String>) -> Self {
         Delta {
-            role: None,
-            content: None,
             reasoning_content: Some(reasoning.into()),
+            ..Default::default()
         }
     }
+
+    pub fn tool_calls(calls: Vec<DeltaToolCall>) -> Self {
+        Delta {
+            tool_calls: Some(calls),
+            ..Default::default()
+        }
+    }
+}
+
+/// One entry of a streaming `delta.tool_calls` array (OpenAI shape). `arguments`
+/// is a JSON-encoded *string*, not an object.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeltaToolCall {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: DeltaFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeltaFunctionCall {
+    pub name: String,
+    pub arguments: String,
 }

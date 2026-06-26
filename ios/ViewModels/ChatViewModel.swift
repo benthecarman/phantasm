@@ -20,6 +20,13 @@ final class ChatViewModel {
     private(set) var streamingReasoning = ""
     private(set) var statusText: String?
     var errorMessage: String?
+    /// A pending `ask_user` prompt awaiting the user's answer (the model called
+    /// the app-hosted `ask_user` tool). The composer + `ChoicePromptView` resolve
+    /// it via `answerPendingChoice`. Nil when there's nothing to answer.
+    private(set) var pendingChoice: MultipleChoice?
+    /// Tool calls forwarded this turn, captured during streaming so `finish` can
+    /// persist them onto the assistant row.
+    private var pendingToolCalls: [WireToolCall]?
 
     private var env: AppEnvironment?
     private var store: ChatStore?
@@ -228,6 +235,15 @@ final class ChatViewModel {
     }
 
     func send(_ rawText: String, attachments: [PendingAttachment] = []) {
+        // A typed message while an `ask_user` prompt is pending IS the answer (it
+        // must be returned as the tool result before the turn can continue).
+        if pendingChoice != nil {
+            let answer = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !answer.isEmpty {
+                answerPendingChoice(answer)
+                return
+            }
+        }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!text.isEmpty || !attachments.isEmpty), canSend,
               let env, let store, var conversation,
@@ -444,6 +460,12 @@ final class ChatViewModel {
         )
         // Scope which server tools this turn may use (spec §2.3). Omitted entirely
         // for backends with no tool manifest, keeping those requests standard.
+        // App-hosted tools (e.g. ask_user) ride as full schemas the orchestrator
+        // forwards back to us — only against an orchestrator with a tool-capable
+        // model (a raw-Ollama backend has nothing to forward through).
+        let appTools = (env.backendMode.capabilities != nil && env.supportsTools(model))
+            ? AppTools.all
+            : []
         let request = ChatRequest(
             model: wireModel,
             messages: detail.wireHistory(),
@@ -454,7 +476,8 @@ final class ChatViewModel {
             ),
             enabledTools: detail.conversation.requestedToolNames(
                 supporting: env.backendMode.capabilities?.tools
-            )
+            ),
+            appTools: appTools
         )
         let stream = env.backendMode.usesOllamaNativeChat
             ? env.ollamaChatClient.stream(request, base: base, token: token)
@@ -469,8 +492,18 @@ final class ChatViewModel {
                 case .reasoning(let r):
                     streamingReasoning += r
                 case .status(let s): statusText = s
+                case .toolCalls(let calls):
+                    statusText = nil
+                    pendingToolCalls = calls
+                    pendingChoice = AskUserParser.firstChoice(in: calls)
                 case .done: break
                 }
+            }
+            // The model called an app-hosted tool: commit the tool_call row and
+            // wait for the user's answer (handled in `finish`).
+            if pendingToolCalls != nil {
+                finish(error: nil)
+                return
             }
             let emptyResponse = streamingText.isEmpty
             if emptyResponse && (!isSceneActive || suspendedByScene) {
@@ -499,8 +532,21 @@ final class ChatViewModel {
         guard !isStreaming, isSceneActive, isViewVisible,
               let env, let store, let conversation,
               let base = env.activeProfile?.baseURL else { return }
-        guard let detail = try? await store.conversationDetail(id: conversation.id),
-              let pending = detail.messages.last,
+        guard let detail = try? await store.conversationDetail(id: conversation.id) else { return }
+
+        // Restore an unanswered `ask_user` prompt. Its assistant tool_call row is
+        // *complete*, so the streaming-recovery path below won't catch it.
+        if pendingChoice == nil, let last = detail.messages.last,
+           last.message.role == "assistant", last.message.isComplete,
+           let json = last.message.toolCalls,
+           let data = json.data(using: .utf8),
+           let calls = try? Wire.decoder().decode([WireToolCall].self, from: data),
+           let choice = AskUserParser.firstChoice(in: calls) {
+            pendingChoice = choice
+            return
+        }
+
+        guard let pending = detail.messages.last,
               pending.message.role == "assistant",
               !pending.message.isComplete else { return }
         let previous = detail.messages.dropLast().last
@@ -568,6 +614,69 @@ final class ChatViewModel {
         }
     }
 
+    /// Answer a pending `ask_user` prompt: persist the choice as a `tool`-role
+    /// result for the forwarded call, then stream the model's continuation. The
+    /// answer is the tapped option(s) or free-typed text — either way it must be
+    /// returned as the tool result before the turn can resume.
+    func answerPendingChoice(_ answer: String) {
+        let text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let choice = pendingChoice, !isStreaming,
+              let env, let store, let conversation,
+              let base = env.activeProfile?.baseURL else { return }
+        guard let model = env.backendMode.resolvedChatModel(
+            conversationModel: conversation.modelID,
+            defaultModel: env.preferredModel
+        ) else { return }
+
+        pendingChoice = nil
+        let toolMessage = Message(
+            conversationId: conversation.id,
+            role: "tool",
+            content: text,
+            isComplete: true,
+            toolCallId: choice.toolCallId,
+            name: ToolName.askUser
+        )
+
+        isStreaming = true
+        streamingText = ""
+        streamingReasoning = ""
+        statusText = nil
+        pendingAssistantMessageID = nil
+        pendingAssistantPreviewMessageID = nil
+        suspendedByScene = false
+        errorMessage = nil
+        let token = env.activeToken ?? ""
+
+        task = Task { [weak self] in
+            do {
+                try await store.insertMessage(toolMessage, attachments: [])
+            } catch {
+                self?.finish(error: AppError.from(error))
+                return
+            }
+            guard await self?.insertPendingAssistantMessage(
+                conversationId: conversation.id,
+                store: store
+            ) != nil else { return }
+            if Task.isCancelled {
+                self?.finishAfterStreamFailure(CancellationError())
+                return
+            }
+            await self?.streamReply(
+                conversationId: conversation.id, model: model,
+                base: base, token: token, env: env, store: store
+            )
+        }
+    }
+
+    /// JSON-encode forwarded tool calls for durable storage on the assistant row.
+    private static func encodeToolCalls(_ calls: [WireToolCall]) -> String {
+        guard let data = try? Wire.encoder().encode(calls),
+              let json = String(data: data, encoding: .utf8) else { return "[]" }
+        return json
+    }
+
     /// Stop button (FR-A9): abort the SSE connection; keep whatever streamed.
     func stop() {
         task?.cancel()
@@ -597,6 +706,31 @@ final class ChatViewModel {
         task = nil
         if emptyPendingDisposition != .keepForRecovery {
             suspendedByScene = false
+        }
+
+        // App-hosted tool call: commit the pending assistant row as a tool_call
+        // message (no streamed text) and keep `pendingChoice` up. The user's
+        // answer (tap or free-type) starts the next turn.
+        if error == nil, let calls = pendingToolCalls, !calls.isEmpty {
+            pendingToolCalls = nil
+            let pendingID = pendingAssistantMessageID
+            pendingAssistantMessageID = nil
+            pendingAssistantPreviewMessageID = nil
+            streamingText = ""
+            streamingReasoning = ""
+            let json = Self.encodeToolCalls(calls)
+            if let store, let conversation, let pendingID {
+                Task { [weak self] in
+                    try? await store.completeToolCallMessage(id: pendingID, toolCalls: json)
+                    try? await store.updateConversation(
+                        id: conversation.id, title: nil, modelID: nil, updatedAt: .now
+                    )
+                    self?.endBackgroundStreamingTask()
+                }
+            } else {
+                endBackgroundStreamingTask()
+            }
+            return
         }
 
         // Commit any streamed text as one complete assistant message.

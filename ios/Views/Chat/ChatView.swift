@@ -84,6 +84,11 @@ struct ChatView: View {
             // (FR-A "flows over text"), rather than sitting in its own reserved
             // strip with the page background filling the gap behind the keyboard.
             .safeAreaInset(edge: .bottom) {
+              VStack(spacing: 8) {
+                if let choice = vm.pendingChoice {
+                    ChoicePromptView(choice: choice) { vm.answerPendingChoice($0) }
+                        .id(choice.toolCallId)
+                }
                 ComposerView(
                     input: $input,
                     attachments: $attachments,
@@ -121,6 +126,7 @@ struct ChatView: View {
                     onSend: send,
                     onStop: { vm.stop() }
                 )
+              }
             }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)

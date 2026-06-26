@@ -14,6 +14,7 @@
 //! `TurnEvent::Error` rather than aborting, since the HTTP status is committed.
 //! Cancellation is checked at every await via `cancel`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -23,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::ollama::ChatBackend;
-use crate::openai::types::ChatMessage;
+use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{ToolExecutor, TurnContext};
 use crate::orchestrator::{ResearchPreset, TurnEvent};
 
@@ -62,6 +63,15 @@ pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec
         .collect()
 }
 
+/// Read `function.name` out of an OpenAI tool-schema `Value`.
+fn schema_name(schema: &Value) -> Option<String> {
+    schema
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn<B, T>(
     cfg: Arc<Config>,
@@ -72,6 +82,7 @@ pub async fn run_turn<B, T>(
     model: String,
     options: Map<String, Value>,
     enabled_tools: Option<Vec<String>>,
+    app_tools: Vec<Value>,
     preset: Option<&'static ResearchPreset>,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
@@ -126,8 +137,22 @@ pub async fn run_turn<B, T>(
         return;
     }
 
-    // A plain turn honors the client's per-turn tool selection.
-    let schemas = select_schemas(tools.schemas(), &enabled_tools);
+    // A plain turn honors the client's per-turn tool selection, then merges in
+    // any app-hosted tools the request defined. On a name collision the server
+    // tool wins (the app entry is dropped); `app_names` records which offered
+    // tools must be forwarded to the app rather than executed here.
+    let mut schemas = select_schemas(tools.schemas(), &enabled_tools);
+    let server_names: HashSet<String> = schemas.iter().filter_map(schema_name).collect();
+    let mut app_names: HashSet<String> = HashSet::new();
+    for tool in app_tools {
+        match schema_name(&tool) {
+            Some(name) if !server_names.contains(&name) => {
+                app_names.insert(name);
+                schemas.push(tool);
+            }
+            _ => {} // unnamed, or collides with a server tool — drop it
+        }
+    }
 
     // Plain fast path: no tools to offer => one streaming call.
     if schemas.is_empty() {
@@ -176,6 +201,27 @@ pub async fn run_turn<B, T>(
                 return;
             }
             Some(calls) => {
+                // App-hosted tool calls are handed back to the app to execute;
+                // the turn ends here. The app owns persistence of the assistant
+                // tool_call message and the tool result, re-sending them next
+                // turn (stateless, XR-2). Any co-occurring server calls are
+                // dropped — the model re-issues them next turn once it has the
+                // app's answer.
+                let app_calls: Vec<ToolCall> = calls
+                    .iter()
+                    .filter(|c| app_names.contains(&c.function.name))
+                    .cloned()
+                    .collect();
+                if !app_calls.is_empty() {
+                    let _ = tx.send(TurnEvent::ToolCalls(app_calls)).await;
+                    let _ = tx
+                        .send(TurnEvent::Done {
+                            reason: "tool_calls".into(),
+                        })
+                        .await;
+                    return;
+                }
+
                 messages.push(resp); // assistant message carrying the tool_calls
                 for call in &calls {
                     if cancel.is_cancelled() {
@@ -533,6 +579,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            Vec::new(),
             None,
             tx,
             CancellationToken::new(),
@@ -567,6 +614,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            Vec::new(),
             None,
             tx,
             CancellationToken::new(),
@@ -604,6 +652,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            Vec::new(),
             None,
             tx,
             CancellationToken::new(),
@@ -647,6 +696,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            Vec::new(),
             preset,
             tx,
             CancellationToken::new(),
@@ -683,6 +733,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
+            Vec::new(),
             None,
             tx,
             cancel,
@@ -694,6 +745,176 @@ mod tests {
 
     fn named_schema(name: &str) -> Value {
         serde_json::json!({ "type": "function", "function": { "name": name } })
+    }
+
+    /// An app-hosted tool definition: a `tools` envelope that carries a
+    /// `parameters` schema (which is what marks it app-side).
+    fn app_schema(name: &str) -> Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "app tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })
+    }
+
+    fn assistant_calling_many(names: &[&str]) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| ToolCall {
+                        id: Some(format!("call_{i}")),
+                        kind: "function".into(),
+                        function: FunctionCall {
+                            name: (*n).into(),
+                            arguments: RawArguments::Obj(serde_json::json!({})),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// The names in the first `ToolCalls` event, if any.
+    fn forwarded_names(events: &[TurnEvent]) -> Vec<String> {
+        events
+            .iter()
+            .find_map(|e| match e {
+                TurnEvent::ToolCalls(calls) => {
+                    Some(calls.iter().map(|c| c.function.name.clone()).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn app_tool_call_is_forwarded_not_executed() {
+        let backend =
+            ScriptedBackend::new(vec![assistant_calling("ask_user")], vec!["unused".into()]);
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![]), // no server tools
+            executed: executed.clone(),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            None,
+            vec![app_schema("ask_user")],
+            None,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let events = drain(rx).await;
+        assert_eq!(forwarded_names(&events), vec!["ask_user".to_string()]);
+        assert!(
+            matches!(events.last(), Some(TurnEvent::Done { reason }) if reason == "tool_calls"),
+            "turn ends with finish_reason tool_calls"
+        );
+        assert!(
+            executed.lock().unwrap().is_empty(),
+            "app tool must not be executed server-side"
+        );
+        assert_eq!(
+            *backend.once_calls.lock().unwrap(),
+            1,
+            "turn ends right after the forwarded call"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_tool_colliding_with_server_tool_runs_server_side() {
+        // The app defines a tool named like a configured server tool; server wins
+        // — the call is executed here, never forwarded.
+        let backend =
+            ScriptedBackend::new(vec![assistant_calling("web_search")], vec!["answer".into()]);
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![named_schema("web_search")]),
+            executed: executed.clone(),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            None,
+            vec![app_schema("web_search")],
+            None,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let events = drain(rx).await;
+        assert!(
+            forwarded_names(&events).is_empty(),
+            "a colliding name is never forwarded"
+        );
+        assert_eq!(
+            executed.lock().unwrap().as_slice(),
+            &["web_search".to_string()]
+        );
+        assert_eq!(collect_text(&events), "answer");
+    }
+
+    #[tokio::test]
+    async fn mixed_app_and_server_calls_forward_only_app() {
+        // One assistant message calls both a server tool and an app tool: only the
+        // app tool is forwarded; the server call is dropped this turn.
+        let backend = ScriptedBackend::new(
+            vec![assistant_calling_many(&["web_search", "ask_user"])],
+            vec!["unused".into()],
+        );
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![named_schema("web_search")]),
+            executed: executed.clone(),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            None,
+            vec![app_schema("ask_user")],
+            None,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let events = drain(rx).await;
+        assert_eq!(forwarded_names(&events), vec!["ask_user".to_string()]);
+        assert!(
+            executed.lock().unwrap().is_empty(),
+            "co-occurring server call is dropped this turn"
+        );
+        assert!(
+            matches!(events.last(), Some(TurnEvent::Done { reason }) if reason == "tool_calls")
+        );
     }
 
     #[test]
@@ -754,6 +975,7 @@ mod tests {
             "m".into(),
             Map::new(),
             Some(vec![]),
+            Vec::new(),
             None,
             tx,
             CancellationToken::new(),

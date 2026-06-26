@@ -91,6 +91,50 @@ final class SSEParserTests: XCTestCase {
         let events = try await collect(chatEventStream(lines: linesStream(lines)))
         XCTAssertEqual(events, [.reasoning("Plan"), .done])
     }
+
+    func testWholeToolCallChunkSurfacesBeforeDone() async throws {
+        // The orchestrator sends the tool call whole in one chunk, then a finish
+        // chunk with finish_reason: tool_calls.
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"ask_user\",\"arguments\":\"{\\\"question\\\":\\\"Pick\\\",\\\"options\\\":[\\\"a\\\",\\\"b\\\"]}\"}}]}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+            "",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        guard case .toolCalls(let calls) = events.first else {
+            return XCTFail("expected toolCalls first, got \(events)")
+        }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls[0].id, "call_1")
+        XCTAssertEqual(calls[0].type, "function")
+        XCTAssertEqual(calls[0].function?.name, "ask_user")
+        // arguments is a JSON-encoded string, decodable on its own.
+        XCTAssertEqual(
+            calls[0].function?.arguments,
+            "{\"question\":\"Pick\",\"options\":[\"a\",\"b\"]}"
+        )
+        XCTAssertEqual(events.last, .done)
+    }
+
+    func testFragmentedToolCallArgumentsAreConcatenated() async throws {
+        // Standard OpenAI streams arguments in fragments sharing one index.
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"ask_user\",\"arguments\":\"{\\\"question\\\":\"}}]}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Hi\\\"}\"}}]}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+            "",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        guard case .toolCalls(let calls) = events.first else {
+            return XCTFail("expected toolCalls first, got \(events)")
+        }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls[0].id, "call_9")
+        XCTAssertEqual(calls[0].function?.arguments, "{\"question\":\"Hi\"}")
+    }
 }
 
 final class OllamaNativeChatClientTests: XCTestCase {

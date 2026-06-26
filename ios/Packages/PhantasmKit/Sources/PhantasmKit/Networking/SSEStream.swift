@@ -32,11 +32,26 @@ private func stripDataPrefix(_ line: String) -> String? {
     return afterColon.hasPrefix(" ") ? String(afterColon.dropFirst()) : String(afterColon)
 }
 
+/// Merge a streamed tool-call fragment into the accumulator at `key`: keep the
+/// first non-nil id/name/type, and append argument fragments. The orchestrator
+/// sends each call whole in one chunk, but this also handles standard OpenAI
+/// fragmented streaming.
+func mergeToolCall(_ call: WireToolCall, into acc: inout [Int: WireToolCall], key: Int) {
+    var merged = acc[key] ?? WireToolCall(index: key, id: nil, type: call.type, function: nil)
+    if let id = call.id { merged.id = id }
+    if let type = call.type { merged.type = type }
+    let name = merged.function?.name ?? call.function?.name
+    let args = (merged.function?.arguments ?? "") + (call.function?.arguments ?? "")
+    merged.function = WireToolCall.Function(name: name, arguments: args.isEmpty ? nil : args)
+    acc[key] = merged
+}
+
 /// A domain event consumed by the chat UI.
 public enum ChatStreamEvent: Sendable, Equatable {
     case token(String)      // append delta.content
     case reasoning(String)  // append model thinking/reasoning deltas
     case status(String)     // x_status -> progress UI (FR-A8)
+    case toolCalls([WireToolCall]) // forwarded app-hosted tool calls (finish_reason: tool_calls)
     case done
 }
 
@@ -52,6 +67,10 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
     AsyncThrowingStream { continuation in
         let task = Task {
             var dataBuffer: [String] = []
+            // Forwarded tool calls accumulate across chunks (merged by index, so
+            // standard fragmented streaming works); flushed on the terminating
+            // frame before `.done`.
+            var toolCalls: [Int: WireToolCall] = [:]
 
             func flush() -> Bool {
                 // Returns true if the stream should end (decoded a finish).
@@ -71,7 +90,18 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                 if let content = chunk.choices.first?.delta.content, !content.isEmpty {
                     continuation.yield(.token(content))
                 }
+                for (offset, call) in (chunk.choices.first?.delta.toolCalls ?? []).enumerated() {
+                    let key = call.index ?? offset
+                    mergeToolCall(call, into: &toolCalls, key: key)
+                }
                 return chunk.choices.first?.finishReason != nil
+            }
+
+            // Emit accumulated tool calls (ordered by index) before `.done`.
+            func emitToolCallsIfAny() {
+                guard !toolCalls.isEmpty else { return }
+                let ordered = toolCalls.keys.sorted().compactMap { toolCalls[$0] }
+                continuation.yield(.toolCalls(ordered))
             }
 
             do {
@@ -82,12 +112,14 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                         dataBuffer.append(data)
                     case .blank:
                         if flush() {
+                            emitToolCallsIfAny()
                             continuation.yield(.done)
                             continuation.finish()
                             return
                         }
                     case .done:
                         _ = flush()
+                        emitToolCallsIfAny()
                         continuation.yield(.done)
                         continuation.finish()
                         return
@@ -96,6 +128,7 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                     }
                 }
                 _ = flush() // trailing frame without a closing blank line
+                emitToolCallsIfAny()
                 continuation.finish()
             } catch is CancellationError {
                 continuation.finish()

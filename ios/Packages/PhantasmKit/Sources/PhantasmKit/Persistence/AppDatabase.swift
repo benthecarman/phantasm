@@ -130,6 +130,17 @@ public final class AppDatabase: Sendable {
                     """
             )
         }
+
+        // Client-executed (app-hosted) tools: an assistant message can carry
+        // forwarded tool calls, and a `tool`-role message records the user's
+        // answer. All nil for existing rows (ordinary chat/assistant messages).
+        migrator.registerMigration("v6_client_tools") { db in
+            try db.alter(table: "message") { t in
+                t.add(column: "toolCalls", .text)
+                t.add(column: "toolCallId", .text)
+                t.add(column: "name", .text)
+            }
+        }
         return migrator
     }
 }
@@ -172,6 +183,16 @@ extension AppDatabase: ChatStore {
             message.content = content
             message.reasoning = reasoning
             message.isComplete = isComplete
+            message.updatedAt = Date()
+            try message.update(db)
+        }
+    }
+
+    public func completeToolCallMessage(id: UUID, toolCalls: String) async throws {
+        try await dbWriter.write { db in
+            guard var message = try Message.fetchOne(db, key: id) else { return }
+            message.toolCalls = toolCalls
+            message.isComplete = true
             message.updatedAt = Date()
             try message.update(db)
         }
