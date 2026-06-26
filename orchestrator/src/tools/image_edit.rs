@@ -114,7 +114,7 @@ async fn edit(
         .decode(input_b64)
         .map_err(|e| format!("input image is not valid base64: {e}"))?;
     let filename = format!("phantasm_edit_{}.png", uuid::Uuid::new_v4().simple());
-    let image_name = comfy::upload_image(cfg, http, bytes, &filename).await?;
+    let image_name = comfy::upload_temp_image(cfg, http, bytes, &filename).await?;
 
     let mut workflow = load_workflow(cfg.comfy_edit_workflow.as_ref()).await?;
     inject_inputs(cfg, &mut workflow, args, &image_name)?;

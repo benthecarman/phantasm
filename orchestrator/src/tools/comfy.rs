@@ -7,8 +7,9 @@
 //! `x_status`, and fetches the finished image from `/history` + `/view`,
 //! returning it as a base64 `data:` URI ready to embed as markdown.
 //!
-//! The edit tool additionally needs the user's image inside ComfyUI's input
-//! folder first; [`upload_image`] handles that via `POST /upload/image`.
+//! The edit tool additionally needs the user's image available to ComfyUI first;
+//! [`upload_temp_image`] handles that via `POST /upload/image` with
+//! `type=temp`, then references it as an annotated `LoadImage` path.
 
 use std::time::Duration;
 
@@ -33,10 +34,11 @@ pub fn set_input(workflow: &mut Value, target: &NodeInput, value: Value) -> Resu
     Ok(())
 }
 
-/// Upload raw image bytes into ComfyUI's `input` folder so a `LoadImage` node can
-/// reference them. Returns the filename ComfyUI stored it under (it may rename to
-/// avoid collisions, so we use the returned name, not the one we sent).
-pub async fn upload_image(
+/// Upload raw image bytes into ComfyUI's temp folder so a `LoadImage` node can
+/// reference them without placing user attachments in ComfyUI's durable input
+/// library. Returns an annotated filename like `foo.png [temp]` (ComfyUI's
+/// `LoadImage` resolves `[temp]` via `folder_paths.get_annotated_filepath`).
+pub async fn upload_temp_image(
     cfg: &Config,
     http: &reqwest::Client,
     bytes: Vec<u8>,
@@ -52,7 +54,7 @@ pub async fn upload_image(
         .map_err(|e| e.to_string())?;
     let form = reqwest::multipart::Form::new()
         .part("image", part)
-        .text("type", "input")
+        .text("type", "temp")
         .text("overwrite", "true");
     let resp = http
         .post(url)
@@ -70,11 +72,10 @@ pub async fn upload_image(
         .get("name")
         .and_then(|n| n.as_str())
         .ok_or_else(|| "upload response missing name".to_string())?;
-    // A non-root subfolder is referenced as `subfolder/name` by LoadImage.
-    match v.get("subfolder").and_then(|s| s.as_str()) {
-        Some(sub) if !sub.is_empty() => Ok(format!("{sub}/{name}")),
-        _ => Ok(name.to_string()),
-    }
+    Ok(temp_image_ref(
+        name,
+        v.get("subfolder").and_then(|s| s.as_str()).unwrap_or(""),
+    ))
 }
 
 /// Submit a fully-prepared workflow, relay progress, and return the produced
@@ -82,9 +83,11 @@ pub async fn upload_image(
 pub async fn run_workflow(
     cfg: &Config,
     http: &reqwest::Client,
-    workflow: Value,
+    mut workflow: Value,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<String, String> {
+    force_temporary_outputs(&mut workflow);
+
     let client_id = uuid::Uuid::new_v4().simple().to_string();
 
     // Open the progress WS *before* submitting so we never miss early frames.
@@ -140,6 +143,37 @@ pub async fn run_workflow(
     let (bytes, mime) = fetch_image(cfg, http, &prompt_id).await?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:{mime};base64,{b64}"))
+}
+
+fn temp_image_ref(name: &str, subfolder: &str) -> String {
+    let path = if subfolder.is_empty() {
+        name.to_string()
+    } else {
+        format!("{subfolder}/{name}")
+    };
+    format!("{path} [temp]")
+}
+
+/// Convert durable built-in image output nodes into temp previews. This lets
+/// ComfyUI expose the image through `/history` + `/view` without writing it to
+/// the durable output library. Custom workflows may still use `SaveImage`; the
+/// orchestrator rewrites it at submission time so the privacy boundary does not
+/// depend on every workflow author remembering to use `PreviewImage`.
+fn force_temporary_outputs(workflow: &mut Value) {
+    let Some(nodes) = workflow.as_object_mut() else {
+        return;
+    };
+    for node in nodes.values_mut() {
+        let Some(obj) = node.as_object_mut() else {
+            continue;
+        };
+        if obj.get("class_type").and_then(Value::as_str) == Some("SaveImage") {
+            obj.insert("class_type".into(), Value::String("PreviewImage".into()));
+            if let Some(inputs) = obj.get_mut("inputs").and_then(Value::as_object_mut) {
+                inputs.remove("filename_prefix");
+            }
+        }
+    }
 }
 
 /// Returns `Some(true)` when generation for our prompt completed.
@@ -316,6 +350,33 @@ mod tests {
         let img = find_first_image(&hist, "pid").unwrap();
         assert_eq!(img.filename, "out.png");
         assert_eq!(img.kind, "output");
+    }
+
+    #[test]
+    fn temp_image_ref_marks_comfy_temp_folder() {
+        assert_eq!(temp_image_ref("in.png", ""), "in.png [temp]");
+        assert_eq!(temp_image_ref("in.png", "turns"), "turns/in.png [temp]");
+    }
+
+    #[test]
+    fn force_temporary_outputs_rewrites_save_image() {
+        let mut wf = serde_json::json!({
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": { "filename_prefix": "phantasm", "images": ["8", 0] }
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": { "samples": ["3", 0] }
+            }
+        });
+
+        force_temporary_outputs(&mut wf);
+
+        assert_eq!(wf["9"]["class_type"], "PreviewImage");
+        assert_eq!(wf["9"]["inputs"]["images"], serde_json::json!(["8", 0]));
+        assert!(wf["9"]["inputs"].get("filename_prefix").is_none());
+        assert_eq!(wf["8"]["class_type"], "VAEDecode");
     }
 
     #[tokio::test]

@@ -396,7 +396,7 @@ async fn fetch_pages(
 ///    `<p>` regions, only their text is kept (drops chrome). Falls back to the
 ///    full body when none are present, so content-light pages still extract.
 /// 3. Strips remaining tags and collapses whitespace, then truncates at `cap`.
-fn html_to_text(html: &str, cap: usize) -> String {
+pub(crate) fn html_to_text(html: &str, cap: usize) -> String {
     let stripped = remove_blocks(html, &["script", "style", "head", "noscript", "template"]);
 
     // Prefer main-content regions when present (cleanly, by block extraction).

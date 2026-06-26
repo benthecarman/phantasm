@@ -3,8 +3,8 @@
 An OpenAI-compatible orchestration proxy for self-hosted AI. It sits between a
 thin chat client (the Phantasm iOS app, or any OpenAI client) and your own
 [Ollama](https://ollama.com) + [ComfyUI](https://github.com/comfyanonymous/ComfyUI),
-adding **web search** and **image generation** via a server-side tool loop that
-is *invisible to the client*.
+adding **read-only tools**, **web search**, and **image generation** via a
+server-side tool loop that is *invisible to the client*.
 
 The client only ever speaks plain OpenAI SSE, so it can point at this
 orchestrator, a bare Ollama instance, or OpenAI itself — unchanged.
@@ -15,8 +15,10 @@ orchestrator, a bare Ollama instance, or OpenAI itself — unchanged.
 iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ Ollama
                              │      └─or OpenAI-compatible /v1
                              │
-                             ├── Brave Search  (web_search tool)
-                             └── ComfyUI       (image_generation tool)
+                             ├── Brave Search / web fetch / APIs
+                             ├── local utility tools (time, calculator, units)
+                             ├── tesseract OCR (temp-file handoff only)
+                             └── ComfyUI       (image_generation / image_edit)
 ```
 
 - **Plain turns** are a near-passthrough: one upstream streaming chat call,
@@ -26,6 +28,13 @@ iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ O
   progress on the additive `x_status` SSE field.
 - Generated **images** are embedded in the answer as markdown
   `![generated](data:image/png;base64,…)`.
+- **Tool privacy boundary:** tools do not persist conversation content, fetched
+  pages, tool outputs, attachments, or intermediate data to durable local
+  storage. The only cache is in-memory and scoped to one turn. When a backend
+  needs file-backed handoff (for example ComfyUI image editing), Phantasm uses
+  temp/scratch paths rather than durable input/output libraries. The
+  orchestrator does not provide local filesystem search/read/write or local-docs
+  indexing tools.
 
 > **Upstream detection.** At startup the orchestrator probes `OLLAMA_BASE_URL`.
 > If `/api/tags` is present, it uses native Ollama `/api/chat`; otherwise, if
@@ -60,9 +69,12 @@ PHANTASM_AUTH_TOKEN=dev-secret OLLAMA_BASE_URL=http://localhost:11434 \
   cargo run
 ```
 
-Enable tools with the env toggles in `.env.example` (`TOOL_WEB_SEARCH` +
-`BRAVE_API_KEY`; `TOOL_IMAGE_GEN` + `COMFYUI_GEN_WORKFLOW`; `TOOL_IMAGE_EDIT` +
-`COMFYUI_EDIT_WORKFLOW`).
+Enable tools with the env toggles in `.env.example`. The read-only first-party
+tools are `TOOL_WEB_FETCH`, `TOOL_CURRENT_TIME`, `TOOL_CALCULATOR`,
+`TOOL_UNIT_CONVERT`, `TOOL_WEATHER`, `TOOL_MAPS_PLACES`, `TOOL_MARKET_DATA`,
+`TOOL_GITHUB`, and `TOOL_OCR`; key-backed tools also need their API key. Brave
+search still uses `TOOL_WEB_SEARCH` + `BRAVE_API_KEY`; image tools use
+`TOOL_IMAGE_GEN` / `TOOL_IMAGE_EDIT` plus their ComfyUI workflow config.
 Thorough (full-page-fetch) search: set `SEARCH_FETCH_PAGES=true`; the model then
 opts into `depth="thorough"` per query, leaving simple lookups snippet-fast.
 

@@ -90,6 +90,32 @@ pub struct Config {
     pub search_fetch_concurrency: usize,
     pub search_fetch_timeout_ms: u64,
 
+    // General first-party tools. They are all stateless and disabled unless
+    // explicitly enabled. API-key-backed tools additionally require their key
+    // before their schema is offered to a model.
+    pub tool_user_agent: String,
+    pub web_fetch_enabled: bool,
+    pub web_fetch_context_chars: usize,
+    pub current_time_enabled: bool,
+    pub calculator_enabled: bool,
+    pub unit_convert_enabled: bool,
+    pub weather_enabled: bool,
+    pub open_meteo_base: Url,
+    pub open_meteo_geocoding_base: Url,
+    pub maps_places_enabled: bool,
+    pub nominatim_base: Url,
+    pub market_data_enabled: bool,
+    pub alpha_vantage_base: Url,
+    pub alpha_vantage_token: Option<String>,
+    pub github_enabled: bool,
+    pub github_base: Url,
+    pub github_token: Option<String>,
+    pub github_context_chars: usize,
+    pub ocr_enabled: bool,
+    pub ocr_timeout_s: u64,
+    pub ocr_context_chars: usize,
+    pub tesseract_bin: String,
+
     // Image tools (ComfyUI). Generation and editing are independent tools, each
     // backed by its own API-format workflow and gated by its own toggle.
     pub image_gen_enabled: bool,
@@ -180,6 +206,38 @@ impl Config {
             search_fetch_pages: env_bool("SEARCH_FETCH_PAGES", false),
             search_fetch_concurrency: env_parse("SEARCH_FETCH_CONCURRENCY", 3usize).max(1),
             search_fetch_timeout_ms: env_parse("SEARCH_FETCH_TIMEOUT_MS", 1500u64),
+            tool_user_agent: env_or(
+                "TOOL_HTTP_USER_AGENT",
+                concat!("Phantasm/", env!("CARGO_PKG_VERSION"), " self-hosted"),
+            ),
+            web_fetch_enabled: env_bool("TOOL_WEB_FETCH", false),
+            web_fetch_context_chars: env_parse("WEB_FETCH_CONTEXT_CHARS", 8000usize).max(500),
+            current_time_enabled: env_bool("TOOL_CURRENT_TIME", false),
+            calculator_enabled: env_bool("TOOL_CALCULATOR", false),
+            unit_convert_enabled: env_bool("TOOL_UNIT_CONVERT", false),
+            weather_enabled: env_bool("TOOL_WEATHER", false),
+            open_meteo_base: parse_url("OPEN_METEO_BASE_URL", "https://api.open-meteo.com")?,
+            open_meteo_geocoding_base: parse_url(
+                "OPEN_METEO_GEOCODING_BASE_URL",
+                "https://geocoding-api.open-meteo.com",
+            )?,
+            maps_places_enabled: env_bool("TOOL_MAPS_PLACES", false),
+            nominatim_base: parse_url("NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org")?,
+            market_data_enabled: env_bool("TOOL_MARKET_DATA", false),
+            alpha_vantage_base: parse_url("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co")?,
+            alpha_vantage_token: std::env::var("ALPHA_VANTAGE_API_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            github_enabled: env_bool("TOOL_GITHUB", false),
+            github_base: parse_url("GITHUB_API_BASE_URL", "https://api.github.com")?,
+            github_token: std::env::var("GITHUB_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            github_context_chars: env_parse("GITHUB_CONTEXT_CHARS", 8000usize).max(500),
+            ocr_enabled: env_bool("TOOL_OCR", false),
+            ocr_timeout_s: env_parse("OCR_TIMEOUT_S", 20u64),
+            ocr_context_chars: env_parse("OCR_CONTEXT_CHARS", 8000usize).max(500),
+            tesseract_bin: env_or("TESSERACT_BIN", "tesseract"),
             image_gen_enabled,
             image_edit_enabled,
             comfy_base,
@@ -227,6 +285,59 @@ impl Config {
     /// `depth` parameter is never offered and every search stays snippet-only.
     pub fn search_thorough_usable(&self) -> bool {
         self.search_fetch_pages
+    }
+
+    pub fn web_fetch_usable(&self) -> bool {
+        self.web_fetch_enabled
+    }
+
+    pub fn current_time_usable(&self) -> bool {
+        self.current_time_enabled
+    }
+
+    pub fn calculator_usable(&self) -> bool {
+        self.calculator_enabled
+    }
+
+    pub fn unit_convert_usable(&self) -> bool {
+        self.unit_convert_enabled
+    }
+
+    pub fn weather_usable(&self) -> bool {
+        self.weather_enabled
+    }
+
+    pub fn maps_places_usable(&self) -> bool {
+        self.maps_places_enabled
+    }
+
+    pub fn market_data_usable(&self) -> bool {
+        self.market_data_enabled && self.alpha_vantage_token.is_some()
+    }
+
+    pub fn github_usable(&self) -> bool {
+        self.github_enabled
+    }
+
+    pub fn ocr_usable(&self) -> bool {
+        self.ocr_enabled
+    }
+
+    /// App-facing "information tools" group. Older app builds can request the
+    /// existing `web_search` capability and still get newly-added read-only
+    /// utility/network tools; research-mode gating still checks real Brave
+    /// search separately.
+    pub fn information_tools_usable(&self) -> bool {
+        self.web_search_usable()
+            || self.web_fetch_usable()
+            || self.current_time_usable()
+            || self.calculator_usable()
+            || self.unit_convert_usable()
+            || self.weather_usable()
+            || self.maps_places_usable()
+            || self.market_data_usable()
+            || self.github_usable()
+            || self.ocr_usable()
     }
 
     /// Whether the image-generation tool can run: toggle on + a workflow and a
@@ -328,6 +439,28 @@ pub mod tests_support {
             search_fetch_pages: false,
             search_fetch_concurrency: 3,
             search_fetch_timeout_ms: 1500,
+            tool_user_agent: "Phantasm/test".into(),
+            web_fetch_enabled: false,
+            web_fetch_context_chars: 8000,
+            current_time_enabled: false,
+            calculator_enabled: false,
+            unit_convert_enabled: false,
+            weather_enabled: false,
+            open_meteo_base: "https://api.open-meteo.com".parse().unwrap(),
+            open_meteo_geocoding_base: "https://geocoding-api.open-meteo.com".parse().unwrap(),
+            maps_places_enabled: false,
+            nominatim_base: "https://nominatim.openstreetmap.org".parse().unwrap(),
+            market_data_enabled: false,
+            alpha_vantage_base: "https://www.alphavantage.co".parse().unwrap(),
+            alpha_vantage_token: None,
+            github_enabled: false,
+            github_base: "https://api.github.com".parse().unwrap(),
+            github_token: None,
+            github_context_chars: 8000,
+            ocr_enabled: false,
+            ocr_timeout_s: 20,
+            ocr_context_chars: 8000,
+            tesseract_bin: "tesseract".into(),
             image_gen_enabled: false,
             image_edit_enabled: false,
             comfy_base: "http://localhost:8188".parse().unwrap(),

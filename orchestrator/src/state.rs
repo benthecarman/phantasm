@@ -91,9 +91,21 @@ pub struct CapabilitySnapshot {
     pub streaming: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ToolFlags {
+    /// App-facing information-tools group. True when at least one read-only
+    /// web/utility tool is available; `web_search` itself may still be false as
+    /// an individual schema if Brave is not configured.
     pub web_search: bool,
+    pub web_fetch: bool,
+    pub current_time: bool,
+    pub calculator: bool,
+    pub unit_convert: bool,
+    pub weather: bool,
+    pub maps_places: bool,
+    pub market_data: bool,
+    pub github: bool,
+    pub ocr: bool,
     pub image_generation: bool,
 }
 

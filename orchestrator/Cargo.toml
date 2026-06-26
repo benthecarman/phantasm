@@ -11,7 +11,7 @@ name = "phantasm-orchestrator"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "process"] }
 axum = { version = "0.8", features = ["json"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
@@ -34,6 +34,9 @@ bytes = "1"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 url = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+tempfile = "3"
 
 # systemd readiness/`Type=notify` integration. Pure-Rust (no libsystemd link),
 # unix-only; a no-op unless `$NOTIFY_SOCKET` is set, so dev/Docker are unaffected.

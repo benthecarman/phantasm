@@ -96,7 +96,17 @@ pub async fn probe_capabilities(
         UpstreamKind::OpenAICompatible => (Vec::new(), Vec::new()),
     };
 
-    let web_search = cfg.web_search_usable();
+    let brave_web_search = cfg.web_search_usable();
+    let web_fetch = cfg.web_fetch_usable();
+    let current_time = cfg.current_time_usable();
+    let calculator = cfg.calculator_usable();
+    let unit_convert = cfg.unit_convert_usable();
+    let weather = cfg.weather_usable();
+    let maps_places = cfg.maps_places_usable();
+    let market_data = cfg.market_data_usable();
+    let github = cfg.github_usable();
+    let ocr = cfg.ocr_usable();
+    let web_search = cfg.information_tools_usable();
     // One app-facing "image generation" capability covers both server tools
     // (generation + editing); editing rides under it (tools are invisible to
     // the app). Advertise it when either is usable and ComfyUI is reachable.
@@ -114,7 +124,7 @@ pub async fn probe_capabilities(
         .filter(|p| {
             p.tools
                 .iter()
-                .all(|t| tool_usable(t, web_search, image_generation))
+                .all(|t| tool_usable(t, brave_web_search, image_generation))
         })
         .map(|p| crate::state::ModeInfo {
             id: p.id.to_string(),
@@ -131,6 +141,15 @@ pub async fn probe_capabilities(
         tool_models,
         tools: ToolFlags {
             web_search,
+            web_fetch,
+            current_time,
+            calculator,
+            unit_convert,
+            weather,
+            maps_places,
+            market_data,
+            github,
+            ocr,
             image_generation,
         },
         modes,

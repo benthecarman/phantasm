@@ -15,7 +15,10 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::TurnEvent;
-use crate::tools::{image_edit, image_gen, web_search};
+use crate::tools::{
+    calculator, current_time, github, image_edit, image_gen, maps_places, market_data, ocr,
+    unit_convert, weather, web_fetch, web_search,
+};
 
 /// Result of executing one tool call: the `tool`-role message to feed back to
 /// the model, plus optional markdown to append to the final answer (used by
@@ -92,6 +95,33 @@ impl ToolExecutor for ToolRegistry {
         if self.cfg.web_search_usable() {
             out.push(web_search::schema(self.cfg.search_thorough_usable()));
         }
+        if self.cfg.web_fetch_usable() {
+            out.push(web_fetch::schema());
+        }
+        if self.cfg.current_time_usable() {
+            out.push(current_time::schema());
+        }
+        if self.cfg.calculator_usable() {
+            out.push(calculator::schema());
+        }
+        if self.cfg.unit_convert_usable() {
+            out.push(unit_convert::schema());
+        }
+        if self.cfg.weather_usable() {
+            out.push(weather::schema());
+        }
+        if self.cfg.maps_places_usable() {
+            out.push(maps_places::schema());
+        }
+        if self.cfg.market_data_usable() {
+            out.push(market_data::schema());
+        }
+        if self.cfg.github_usable() {
+            out.push(github::schema());
+        }
+        if self.cfg.ocr_usable() {
+            out.push(ocr::schema());
+        }
         if self.cfg.image_gen_usable() {
             out.push(image_gen::schema());
         }
@@ -114,6 +144,33 @@ impl ToolExecutor for ToolRegistry {
         match name {
             "web_search" if self.cfg.web_search_usable() => {
                 web_search::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
+            }
+            "web_fetch" if self.cfg.web_fetch_usable() => {
+                web_fetch::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
+            }
+            "current_time" if self.cfg.current_time_usable() => {
+                current_time::run(call, &call_id, &tx, &cancel).await
+            }
+            "calculator" if self.cfg.calculator_usable() => {
+                calculator::run(call, &call_id, &tx, &cancel).await
+            }
+            "unit_convert" if self.cfg.unit_convert_usable() => {
+                unit_convert::run(call, &call_id, &tx, &cancel).await
+            }
+            "weather" if self.cfg.weather_usable() => {
+                weather::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
+            }
+            "maps_places" if self.cfg.maps_places_usable() => {
+                maps_places::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
+            }
+            "market_data" if self.cfg.market_data_usable() => {
+                market_data::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
+            }
+            "github" if self.cfg.github_usable() => {
+                github::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
+            }
+            "ocr" if self.cfg.ocr_usable() => {
+                ocr::run(&self.cfg, call, &call_id, ctx, &tx, &cancel).await
             }
             "image_generation" if self.cfg.image_gen_usable() => {
                 image_gen::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await

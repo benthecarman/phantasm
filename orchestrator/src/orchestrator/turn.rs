@@ -28,12 +28,14 @@ use crate::orchestrator::tools::{ToolExecutor, TurnContext};
 use crate::orchestrator::{ResearchPreset, TurnEvent};
 
 /// Map an internal server tool name to the app-facing capability that gates it.
-/// Most tools map to themselves; `image_edit` rides under the `image_generation`
-/// capability so the app needs no separate toggle (tools are invisible to the
-/// app — the app's `x_tools` only ever names `image_generation`).
+/// Most tools map to themselves. `image_edit` rides under `image_generation`;
+/// read-only utility/network tools ride under `web_search` so older app builds
+/// that only know the broad web-tools toggle can still use newly-added tools.
 fn capability_name(tool: &str) -> &str {
     match tool {
         "image_edit" => "image_generation",
+        "web_fetch" | "current_time" | "calculator" | "unit_convert" | "weather"
+        | "maps_places" | "market_data" | "github" | "ocr" => "web_search",
         other => other,
     }
 }
@@ -705,6 +707,25 @@ mod tests {
         let schemas = vec![named_schema("web_search"), named_schema("image_generation")];
         let kept = select_schemas(schemas, &Some(vec!["web_search".into()]));
         assert_eq!(kept, vec![named_schema("web_search")]);
+    }
+
+    #[test]
+    fn select_schemas_maps_information_tools_to_web_search_capability() {
+        let schemas = vec![
+            named_schema("web_fetch"),
+            named_schema("calculator"),
+            named_schema("weather"),
+            named_schema("image_generation"),
+        ];
+        let kept = select_schemas(schemas, &Some(vec!["web_search".into()]));
+        assert_eq!(
+            kept,
+            vec![
+                named_schema("web_fetch"),
+                named_schema("calculator"),
+                named_schema("weather"),
+            ]
+        );
     }
 
     #[test]

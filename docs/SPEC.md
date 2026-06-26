@@ -37,7 +37,19 @@ image generation on top of plain inference.
   "models": ["llama3.3:70b", "qwen2.5:14b"],
   "vision_models": ["llama3.3:70b"],
   "tool_models": ["qwen2.5:14b"],
-  "tools": { "web_search": true, "image_generation": true },
+  "tools": {
+    "web_search": true,
+    "web_fetch": true,
+    "current_time": true,
+    "calculator": true,
+    "unit_convert": true,
+    "weather": true,
+    "maps_places": true,
+    "market_data": false,
+    "github": true,
+    "ocr": true,
+    "image_generation": true
+  },
   "streaming": "sse"
 }
 ```
@@ -78,6 +90,11 @@ via Ollama `/api/show`; both optional, omitted/empty ⇒ the app treats that
 capability as unknown and allows it optimistically). Because the server tools
 are invoked by the model, a tool is usable only when `tools` advertises it **and**
 the chosen model is in `tool_models` — the app gates the per-tool toggles on both.
+For compatibility with older Phantasm app builds, the `web_search` flag is the
+app-facing **read-only information tools** group: if any read-only information
+tool is available, `web_search` may be true so the app can offer the broad tools
+toggle. Individual booleans name the exact configured tools. Research modes are
+advertised only when the actual Brave-backed `web_search` schema is usable.
 
 ### 2.2 Chat (single OpenAI-compatible endpoint)
 
@@ -189,12 +206,28 @@ Consequences:
 - Cancellation: the client aborts the SSE connection; the orchestrator detects
   the disconnect and halts generation and in-flight tool work.
 
+**Tool privacy / persistence boundary.** Server-side tools MUST NOT persist
+conversation content, tool inputs, tool outputs, fetched pages, generated
+intermediate data, or user attachments to durable local storage. Any cache must
+be in-memory and scoped to a single turn unless this spec is deliberately
+changed. If a backend API requires file-backed handoff, the tool must use
+request-scoped temp/scratch storage rather than durable input/output libraries
+and must only read it back for the active turn. The orchestrator MUST NOT offer
+local filesystem search/read/write tools or local-docs indexing; tools may only
+read static operator-configured assets needed to run themselves (for example
+ComfyUI workflow JSON). Future side-effecting tools (email/calendar/file/
+database writes, shell/code execution, browser automation) require an explicit
+contract update and user-confirmation UI.
+
 ## 3. Orchestration server requirements
 
 **Functional:** capabilities endpoint (FR-O1), OpenAI-compatible chat with SSE
 (FR-O2), server-side tool loop with iteration cap (FR-O3), Brave web search
 (snippet-first; FR-O4), ComfyUI image gen with progress relay (FR-O5), model
-listing (FR-O6), bearer auth → 401 (FR-O7), cancellation on disconnect (FR-O8).
+listing (FR-O6), bearer auth → 401 (FR-O7), cancellation on disconnect (FR-O8),
+optional read-only tools for web fetch, current time, calculator, unit
+conversion, weather, places/geocoding, market data, GitHub reads, and OCR
+(FR-O9). Local docs/filesystem tools and side-effecting tools are out of scope.
 
 **Non-functional:** co-location over localhost/LAN (NFR-O1), async concurrency
 with a configurable Ollama concurrency limit (NFR-O2), low plain-chat latency
@@ -223,6 +256,8 @@ start (NFR-A5), optional multiple backend profiles (NFR-A6).
 - **XR-2 Stateless server, stateful client** — the app sends full history each
   turn.
 - **XR-3 Versioning** — the capabilities manifest carries a version.
+- **XR-4 No tool persistence** — server tools do not write local state or index
+  local files; per-turn in-memory caches are allowed only as an optimization.
 
 ## 6. Build phases
 
