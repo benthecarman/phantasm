@@ -43,12 +43,17 @@ pub async fn chat_completions(
         model,
         stream,
         messages,
-        research,
         extra: options,
         ..
     } = req;
-    let model_name = model.unwrap_or_else(|| state.cfg.default_model.clone());
-    let model = model_name.clone();
+    let requested_model = model.unwrap_or_else(|| state.cfg.default_model.clone());
+    // Deep Research is selected by the model id, not a request flag: split the
+    // requested model into its base model and an optional research preset.
+    let (base_model, preset) = state.cfg.presets().resolve_model(&requested_model);
+    // The downstream OpenAI response echoes back the model the client asked for
+    // (including any mode suffix); the base model is what we run upstream.
+    let model_name = requested_model;
+    let model = base_model;
 
     let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel::<TurnEvent>(64);
@@ -70,13 +75,15 @@ pub async fn chat_completions(
         let tools_offered =
             crate::orchestrator::turn::select_schemas(tools.schemas(), &enabled_tools).len();
         let log_model = model.clone();
+        // Resolved research mode id (if any) for per-turn logging.
+        let mode = preset.map(|p| p.id);
         if cfg.log_content {
             tracing::debug!(turn_id, messages = ?messages, "turn content");
         }
 
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            tracing::info!(turn_id, model = %log_model, stream, tools_offered, research, "turn started");
+            tracing::info!(turn_id, model = %log_model, stream, tools_offered, mode, "turn started");
             run_turn(
                 cfg,
                 backend,
@@ -86,7 +93,7 @@ pub async fn chat_completions(
                 model,
                 options,
                 enabled_tools,
-                research,
+                preset,
                 tx,
                 cancel,
             )

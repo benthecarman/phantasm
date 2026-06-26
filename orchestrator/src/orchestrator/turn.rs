@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::ollama::ChatBackend;
 use crate::openai::types::ChatMessage;
 use crate::orchestrator::tools::{ToolExecutor, TurnContext};
-use crate::orchestrator::TurnEvent;
+use crate::orchestrator::{ResearchPreset, TurnEvent};
 
 /// Map an internal server tool name to the app-facing capability that gates it.
 /// Most tools map to themselves; `image_edit` rides under the `image_generation`
@@ -60,24 +60,6 @@ pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec
         .collect()
 }
 
-/// System prompt injected for Deep Research turns (`x_research`). Drives the
-/// decompose → reason-before-search → reflect → synthesize-with-citations loop.
-const RESEARCH_SYSTEM_PROMPT: &str = "\
-You are operating in Deep Research mode: the user wants a thorough, well-sourced \
-answer, not a quick reply. Work in this order:\n\
-1. Decompose the question into 3-5 focused sub-questions that together fully \
-answer it. State them briefly before you start searching.\n\
-2. Before each web_search call, say in one sentence what you are looking for and \
-why.\n\
-3. Use web_search to investigate the sub-questions, reading the returned pages.\n\
-4. After each round of results, assess what is still missing and search again if \
-needed. Don't stop until you can answer well, but don't run redundant searches.\n\
-5. When you have enough, write one synthesized answer that directly answers the \
-original question. Support claims with inline citations like [1], [2] that refer \
-to the sources you actually used, and end with a numbered \"Sources\" list of \
-those URLs.\n\
-Cite only sources you genuinely used. Prefer recent, primary sources.";
-
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn<B, T>(
     cfg: Arc<Config>,
@@ -88,7 +70,7 @@ pub async fn run_turn<B, T>(
     model: String,
     options: Map<String, Value>,
     enabled_tools: Option<Vec<String>>,
-    research: bool,
+    preset: Option<&'static ResearchPreset>,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
 ) where
@@ -103,7 +85,7 @@ pub async fn run_turn<B, T>(
                 .send(TurnEvent::Status("waiting for a free model slot…".into()))
                 .await;
             tokio::select! {
-                p = sem.acquire_owned() => match p {
+                p = sem.clone().acquire_owned() => match p {
                     Ok(p) => p,
                     Err(_) => {
                         let _ = tx.send(TurnEvent::Error("server shutting down".into())).await;
@@ -119,17 +101,31 @@ pub async fn run_turn<B, T>(
         return;
     }
 
-    // Research mode offers only web_search (it's a focused search loop) and
-    // prepends the research system prompt; otherwise honor the client's per-turn
-    // tool selection.
-    let schemas = if research {
-        select_schemas(tools.schemas(), &Some(vec!["web_search".to_string()]))
-    } else {
-        select_schemas(tools.schemas(), &enabled_tools)
-    };
-    if research {
-        messages.insert(0, ChatMessage::system(RESEARCH_SYSTEM_PROMPT));
+    // Deep Research: delegate to the orchestrator/worker engine, which drives its
+    // own plan / isolated-sub-agent / synthesize / verify stages (each with its
+    // own message context). Plain and ordinary tool turns keep the fast paths
+    // below untouched (NFR-O3).
+    //
+    // Unlike a plain turn, a research run issues *many* upstream calls — fanned
+    // out across concurrent sub-agents. Holding a single whole-run permit here
+    // would under-count those calls and let `research_fanout_concurrency`
+    // sub-agent calls run per permit, over-subscribing the GPU past
+    // OLLAMA_MAX_CONCURRENCY (NFR-O2). So we drop the outer permit and hand the
+    // semaphore to the engine, which re-acquires it per upstream call — keeping
+    // total concurrent Ollama work across plain + research turns <= the global
+    // bound. (Dropping first also avoids a self-deadlock: the engine's first
+    // acquire would otherwise contend with the permit we still hold.)
+    if let Some(p) = preset {
+        drop(_permit);
+        crate::orchestrator::research::run_research(
+            cfg, backend, tools, sem, p, model, messages, options, tx, cancel,
+        )
+        .await;
+        return;
     }
+
+    // A plain turn honors the client's per-turn tool selection.
+    let schemas = select_schemas(tools.schemas(), &enabled_tools);
 
     // Plain fast path: no tools to offer => one streaming call.
     if schemas.is_empty() {
@@ -149,15 +145,11 @@ pub async fn run_turn<B, T>(
     let mut appends: Vec<String> = Vec::new();
     let ctx = TurnContext {
         input_images: latest_input_images(&messages),
-        research,
+        research: false,
+        ..Default::default()
     };
 
-    let max_iters = if research {
-        cfg.max_research_iters
-    } else {
-        cfg.max_tool_iters
-    };
-    for _ in 0..max_iters {
+    for _ in 0..cfg.max_tool_iters {
         if cancel.is_cancelled() {
             return;
         }
@@ -225,6 +217,33 @@ fn latest_input_images(messages: &[ChatMessage]) -> Vec<String> {
 /// Issue a streaming call (without tools) and relay tokens, then append any
 /// deferred content (e.g. generated images) and finish.
 async fn stream_final<B: ChatBackend>(
+    backend: &B,
+    model: &str,
+    messages: &[ChatMessage],
+    options: &Map<String, Value>,
+    appends: Vec<String>,
+    tx: &mpsc::Sender<TurnEvent>,
+    cancel: &CancellationToken,
+) {
+    stream_relay_inner(backend, model, messages, options, appends, tx, cancel).await;
+}
+
+/// Stream a final-answer call and relay its tokens/reasoning, ending with a
+/// `Done` event — the reusable streaming relay shared by the plain turn path and
+/// the research synthesis stage (which appends nothing). Public to the crate so
+/// `research.rs` can stream its synthesized answer through the same logic.
+pub(crate) async fn stream_relay<B: ChatBackend>(
+    backend: &B,
+    model: &str,
+    messages: &[ChatMessage],
+    options: &Map<String, Value>,
+    tx: &mpsc::Sender<TurnEvent>,
+    cancel: &CancellationToken,
+) {
+    stream_relay_inner(backend, model, messages, options, Vec::new(), tx, cancel).await;
+}
+
+async fn stream_relay_inner<B: ChatBackend>(
     backend: &B,
     model: &str,
     messages: &[ChatMessage],
@@ -485,13 +504,6 @@ mod tests {
         Arc::new(c)
     }
 
-    fn cfg_research(tool_iters: u8, research_iters: u8) -> Arc<Config> {
-        let mut c = crate::config::tests_support::minimal();
-        c.max_tool_iters = tool_iters;
-        c.max_research_iters = research_iters;
-        Arc::new(c)
-    }
-
     fn collect_text(events: &[TurnEvent]) -> String {
         events
             .iter()
@@ -519,7 +531,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
-            false,
+            None,
             tx,
             CancellationToken::new(),
         )
@@ -553,7 +565,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
-            false,
+            None,
             tx,
             CancellationToken::new(),
         )
@@ -590,7 +602,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
-            false,
+            None,
             tx,
             CancellationToken::new(),
         )
@@ -602,13 +614,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn research_mode_injects_prompt_and_uses_research_cap() {
-        // Model keeps searching forever; the research cap (not max_tool_iters)
-        // must bound the loop, and the research system prompt must be prepended.
+    async fn research_preset_delegates_to_engine_and_streams() {
+        // A resolved research preset must DELEGATE to research::run_research,
+        // not run the plain tool loop. The scripted backend's chat_once is used
+        // for plan/sub-agent/compress/draft/verify; chat_stream is only reached
+        // for the (non-verify) streaming synthesis, so a verify preset emits its
+        // final answer as a Token (here the compress/verify echo "done"). The
+        // key assertion is that we got a non-empty answer through the engine.
         let infinite = std::iter::repeat_with(|| assistant_calling("web_search"))
             .take(100)
             .collect::<Vec<_>>();
-        let backend = ScriptedBackend::new(infinite, vec!["report".into()]);
+        let backend = ScriptedBackend::new(infinite, vec!["streamed".into()]);
         let executed = Arc::new(Mutex::new(vec![]));
         let tools = ScriptedTools {
             schemas: Arc::new(vec![
@@ -618,8 +634,10 @@ mod tests {
             executed: executed.clone(),
         };
         let (tx, rx) = mpsc::channel(256);
+        let cfg = cfg_with_iters(2);
+        let (_base, preset) = cfg.presets().resolve_model("m:quick-research");
         run_turn(
-            cfg_research(2, 4), // tool cap 2, research cap 4
+            cfg.clone(),
             backend.clone(),
             tools,
             Arc::new(Semaphore::new(1)),
@@ -627,17 +645,21 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
-            true, // research mode
+            preset,
             tx,
             CancellationToken::new(),
         )
         .await;
-        let _ = drain(rx).await;
-        // Research uses its own (larger) cap, not max_tool_iters (2).
-        assert_eq!(*backend.once_calls.lock().unwrap(), 4);
-        // The research system prompt is prepended as the first message.
-        let seen = backend.seen.lock().unwrap();
-        assert_eq!(seen.first().map(|m| m.role.as_str()), Some("system"));
+        let events = drain(rx).await;
+        // quick-research has verify=false → synthesis STREAMS the answer.
+        assert_eq!(collect_text(&events), "streamed");
+        // Only web_search was ever executed (research narrows to its tool list),
+        // proving the engine ran the isolated sub-agent loop.
+        assert!(executed.lock().unwrap().iter().all(|t| t == "web_search"));
+        // A planning heartbeat was emitted (engine entry, not the plain loop).
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Status(s) if s.contains("planning"))));
     }
 
     #[tokio::test]
@@ -659,7 +681,7 @@ mod tests {
             "m".into(),
             Map::new(),
             None,
-            false,
+            None,
             tx,
             cancel,
         )
@@ -711,7 +733,7 @@ mod tests {
             "m".into(),
             Map::new(),
             Some(vec![]),
-            false,
+            None,
             tx,
             CancellationToken::new(),
         )

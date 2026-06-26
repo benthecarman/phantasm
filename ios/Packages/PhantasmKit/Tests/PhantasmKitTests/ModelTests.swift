@@ -73,20 +73,98 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertNil(json["tools"], "plain-chat selection sends only tool_choice:none")
     }
 
-    func testChatRequestOmitsXResearchWhenNil() throws {
-        let request = ChatRequest(model: "m", messages: [WireMessage(role: "user", content: "hi")])
-        let json = try encodedKeys(request)
-        XCTAssertNil(json["x_research"], "research off must keep the request standard")
-    }
-
-    func testChatRequestEncodesXResearchWhenOn() throws {
+    func testChatRequestNeverEmitsResearchFlag() throws {
+        // Research is now selected by the model id, never a request field.
         let request = ChatRequest(
-            model: "m",
-            messages: [WireMessage(role: "user", content: "hi")],
-            xResearch: true
+            model: "qwen2.5:14b:deep-research",
+            messages: [WireMessage(role: "user", content: "hi")]
         )
         let json = try encodedKeys(request)
-        XCTAssertEqual(json["x_research"] as? Bool, true)
+        XCTAssertNil(json["x_research"], "the research flag is deleted from the wire")
+        XCTAssertNil(json["research"], "the research flag is deleted from the wire")
+        XCTAssertEqual(json["model"] as? String, "qwen2.5:14b:deep-research")
+    }
+
+    // MARK: - Modes (capabilities + wire model id)
+
+    func testManifestDecodesModes() throws {
+        let json = """
+        {"version":"0.2.0","chat":true,"models":["qwen2.5:14b"],
+         "tool_models":["qwen2.5:14b"],
+         "tools":{"web_search":true,"image_generation":true},
+         "modes":[
+           {"id":"deep-research","label":"Deep Research","needs":["web_search"]},
+           {"id":"quick-research","label":"Quick Research","needs":["web_search"]}
+         ],
+         "streaming":"sse"}
+        """
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+        XCTAssertEqual(caps.modes?.count, 2)
+        XCTAssertEqual(caps.modes?.first?.id, "deep-research")
+        XCTAssertEqual(caps.modes?.first?.label, "Deep Research")
+        XCTAssertEqual(caps.modes?.first?.needs, ["web_search"])
+    }
+
+    func testManifestWithoutModesIsNil() throws {
+        let json = #"{"version":"x","chat":true,"models":["m"],"streaming":"sse"}"#
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+        XCTAssertNil(caps.modes, "older servers omit modes; the app shows no research UI")
+    }
+
+    func testAvailableModesGateOnNeededTools() throws {
+        // web_search available, image_generation not.
+        let json = """
+        {"version":"0.2.0","chat":true,"models":["m"],
+         "tools":{"web_search":true,"image_generation":false},
+         "modes":[
+           {"id":"deep-research","label":"Deep Research","needs":["web_search"]},
+           {"id":"image-mode","label":"Image","needs":["image_generation"]}
+         ],
+         "streaming":"sse"}
+        """
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+        let modes = BackendMode.full(caps).availableModes
+        XCTAssertEqual(modes.map(\.id), ["deep-research"])
+    }
+
+    func testAvailableModesEmptyForNonOrchestrator() {
+        XCTAssertTrue(BackendMode.plainChatOnly(models: ["m"]).availableModes.isEmpty)
+        XCTAssertTrue(BackendMode.ollamaNative(models: ["m"]).availableModes.isEmpty)
+    }
+
+    func testWireModelAppendsModeSuffixWhenAdvertisedAndToolCapable() {
+        let convo = Conversation(modeID: "deep-research")
+        let modes = [Capabilities.Mode(id: "deep-research", label: "Deep Research", needs: ["web_search"])]
+        XCTAssertEqual(
+            convo.wireModel(base: "qwen2.5:14b", availableModes: modes, baseModelIsToolCapable: true),
+            "qwen2.5:14b:deep-research"
+        )
+    }
+
+    func testWireModelStaysBareWhenModeUnselected() {
+        let convo = Conversation(modeID: nil)
+        let modes = [Capabilities.Mode(id: "deep-research", label: "Deep Research", needs: ["web_search"])]
+        XCTAssertEqual(
+            convo.wireModel(base: "qwen2.5:14b", availableModes: modes, baseModelIsToolCapable: true),
+            "qwen2.5:14b"
+        )
+    }
+
+    func testWireModelStaysBareWhenBackendDoesNotAdvertiseMode() {
+        let convo = Conversation(modeID: "deep-research")
+        XCTAssertEqual(
+            convo.wireModel(base: "qwen2.5:14b", availableModes: [], baseModelIsToolCapable: true),
+            "qwen2.5:14b"
+        )
+    }
+
+    func testWireModelStaysBareWhenBaseModelNotToolCapable() {
+        let convo = Conversation(modeID: "deep-research")
+        let modes = [Capabilities.Mode(id: "deep-research", label: "Deep Research", needs: ["web_search"])]
+        XCTAssertEqual(
+            convo.wireModel(base: "qwen2.5:14b", availableModes: modes, baseModelIsToolCapable: false),
+            "qwen2.5:14b"
+        )
     }
 
     func testRequestedToolNamesNilWithoutManifest() {
@@ -115,7 +193,7 @@ final class CapabilityDecodeTests: XCTestCase {
     }
 
     func testReasoningEffortUsesSavedThinkingPreference() {
-        let convo = Conversation(deepResearchEnabled: false)
+        let convo = Conversation(modeID: nil)
 
         XCTAssertEqual(
             convo.reasoningEffort(thinkingEnabled: true, disabledEffort: ReasoningEffort.disabled),
@@ -130,12 +208,17 @@ final class CapabilityDecodeTests: XCTestCase {
         )
     }
 
-    func testDeepResearchForcesReasoningForThatTurn() {
-        let convo = Conversation(deepResearchEnabled: true)
+    func testResearchModeDoesNotForceThinking() {
+        // Thinking is independent of the research mode (redesign §7): selecting a
+        // mode must not flip reasoning on.
+        let convo = Conversation(modeID: "deep-research")
 
+        XCTAssertNil(
+            convo.reasoningEffort(thinkingEnabled: false, disabledEffort: nil)
+        )
         XCTAssertEqual(
-            convo.reasoningEffort(thinkingEnabled: false, disabledEffort: nil),
-            ReasoningEffort.enabledDefault
+            convo.reasoningEffort(thinkingEnabled: false, disabledEffort: ReasoningEffort.disabled),
+            ReasoningEffort.disabled
         )
     }
 

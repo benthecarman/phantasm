@@ -4,8 +4,9 @@
 //! scripted executor. `ToolRegistry` is the production implementation: it owns
 //! the HTTP client + config and dispatches to the concrete tool modules.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -24,14 +25,38 @@ pub struct ToolOutcome {
     pub append_to_answer: Option<String>,
 }
 
+/// A within-turn dedup cache, shared (cheaply, behind `Arc<Mutex<_>>`) across
+/// every tool call and research sub-agent in a single turn. It lives and dies
+/// with the turn — it is never keyed by session and never outlives the request,
+/// so it introduces no cross-turn server state (contract item 6 / XR-2). An
+/// empty cache produces identical results; it only elides redundant work.
+///
+/// Two maps:
+/// - `queries`: `query → formatted search output`, so the same search string is
+///   not issued to Brave twice within one turn.
+/// - `pages`: `url → extracted page text`, so the same page is not fetched and
+///   extracted twice (e.g. when several sub-agents surface the same source).
+///   A `None` value records a page we tried to fetch but that failed/timed out,
+///   so we don't re-attempt a known-bad URL within the turn.
+#[derive(Default)]
+pub struct TurnCache {
+    pub queries: HashMap<String, String>,
+    pub pages: HashMap<String, Option<String>>,
+}
+
 /// Per-turn inputs a tool may need beyond its own arguments: the images the user
 /// attached this turn (most recent last), so the edit tool can operate on "the
-/// image I just sent" without the app naming it explicitly; and whether this is a
-/// Deep Research turn, which forces `web_search` to fetch full pages.
+/// image I just sent" without the app naming it explicitly; whether this is a
+/// Deep Research turn, which forces `web_search` to fetch full pages; and a
+/// within-turn dedup cache so repeated queries/page-fetches are served once.
 #[derive(Clone, Default)]
 pub struct TurnContext {
     pub input_images: Vec<String>,
     pub research: bool,
+    /// Within-turn fetch/query dedup cache (see [`TurnCache`]). Cloning a
+    /// `TurnContext` shares the same cache (it's an `Arc`), so sub-agents that
+    /// receive a cloned context still dedup against each other.
+    pub cache: Arc<Mutex<TurnCache>>,
 }
 
 pub trait ToolExecutor: Send + Sync + Clone + 'static {

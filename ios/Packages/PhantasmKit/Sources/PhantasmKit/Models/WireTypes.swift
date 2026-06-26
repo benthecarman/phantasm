@@ -40,19 +40,13 @@ public struct ChatRequest: Encodable, Sendable {
     public var tools: [ToolSpec]?
     /// Standard OpenAI `tool_choice`. Set to `"none"` to force plain chat.
     public var toolChoice: String?
-    /// Deep Research mode (spec §2.3): when `true`, encoded as the additive
-    /// `x_research` field so the orchestrator runs its server-side research loop
-    /// (decompose → search across several rounds → synthesize with citations).
-    /// `nil` omits the field, keeping ordinary requests standard.
-    public var xResearch: Bool?
 
     public init(
         model: String,
         messages: [WireMessage],
         stream: Bool = true,
         reasoningEffort: String? = nil,
-        enabledTools: [String]? = nil,
-        xResearch: Bool? = nil
+        enabledTools: [String]? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -69,7 +63,6 @@ public struct ChatRequest: Encodable, Sendable {
                 self.tools = enabledTools.map(ToolSpec.init(name:))
             }
         }
-        self.xResearch = xResearch
     }
 }
 
@@ -222,6 +215,21 @@ public struct Capabilities: Decodable, Sendable, Equatable {
             self.imageGeneration = imageGeneration
         }
     }
+    /// One advertised turn mode (spec §2.3 `modes`). The app composes
+    /// `model + ":" + id` for a turn, gated on `needs ⊆ available tools` and a
+    /// tool-capable base model. Modes are server-side data; the app only mirrors
+    /// the manifest, never hardcodes the table.
+    public struct Mode: Decodable, Sendable, Equatable, Identifiable {
+        public let id: String
+        public let label: String
+        public let needs: [String]
+
+        public init(id: String, label: String, needs: [String]) {
+            self.id = id
+            self.label = label
+            self.needs = needs
+        }
+    }
     public let version: String
     public let chat: Bool
     public let models: [String]
@@ -233,6 +241,10 @@ public struct Capabilities: Decodable, Sendable, Equatable {
     /// `nil` when the manifest omits the field — tool support is then unknown.
     public let toolModels: [String]?
     public let tools: Tools?
+    /// Advertised turn modes (e.g. Deep Research), present only when their needed
+    /// tools are usable. `nil` when the manifest omits the field (older
+    /// orchestrator) — the app then shows no research UI (graceful, FR-A2).
+    public let modes: [Mode]?
     public let streaming: String?
 
     public init(
@@ -242,6 +254,7 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         visionModels: [String]? = nil,
         toolModels: [String]? = nil,
         tools: Tools?,
+        modes: [Mode]? = nil,
         streaming: String?
     ) {
         self.version = version
@@ -250,6 +263,7 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         self.visionModels = visionModels
         self.toolModels = toolModels
         self.tools = tools
+        self.modes = modes
         self.streaming = streaming
     }
 }
@@ -289,6 +303,23 @@ public enum BackendMode: Sendable, Equatable {
     public var showsTools: Bool {
         guard let tools = capabilities?.tools else { return false }
         return tools.webSearch || tools.imageGeneration
+    }
+
+    /// Turn modes (e.g. Deep Research) advertised by the backend whose needed
+    /// tools are actually usable. Empty for non-orchestrator backends or when the
+    /// manifest omits `modes` — the composer hides the research UI then.
+    public var availableModes: [Capabilities.Mode] {
+        guard let caps = capabilities, let modes = caps.modes else { return [] }
+        let tools = caps.tools
+        return modes.filter { mode in
+            mode.needs.allSatisfy { need in
+                switch need {
+                case ToolName.webSearch: return tools?.webSearch == true
+                case ToolName.imageGeneration: return tools?.imageGeneration == true
+                default: return false
+                }
+            }
+        }
     }
 
     public var usesOllamaNativeChat: Bool {

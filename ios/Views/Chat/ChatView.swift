@@ -109,9 +109,10 @@ struct ChatView: View {
                         get: { vm.imageGenerationEnabled },
                         set: { vm.setImageGenerationEnabled($0) }
                     ),
-                    deepResearchEnabled: Binding(
-                        get: { vm.deepResearchEnabled },
-                        set: { vm.setDeepResearchEnabled($0) }
+                    availableModes: vm.availableModes,
+                    modeID: Binding(
+                        get: { vm.modeID },
+                        set: { vm.setModeID($0) }
                     ),
                     thinkingEnabled: Binding(
                         get: { env.thinkingEnabled(for: currentModelID) },
@@ -348,7 +349,11 @@ struct ComposerView: View {
     let modelSupportsTools: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
-    let deepResearchEnabled: Binding<Bool>
+    /// Research modes the backend advertises (e.g. Deep Research). Empty ⇒ the
+    /// composer hides the research UI (graceful, older/non-orchestrator backends).
+    let availableModes: [Capabilities.Mode]
+    /// The per-message research mode selection (nil = ordinary turn).
+    let modeID: Binding<String?>
     let thinkingEnabled: Binding<Bool>
     let onSend: () -> Void
     let onStop: () -> Void
@@ -466,7 +471,8 @@ struct ComposerView: View {
                 modelSupportsTools: modelSupportsTools,
                 webSearchEnabled: webSearchEnabled,
                 imageGenerationEnabled: imageGenerationEnabled,
-                deepResearchEnabled: deepResearchEnabled,
+                availableModes: availableModes,
+                modeID: modeID,
                 thinkingEnabled: thinkingEnabled
             )
         }

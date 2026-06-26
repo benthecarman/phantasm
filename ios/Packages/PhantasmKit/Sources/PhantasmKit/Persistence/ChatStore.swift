@@ -66,14 +66,15 @@ public protocol ChatStore: Sendable {
     ) async throws
 
     /// Persist a conversation's per-chat tool selection (web search / image
-    /// generation) and Deep Research mode. Does not bump `updatedAt`, so toggling
-    /// doesn't reorder the history. A no-op if the conversation doesn't exist yet
-    /// (an unsent draft carries its selection into the first send instead).
+    /// generation) and selected research mode (`modeID`, nil = ordinary).
+    /// Does not bump `updatedAt`, so toggling doesn't reorder the history. A no-op
+    /// if the conversation doesn't exist yet (an unsent draft carries its
+    /// selection into the first send instead).
     func setConversationOptions(
         id: UUID,
         webSearchEnabled: Bool,
         imageGenerationEnabled: Bool,
-        deepResearchEnabled: Bool
+        modeID: String?
     ) async throws
 
     /// Edit a previously sent message in place and truncate the conversation

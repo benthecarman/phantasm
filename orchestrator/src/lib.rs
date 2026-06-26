@@ -103,6 +103,26 @@ pub async fn probe_capabilities(
     let image_generation = (cfg.image_gen_usable() || cfg.image_edit_usable())
         && probe_reachable(http, cfg.comfy_base.as_str(), "/system_stats").await;
 
+    // Advertise research modes only when their required tools are usable. Each
+    // preset declares its `needs` (web_search only, today); a mode is offered
+    // when every needed tool is usable. Empty otherwise — the app shows no
+    // research UI (graceful for older/leaner deployments).
+    let modes = cfg
+        .presets()
+        .all()
+        .iter()
+        .filter(|p| {
+            p.tools
+                .iter()
+                .all(|t| tool_usable(t, web_search, image_generation))
+        })
+        .map(|p| crate::state::ModeInfo {
+            id: p.id.to_string(),
+            label: p.label.to_string(),
+            needs: p.tools.iter().map(|t| t.to_string()).collect(),
+        })
+        .collect();
+
     CapabilitySnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
         chat: true,
@@ -113,7 +133,17 @@ pub async fn probe_capabilities(
             web_search,
             image_generation,
         },
+        modes,
         streaming: "sse",
+    }
+}
+
+/// Whether a tool name a preset `needs` maps to a currently-usable capability.
+fn tool_usable(tool: &str, web_search: bool, image_generation: bool) -> bool {
+    match tool {
+        "web_search" => web_search,
+        "image_generation" => image_generation,
+        _ => false,
     }
 }
 

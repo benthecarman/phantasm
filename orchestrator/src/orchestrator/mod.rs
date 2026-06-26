@@ -1,6 +1,9 @@
+pub mod presets;
+pub mod research;
 pub mod tools;
 pub mod turn;
 
+pub use presets::{PresetTable, ResearchPreset};
 pub use turn::run_turn;
 
 /// Transport-agnostic events produced by a turn. The chat route maps these to

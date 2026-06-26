@@ -54,10 +54,19 @@ pub struct Config {
     /// Models advertised in /v1/capabilities. Empty => probe `/api/tags` at startup.
     pub models: Vec<String>,
     pub max_tool_iters: u8,
-    /// Tool-loop cap for Deep Research turns (`x_research`). Larger than
-    /// `max_tool_iters` so research can run several search/reflect rounds.
-    pub max_research_iters: u8,
     pub ollama_concurrency: usize,
+
+    // Research mode presets. Mode ids/labels/tools are server-side data
+    // (orchestrator::presets); these knobs override the per-tier numeric/boolean
+    // defaults. Used by `PresetTable::from_config`. `research_fanout_concurrency`
+    // bounds how many sub-questions run in parallel (stage 3 fan-out).
+    pub research_deep_fanout: usize,
+    pub research_deep_searches_per_subq: usize,
+    pub research_deep_verify: bool,
+    pub research_quick_fanout: usize,
+    pub research_quick_searches_per_subq: usize,
+    pub research_quick_verify: bool,
+    pub research_fanout_concurrency: usize,
 
     // Web search tool (Brave)
     pub web_search_enabled: bool,
@@ -65,6 +74,16 @@ pub struct Config {
     pub brave_token: Option<String>,
     pub search_max_results: usize,
     pub search_context_char_cap: usize,
+    /// Per-PAGE extract cap when fetching full pages (independent of result
+    /// count) — stops the old `cap / results.len()` starvation that left each
+    /// page with ~800 chars. A sub-agent reading one sub-question reads each
+    /// page up to this many chars.
+    pub search_page_chars: usize,
+    /// Overall context cap for a *research* search turn. Larger than
+    /// `search_context_char_cap` (which still bounds ordinary thorough searches)
+    /// so a research sub-agent reading several pages for one sub-question is not
+    /// starved.
+    pub research_context_char_cap: usize,
     // Thorough (full-page-fetch) search: runtime gate + fetch bounds. The model
     // opts in per query via `depth="thorough"`; this only permits it.
     pub search_fetch_pages: bool,
@@ -99,6 +118,11 @@ pub struct Config {
     // Logging
     pub log_format: LogFormat,
     pub log_content: bool,
+
+    /// Lazily-built, process-lifetime research preset table (built from the knobs
+    /// above on first access via [`Config::presets`]). Internal cache: construct
+    /// it empty (`Default::default()`) — never populate it directly.
+    pub presets: std::sync::OnceLock<&'static crate::orchestrator::PresetTable>,
 }
 
 impl Config {
@@ -138,13 +162,21 @@ impl Config {
             default_model,
             models,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
-            max_research_iters: env_parse("MAX_RESEARCH_ITERS", 6u8),
             ollama_concurrency: env_parse("OLLAMA_MAX_CONCURRENCY", 4usize).max(1),
+            research_deep_fanout: env_parse("RESEARCH_DEEP_FANOUT", 4usize),
+            research_deep_searches_per_subq: env_parse("RESEARCH_DEEP_SEARCHES_PER_SUBQ", 3usize),
+            research_deep_verify: env_bool("RESEARCH_DEEP_VERIFY", true),
+            research_quick_fanout: env_parse("RESEARCH_QUICK_FANOUT", 2usize),
+            research_quick_searches_per_subq: env_parse("RESEARCH_QUICK_SEARCHES_PER_SUBQ", 2usize),
+            research_quick_verify: env_bool("RESEARCH_QUICK_VERIFY", false),
+            research_fanout_concurrency: env_parse("RESEARCH_FANOUT_CONCURRENCY", 2usize).max(1),
             web_search_enabled,
             brave_base,
             brave_token,
             search_max_results: env_parse("SEARCH_MAX_RESULTS", 5usize),
             search_context_char_cap: env_parse("SEARCH_CONTEXT_CHARS", 4000usize),
+            search_page_chars: env_parse("SEARCH_PAGE_CHARS", 2500usize).max(200),
+            research_context_char_cap: env_parse("RESEARCH_CONTEXT_CHARS", 12000usize),
             search_fetch_pages: env_bool("SEARCH_FETCH_PAGES", false),
             search_fetch_concurrency: env_parse("SEARCH_FETCH_CONCURRENCY", 3usize).max(1),
             search_fetch_timeout_ms: env_parse("SEARCH_FETCH_TIMEOUT_MS", 1500u64),
@@ -169,6 +201,19 @@ impl Config {
                 LogFormat::Text
             },
             log_content: env_bool("LOG_MESSAGE_CONTENT", false),
+            presets: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The research preset table for this deployment, built once from the
+    /// `research_*` knobs and cached for the process lifetime. Used by the chat
+    /// route to resolve a request model id into its base + optional preset, and
+    /// to populate `capabilities.modes`.
+    pub fn presets(&self) -> &'static crate::orchestrator::PresetTable {
+        self.presets.get_or_init(|| {
+            Box::leak(Box::new(crate::orchestrator::PresetTable::from_config(
+                self,
+            )))
         })
     }
 
@@ -265,13 +310,21 @@ pub mod tests_support {
             default_model: "m".into(),
             models: vec![],
             max_tool_iters: 5,
-            max_research_iters: 6,
             ollama_concurrency: 4,
+            research_deep_fanout: 4,
+            research_deep_searches_per_subq: 3,
+            research_deep_verify: true,
+            research_quick_fanout: 2,
+            research_quick_searches_per_subq: 2,
+            research_quick_verify: false,
+            research_fanout_concurrency: 2,
             web_search_enabled: false,
             brave_base: "https://api.search.brave.com".parse().unwrap(),
             brave_token: None,
             search_max_results: 5,
             search_context_char_cap: 4000,
+            search_page_chars: 2500,
+            research_context_char_cap: 12000,
             search_fetch_pages: false,
             search_fetch_concurrency: 3,
             search_fetch_timeout_ms: 1500,
@@ -292,6 +345,7 @@ pub mod tests_support {
             comfy_edit_seed: None,
             log_format: LogFormat::Text,
             log_content: false,
+            presets: std::sync::OnceLock::new(),
         }
     }
 }

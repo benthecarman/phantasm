@@ -30,13 +30,6 @@ pub struct ChatRequest {
     /// the normal auto behavior.
     #[serde(default)]
     pub tool_choice: Option<Value>,
-    /// Additive, non-standard request field (spec §2.3 `x_`-prefix convention):
-    /// run this turn in Deep Research mode. The server then injects a research
-    /// system prompt, offers only `web_search` (forcing full-page fetching
-    /// regardless of `SEARCH_FETCH_PAGES`), and uses a larger iteration budget.
-    /// Absent/false => an ordinary turn. Standard clients omit it entirely.
-    #[serde(default, rename = "x_research")]
-    pub research: bool,
     /// Any other OpenAI sampling parameters (temperature, top_p, …) passed through to Ollama.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -110,6 +103,16 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         ChatMessage {
             role: "system".into(),
+            content: Some(MessageContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        ChatMessage {
+            role: "user".into(),
             content: Some(MessageContent::Text(content.into())),
             tool_calls: None,
             tool_call_id: None,

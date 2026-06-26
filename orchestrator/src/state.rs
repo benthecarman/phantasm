@@ -81,6 +81,13 @@ pub struct CapabilitySnapshot {
     #[serde(default)]
     pub tool_models: Vec<String>,
     pub tools: ToolFlags,
+    /// Research modes (mode-suffixed model ids) the app may offer, populated from
+    /// the server-side preset table — but only when their required tools are
+    /// usable (currently `web_search`). Empty otherwise; older clients tolerate
+    /// its absence / emptiness (no research UI). Additive, ignorable by standard
+    /// OpenAI clients.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<ModeInfo>,
     pub streaming: &'static str,
 }
 
@@ -88,4 +95,14 @@ pub struct CapabilitySnapshot {
 pub struct ToolFlags {
     pub web_search: bool,
     pub image_generation: bool,
+}
+
+/// One advertised research mode, mirroring the `capabilities.modes` JSON: a
+/// stable `id` (the model-suffix mode), a human `label`, and the capabilities it
+/// `needs` to be usable (the app gates the mode on `needs ⊆ available tools`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ModeInfo {
+    pub id: String,
+    pub label: String,
+    pub needs: Vec<String>,
 }

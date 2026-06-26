@@ -122,7 +122,7 @@ pub async fn run(
     let _ = tx.send(TurnEvent::Status(status.into())).await;
 
     let result = tokio::select! {
-        r = do_search(cfg, http, &args, ctx.research) => r,
+        r = do_search(cfg, http, &args, ctx) => r,
         _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
     };
 
@@ -159,8 +159,20 @@ async fn do_search(
     cfg: &Config,
     http: &reqwest::Client,
     args: &WebSearchArgs,
-    research: bool,
+    ctx: &TurnContext,
 ) -> Result<String, String> {
+    // Within-turn query dedup: an identical query string already issued this
+    // turn returns its formatted output without touching Brave. The cache lives
+    // and dies with the turn (TurnCache), so this introduces no cross-turn state.
+    if let Some(hit) = ctx
+        .cache
+        .lock()
+        .ok()
+        .and_then(|c| c.queries.get(&args.query).cloned())
+    {
+        return Ok(hit);
+    }
+
     let token = cfg
         .brave_token
         .as_deref()
@@ -199,35 +211,62 @@ async fn do_search(
     let results = body.web.map(|w| w.results).unwrap_or_default();
 
     if results.is_empty() {
-        return Ok(format!("No web results for \"{}\".", args.query));
+        let out = format!("No web results for \"{}\".", args.query);
+        cache_query(ctx, &args.query, &out);
+        return Ok(out);
     }
 
     let results: Vec<BraveResult> = results.into_iter().take(count).collect();
 
     // Research forces page fetching even when the global gate is off; otherwise
     // it's the gated, model-chosen `depth="thorough"` path.
-    let extracts =
-        if research || (cfg.search_fetch_pages && matches!(args.depth, SearchDepth::Thorough)) {
-            fetch_pages(cfg, http, &results).await
-        } else {
-            Vec::new()
-        };
+    let fetch =
+        ctx.research || (cfg.search_fetch_pages && matches!(args.depth, SearchDepth::Thorough));
 
-    Ok(format_snippets(
+    // Per-PAGE cap (independent of result count) so reading one page is never
+    // starved to ~cap/N chars. The OVERALL cap is larger for research so a
+    // sub-agent reading several pages for one sub-question fits; ordinary
+    // thorough searches keep the snippet-cheap overall cap.
+    let (extracts, fetched, attempted) = if fetch {
+        fetch_pages(cfg, http, &results, ctx).await
+    } else {
+        (Vec::new(), 0, 0)
+    };
+    let overall_cap = if ctx.research {
+        cfg.research_context_char_cap
+    } else {
+        cfg.search_context_char_cap
+    };
+
+    let out = format_snippets(
         &args.query,
         &results,
         &extracts,
-        cfg.search_context_char_cap,
-    ))
+        overall_cap,
+        fetched,
+        attempted,
+    );
+    cache_query(ctx, &args.query, &out);
+    Ok(out)
+}
+
+fn cache_query(ctx: &TurnContext, query: &str, out: &str) {
+    if let Ok(mut c) = ctx.cache.lock() {
+        c.queries.insert(query.to_string(), out.to_string());
+    }
 }
 
 /// Build a compact, context-capped result list. `extracts[i]` (if present) is an
-/// optional page extract appended under result `i`.
+/// optional page extract appended under result `i`. When pages were fetched
+/// (`attempted > 0`) and some were dropped, a trailing note reports the shortfall
+/// instead of silently losing stragglers.
 fn format_snippets(
     query: &str,
     results: &[BraveResult],
     extracts: &[Option<String>],
     cap: usize,
+    fetched: usize,
+    attempted: usize,
 ) -> String {
     let mut out = format!("Web search results for \"{query}\":\n\n");
     for (i, r) in results.iter().enumerate() {
@@ -243,7 +282,22 @@ fn format_snippets(
         out.push_str(&entry);
     }
     truncate_at_char_boundary(&mut out, cap);
+    if let Some(note) = straggler_note(fetched, attempted) {
+        out.push_str(&note);
+    }
     out
+}
+
+/// When page-fetching dropped sources, surface it (timeouts/errors are not
+/// silently swallowed). `None` when nothing was fetched or all pages arrived.
+fn straggler_note(fetched: usize, attempted: usize) -> Option<String> {
+    if attempted == 0 || fetched >= attempted {
+        return None;
+    }
+    let timed_out = attempted - fetched;
+    Some(format!(
+        "\n(fetched {fetched} of {attempted} sources; {timed_out} timed out)\n"
+    ))
 }
 
 fn truncate_at_char_boundary(out: &mut String, cap: usize) {
@@ -258,23 +312,43 @@ fn truncate_at_char_boundary(out: &mut String, cap: usize) {
     out.truncate(end);
 }
 
+/// Fetch + extract result pages. Returns `(extracts_in_result_order, fetched,
+/// attempted)` where `attempted` counts pages we actually tried to fetch this
+/// turn (cache hits don't count as attempts — they already succeeded or already
+/// failed earlier) and `fetched` how many of those yielded text, so the caller
+/// can report the shortfall.
 async fn fetch_pages(
     cfg: &Config,
     http: &reqwest::Client,
     results: &[BraveResult],
-) -> Vec<Option<String>> {
+    ctx: &TurnContext,
+) -> (Vec<Option<String>>, usize, usize) {
     use futures_util::stream::{self, StreamExt};
 
     let timeout = Duration::from_millis(cfg.search_fetch_timeout_ms);
-    let per_extract_cap = (cfg.search_context_char_cap / results.len().max(1)).max(200);
+    // Per-PAGE cap, independent of result count (was `cap / results.len()`,
+    // which starved each page to ~800 chars in a 5-result search).
+    let per_extract_cap = cfg.search_page_chars;
 
-    // Map over owned `String`s (not `&BraveResult`) and move an owned client
-    // clone (cheap — `reqwest::Client` is `Arc` inside) into each future, so the
-    // bounded-concurrency stream carries no borrow lifetime (avoids an HRTB error).
-    // Pair each fetch with its original index because `buffer_unordered` completes
-    // by response time, while snippets must stay aligned with Brave's result order.
-    let urls: Vec<String> = results.iter().map(|r| r.url.clone()).collect();
-    let futures = urls.into_iter().enumerate().map(|(idx, url)| {
+    // Within-turn page dedup: split URLs into cache hits (served from
+    // TurnCache, no network, not counted as a fresh attempt) and misses (fetched
+    // below). Pair each with its original index because `buffer_unordered`
+    // completes by response time while snippets must stay in Brave's order.
+    let mut extracts: Vec<Option<String>> = vec![None; results.len()];
+    let mut to_fetch: Vec<(usize, String)> = Vec::new();
+    {
+        let cache = ctx.cache.lock().ok();
+        for (idx, r) in results.iter().enumerate() {
+            let cached = cache.as_ref().and_then(|c| c.pages.get(&r.url).cloned());
+            match cached {
+                Some(hit) => extracts[idx] = hit,
+                None => to_fetch.push((idx, r.url.clone())),
+            }
+        }
+    }
+
+    let attempted = to_fetch.len();
+    let futures = to_fetch.into_iter().map(|(idx, url)| {
         let http = http.clone();
         async move {
             let extract = match tokio::time::timeout(timeout, http.get(&url).send()).await {
@@ -284,30 +358,132 @@ async fn fetch_pages(
                 },
                 _ => None, // timed out or errored — drop this straggler
             };
-            (idx, extract)
+            (idx, url, extract)
         }
     });
 
-    let fetched = stream::iter(futures)
+    let results_fetched: Vec<(usize, String, Option<String>)> = stream::iter(futures)
         .buffer_unordered(cfg.search_fetch_concurrency)
         .collect()
         .await;
-    restore_extract_order(results.len(), fetched)
-}
 
-fn restore_extract_order(len: usize, fetched: Vec<(usize, Option<String>)>) -> Vec<Option<String>> {
-    let mut extracts = vec![None; len];
-    for (idx, extract) in fetched {
-        if idx < len {
-            extracts[idx] = extract;
+    let mut fetched = 0usize;
+    if let Ok(mut cache) = ctx.cache.lock() {
+        for (idx, url, extract) in results_fetched {
+            if extract.is_some() {
+                fetched += 1;
+            }
+            // Record the outcome (incl. a failed fetch as `None`) so the same
+            // URL is not re-attempted later in this turn.
+            cache.pages.insert(url, extract.clone());
+            if idx < extracts.len() {
+                extracts[idx] = extract;
+            }
         }
     }
-    extracts
+
+    (extracts, fetched, attempted)
 }
 
-/// Minimal HTML-to-text: strip tags and collapse whitespace, then truncate.
+/// HTML-to-text without a heavy dependency.
+///
+/// The old version stripped tags but kept the *content* of `<script>`/`<style>`
+/// (JS/CSS source leaked in as "text") and all nav/footer boilerplate. This:
+///
+/// 1. Removes whole `<script>`, `<style>`, and `<head>` blocks (tag + content)
+///    before any tag-stripping, so their bodies never reach the output.
+/// 2. Prefers main-content blocks: if the page has `<article>`, `<main>`, or
+///    `<p>` regions, only their text is kept (drops chrome). Falls back to the
+///    full body when none are present, so content-light pages still extract.
+/// 3. Strips remaining tags and collapses whitespace, then truncates at `cap`.
 fn html_to_text(html: &str, cap: usize) -> String {
-    let mut text = String::new();
+    let stripped = remove_blocks(html, &["script", "style", "head", "noscript", "template"]);
+
+    // Prefer main-content regions when present (cleanly, by block extraction).
+    let main = extract_blocks(&stripped, &["article", "main", "p"]);
+    let source = if main.trim().is_empty() {
+        &stripped
+    } else {
+        &main
+    };
+
+    let text = strip_tags(source);
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(cap).collect()
+}
+
+/// Remove `<tag>…</tag>` blocks (opening tag, inner content, closing tag) for
+/// each named tag, case-insensitively. Unclosed tags drop the rest of the input
+/// (defensive — a runaway `<script>` shouldn't leak). Bounded single pass.
+fn remove_blocks(html: &str, tags: &[&str]) -> String {
+    let mut out = String::with_capacity(html.len());
+    let lower = html.to_ascii_lowercase();
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    'outer: while i < bytes.len() {
+        if bytes[i] == b'<' {
+            for tag in tags {
+                // Match "<tag" followed by '>' , whitespace, or '/'.
+                let open = format!("<{tag}");
+                if lower[i..].starts_with(&open) {
+                    let after = i + open.len();
+                    let boundary = lower[after..]
+                        .chars()
+                        .next()
+                        .map(|c| c == '>' || c == '/' || c.is_whitespace())
+                        .unwrap_or(true);
+                    if boundary {
+                        let close = format!("</{tag}>");
+                        match lower[i..].find(&close) {
+                            Some(rel) => {
+                                i += rel + close.len();
+                            }
+                            None => break 'outer, // unclosed: drop the remainder
+                        }
+                        continue 'outer;
+                    }
+                }
+            }
+        }
+        // Advance one full char (the input is valid UTF-8).
+        let ch_len = utf8_len(bytes[i]);
+        out.push_str(&html[i..(i + ch_len).min(html.len())]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Concatenate the inner text of every `<tag>…</tag>` block for each named tag
+/// (case-insensitive), separated by spaces. Returns empty if none are found.
+fn extract_blocks(html: &str, tags: &[&str]) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::new();
+    for tag in tags {
+        let open_prefix = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(&open_prefix) {
+            let open_at = from + rel;
+            // Find the end of the opening tag.
+            let Some(gt) = lower[open_at..].find('>') else {
+                break;
+            };
+            let content_start = open_at + gt + 1;
+            let Some(crel) = lower[content_start..].find(&close) else {
+                break;
+            };
+            let content_end = content_start + crel;
+            out.push_str(&html[content_start..content_end]);
+            out.push(' ');
+            from = content_end + close.len();
+        }
+    }
+    out
+}
+
+/// Strip all remaining `<…>` tags, leaving text content.
+fn strip_tags(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
     let mut in_tag = false;
     for c in html.chars() {
         match c {
@@ -317,8 +493,22 @@ fn html_to_text(html: &str, cap: usize) -> String {
             _ => {}
         }
     }
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.chars().take(cap).collect()
+    text
+}
+
+/// UTF-8 byte length from a leading byte.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -339,7 +529,7 @@ mod tests {
             r("Rust", "A language", "https://rust-lang.org"),
             r("Tokio", "Async runtime", "https://tokio.rs"),
         ];
-        let out = format_snippets("rust", &results, &[], 4000);
+        let out = format_snippets("rust", &results, &[], 4000, 0, 0);
         assert!(out.contains("1. Rust — A language (https://rust-lang.org)"));
         assert!(out.contains("2. Tokio — Async runtime (https://tokio.rs)"));
     }
@@ -347,7 +537,8 @@ mod tests {
     #[test]
     fn context_cap_is_respected() {
         let results = vec![r("T", "long description here", "https://x")];
-        let out = format_snippets("q", &results, &[], 20);
+        let out = format_snippets("q", &results, &[], 20, 0, 0);
+        // The straggler note (if any) is appended after the cap; the body is capped.
         assert!(out.len() <= 20);
     }
 
@@ -355,8 +546,65 @@ mod tests {
     fn context_cap_does_not_split_utf8_query() {
         let query = "\u{1f600}";
         let cap = "Web search results for \"".len() + 1;
-        let out = format_snippets(query, &[], &[], cap);
+        let out = format_snippets(query, &[], &[], cap, 0, 0);
         assert!(out.len() <= cap);
+    }
+
+    #[test]
+    fn straggler_note_reports_dropped_pages() {
+        // 5 attempted, 3 fetched → 2 timed out, surfaced in the note.
+        let results = vec![r("T", "d", "https://x")];
+        let out = format_snippets("q", &results, &[], 4000, 3, 5);
+        assert!(out.contains("(fetched 3 of 5 sources; 2 timed out)"));
+    }
+
+    #[test]
+    fn no_straggler_note_when_all_pages_fetched() {
+        assert!(straggler_note(5, 5).is_none());
+        assert!(straggler_note(0, 0).is_none()); // snippet-only search
+        assert!(straggler_note(6, 5).is_none()); // never negative
+    }
+
+    #[test]
+    fn html_to_text_drops_script_and_style_content() {
+        let html = "<html><head><title>t</title></head><body>\
+            <style>.x{color:red;font-size:99px}</style>\
+            <script>var secret = 'leak-me'; doEvil();</script>\
+            <p>Visible body text.</p></body></html>";
+        let out = html_to_text(html, 4000);
+        assert!(out.contains("Visible body text."));
+        // None of the script/style/head source survives.
+        assert!(!out.contains("leak-me"));
+        assert!(!out.contains("doEvil"));
+        assert!(!out.contains("color:red"));
+        assert!(!out.contains("font-size"));
+    }
+
+    #[test]
+    fn html_to_text_unclosed_script_does_not_leak() {
+        let html = "<p>before</p><script>never_closed = true; trailing junk";
+        let out = html_to_text(html, 4000);
+        assert!(out.contains("before"));
+        assert!(!out.contains("never_closed"));
+        assert!(!out.contains("trailing junk"));
+    }
+
+    #[test]
+    fn html_to_text_prefers_main_content() {
+        let html = "<body><nav>Home About Contact</nav>\
+            <main>The actual article body.</main>\
+            <footer>Copyright boilerplate 2026</footer></body>";
+        let out = html_to_text(html, 4000);
+        assert!(out.contains("The actual article body."));
+        assert!(!out.contains("Copyright boilerplate"));
+        assert!(!out.contains("Home About Contact"));
+    }
+
+    #[test]
+    fn html_to_text_falls_back_to_body_without_main_blocks() {
+        let html = "<div>Just some plain divs with no article or p.</div>";
+        let out = html_to_text(html, 4000);
+        assert!(out.contains("Just some plain divs"));
     }
 
     #[test]
@@ -405,19 +653,37 @@ mod tests {
         assert_eq!(args.depth, SearchDepth::Thorough);
     }
 
-    #[test]
-    fn fetched_page_extracts_are_restored_to_result_order() {
-        let extracts = restore_extract_order(
-            3,
-            vec![
-                (2, Some("third".into())),
-                (0, Some("first".into())),
-                (1, None),
-            ],
-        );
-        assert_eq!(
-            extracts,
-            vec![Some("first".into()), None, Some("third".into())]
-        );
+    #[tokio::test]
+    async fn repeated_fetch_hits_within_turn_cache() {
+        use crate::config::tests_support::minimal;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<p>page body</p>"))
+            .mount(&server)
+            .await;
+
+        let cfg = minimal();
+        let http = reqwest::Client::new();
+        let ctx = TurnContext::default();
+        let url = server.uri();
+        let results = vec![r("T", "d", &url)];
+
+        // First fetch hits the network and populates the cache.
+        let (e1, fetched1, attempted1) = fetch_pages(&cfg, &http, &results, &ctx).await;
+        assert_eq!(attempted1, 1);
+        assert_eq!(fetched1, 1);
+        assert!(e1[0].as_deref().unwrap().contains("page body"));
+
+        // Second fetch of the same URL is served from the cache: no new attempt.
+        let (e2, fetched2, attempted2) = fetch_pages(&cfg, &http, &results, &ctx).await;
+        assert_eq!(attempted2, 0, "cache hit must not re-attempt the fetch");
+        assert_eq!(fetched2, 0);
+        assert!(e2[0].as_deref().unwrap().contains("page body"));
+
+        // Exactly one request reached the server despite two fetch_pages calls.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

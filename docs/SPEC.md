@@ -48,7 +48,29 @@ only tells the app whether to *show* affordances. The app never executes tools.
 
 The orchestrator also serves the standard `GET /v1/models` (OpenAI list shape)
 backed by the same probe, so any standard OpenAI client can discover models;
-`/v1/capabilities` is the Phantasm-aware superset the app prefers.
+`/v1/capabilities` is the Phantasm-aware superset the app prefers. `/v1/models`
+lists the real **base** model ids only — a standard OpenAI client sees a normal
+model list — while research **modes** live in the capabilities superset as the
+Phantasm-aware detail (see below).
+
+An optional `modes` array advertises the research modes the deployment offers
+(see §2.3). It is present **only** when `web_search` is usable; older clients
+tolerate its absence (a missing/`nil` field simply means no research UI):
+
+```jsonc
+{
+  // …the fields above, plus:
+  "modes": [
+    { "id": "deep-research",  "label": "Deep Research",  "needs": ["web_search"] },
+    { "id": "quick-research", "label": "Quick Research", "needs": ["web_search"] }
+  ]
+}
+```
+
+Each entry carries a mode `id` (the suffix the app composes onto a base model id,
+§2.3), a human `label`, and a `needs` list of capabilities the mode requires. The
+app shows a mode only when its `needs` ⊆ the advertised tools **and** the chosen
+base model is in `tool_models` — the same gating the per-tool toggles already use.
 
 `vision_models` and `tool_models` are subsets of `models` reporting which models
 accept image input and which can drive tool/function calls (probed server-side
@@ -126,17 +148,25 @@ scope which of the advertised (`/v1/capabilities`) tools apply to a given
 conversation. Because selection rides standard fields, any OpenAI client can do
 it and a bare backend ignores it harmlessly.
 
-**Deep Research mode (additive).** The app MAY include an `x_research: true`
-field to run the turn in Deep Research mode. Following the `x_`-prefix
-convention, standard clients and backends ignore it; **absent/false** is an
-ordinary turn. When set, the orchestrator injects a research system prompt,
-offers only `web_search` (forcing full-page fetching regardless of the
-operator's `SEARCH_FETCH_PAGES` gate), and runs a larger tool-loop budget
-(`MAX_RESEARCH_ITERS`) so the model can decompose the question, search across
-several rounds, and synthesize a single cited answer. The result still streams
-back as ordinary assistant markdown (inline `[n]` citations + a sources list),
-so a standard client renders it with no special handling. Deep Research depends
-on `web_search` being configured; the app gates its toggle on that capability.
+**Deep Research mode (model id, not a flag).** Deep Research is a **mode**
+selected via the standard `model` field, never a request flag — there is no
+`x_research`. The app sends a mode-suffixed model id, `"<base>:<mode>"` (e.g.
+`"qwen2.5:14b:deep-research"`), and the server resolves the mode server-side
+against a preset table. The parse rule is **split on the LAST `:`**: if the
+suffix exactly matches a known mode id, the prefix is the base model and the
+matched preset applies; otherwise the whole string is the base model and there is
+no research mode. This handles colon-bearing Ollama ids correctly —
+`"qwen2.5:14b"` → suffix `14b`, not a mode, so the whole string is the base;
+`"qwen2.5:14b:deep-research"` → suffix `deep-research`, a mode, so base is
+`"qwen2.5:14b"`. Modes are discoverable via `capabilities.modes` (§2.1); a bare
+OpenAI client that never sends a suffix simply never researches. Each preset
+declares its budget and the tools it offers (research offers `web_search` only,
+resolved through the existing `tools` narrowing — §2.3 above). The result streams
+back as ordinary assistant markdown (inline `[n]` citations + a numbered
+`Sources:` list embedded in `content`), so a standard client renders it with no
+special handling; progress rides the existing `x_status` field. Modes are
+advertised only when `web_search` is usable, and the app gates each on its
+`needs`.
 
 **Thinking mode.** The app MAY include `reasoning_effort` on the request.
 `"none"` asks the backend to suppress thinking/reasoning (the default app
@@ -209,10 +239,13 @@ MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel
 ## 8. Resolved decisions
 
 - Single OpenAI-compatible SSE endpoint; tools server-side; the only
-  non-standard wire elements are the `x_`-prefixed `x_status` (progress) and
-  `x_research` (deep-research mode) fields. Tool selection rides standard
-  `tools`/`tool_choice`; streamed reasoning rides `delta.reasoning_content`;
-  `/v1/models` is served alongside `/v1/capabilities`.
+  non-standard wire element is the `x_`-prefixed `x_status` (progress) field.
+  Deep Research rides the standard `model` id (a `"<base>:<mode>"` suffix
+  resolved server-side, §2.3) rather than a proprietary flag, so research stops
+  being non-standard wire surface — the headline win. Tool selection rides
+  standard `tools`/`tool_choice`; streamed reasoning rides
+  `delta.reasoning_content`; `/v1/models` is served alongside
+  `/v1/capabilities`.
 - Upstream native Ollama via **`/api/chat`** when available (Ollama
   OpenAI-compat drops streamed tool_calls), with OpenAI-compatible `/v1`
   fallback for non-Ollama model hosts.

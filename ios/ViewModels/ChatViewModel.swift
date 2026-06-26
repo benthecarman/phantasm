@@ -145,41 +145,47 @@ final class ChatViewModel {
     /// fresh draft mirrors a tools-enabled backend's out-of-the-box behavior.
     var webSearchEnabled: Bool { conversation?.webSearchEnabled ?? true }
     var imageGenerationEnabled: Bool { conversation?.imageGenerationEnabled ?? true }
-    /// Deep Research is off by default — a deliberate, slower mode.
-    var deepResearchEnabled: Bool { conversation?.deepResearchEnabled ?? false }
+    /// The selected research mode for this chat (e.g. `"deep-research"`), or `nil`
+    /// for an ordinary turn. It only reaches the wire as a model-id suffix at send
+    /// time (redesign §7), gated on the backend advertising it.
+    var modeID: String? { conversation?.modeID }
+
+    /// The research modes the active backend advertises whose needed tools are
+    /// usable. Empty ⇒ no research UI. Drives the composer's mode picker.
+    var availableModes: [Capabilities.Mode] { env?.backendMode.availableModes ?? [] }
 
     func setWebSearchEnabled(_ on: Bool) {
-        setTools(
+        setOptions(
             webSearch: on,
             imageGeneration: imageGenerationEnabled,
-            deepResearch: deepResearchEnabled
+            modeID: modeID
         )
     }
 
     func setImageGenerationEnabled(_ on: Bool) {
-        setTools(
+        setOptions(
             webSearch: webSearchEnabled,
             imageGeneration: on,
-            deepResearch: deepResearchEnabled
+            modeID: modeID
         )
     }
 
-    func setDeepResearchEnabled(_ on: Bool) {
-        setTools(
+    func setModeID(_ modeID: String?) {
+        setOptions(
             webSearch: webSearchEnabled,
             imageGeneration: imageGenerationEnabled,
-            deepResearch: on
+            modeID: modeID
         )
     }
 
     /// Update the conversation's tool/research selection and persist it. For an
     /// unsent draft the store write is a no-op and the selection rides along on
     /// the first send (the draft is inserted whole), mirroring `setModel`.
-    private func setTools(webSearch: Bool, imageGeneration: Bool, deepResearch: Bool) {
+    private func setOptions(webSearch: Bool, imageGeneration: Bool, modeID: String?) {
         guard var conversation else { return }
         conversation.webSearchEnabled = webSearch
         conversation.imageGenerationEnabled = imageGeneration
-        conversation.deepResearchEnabled = deepResearch
+        conversation.modeID = modeID
         self.conversation = conversation
         let id = conversation.id
         Task { [store] in
@@ -187,7 +193,7 @@ final class ChatViewModel {
                 id: id,
                 webSearchEnabled: webSearch,
                 imageGenerationEnabled: imageGeneration,
-                deepResearchEnabled: deepResearch
+                modeID: modeID
             )
         }
     }
@@ -426,12 +432,20 @@ final class ChatViewModel {
             finish(error: .modelError("Could not load the conversation history."))
             return
         }
+        // Research is selected by the model id, not a request flag (redesign §2):
+        // when this chat has a mode selected AND the backend advertises it AND the
+        // base model is tool-capable, the mode rides as a `<base>:<mode>` suffix —
+        // resolved server-side. Otherwise the bare base model. This is the only
+        // place mode reaches the wire.
+        let wireModel = detail.conversation.wireModel(
+            base: model,
+            availableModes: env.backendMode.availableModes,
+            baseModelIsToolCapable: env.supportsTools(model)
+        )
         // Scope which server tools this turn may use (spec §2.3). Omitted entirely
         // for backends with no tool manifest, keeping those requests standard.
-        // Deep Research rides the additive `x_research` flag (server forces its
-        // own search loop); `nil` when off keeps the request standard.
         let request = ChatRequest(
-            model: model,
+            model: wireModel,
             messages: detail.wireHistory(),
             stream: true,
             reasoningEffort: detail.conversation.reasoningEffort(
@@ -440,8 +454,7 @@ final class ChatViewModel {
             ),
             enabledTools: detail.conversation.requestedToolNames(
                 supporting: env.backendMode.capabilities?.tools
-            ),
-            xResearch: detail.conversation.deepResearchEnabled ? true : nil
+            )
         )
         let stream = env.backendMode.usesOllamaNativeChat
             ? env.ollamaChatClient.stream(request, base: base, token: token)

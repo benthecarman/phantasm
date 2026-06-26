@@ -31,10 +31,12 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     public var webSearchEnabled: Bool
     /// Whether this chat wants the server's image-generation tool offered.
     public var imageGenerationEnabled: Bool
-    /// Whether this chat runs in Deep Research mode (`x_research`). Off by
-    /// default — it's a slower, deliberate mode the user opts into per chat; the
-    /// composer's research toggle flips it.
-    public var deepResearchEnabled: Bool
+    /// The selected research/turn mode for this chat (e.g. `"deep-research"`), or
+    /// `nil` for an ordinary turn. It's the *UI preference*; at send time it
+    /// reaches the wire only as a suffix on the `model` id (`<base>:<modeID>`),
+    /// and only when the backend advertises that mode. The composer's research
+    /// picker flips it.
+    public var modeID: String?
     public init(
         id: UUID = UUID(),
         title: String = "New Chat",
@@ -45,7 +47,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         profileID: UUID? = nil,
         webSearchEnabled: Bool = true,
         imageGenerationEnabled: Bool = true,
-        deepResearchEnabled: Bool = false
+        modeID: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -56,7 +58,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         self.profileID = profileID
         self.webSearchEnabled = webSearchEnabled
         self.imageGenerationEnabled = imageGenerationEnabled
-        self.deepResearchEnabled = deepResearchEnabled
+        self.modeID = modeID
     }
 
     public static let databaseTableName = "conversation"
@@ -76,12 +78,27 @@ public extension Conversation {
         return names
     }
 
-    /// Deep Research is an explicit slow/thorough turn mode, so it opts the
-    /// request into thinking for that turn without changing the saved preference.
+    /// Thinking is independent of the research mode (redesign §7): the preset
+    /// (server) or the user (client) decides reasoning, never welded to the mode.
     func reasoningEffort(thinkingEnabled: Bool, disabledEffort: String?) -> String? {
-        deepResearchEnabled || thinkingEnabled
-            ? ReasoningEffort.enabledDefault
-            : disabledEffort
+        thinkingEnabled ? ReasoningEffort.enabledDefault : disabledEffort
+    }
+
+    /// The `model` string to send for this turn. When this chat has a research
+    /// mode selected AND the backend advertises it (`availableModes`) AND the
+    /// base model is tool-capable, the mode rides as a suffix (`<base>:<modeID>`,
+    /// resolved server-side, spec §2.1). Otherwise the bare base model — the only
+    /// place mode reaches the wire (redesign §7).
+    func wireModel(
+        base: String,
+        availableModes: [Capabilities.Mode],
+        baseModelIsToolCapable: Bool
+    ) -> String {
+        guard let modeID,
+              baseModelIsToolCapable,
+              availableModes.contains(where: { $0.id == modeID })
+        else { return base }
+        return "\(base):\(modeID)"
     }
 }
 

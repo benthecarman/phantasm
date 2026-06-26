@@ -21,9 +21,12 @@ struct ComposerOptionsSheet: View {
     let modelSupportsTools: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
-    /// Deep Research mode. Needs the same backing as web search (it's a server
-    /// search loop) plus a tool-capable model.
-    let deepResearchEnabled: Binding<Bool>
+    /// Research modes the backend advertises (e.g. Deep Research), already gated on
+    /// their needed tools being usable. Empty ⇒ the Research section is hidden.
+    let availableModes: [Capabilities.Mode]
+    /// The per-message research mode selection (nil = ordinary turn). Selecting a
+    /// mode reaches the wire only as a `<base>:<mode>` model-id suffix at send time.
+    let modeID: Binding<String?>
     /// Whether the backend should be allowed to emit thinking/reasoning deltas.
     let thinkingEnabled: Binding<Bool>
 
@@ -86,21 +89,18 @@ struct ComposerOptionsSheet: View {
                     )
                 }
 
-                Section {
-                    toolRow(
-                        "Deep research",
-                        systemImage: "text.magnifyingglass",
-                        backendSupports: supportsWebSearch,
-                        isOn: deepResearchEnabled
-                    )
-                } header: {
-                    Text("Research")
-                } footer: {
-                    Text(
-                        "Breaks your question into parts, searches the web across "
-                            + "several rounds, and writes a cited answer. Much slower "
-                            + "than a normal reply."
-                    )
+                if !availableModes.isEmpty {
+                    Section {
+                        researchRows
+                    } header: {
+                        Text("Research")
+                    } footer: {
+                        Text(
+                            "Breaks your question into parts, searches the web across "
+                                + "several rounds, and writes a cited answer. Much slower "
+                                + "than a normal reply."
+                        )
+                    }
                 }
             }
             .navigationTitle("Add to message")
@@ -195,6 +195,68 @@ struct ComposerOptionsSheet: View {
             }
             .disabled(!available)
         }
+    }
+
+    /// Research-mode selector. A single advertised mode renders as one toggle that
+    /// maps to that mode id; multiple modes render as mutually-exclusive rows with
+    /// an "Off" option. Disabled (and pinned off) when the model can't drive tools,
+    /// since every research mode runs a server-side tool loop.
+    @ViewBuilder
+    private var researchRows: some View {
+        if availableModes.count == 1, let mode = availableModes.first {
+            researchToggleRow(mode)
+        } else {
+            researchSelectRow(id: nil, label: "Off")
+            ForEach(availableModes) { mode in
+                researchSelectRow(id: mode.id, label: mode.label)
+            }
+        }
+    }
+
+    private func researchToggleRow(_ mode: Capabilities.Mode) -> some View {
+        let available = modelSupportsTools
+        let binding = Binding(
+            get: { modeID.wrappedValue == mode.id },
+            set: { modeID.wrappedValue = $0 ? mode.id : nil }
+        )
+        return HStack(spacing: 12) {
+            icon("text.magnifyingglass", tint: available ? .accentColor : .secondary)
+            Toggle(isOn: available ? binding : .constant(false)) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(mode.label)
+                        .foregroundStyle(available ? Color.primary : Color.secondary)
+                    if !available {
+                        Text("This model can't use tools")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .disabled(!available)
+        }
+    }
+
+    private func researchSelectRow(id: String?, label: String) -> some View {
+        let available = modelSupportsTools || id == nil
+        let selected = modeID.wrappedValue == id
+        return Button {
+            modeID.wrappedValue = id
+        } label: {
+            HStack(spacing: 12) {
+                icon(
+                    id == nil ? "slash.circle" : "text.magnifyingglass",
+                    tint: available ? .accentColor : .secondary
+                )
+                Text(label)
+                    .foregroundStyle(available ? Color.primary : Color.secondary)
+                Spacer()
+                if selected {
+                    Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .disabled(!available)
     }
 
     private func optionRow(

@@ -102,13 +102,14 @@ fn test_config(ollama_base: &str) -> Config {
         default_model: "m".into(),
         models: vec!["m".into()],
         max_tool_iters: 5,
-        max_research_iters: 6,
         ollama_concurrency: 4,
         web_search_enabled: false,
         brave_base: "https://api.search.brave.com".parse().unwrap(),
         brave_token: None,
         search_max_results: 5,
         search_context_char_cap: 4000,
+        search_page_chars: 2500,
+        research_context_char_cap: 12000,
         search_fetch_pages: false,
         search_fetch_concurrency: 3,
         search_fetch_timeout_ms: 1500,
@@ -127,8 +128,16 @@ fn test_config(ollama_base: &str) -> Config {
         comfy_edit_prompt: None,
         comfy_edit_image: None,
         comfy_edit_seed: None,
+        research_deep_fanout: 4,
+        research_deep_searches_per_subq: 3,
+        research_deep_verify: true,
+        research_quick_fanout: 2,
+        research_quick_searches_per_subq: 2,
+        research_quick_verify: false,
+        research_fanout_concurrency: 2,
         log_format: LogFormat::Text,
         log_content: false,
+        presets: Default::default(),
     }
 }
 
@@ -148,6 +157,7 @@ async fn spawn_orchestrator_with_kind(ollama_base: &str, upstream_kind: Upstream
             web_search: false,
             image_generation: false,
         },
+        modes: vec![],
         streaming: "sse",
     });
     let state = phantasm_orchestrator::build_state(cfg, capabilities, upstream_kind);

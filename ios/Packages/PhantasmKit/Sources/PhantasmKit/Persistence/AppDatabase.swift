@@ -112,6 +112,24 @@ public final class AppDatabase: Sendable {
                 t.add(column: "reasoning", .text).notNull().defaults(to: "")
             }
         }
+
+        // Deep Research becomes a selected mode id rather than a bool: research is
+        // now chosen via a mode-suffixed model id (redesign §2/§7), and the mode
+        // table is server-side. Add `modeID` (nil = ordinary turn) and
+        // migrate rows that had `deepResearchEnabled` on to "deep-research". The
+        // old boolean column is left in place (unused) to keep the migration simple.
+        migrator.registerMigration("v5_research_mode") { db in
+            try db.alter(table: "conversation") { t in
+                t.add(column: "modeID", .text)
+            }
+            try db.execute(
+                sql: """
+                    UPDATE conversation
+                    SET modeID = 'deep-research'
+                    WHERE deepResearchEnabled = 1
+                    """
+            )
+        }
         return migrator
     }
 }
@@ -181,13 +199,13 @@ extension AppDatabase: ChatStore {
         id: UUID,
         webSearchEnabled: Bool,
         imageGenerationEnabled: Bool,
-        deepResearchEnabled: Bool
+        modeID: String?
     ) async throws {
         try await dbWriter.write { db in
             guard var convo = try Conversation.fetchOne(db, key: id) else { return }
             convo.webSearchEnabled = webSearchEnabled
             convo.imageGenerationEnabled = imageGenerationEnabled
-            convo.deepResearchEnabled = deepResearchEnabled
+            convo.modeID = modeID
             try convo.update(db)
         }
     }
