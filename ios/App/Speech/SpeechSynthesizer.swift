@@ -161,9 +161,20 @@ final class SpeechSynthesizer {
 
     /// Build the picker's voice options off the main thread (enumerating voices
     /// and resolving their display labels can be slow enough to jank the UI).
+    ///
+    /// When two distinct voices would render to the same base label (e.g. the
+    /// same name installed for two `en-*` regions), the region is appended so the
+    /// rows are distinguishable rather than looking like duplicates.
     nonisolated static func voiceOptionsForCurrentLanguage() -> [VoiceOption] {
-        installedVoicesForCurrentLanguage().map {
-            VoiceOption(id: $0.identifier, label: displayLabel(for: $0))
+        let voices = installedVoicesForCurrentLanguage()
+        var labelCounts: [String: Int] = [:]
+        for voice in voices { labelCounts[displayLabel(for: voice), default: 0] += 1 }
+        return voices.map { voice in
+            let base = displayLabel(for: voice)
+            let label = labelCounts[base, default: 0] > 1
+                ? "\(base) — \(regionLabel(for: voice))"
+                : base
+            return VoiceOption(id: voice.identifier, label: label)
         }
     }
 
@@ -176,15 +187,29 @@ final class SpeechSynthesizer {
         return "\(voice.name) (\(quality))"
     }
 
+    /// Short region tag for a voice's language (e.g. "en-GB" → "GB"), used to
+    /// disambiguate otherwise identically-labelled voices without bloating the
+    /// row. Falls back to the full language tag when no region is present.
+    nonisolated static func regionLabel(for voice: AVSpeechSynthesisVoice) -> String {
+        Locale(identifier: voice.language).region?.identifier ?? voice.language
+    }
+
     /// Installed voices for the user's current base language (e.g. all "en-*"),
     /// best quality first then alphabetical — the candidates shown in the Voice
     /// settings picker. Excludes the legacy novelty voices (Bells, Bubbles,
     /// Trinoids, …), which aren't usable speech voices.
+    ///
+    /// `AVSpeechSynthesisVoice.speechVoices()` can list the same voice more than
+    /// once (a long-standing platform quirk), so identifiers are deduped — both
+    /// to drop visual duplicates and to keep the picker's `Identifiable` ids
+    /// unique for SwiftUI.
     nonisolated static func installedVoicesForCurrentLanguage() -> [AVSpeechSynthesisVoice] {
         let basePrefix = String(AVSpeechSynthesisVoice.currentLanguageCode().prefix(2))
+        var seen = Set<String>()
         return AVSpeechSynthesisVoice.speechVoices()
             .filter { $0.language.hasPrefix(basePrefix) }
             .filter { !$0.identifier.hasPrefix("com.apple.speech.synthesis.voice.") }
+            .filter { seen.insert($0.identifier).inserted }
             .sorted {
                 rank($0.quality) != rank($1.quality)
                     ? rank($0.quality) > rank($1.quality)
