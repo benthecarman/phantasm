@@ -22,16 +22,18 @@ struct RootView: View {
     @State private var dragOffset: CGFloat = 0
 
     private let drawerWidth: CGFloat = 320
+    private let edgeSwipeWidth: CGFloat = 24
+    private let toolbarGestureExclusionHeight: CGFloat = 44
 
     var body: some View {
         ZStack(alignment: .leading) {
             chatArea
                 .disabled(isDrawerOpen)
 
+            edgeOpenArea
             scrim
             drawer
         }
-        .gesture(edgeOpenGesture)
         .animation(.interactiveSpring(response: 0.35, dampingFraction: 0.85), value: isDrawerOpen)
         .sheet(isPresented: $showSettings) {
             SettingsView(onHistoryCleared: { startNewChat() })
@@ -46,6 +48,24 @@ struct RootView: View {
                 selection = chat
             }
         }
+    }
+
+    private var edgeOpenArea: some View {
+        GeometryReader { proxy in
+            edgeOpenHitRegion(in: proxy)
+        }
+        .allowsHitTesting(!isDrawerOpen)
+    }
+
+    private func edgeOpenHitRegion(in proxy: GeometryProxy) -> some View {
+        let topOffset = proxy.safeAreaInsets.top + toolbarGestureExclusionHeight
+        let height = max(0, proxy.size.height - topOffset)
+
+        return Color.clear
+            .frame(width: edgeSwipeWidth, height: height)
+            .contentShape(Rectangle())
+            .gesture(edgeOpenGesture)
+            .position(x: edgeSwipeWidth / 2, y: topOffset + height / 2)
     }
 
     // MARK: Chat
@@ -87,6 +107,8 @@ struct RootView: View {
         .frame(maxHeight: .infinity)
         .offset(x: drawerXOffset)
         .gesture(closeDragGesture)
+        .allowsHitTesting(isDrawerOpen)
+        .accessibilityHidden(!isDrawerOpen)
         .shadow(color: .black.opacity(isDrawerOpen ? 0.2 : 0), radius: 12, x: 4)
     }
 
