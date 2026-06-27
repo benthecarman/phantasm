@@ -142,12 +142,16 @@ pub struct Config {
     // references (`/v1/images/<id>`) instead of inline base64 — keeping re-sent
     // history small. Unset => disabled, and images stay inline (back-compat).
     pub image_store_dir: Option<PathBuf>,
-    /// Lifespan of a stored blob before the lazy pruner evicts it. A backstop:
-    /// the app deletes blobs explicitly when its conversation is deleted, but a
-    /// missed delete (uninstall, lost request) must not leak disk forever.
+    /// Lifespan of a stored blob before the lazy pruner evicts it. A generous
+    /// backstop, not the primary lifecycle: the app deletes blobs explicitly when
+    /// its conversation is deleted; this only catches deletes that never arrive
+    /// (uninstall, lost request) so disk isn't leaked forever.
     pub image_store_ttl_s: u64,
-    /// Validity window of a signed image URL. Short — the app fetches right after
-    /// receiving the turn — so a leaked link stops resolving quickly.
+    /// Validity window of a signed image URL. Generous: the reference is stored in
+    /// the app's history and must keep resolving for the conversation's life (the
+    /// app holds a link, not the bytes). The unguessable content-hash id is the
+    /// primary guard; the signature + expiry are defense-in-depth. Shorten this
+    /// only if the client caches image bytes locally on receipt.
     pub image_url_ttl_s: u64,
     /// Public origin the app reaches this server at, used to mint absolute image
     /// URLs. Unset => emit site-relative `/v1/images/<id>` and let the app
@@ -275,8 +279,8 @@ impl Config {
             comfy_timeout_s: env_parse("COMFYUI_TIMEOUT_S", 120u64),
             comfy_max_image_bytes: env_parse("COMFYUI_MAX_IMAGE_BYTES", 16 * 1024 * 1024),
             image_store_dir: env_path("IMAGE_STORE_DIR"),
-            image_store_ttl_s: env_parse("IMAGE_STORE_TTL_S", 7 * 24 * 60 * 60),
-            image_url_ttl_s: env_parse("IMAGE_URL_TTL_S", 24 * 60 * 60),
+            image_store_ttl_s: env_parse("IMAGE_STORE_TTL_S", 365 * 24 * 60 * 60),
+            image_url_ttl_s: env_parse("IMAGE_URL_TTL_S", 365 * 24 * 60 * 60),
             public_base_url: parse_opt_url("PUBLIC_BASE_URL")?,
             comfy_gen_workflow: env_path("COMFYUI_GEN_WORKFLOW"),
             comfy_gen_prompt: env_node("COMFYUI_GEN_PROMPT"),
