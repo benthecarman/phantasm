@@ -40,7 +40,7 @@ struct MessageBubble: View {
                         ThinkingDisclosure(text: message.message.reasoning)
                     }
                     if !content.isEmpty {
-                        MarkdownMessageView(text: content)
+                        MarkdownMessageView(text: content, imageBaseURL: env.activeProfile?.baseURL)
                             .contextMenu {
                                 copyButton
                                 speakButton
@@ -153,6 +153,7 @@ struct StreamingBubble: View {
     let reasoning: String
     let status: String?
     @State private var startedAt = Date.now
+    @Environment(AppEnvironment.self) private var env
 
     var body: some View {
         HStack {
@@ -166,7 +167,7 @@ struct StreamingBubble: View {
                 if text.isEmpty && reasoning.isEmpty && (status == nil) {
                     ProgressView()
                 } else if !text.isEmpty {
-                    MarkdownMessageView(text: text)
+                    MarkdownMessageView(text: text, imageBaseURL: env.activeProfile?.baseURL)
                 }
                 timestamp
             }

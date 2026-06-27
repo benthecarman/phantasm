@@ -73,6 +73,15 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertNil(json["tools"], "plain-chat selection sends only tool_choice:none")
     }
 
+    func testChatRequestOptsIntoImageURLs() throws {
+        let request = ChatRequest(model: "m", messages: [WireMessage(role: "user", content: "hi")])
+        let json = try encodedKeys(request)
+        XCTAssertEqual(
+            json["x_image_urls"] as? Bool, true,
+            "the client always opts into server-hosted image URL delivery"
+        )
+    }
+
     func testChatRequestNeverEmitsResearchFlag() throws {
         // Research is now selected by the model id, never a request field.
         let request = ChatRequest(

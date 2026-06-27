@@ -7,11 +7,17 @@ import SwiftUI
 /// provider.
 struct MarkdownMessageView: View {
     let text: String
+    /// Backend origin used to resolve server-hosted `/v1/images/<id>` references,
+    /// which arrive as relative paths (spec §2.2b). Nil => only inline/absolute
+    /// images render.
+    var imageBaseURL: URL? = nil
 
     var body: some View {
         let extracted = Base64ImageExtractor().extractCached(text)
         Markdown(extracted.markdown)
-            .markdownImageProvider(PhantasmImageProvider(images: extracted.images))
+            .markdownImageProvider(
+                PhantasmImageProvider(images: extracted.images, baseURL: imageBaseURL)
+            )
             .markdownBlockStyle(\.codeBlock) { configuration in
                 CodeBlockView(configuration: configuration)
             }
@@ -57,6 +63,8 @@ private struct CodeBlockView: View {
 /// extracted base64 payloads, and ordinary `http(s)` images via `AsyncImage`.
 struct PhantasmImageProvider: ImageProvider {
     let images: [Int: Data]
+    /// Origin for resolving relative `/v1/images/<id>` references to absolute URLs.
+    var baseURL: URL? = nil
 
     func makeImage(url: URL?) -> some View {
         Group {
@@ -67,7 +75,7 @@ struct PhantasmImageProvider: ImageProvider {
                 resizable(Image(uiImage: uiImage))
                     .contextMenu { ImageActions(image: uiImage) }
             } else if let url {
-                AsyncImage(url: url) { image in
+                AsyncImage(url: resolve(url)) { image in
                     resizable(image)
                 } placeholder: {
                     ProgressView()
@@ -76,6 +84,13 @@ struct PhantasmImageProvider: ImageProvider {
                 EmptyView()
             }
         }
+    }
+
+    /// A server-hosted image arrives as a relative path (`/v1/images/<id>?…`);
+    /// resolve it against the backend origin. Absolute URLs pass through.
+    private func resolve(_ url: URL) -> URL {
+        guard url.scheme == nil, let baseURL else { return url }
+        return URL(string: url.absoluteString, relativeTo: baseURL)?.absoluteURL ?? url
     }
 
     private func resizable(_ image: Image) -> some View {
