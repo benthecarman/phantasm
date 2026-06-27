@@ -144,61 +144,74 @@ pub async fn probe_capabilities(
 }
 
 async fn tool_selectors(cfg: &Config, http: &reqwest::Client) -> Vec<ToolSelector> {
-    let mut selectors = Vec::new();
-
-    let mut information_tools = Vec::new();
-    if cfg.web_search_usable() {
-        information_tools.push("web_search".to_string());
-    }
-    if cfg.web_fetch_usable() {
-        information_tools.push("web_fetch".to_string());
-    }
-    if cfg.calculator_usable() {
-        information_tools.push("calculator".to_string());
-    }
-    if cfg.unit_convert_usable() {
-        information_tools.push("unit_convert".to_string());
-    }
-    if cfg.weather_usable() {
-        information_tools.push("weather".to_string());
-    }
-    if cfg.maps_places_usable() {
-        information_tools.push("maps_places".to_string());
-    }
-    if cfg.market_data_usable() {
-        information_tools.push("market_data".to_string());
-    }
-    if cfg.github_usable() {
-        information_tools.push("github".to_string());
-    }
-    if cfg.ocr_usable() {
-        information_tools.push("ocr".to_string());
-    }
-    if !information_tools.is_empty() {
-        selectors.push(ToolSelector {
-            id: "information".to_string(),
-            label: "Information".to_string(),
-            tools: information_tools,
-        });
-    }
-
+    let mut selectors = offline_tool_selectors(cfg);
     let comfy_reachable = probe_reachable(http, cfg.comfy_base.as_str(), "/system_stats").await;
-    let mut image_tools = Vec::new();
-    if comfy_reachable && cfg.image_gen_usable() {
-        image_tools.push("image_generation".to_string());
+    if comfy_reachable {
+        if let Some(images) = make_selector(
+            "image_generation",
+            "Images",
+            &[
+                (cfg.image_gen_usable(), "image_generation"),
+                (cfg.image_edit_usable(), "image_edit"),
+            ],
+        ) {
+            selectors.push(images);
+        }
     }
-    if comfy_reachable && cfg.image_edit_usable() {
-        image_tools.push("image_edit".to_string());
-    }
-    if !image_tools.is_empty() {
-        selectors.push(ToolSelector {
-            id: "image_generation".to_string(),
-            label: "Images".to_string(),
-            tools: image_tools,
-        });
-    }
-
     selectors
+}
+
+/// The selectors derivable from config alone (everything except images, which
+/// also needs a reachable ComfyUI). Split out so the bucketing is unit-testable
+/// without a network probe.
+///
+/// `web_search` groups the tools that reach out to third parties over the
+/// network; `utilities` groups the offline, on-box tools (calculator, unit
+/// conversion, local OCR) — the app offers those unconditionally, so toggling
+/// web access off never disables them.
+fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
+    let mut selectors = Vec::new();
+    if let Some(web) = make_selector(
+        "web_search",
+        "Web access",
+        &[
+            (cfg.web_search_usable(), "web_search"),
+            (cfg.web_fetch_usable(), "web_fetch"),
+            (cfg.weather_usable(), "weather"),
+            (cfg.maps_places_usable(), "maps_places"),
+            (cfg.market_data_usable(), "market_data"),
+            (cfg.github_usable(), "github"),
+        ],
+    ) {
+        selectors.push(web);
+    }
+    if let Some(utilities) = make_selector(
+        "utilities",
+        "Utilities",
+        &[
+            (cfg.calculator_usable(), "calculator"),
+            (cfg.unit_convert_usable(), "unit_convert"),
+            (cfg.ocr_usable(), "ocr"),
+        ],
+    ) {
+        selectors.push(utilities);
+    }
+    selectors
+}
+
+/// Build a selector from its usable tools, or `None` when none are usable (so an
+/// empty bucket is never advertised).
+fn make_selector(id: &str, label: &str, candidates: &[(bool, &str)]) -> Option<ToolSelector> {
+    let tools: Vec<String> = candidates
+        .iter()
+        .filter(|(usable, _)| *usable)
+        .map(|(_, name)| name.to_string())
+        .collect();
+    (!tools.is_empty()).then(|| ToolSelector {
+        id: id.to_string(),
+        label: label.to_string(),
+        tools,
+    })
 }
 
 /// Whether a preset tool name maps to a currently usable server capability.
@@ -210,10 +223,16 @@ fn tool_usable(tool: &str, web_search: bool, image_generation: bool) -> bool {
     }
 }
 
+/// The app-facing selector id that gates a concrete server tool, mirroring the
+/// buckets built in `tool_selectors`. Used to translate a preset's concrete tool
+/// needs into the selector ids a mode requires.
 fn tool_selector_id(tool: &str) -> Option<&'static str> {
     match tool {
-        "web_search" => Some("information"),
-        "image_generation" => Some("image_generation"),
+        "web_search" | "web_fetch" | "weather" | "maps_places" | "market_data" | "github" => {
+            Some("web_search")
+        }
+        "calculator" | "unit_convert" | "ocr" => Some("utilities"),
+        "image_generation" | "image_edit" => Some("image_generation"),
         _ => None,
     }
 }
@@ -304,5 +323,58 @@ pub fn build_state(
         capabilities,
         continuations: state::ContinuationCache::new(),
         images,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{make_selector, tool_selector_id};
+
+    #[test]
+    fn tool_selector_id_groups_network_and_local_tools() {
+        // Outbound-to-the-internet tools ride the web-search toggle.
+        for tool in [
+            "web_search",
+            "web_fetch",
+            "weather",
+            "maps_places",
+            "market_data",
+            "github",
+        ] {
+            assert_eq!(
+                tool_selector_id(tool),
+                Some("web_search"),
+                "{tool} should gate under web_search"
+            );
+        }
+        // Offline tools live in their own always-on bucket, never gated by web access.
+        for tool in ["calculator", "unit_convert", "ocr"] {
+            assert_eq!(
+                tool_selector_id(tool),
+                Some("utilities"),
+                "{tool} should gate under utilities"
+            );
+        }
+        for tool in ["image_generation", "image_edit"] {
+            assert_eq!(tool_selector_id(tool), Some("image_generation"));
+        }
+        assert_eq!(tool_selector_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn make_selector_keeps_usable_tools_and_drops_empty_buckets() {
+        let selector = make_selector(
+            "web_search",
+            "Web search",
+            &[(true, "web_search"), (false, "weather"), (true, "github")],
+        )
+        .expect("a bucket with usable tools is advertised");
+        assert_eq!(selector.id, "web_search");
+        assert_eq!(selector.tools, vec!["web_search", "github"]);
+
+        assert!(
+            make_selector("utilities", "Utilities", &[(false, "calculator")]).is_none(),
+            "a bucket with no usable tools is not advertised"
+        );
     }
 }

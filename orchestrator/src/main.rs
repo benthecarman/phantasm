@@ -61,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
         completion_models,
         vision_models,
         tool_models,
-        information = capabilities.has_tool_selector("information"),
+        web_search = capabilities.has_tool_selector("web_search"),
+        utilities = capabilities.has_tool_selector("utilities"),
         image_generation = capabilities.has_tool_selector("image_generation"),
         "capabilities resolved"
     );

@@ -44,6 +44,12 @@ final class AppEnvironment {
     /// undetectable for this backend, so tools are allowed optimistically. The
     /// server tools also require the backend to advertise them (`backendMode`).
     var toolModels: Set<String>?
+    /// Models known to support reasoning/thinking. `nil` means it's undetectable
+    /// for this backend, so the Thinking toggle is offered optimistically.
+    var thinkingModels: Set<String>?
+    /// Per-model context window sizes, when the backend reports them. Empty/missing
+    /// for a model ⇒ the picker omits the size badge and no overflow warning shows.
+    var contextLengths: [String: Int]?
     /// Observable cache over persisted per-profile, per-model Thinking preferences.
     private var thinkingPreferences: [String: [String: Bool]]
     private var capabilityRefreshGeneration = 0
@@ -176,6 +182,8 @@ final class AppEnvironment {
             backendMode = .plainChatOnly(models: [])
             visionModels = nil
             toolModels = nil
+            thinkingModels = nil
+            contextLengths = nil
             isProbing = false
             return
         }
@@ -195,6 +203,8 @@ final class AppEnvironment {
         guard isCurrentCapabilityRefresh(generation, profileID: profileID) else { return }
         visionModels = modelCapabilities.vision
         toolModels = modelCapabilities.tools
+        thinkingModels = modelCapabilities.thinking
+        contextLengths = modelCapabilities.contextLengths
         warmActiveModel(base: base, token: token)
     }
 
@@ -211,17 +221,27 @@ final class AppEnvironment {
         for mode: BackendMode,
         base: URL,
         token: String
-    ) async -> (vision: Set<String>?, tools: Set<String>?) {
+    ) async -> (
+        vision: Set<String>?,
+        tools: Set<String>?,
+        thinking: Set<String>?,
+        contextLengths: [String: Int]?
+    ) {
         switch mode {
         case .full(let caps):
-            return (caps.visionModelIDs, caps.toolModelIDs)
+            return (
+                caps.visionModelIDs,
+                caps.toolModelIDs,
+                caps.thinkingModelIDs,
+                caps.contextLengthByID
+            )
         case .ollamaNative(let models):
             let vision = await capabilitiesClient.fetchOllamaVisionModels(
                 base: base, token: token, models: models
             )
-            return (vision, nil)
+            return (vision, nil, nil, nil)
         case .plainChatOnly:
-            return (nil, nil)
+            return (nil, nil, nil, nil)
         }
     }
 
@@ -242,10 +262,25 @@ final class AppEnvironment {
         return toolModels.contains(model)
     }
 
+    /// Whether `model` can produce reasoning/thinking output. Unknown backends
+    /// return `true` (optimistic) so we never hide a capability that may exist.
+    func supportsThinking(_ model: String?) -> Bool {
+        guard let thinkingModels else { return true }
+        guard let model else { return false }
+        return thinkingModels.contains(model)
+    }
+
+    /// The effective Thinking setting for `model`: the stored preference, but
+    /// only when the model actually supports reasoning. A model that can't think
+    /// reports `false` regardless of the saved toggle, so we never send
+    /// `reasoning_effort` to a backend that would ignore (or reject) it. The
+    /// preference itself is left intact for when a thinking-capable model is
+    /// reselected.
     func thinkingEnabled(for model: String?) -> Bool {
         guard let profileID = activeProfileID,
               let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty else { return false }
+              !model.isEmpty,
+              supportsThinking(model) else { return false }
         return thinkingPreferences[profileID.uuidString]?[model] ?? false
     }
 

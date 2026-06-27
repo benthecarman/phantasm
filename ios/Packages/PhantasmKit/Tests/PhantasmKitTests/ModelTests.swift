@@ -14,13 +14,15 @@ final class CapabilityDecodeTests: XCTestCase {
             "capabilities":{"completion":false,"vision":false,"audio":false,"tools":false,"insert":false,"thinking":false,"embedding":true}}
          ],
          "tool_selectors":[
-           {"id":"information","label":"Information","tools":["web_search","calculator"]}
+           {"id":"web_search","label":"Web search","tools":["web_search","weather"]},
+           {"id":"utilities","label":"Utilities","tools":["calculator"]}
          ]}
         """
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertEqual(caps.models, ["llama3.1", "qwen2.5:14b"])
         XCTAssertEqual(caps.modelEntries.first?.contextLength, 8192)
-        XCTAssertTrue(caps.hasToolSelector(ToolSelectorName.information))
+        XCTAssertTrue(caps.hasToolSelector(ToolSelectorName.webSearch))
+        XCTAssertTrue(caps.hasToolSelector(ToolSelectorName.utilities))
         XCTAssertFalse(caps.hasToolSelector(ToolSelectorName.imageGeneration))
         XCTAssertEqual(caps.toolModelIDs, ["qwen2.5:14b"])
 
@@ -124,19 +126,19 @@ final class CapabilityDecodeTests: XCTestCase {
         {"version":"0.3.0",
          "models":[{"id":"qwen2.5:14b","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":false,"embedding":false}}],
          "tool_selectors":[
-           {"id":"information","label":"Information","tools":["web_search"]},
+           {"id":"web_search","label":"Web search","tools":["web_search"]},
            {"id":"image_generation","label":"Images","tools":["image_generation"]}
          ],
          "modes":[
-           {"id":"deep-research","label":"Deep Research","required_tools":["information"]},
-           {"id":"quick-research","label":"Quick Research","required_tools":["information"]}
+           {"id":"deep-research","label":"Deep Research","required_tools":["web_search"]},
+           {"id":"quick-research","label":"Quick Research","required_tools":["web_search"]}
          ]}
         """
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertEqual(caps.modes.count, 2)
         XCTAssertEqual(caps.modes.first?.id, "deep-research")
         XCTAssertEqual(caps.modes.first?.label, "Deep Research")
-        XCTAssertEqual(caps.modes.first?.requiredTools, ["information"])
+        XCTAssertEqual(caps.modes.first?.requiredTools, ["web_search"])
     }
 
     func testManifestWithoutModesIsEmpty() throws {
@@ -150,9 +152,9 @@ final class CapabilityDecodeTests: XCTestCase {
         let json = """
         {"version":"0.3.0",
          "models":[{"id":"m","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":false,"embedding":false}}],
-         "tool_selectors":[{"id":"information","label":"Information","tools":["web_search"]}],
+         "tool_selectors":[{"id":"web_search","label":"Web search","tools":["web_search"]}],
          "modes":[
-           {"id":"deep-research","label":"Deep Research","required_tools":["information"]},
+           {"id":"deep-research","label":"Deep Research","required_tools":["web_search"]},
            {"id":"image-mode","label":"Image","required_tools":["image_generation"]}
          ]}
         """
@@ -172,7 +174,7 @@ final class CapabilityDecodeTests: XCTestCase {
             Capabilities.Mode(
                 id: "deep-research",
                 label: "Deep Research",
-                requiredTools: ["information"]
+                requiredTools: ["web_search"]
             )
         ]
         XCTAssertEqual(
@@ -187,7 +189,7 @@ final class CapabilityDecodeTests: XCTestCase {
             Capabilities.Mode(
                 id: "deep-research",
                 label: "Deep Research",
-                requiredTools: ["information"]
+                requiredTools: ["web_search"]
             )
         ]
         XCTAssertEqual(
@@ -210,7 +212,7 @@ final class CapabilityDecodeTests: XCTestCase {
             Capabilities.Mode(
                 id: "deep-research",
                 label: "Deep Research",
-                requiredTools: ["information"]
+                requiredTools: ["web_search"]
             )
         ]
         XCTAssertEqual(
@@ -224,14 +226,17 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertNil(convo.requestedToolNames(supporting: nil))
     }
 
-    func testRequestedToolNamesIntersectsBackendAndChatToggles() {
-        // Backend offers an Information bucket with concrete tools; chat disabled
-        // image gen -> only the concrete information tools are requested.
-        let tools = [
+    private func standardSelectors() -> [Capabilities.ToolSelector] {
+        [
             Capabilities.ToolSelector(
-                id: ToolSelectorName.information,
-                label: "Information",
-                tools: [ToolName.webSearch, "calculator"]
+                id: ToolSelectorName.webSearch,
+                label: "Web search",
+                tools: [ToolName.webSearch, "weather"]
+            ),
+            Capabilities.ToolSelector(
+                id: ToolSelectorName.utilities,
+                label: "Utilities",
+                tools: ["calculator", "unit_convert", "ocr"]
             ),
             Capabilities.ToolSelector(
                 id: ToolSelectorName.imageGeneration,
@@ -239,16 +244,32 @@ final class CapabilityDecodeTests: XCTestCase {
                 tools: [ToolName.imageGeneration, "image_edit"]
             ),
         ]
+    }
+
+    func testRequestedToolNamesIntersectsBackendAndChatToggles() {
+        // Web access on, image gen off -> network tools + always-on utilities, no images.
         let convo = Conversation(webSearchEnabled: true, imageGenerationEnabled: false)
-        XCTAssertEqual(convo.requestedToolNames(supporting: tools), ["web_search", "calculator"])
+        XCTAssertEqual(
+            convo.requestedToolNames(supporting: standardSelectors()),
+            ["calculator", "unit_convert", "ocr", ToolName.webSearch, "weather"]
+        )
+    }
+
+    func testRequestedToolNamesKeepsUtilitiesWhenWebAccessDisabled() {
+        // The bug fix: disabling web access must NOT disable the offline tools.
+        let convo = Conversation(webSearchEnabled: false, imageGenerationEnabled: false)
+        XCTAssertEqual(
+            convo.requestedToolNames(supporting: standardSelectors()),
+            ["calculator", "unit_convert", "ocr"]
+        )
     }
 
     func testRequestedToolNamesDropsUnsupportedTool() {
-        // Chat wants image gen but backend doesn't offer it -> excluded.
+        // Chat wants image gen but backend offers only web search -> images excluded.
         let tools = [
             Capabilities.ToolSelector(
-                id: ToolSelectorName.information,
-                label: "Information",
+                id: ToolSelectorName.webSearch,
+                label: "Web search",
                 tools: [ToolName.webSearch]
             )
         ]
@@ -256,8 +277,9 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(convo.requestedToolNames(supporting: tools), [ToolName.webSearch])
     }
 
-    func testRequestedToolNamesEmptyWhenAllDisabled() {
-        let tools = toolSelectors(ToolSelectorName.information, ToolSelectorName.imageGeneration)
+    func testRequestedToolNamesEmptyWhenNoUtilitiesAndTogglesOff() {
+        // No offline bucket advertised; both toggles off -> nothing requested.
+        let tools = toolSelectors(ToolSelectorName.webSearch, ToolSelectorName.imageGeneration)
         let convo = Conversation(webSearchEnabled: false, imageGenerationEnabled: false)
         XCTAssertEqual(convo.requestedToolNames(supporting: tools), [])
     }

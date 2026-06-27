@@ -391,6 +391,21 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         supportedModels(where: \.tools)
     }
 
+    /// `nil` means reasoning support is unknown for this backend.
+    public var thinkingModelIDs: Set<String>? {
+        supportedModels(where: \.thinking)
+    }
+
+    /// Per-model context window sizes, for the models that report one. Models
+    /// without a reported window are simply absent from the map.
+    public var contextLengthByID: [String: Int] {
+        var map: [String: Int] = [:]
+        for model in modelEntries {
+            if let length = model.contextLength { map[model.id] = length }
+        }
+        return map
+    }
+
     public init(
         version: String,
         modelEntries: [Model],
@@ -453,7 +468,11 @@ public enum ToolName {
 /// App-facing capability bucket ids from `capabilities.tool_selectors`.
 /// These are UI selectors, not server tool schema names.
 public enum ToolSelectorName {
-    public static let information = "information"
+    /// Tools that reach the internet — gated by the per-chat web-access toggle.
+    public static let webSearch = "web_search"
+    /// Offline, on-box tools (calculator, unit convert, OCR). The app offers these
+    /// unconditionally, so turning web access off never disables them.
+    public static let utilities = "utilities"
     public static let imageGeneration = "image_generation"
 }
 
@@ -492,7 +511,7 @@ public enum BackendMode: Sendable, Equatable {
 
     public var showsTools: Bool {
         guard let capabilities else { return false }
-        return capabilities.hasToolSelector(ToolSelectorName.information)
+        return capabilities.hasToolSelector(ToolSelectorName.webSearch)
             || capabilities.hasToolSelector(ToolSelectorName.imageGeneration)
     }
 

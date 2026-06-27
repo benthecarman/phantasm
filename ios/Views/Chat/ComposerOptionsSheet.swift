@@ -23,6 +23,9 @@ struct ComposerOptionsSheet: View {
     /// the Location row is usable.
     let supportsLocation: Bool
     let modelSupportsTools: Bool
+    /// Whether the selected model can produce reasoning output. When false the
+    /// Thinking row renders disabled + pinned off rather than hidden.
+    let modelSupportsThinking: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
     let locationEnabled: Binding<Bool>
@@ -75,13 +78,15 @@ struct ComposerOptionsSheet: View {
                     optionRow(
                         "Thinking",
                         systemImage: "brain.head.profile",
+                        available: modelSupportsThinking,
+                        disabledReason: "This model can't think",
                         isOn: thinkingEnabled
                     )
                 }
 
                 Section("Tools") {
                     toolRow(
-                        "Web search",
+                        "Web access",
                         systemImage: "globe",
                         backendSupports: supportsWebSearch,
                         isOn: webSearchEnabled
@@ -275,14 +280,30 @@ struct ComposerOptionsSheet: View {
         .disabled(!available)
     }
 
+    /// A response toggle. When the model can't drive the feature it renders
+    /// disabled + pinned off, captioned with the reason — same treatment as
+    /// `toolRow`, so an unusable toggle stays discoverable instead of vanishing.
     private func optionRow(
         _ title: String,
         systemImage: String,
+        available: Bool,
+        disabledReason: String,
         isOn: Binding<Bool>
     ) -> some View {
         HStack(spacing: 12) {
-            icon(systemImage, tint: .accentColor)
-            Toggle(title, isOn: feedbackBinding(isOn))
+            icon(systemImage, tint: available ? .accentColor : .secondary)
+            Toggle(isOn: available ? feedbackBinding(isOn) : .constant(false)) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .foregroundStyle(available ? Color.primary : Color.secondary)
+                    if !available {
+                        Text(disabledReason)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .disabled(!available)
         }
     }
 
@@ -350,6 +371,9 @@ struct ModelPickerSheet: View {
     /// corresponding badge is omitted (rather than implying the model lacks it).
     let visionModels: Set<String>?
     let toolModels: Set<String>?
+    /// Per-model context window sizes. A model absent from the map shows no size
+    /// badge (the backend didn't report one).
+    let contextLengths: [String: Int]?
     /// The configured default model, badged so it's identifiable in the list.
     let defaultModel: String?
     @Environment(\.dismiss) private var dismiss
@@ -394,11 +418,15 @@ struct ModelPickerSheet: View {
         let isDefault = model == defaultModel
         let isVision = visionModels?.contains(model) == true
         let isTools = toolModels?.contains(model) == true
-        if isDefault || isVision || isTools {
+        let context = contextLengths?[model]
+        if isDefault || isVision || isTools || context != nil {
             HStack(spacing: 6) {
                 if isDefault { badge("Default", systemImage: "star.fill", tint: .accentColor) }
                 if isVision { badge("Vision", systemImage: "eye") }
                 if isTools { badge("Tools", systemImage: "wrench.and.screwdriver") }
+                if let context {
+                    badge(ContextWindow.formatTokens(context), systemImage: "memorychip")
+                }
             }
         }
     }

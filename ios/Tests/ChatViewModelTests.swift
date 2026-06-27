@@ -280,7 +280,7 @@ final class ChatViewModelTests: XCTestCase {
                 )
             ],
             toolSelectors: [
-                .init(id: ToolSelectorName.information, label: "Information", tools: [ToolName.webSearch]),
+                .init(id: ToolSelectorName.webSearch, label: "Web search", tools: [ToolName.webSearch]),
                 .init(
                     id: ToolSelectorName.imageGeneration,
                     label: "Images",

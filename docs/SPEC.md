@@ -75,18 +75,21 @@ image generation on top of plain inference.
   ],
   "tool_selectors": [
     {
-      "id": "information",
-      "label": "Information",
+      "id": "web_search",
+      "label": "Web access",
       "tools": [
         "web_search",
         "web_fetch",
-        "calculator",
-        "unit_convert",
         "weather",
         "maps_places",
-        "github",
-        "ocr"
+        "market_data",
+        "github"
       ]
+    },
+    {
+      "id": "utilities",
+      "label": "Utilities",
+      "tools": ["calculator", "unit_convert", "ocr"]
     },
     {
       "id": "image_generation",
@@ -117,8 +120,8 @@ usable:
 {
   // …the fields above, plus:
   "modes": [
-    { "id": "deep-research",  "label": "Deep Research",  "required_tools": ["information"] },
-    { "id": "quick-research", "label": "Quick Research", "required_tools": ["information"] }
+    { "id": "deep-research",  "label": "Deep Research",  "required_tools": ["web_search"] },
+    { "id": "quick-research", "label": "Quick Research", "required_tools": ["web_search"] }
   ]
 }
 ```
@@ -140,10 +143,19 @@ metadata, not a capability, so it lives beside `capabilities`.
 
 Each `tool_selectors[]` entry names one app-facing UI bucket. When a bucket is
 enabled, the app sends the concrete server-side schema names listed in that
-entry's `tools[]` as standard OpenAI `tools[].function.name` entries; for
-example, the app-facing `information` selector may send both `web_search` and
-`calculator` when both concrete tools are listed. Research modes are advertised
-only when the actual Brave-backed `web_search` schema is usable.
+entry's `tools[]` as standard OpenAI `tools[].function.name` entries; e.g. the
+`web_search` selector may send `web_search`, `weather`, and `github` together
+when all three concrete tools are listed.
+
+Buckets are grouped by what a user reasons about, not by implementation:
+`web_search` holds the tools that reach **out to the internet** (search, fetch,
+weather, maps, market data, GitHub) and is gated by the per-chat web-access
+toggle; `utilities` holds **offline, on-box** tools (calculator, unit
+conversion, local OCR) that the app offers **unconditionally** — disabling web
+access never disables them, and the app needs no separate toggle for them.
+`image_generation` covers image gen + edit, gated by the image toggle. Research
+modes are advertised only when the actual Brave-backed `web_search` schema is
+usable.
 
 ### 2.2 Chat (single OpenAI-compatible endpoint)
 

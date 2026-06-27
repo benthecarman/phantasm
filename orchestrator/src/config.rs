@@ -359,21 +359,6 @@ impl Config {
         self.ocr_enabled
     }
 
-    /// App-facing "information tools" group. The capabilities manifest exposes
-    /// these as concrete tool names under one UI bucket; research-mode gating
-    /// still checks real Brave search separately.
-    pub fn information_tools_usable(&self) -> bool {
-        self.web_search_usable()
-            || self.web_fetch_usable()
-            || self.calculator_usable()
-            || self.unit_convert_usable()
-            || self.weather_usable()
-            || self.maps_places_usable()
-            || self.market_data_usable()
-            || self.github_usable()
-            || self.ocr_usable()
-    }
-
     /// Whether the image-generation tool can run: toggle on + a workflow and a
     /// prompt-injection node configured (without those it could never run).
     pub fn image_gen_usable(&self) -> bool {

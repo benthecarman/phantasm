@@ -82,7 +82,11 @@ public extension Conversation {
             toolSelectors.first { $0.id == id }?.tools ?? []
         }
         var names: [String] = []
-        if webSearchEnabled { names.append(contentsOf: tools(for: ToolSelectorName.information)) }
+        // Offline utility tools (calculator, unit convert, OCR) never touch the
+        // network, so they're always offered — independent of the web-access and
+        // image toggles.
+        names.append(contentsOf: tools(for: ToolSelectorName.utilities))
+        if webSearchEnabled { names.append(contentsOf: tools(for: ToolSelectorName.webSearch)) }
         if imageGenerationEnabled { names.append(contentsOf: tools(for: ToolSelectorName.imageGeneration)) }
         return names
     }

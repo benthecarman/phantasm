@@ -76,6 +76,21 @@ struct ChatView: View {
         env.supportsTools(currentModelID)
     }
 
+    /// Whether the selected model can produce reasoning output. Gates the
+    /// Thinking toggle; unknown backends stay optimistic (allowed).
+    private var modelSupportsThinking: Bool {
+        env.supportsThinking(currentModelID)
+    }
+
+    /// Estimated context-window usage for this conversation, or `nil` when the
+    /// model's window is unknown (then no warning shows).
+    private var contextUsage: ContextUsage? {
+        ContextWindow.usage(
+            for: messages,
+            contextLength: currentModelID.flatMap { env.contextLengths?[$0] }
+        )
+    }
+
     /// The active orchestrator manifest, or nil for raw Ollama / generic OpenAI.
     private var backendCapabilities: Capabilities? {
         env.backendMode.capabilities
@@ -111,6 +126,9 @@ struct ChatView: View {
                             .id(choice.toolCallId)
                     }
                 }
+                if let usage = contextUsage, usage.isNearLimit || usage.isOverLimit {
+                    ContextLimitBanner(usage: usage)
+                }
                 ComposerView(
                     input: $input,
                     attachments: $attachments,
@@ -123,12 +141,14 @@ struct ChatView: View {
                     modelSelection: modelBinding,
                     visionModels: env.visionModels,
                     toolModels: env.toolModels,
+                    contextLengths: env.contextLengths,
                     defaultModel: env.defaultModelID,
                     allowsImageAttachments: allowsImageAttachments,
-                    supportsWebSearch: backendCapabilities?.hasToolSelector(ToolSelectorName.information) ?? false,
+                    supportsWebSearch: backendCapabilities?.hasToolSelector(ToolSelectorName.webSearch) ?? false,
                     supportsImageGeneration: backendCapabilities?.hasToolSelector(ToolSelectorName.imageGeneration) ?? false,
                     supportsLocation: supportsAppTools,
                     modelSupportsTools: modelSupportsTools,
+                    modelSupportsThinking: modelSupportsThinking,
                     webSearchEnabled: Binding(
                         get: { vm.webSearchEnabled },
                         set: { vm.setWebSearchEnabled($0) }
@@ -393,6 +413,8 @@ struct ComposerView: View {
     /// this backend, so the badge is omitted rather than shown as unsupported).
     let visionModels: Set<String>?
     let toolModels: Set<String>?
+    /// Per-model context window sizes for the picker's size badge.
+    let contextLengths: [String: Int]?
     /// The configured default model, badged in the picker.
     let defaultModel: String?
     /// Whether the selected model can accept images (vision). Files are always
@@ -407,6 +429,8 @@ struct ComposerView: View {
     let supportsLocation: Bool
     /// Whether the selected model supports tool/function calling.
     let modelSupportsTools: Bool
+    /// Whether the selected model supports reasoning/thinking output.
+    let modelSupportsThinking: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
     let locationEnabled: Binding<Bool>
@@ -531,6 +555,7 @@ struct ComposerView: View {
                 supportsImageGeneration: supportsImageGeneration,
                 supportsLocation: supportsLocation,
                 modelSupportsTools: modelSupportsTools,
+                modelSupportsThinking: modelSupportsThinking,
                 webSearchEnabled: webSearchEnabled,
                 imageGenerationEnabled: imageGenerationEnabled,
                 locationEnabled: locationEnabled,
@@ -545,6 +570,7 @@ struct ComposerView: View {
                 selection: modelSelection,
                 visionModels: visionModels,
                 toolModels: toolModels,
+                contextLengths: contextLengths,
                 defaultModel: defaultModel
             )
         }

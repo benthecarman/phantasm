@@ -159,12 +159,12 @@ Advertise modes so the app discovers them instead of inferring research from
     }
   ],
   "tool_selectors": [
-    { "id": "information", "label": "Information", "tools": ["web_search"] },
+    { "id": "web_search", "label": "Web access", "tools": ["web_search"] },
     { "id": "image_generation", "label": "Images", "tools": ["image_generation"] }
   ],
   "modes": [
-    { "id": "deep-research",  "label": "Deep Research",  "required_tools": ["information"] },
-    { "id": "quick-research", "label": "Quick Research", "required_tools": ["information"] }
+    { "id": "deep-research",  "label": "Deep Research",  "required_tools": ["web_search"] },
+    { "id": "quick-research", "label": "Quick Research", "required_tools": ["web_search"] }
   ]
 }
 ```
