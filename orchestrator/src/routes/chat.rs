@@ -45,7 +45,6 @@ pub async fn chat_completions(
     // the request apart.
     let enabled_tools = req.tool_selection();
     let app_tools = req.app_tools();
-    let image_refs = req.image_urls;
 
     // Per XR-2 the app resends full history each turn, including multi-MB base64
     // image data-URIs from prior turns — so move the heavy fields out of `req`
@@ -126,7 +125,6 @@ pub async fn chat_completions(
                 app_tools,
                 preset,
                 images,
-                image_refs,
                 tx,
                 cancel,
             )

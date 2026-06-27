@@ -1,9 +1,10 @@
 //! Server-hosted image blobs (the storage half of FR-O5's URL delivery).
 //!
-//! When `IMAGE_STORE_DIR` is configured, generated/edited images are persisted
-//! here and handed to the app as **signed URL references** instead of inline
-//! base64, so a re-sent conversation history stays small (it carries short
-//! `/v1/images/<id>` links, not multi-MB data URIs).
+//! When `IMAGE_STORE_DIR` (plus `PUBLIC_BASE_URL`) is configured, generated/
+//! edited images are persisted here and handed to the app as **signed,
+//! Files-style URLs** (`/v1/files/<id>/content`) instead of inline base64, so a
+//! re-sent conversation history stays small (it carries short links, not
+//! multi-MB data URIs).
 //!
 //! Protection model:
 //!   * **Content-hash ids** (sha256 → base64url): opaque, non-enumerable, and
@@ -12,10 +13,10 @@
 //!   * **Signed URLs** (HMAC-SHA256 over `id:exp`, keyed by the server's auth
 //!     token): the fetch route is exempt from bearer auth — markdown image
 //!     loaders can't send an `Authorization` header — so a valid, unexpired
-//!     signature is what authorizes a read. A leaked link stops resolving after
-//!     `IMAGE_URL_TTL_S`.
+//!     signature is what authorizes a read. The content-hash id is the primary
+//!     guard; the signature + `IMAGE_URL_TTL_S` expiry are defense-in-depth.
 //!   * **Lifecycle**: the app deletes a blob when its conversation is deleted
-//!     (`DELETE /v1/images/<id>`); a lazy TTL pruner (`IMAGE_STORE_TTL_S`) is the
+//!     (`DELETE /v1/files/<id>`); a lazy TTL pruner (`IMAGE_STORE_TTL_S`) is the
 //!     backstop for deletes that never arrive (uninstall, lost request).
 
 use std::path::{Path, PathBuf};
@@ -40,7 +41,8 @@ pub struct BlobStore {
 struct Inner {
     dir: PathBuf,
     /// Signing key (the server auth token's bytes). Rotating the token
-    /// invalidates outstanding URLs — acceptable; they're short-lived anyway.
+    /// invalidates outstanding URLs — acceptable; the app re-fetches on next view
+    /// and the content-hash id still gates access.
     key: Vec<u8>,
     store_ttl_s: u64,
     url_ttl_s: u64,
@@ -129,13 +131,22 @@ impl BlobStore {
         }
     }
 
-    /// The signed reference to embed for `id`: `<base>/v1/images/<id>?exp=&sig=`,
-    /// site-relative when no public base is configured.
+    /// Whether absolute URLs can be minted (a public origin is configured). URL
+    /// delivery is gated on this so the app only ever receives standard,
+    /// directly-loadable absolute image URLs — never a relative path it would
+    /// have to resolve itself.
+    pub fn has_public_base(&self) -> bool {
+        self.inner.public_base.is_some()
+    }
+
+    /// The signed reference to embed for `id` (OpenAI Files-style content path):
+    /// `<base>/v1/files/<id>/content?exp=&sig=`, site-relative when no public base
+    /// is configured.
     pub fn signed_ref(&self, id: &str) -> String {
         let exp = now_s() + self.inner.url_ttl_s;
         let sig = self.sign(id, exp);
         let base = self.inner.public_base.as_deref().unwrap_or("");
-        format!("{base}/v1/images/{id}?exp={exp}&sig={sig}")
+        format!("{base}/v1/files/{id}/content?exp={exp}&sig={sig}")
     }
 
     /// Validate a fetch URL's signature: the signature must match and `exp` must
@@ -328,7 +339,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Relative when no public base.
         let s = store(tmp.path().to_path_buf());
-        assert!(s.signed_ref("abc").starts_with("/v1/images/abc?exp="));
+        assert!(!s.has_public_base());
+        assert!(s
+            .signed_ref("abc")
+            .starts_with("/v1/files/abc/content?exp="));
 
         // Absolute (trailing slash trimmed) when configured.
         let base = url::Url::parse("https://host.example/").unwrap();
@@ -341,9 +355,10 @@ mod tests {
             Some(&base),
         )
         .unwrap();
+        assert!(s2.has_public_base());
         assert!(s2
             .signed_ref("abc")
-            .starts_with("https://host.example/v1/images/abc?exp="));
+            .starts_with("https://host.example/v1/files/abc/content?exp="));
     }
 
     #[tokio::test]

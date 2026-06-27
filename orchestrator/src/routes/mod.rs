@@ -11,8 +11,9 @@ use axum::{middleware, Router};
 use crate::state::AppState;
 
 /// Assemble the router. Bearer auth gates every route except the image-serving
-/// `GET /v1/images/{id}`, which is authorized by the signed URL instead (image
-/// loaders can't send an `Authorization` header).
+/// `GET /v1/files/{id}/content`, which is authorized by the signed URL instead
+/// (image loaders can't send an `Authorization` header). The Files-style paths
+/// mirror OpenAI's binary-by-id convention.
 pub fn router(state: AppState) -> Router {
     // Cap the whole request body before we buffer it (the coarse DoS guard, and
     // what overrides axum's silent 2 MiB default that rejected image-bearing
@@ -25,15 +26,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(models::models))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/warm", post(warm::warm))
-        .route("/v1/images/{id}", delete(images::delete_image))
+        .route("/v1/files/{id}", delete(images::delete_image))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_bearer,
         ));
 
-    // Signature-gated, auth-exempt image fetch. Merged so it shares the path with
-    // the bearer-gated DELETE (distinct methods don't collide).
-    let public = Router::new().route("/v1/images/{id}", get(images::get_image));
+    // Signature-gated, auth-exempt image fetch (Files-style content path), merged
+    // alongside the bearer-gated DELETE on the resource.
+    let public = Router::new().route("/v1/files/{id}/content", get(images::get_image));
 
     authed
         .merge(public)

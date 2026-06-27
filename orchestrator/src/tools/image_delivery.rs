@@ -71,13 +71,13 @@ mod tests {
             ..Default::default()
         };
         let md = deliver_image(&ctx, PNG, "image/png", "edited").await;
-        assert!(md.starts_with("![edited](/v1/images/"), "{md}");
+        assert!(md.starts_with("![edited](/v1/files/"), "{md}");
 
         // The referenced id resolves back to the stored bytes.
         let id = md
-            .split("/v1/images/")
+            .split("/v1/files/")
             .nth(1)
-            .and_then(|s| s.split('?').next())
+            .and_then(|s| s.split('/').next())
             .unwrap();
         assert_eq!(store.get(id).await.unwrap().bytes, PNG);
     }

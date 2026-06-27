@@ -88,7 +88,6 @@ pub async fn run_turn<B, T>(
     app_tools: Vec<Value>,
     preset: Option<&'static ResearchPreset>,
     images: Option<crate::images::BlobStore>,
-    image_refs: bool,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
 ) where
@@ -175,10 +174,12 @@ pub async fn run_turn<B, T>(
     }
 
     let mut appends: Vec<String> = Vec::new();
-    // URL delivery requires both a configured store and a client that opted in;
-    // otherwise images stay inline (back-compat). The store is still used for
-    // *resolving* references in incoming history regardless of the opt-in.
-    let deliver_image_refs = image_refs && images.is_some();
+    // URL delivery happens only when the store can mint *absolute* URLs (a public
+    // base is configured) — so the app always receives a standard, directly-
+    // loadable image URL, never a relative path. Otherwise images stay inline.
+    // The store is still used to *resolve* references in incoming history (for
+    // editing) regardless.
+    let deliver_image_refs = images.as_ref().is_some_and(|s| s.has_public_base());
     let mut ctx = TurnContext {
         input_images: latest_input_images(&messages, images.as_ref()).await,
         research: false,
@@ -817,7 +818,6 @@ mod tests {
             Vec::new(),
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -854,7 +854,6 @@ mod tests {
             Vec::new(),
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -901,7 +900,6 @@ mod tests {
             Vec::new(),
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -951,7 +949,6 @@ mod tests {
             Vec::new(),
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -997,7 +994,6 @@ mod tests {
             Vec::new(),
             preset,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -1036,7 +1032,6 @@ mod tests {
             Vec::new(),
             None,
             None,
-            false,
             tx,
             cancel,
         )
@@ -1128,7 +1123,6 @@ mod tests {
             vec![app_schema("ask_user")],
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -1174,7 +1168,6 @@ mod tests {
             vec![app_schema("web_search")],
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -1219,7 +1212,6 @@ mod tests {
             vec![app_schema("ask_user")],
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -1273,7 +1265,6 @@ mod tests {
             vec![app_schema("ask_user")],
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )
@@ -1344,7 +1335,6 @@ mod tests {
             Vec::new(),
             None,
             None,
-            false,
             tx,
             CancellationToken::new(),
         )

@@ -240,23 +240,24 @@ backend profile and model.
 
 Consequences:
 
-- **Images** are embedded in the assistant message as markdown — either an
-  inline `![generated](data:image/png;base64,…)` data URI (default), or a
-  server-hosted reference `![generated](/v1/images/<id>?exp=…&sig=…)` when the
-  client opts in with the additive request field `"x_image_urls": true` *and*
-  the deployment has an image store configured (`IMAGE_STORE_DIR`). References
-  keep re-sent history small: the app stores image bytes locally and re-sends
-  short links, not multi-MB base64.
-  - **Fetch**: `GET /v1/images/<id>?exp=&sig=` is authorized by the signed query
-    string (HMAC over `id:exp`), so it is exempt from bearer auth — standard
-    image loaders can't send an `Authorization` header. Links expire
-    (`IMAGE_URL_TTL_S`). Relative paths resolve against the client's backend base
-    URL unless `PUBLIC_BASE_URL` makes them absolute.
-  - **Lifecycle**: the app owns the bytes. `DELETE /v1/images/<id>` (bearer-
-    authed) drops a blob when its conversation is deleted; a server-side TTL
-    (`IMAGE_STORE_TTL_S`) is the backstop for deletes that never arrive.
-  - The edit tool resolves a referenced image back to bytes server-side, so
-    editing a previously-generated image works regardless of delivery mode.
+- **Images** are embedded in the assistant message as ordinary markdown — no
+  custom request field or client logic. Two interchangeable, fully-standard
+  forms, chosen by *server config* alone:
+  - **Inline** (default): `![generated](data:image/png;base64,…)` — exactly
+    OpenAI's vision data-URI form.
+  - **URL**: `![generated](https://host/v1/files/<id>/content?exp=…&sig=…)` —
+    an absolute image URL, emitted when the deployment sets both
+    `IMAGE_STORE_DIR` and `PUBLIC_BASE_URL`. Any markdown-rendering client loads
+    it directly; the signing/expiry are invisible server-side details. This keeps
+    re-sent history small (a short link, not multi-MB base64).
+  - **Fetch**: `GET /v1/files/<id>/content?exp=&sig=` (OpenAI Files-style path)
+    is authorized by the signed query string (HMAC over `id:exp`), so it is
+    exempt from bearer auth — image loaders can't send an `Authorization` header.
+  - **Lifecycle**: the app owns it. `DELETE /v1/files/<id>` (bearer-authed) drops
+    a blob when its conversation is deleted; a server-side TTL (`IMAGE_STORE_TTL_S`)
+    is the backstop for deletes that never arrive.
+  - The edit tool resolves a URL-delivered image back to bytes server-side, so
+    editing a previously-generated image works in either form.
 - **Progress** rides an optional additive field on the SSE chunk,
   `"x_status": "generating image… 42%"`. Standard clients ignore unknown fields;
   the app reads `x_status`. Future custom fields should be `x_`-prefixed.
@@ -346,6 +347,7 @@ MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel
 - Upstream native Ollama via **`/api/chat`** when available (Ollama
   OpenAI-compat drops streamed tool_calls), with OpenAI-compatible `/v1`
   fallback for non-Ollama model hosts.
-- Image return format: inline base64 data-URI markdown by default; optional
-  server-hosted signed URL references when the client opts in (see §2.2b).
+- Image return format: inline base64 data-URI markdown by default; absolute
+  server-hosted image URLs when the deployment configures a store + public base
+  (server-side choice, no client opt-in; see §2.2b).
 - Ship one default ComfyUI workflow, overridable via config.

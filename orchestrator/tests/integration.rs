@@ -653,7 +653,7 @@ async fn image_fetch_is_signed_and_auth_exempt() {
     )
     .unwrap();
     let id = seeder.put(PNG).await.unwrap();
-    let signed = seeder.signed_ref(&id); // "/v1/images/<id>?exp=..&sig=.."
+    let signed = seeder.signed_ref(&id); // "/v1/files/<id>/content?exp=..&sig=.."
 
     let base = spawn_orchestrator_with_images(&ollama, tmp.path().to_path_buf()).await;
     let client = reqwest::Client::new();
@@ -671,7 +671,7 @@ async fn image_fetch_is_signed_and_auth_exempt() {
 
     // Missing signature params => 400 (Query extractor rejects).
     let no_sig = client
-        .get(format!("{base}/v1/images/{id}"))
+        .get(format!("{base}/v1/files/{id}/content"))
         .send()
         .await
         .unwrap();
@@ -701,7 +701,7 @@ async fn image_delete_requires_auth_then_removes() {
 
     // DELETE without bearer => 401.
     let unauthed = client
-        .delete(format!("{base}/v1/images/{id}"))
+        .delete(format!("{base}/v1/files/{id}"))
         .send()
         .await
         .unwrap();
@@ -710,7 +710,7 @@ async fn image_delete_requires_auth_then_removes() {
     // DELETE with bearer => 204, and the blob is gone afterward (404 even with a
     // still-valid signature).
     let deleted = client
-        .delete(format!("{base}/v1/images/{id}"))
+        .delete(format!("{base}/v1/files/{id}"))
         .header("Authorization", format!("Bearer {TOKEN}"))
         .send()
         .await

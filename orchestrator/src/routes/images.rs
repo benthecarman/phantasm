@@ -1,10 +1,12 @@
-//! Server-hosted image endpoints (FR-O5 URL delivery).
+//! Server-hosted image endpoints (FR-O5 URL delivery), shaped after OpenAI's
+//! Files API (binary-by-id).
 //!
-//! `GET /v1/images/{id}` serves a stored blob. It is **exempt from bearer auth**
-//! (standard markdown image loaders can't attach an `Authorization` header), so
-//! authorization comes from the signed query string the server minted — a valid,
-//! unexpired HMAC over the id. `DELETE /v1/images/{id}` stays behind bearer auth
-//! and lets the app drop a blob when its conversation is deleted.
+//! `GET /v1/files/{id}/content` serves a stored blob. It is **exempt from bearer
+//! auth** (standard markdown image loaders can't attach an `Authorization`
+//! header), so authorization comes from the signed query string the server
+//! minted — a valid, unexpired HMAC over the id. `DELETE /v1/files/{id}` stays
+//! behind bearer auth and lets the app drop a blob when its conversation is
+//! deleted.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};

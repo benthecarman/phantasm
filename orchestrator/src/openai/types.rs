@@ -35,13 +35,6 @@ pub struct ChatRequest {
     /// the normal auto behavior.
     #[serde(default)]
     pub tool_choice: Option<Value>,
-    /// Additive opt-in: when true, the server delivers generated/edited images as
-    /// `/v1/images/<id>` URL references (if it has a store configured) instead of
-    /// inline base64, so the client's re-sent history stays small. Clients that
-    /// can't resolve those references omit it and keep inline delivery. A named
-    /// field (not in `extra`) so it's consumed, never forwarded upstream.
-    #[serde(default, rename = "x_image_urls")]
-    pub image_urls: bool,
     /// Any other OpenAI sampling parameters (temperature, top_p, …) passed through to Ollama.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -254,10 +247,10 @@ impl MessageContent {
         }
     }
 
-    /// Server-hosted blob ids referenced by `/v1/images/<id>` links in this
-    /// content — whether in an `image_url` part or in markdown text (the form a
-    /// generated image takes once delivered as a URL). The turn loop resolves
-    /// these against the store so the edit tool sees bytes, not a link.
+    /// Server-hosted blob ids referenced by `/v1/files/<id>/content` links in
+    /// this content — whether in an `image_url` part or in markdown text (the
+    /// form a generated image takes once delivered as a URL). The turn loop
+    /// resolves these against the store so the edit tool sees bytes, not a link.
     pub fn store_image_ids(&self) -> Vec<String> {
         match self {
             MessageContent::Text(s) => extract_store_ids(s),
@@ -272,10 +265,10 @@ impl MessageContent {
     }
 }
 
-/// Pull every `<id>` out of `/v1/images/<id>` occurrences in `s` (id = our
-/// base64url charset, terminated by `?`, `)`, `/`, quote, whitespace, …).
+/// Pull every `<id>` out of `/v1/files/<id>/content` occurrences in `s` (id =
+/// our base64url charset, terminated by `/`, `?`, `)`, quote, whitespace, …).
 fn extract_store_ids(s: &str) -> Vec<String> {
-    const MARKER: &str = "/v1/images/";
+    const MARKER: &str = "/v1/files/";
     let mut out = Vec::new();
     let mut rest = s;
     while let Some(idx) = rest.find(MARKER) {
