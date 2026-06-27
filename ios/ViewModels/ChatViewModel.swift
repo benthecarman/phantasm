@@ -893,6 +893,7 @@ final class ChatViewModel {
                             reasoning: committedReasoning,
                             isComplete: true
                         )
+                        self?.cacheServerImages(messageID: pendingID, content: committed)
                         try await store.updateConversation(
                             id: conversation.id, title: nil, modelID: nil, updatedAt: .now
                         )
@@ -917,6 +918,7 @@ final class ChatViewModel {
                 Task { [weak self] in
                     do {
                         try await store.insertMessage(assistant, attachments: [])
+                        self?.cacheServerImages(messageID: assistant.id, content: committed)
                         try await store.updateConversation(
                             id: conversation.id, title: nil, modelID: nil, updatedAt: .now
                         )
@@ -953,6 +955,29 @@ final class ChatViewModel {
         streamingText = ""
         streamingReasoning = ""
         errorMessage = AppError.from(error).userMessage
+    }
+
+    /// Fetch and locally cache any server-hosted images the just-committed
+    /// assistant message references, so they render offline and survive the
+    /// signed URL's expiry (the message keeps the compact reference for re-sent
+    /// history). Fire-and-forget and best-effort — off the commit path.
+    private func cacheServerImages(messageID: UUID, content: String) {
+        let refs = ServerImageRef.references(in: content)
+        guard !refs.isEmpty, let store else { return }
+        Task {
+            let client = ImageClient()
+            var attachments: [Attachment] = []
+            for ref in refs {
+                guard let url = URL(string: ref.url), let img = await client.fetch(url) else {
+                    continue
+                }
+                attachments.append(
+                    Attachment(
+                        messageId: messageID, kind: .remoteImage, name: ref.id,
+                        data: img.data, mimeType: img.mime))
+            }
+            try? await store.addAttachments(messageID: messageID, attachments: attachments)
+        }
     }
 
     /// After the very first assistant reply, replace the first-message placeholder

@@ -25,6 +25,16 @@ struct MessageBubble: View {
     private var isUser: Bool { message.message.role == "user" }
     private var content: String { message.message.content }
 
+    /// Locally-cached server images for this message, keyed by file id, so
+    /// references render from local bytes once fetched.
+    private var cachedImages: [String: ServerImageRef.CachedImage] {
+        var out: [String: ServerImageRef.CachedImage] = [:]
+        for a in message.attachments where a.kind == AttachmentKind.remoteImage.rawValue {
+            out[a.name] = ServerImageRef.CachedImage(data: a.data, mime: a.mimeType)
+        }
+        return out
+    }
+
     var body: some View {
         HStack {
             if isUser { Spacer(minLength: 40) }
@@ -40,7 +50,7 @@ struct MessageBubble: View {
                         ThinkingDisclosure(text: message.message.reasoning)
                     }
                     if !content.isEmpty {
-                        MarkdownMessageView(text: content)
+                        MarkdownMessageView(text: content, cachedImages: cachedImages)
                             .contextMenu {
                                 copyButton
                                 speakButton

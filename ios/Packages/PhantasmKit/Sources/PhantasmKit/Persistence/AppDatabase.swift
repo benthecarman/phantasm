@@ -181,6 +181,17 @@ extension AppDatabase: ChatStore {
         }
     }
 
+    public func addAttachments(messageID: UUID, attachments: [Attachment]) async throws {
+        guard !attachments.isEmpty else { return }
+        try await dbWriter.write { db in
+            // Skip if the message was deleted between commit and fetch completing.
+            guard try Message.exists(db, key: messageID) else { return }
+            for attachment in attachments {
+                try attachment.insert(db)
+            }
+        }
+    }
+
     public func updateMessage(
         id: UUID,
         content: String,

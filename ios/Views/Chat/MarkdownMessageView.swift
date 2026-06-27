@@ -7,9 +7,14 @@ import SwiftUI
 /// provider.
 struct MarkdownMessageView: View {
     let text: String
+    /// Locally-cached server image bytes, keyed by file id. A referenced image
+    /// present here renders from local bytes (offline / after URL expiry) instead
+    /// of refetching; absent ones still load over the network.
+    var cachedImages: [String: ServerImageRef.CachedImage] = [:]
 
     var body: some View {
-        let extracted = Base64ImageExtractor().extractCached(text)
+        let resolved = ServerImageRef.inlineCached(text, cache: cachedImages)
+        let extracted = Base64ImageExtractor().extractCached(resolved)
         Markdown(extracted.markdown)
             .markdownImageProvider(PhantasmImageProvider(images: extracted.images))
             .markdownBlockStyle(\.codeBlock) { configuration in

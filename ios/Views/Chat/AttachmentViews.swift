@@ -72,6 +72,10 @@ struct PendingAttachmentChip: View {
             }
         case .text:
             FileChipLabel(name: attachment.name)
+        case .remoteImage:
+            // A locally-cached server image; rendered inline in the assistant
+            // markdown, never shown as an attachment chip.
+            EmptyView()
         }
     }
 }

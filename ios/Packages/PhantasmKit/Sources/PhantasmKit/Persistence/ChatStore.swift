@@ -55,6 +55,11 @@ public protocol ChatStore: Sendable {
         isComplete: Bool
     ) async throws
 
+    /// Attach rows to an already-persisted message (post-commit). Used to cache
+    /// server-hosted generated images locally once they've been fetched, after
+    /// the assistant message itself is committed. A no-op if the message is gone.
+    func addAttachments(messageID: UUID, attachments: [Attachment]) async throws
+
     /// Finalize a pending assistant row as one that forwarded app-hosted tool
     /// calls: store the JSON-encoded `[WireToolCall]` and mark it complete. Used
     /// when a turn ends with the model calling an app tool (e.g. `ask_user`).

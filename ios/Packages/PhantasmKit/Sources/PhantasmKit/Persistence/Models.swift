@@ -166,6 +166,12 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
 public enum AttachmentKind: String, Sendable {
     case image
     case text
+    /// A locally-cached copy of a server-hosted generated image. The message
+    /// content keeps the compact `/v1/files/<id>/content` reference (so re-sent
+    /// history stays small); these bytes back its display once the signed URL
+    /// expires and offline. `name` holds the server `<id>`. Deliberately *not*
+    /// re-serialized to the wire by `wireContent()` — the reference already is.
+    case remoteImage = "remote_image"
 }
 
 public struct Attachment: Identifiable, Codable, Equatable, Sendable,

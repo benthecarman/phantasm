@@ -37,6 +37,30 @@ final class ImageClientTests: XCTestCase {
         return URLSession(configuration: config)
     }
 
+    final class ContentProtocol: URLProtocol {
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+        override func startLoading() {
+            let http = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "image/webp"])!
+            client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data([0xAA, 0xBB, 0xCC]))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        override func stopLoading() {}
+    }
+
+    func testFetchReturnsBytesAndContentType() async {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [ContentProtocol.self]
+        let client = ImageClient(session: URLSession(configuration: config))
+
+        let img = await client.fetch(URL(string: "https://host.example/v1/files/x/content?sig=z")!)
+        XCTAssertEqual(img?.data, Data([0xAA, 0xBB, 0xCC]))
+        XCTAssertEqual(img?.mime, "image/webp")
+    }
+
     func testDeletesEachIDWithBearer() async {
         RecordingProtocol.hits = []
         await ImageClient(session: session())

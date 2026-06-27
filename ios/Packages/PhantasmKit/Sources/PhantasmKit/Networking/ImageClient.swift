@@ -11,6 +11,17 @@ public struct ImageClient: Sendable {
         self.session = session
     }
 
+    /// Fetch a signed image URL's bytes + content type while it's fresh, so the
+    /// app can cache it locally. `nil` on any failure (caller falls back to
+    /// loading the URL directly until it expires).
+    public func fetch(_ url: URL) async -> ServerImageRef.CachedImage? {
+        guard let (data, response) = try? await session.data(from: url),
+            let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode)
+        else { return nil }
+        let mime = http.value(forHTTPHeaderField: "Content-Type") ?? "image/png"
+        return ServerImageRef.CachedImage(data: data, mime: mime)
+    }
+
     /// Fire a DELETE for each id against `base`. Concurrent and best-effort.
     public func delete(ids: [String], base: URL, token: String) async {
         await withTaskGroup(of: Void.self) { group in
