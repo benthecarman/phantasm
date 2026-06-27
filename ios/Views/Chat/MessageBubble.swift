@@ -10,6 +10,8 @@ struct MessageBubble: View {
     var isEditing = false
     /// Whether the "Edit" action is offered (user messages, no turn in flight).
     var canEdit = false
+    /// Whether the "Resend" action is offered (user messages, no turn in flight).
+    var canResend = false
     /// Whether the "Regenerate" action is offered (assistant messages, idle).
     var canRegenerate = false
     /// The shared draft text while editing (only the editing row reads it).
@@ -17,6 +19,7 @@ struct MessageBubble: View {
     var onBeginEdit: () -> Void = {}
     var onSubmitEdit: () -> Void = {}
     var onCancelEdit: () -> Void = {}
+    var onResend: () -> Void = {}
     var onRegenerate: () -> Void = {}
 
     @Environment(AppEnvironment.self) private var env
@@ -107,6 +110,11 @@ struct MessageBubble: View {
                         if canEdit {
                             Button(action: onBeginEdit) {
                                 Label("Edit", systemImage: "pencil")
+                            }
+                        }
+                        if canResend {
+                            Button(action: onResend) {
+                                Label("Resend", systemImage: "arrow.clockwise")
                             }
                         }
                     }

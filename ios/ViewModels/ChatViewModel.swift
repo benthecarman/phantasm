@@ -386,6 +386,13 @@ final class ChatViewModel {
         ctx.task { store in try await store.deleteMessagesFrom(id: messageID) }
     }
 
+    /// Resend a user message unchanged: keep it, drop everything after it, then
+    /// re-stream from the kept history. The message keeps its attachments.
+    func resend(messageID: UUID) {
+        guard let ctx = beginTurn() else { return }
+        ctx.task { store in try await store.deleteMessagesAfter(id: messageID) }
+    }
+
     /// The resolved inputs for a streaming turn, plus a helper that runs a
     /// store mutation and then streams the reply. Shared by `resend`/`regenerate`.
     private struct TurnContext {

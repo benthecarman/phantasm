@@ -291,6 +291,23 @@ extension AppDatabase: ChatStore {
         }
     }
 
+    public func deleteMessagesAfter(id: UUID) async throws {
+        try await dbWriter.write { db in
+            guard let message = try Message.fetchOne(db, key: id) else { return }
+            let now = Date()
+            // Keep this message; delete everything after it (cascades to
+            // attachments + fires the FTS triggers).
+            try Message
+                .filter(Col.conversationId == message.conversationId)
+                .filter(Col.createdAt > message.createdAt)
+                .deleteAll(db)
+            if var convo = try Conversation.fetchOne(db, key: message.conversationId) {
+                convo.updatedAt = now
+                try convo.update(db)
+            }
+        }
+    }
+
     public func deleteConversation(id: UUID) async throws {
         try await dbWriter.write { db in
             // Hard-delete the heavy data: removing messages cascades to

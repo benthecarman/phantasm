@@ -103,6 +103,13 @@ public protocol ChatStore: Sendable {
     /// if the message no longer exists.
     func deleteMessagesFrom(id: UUID) async throws
 
+    /// Delete every message *after* the given one in the same conversation,
+    /// keeping the message itself (cascades to attachments, fires the FTS
+    /// triggers), bumping the conversation's `updatedAt`. Used to resend a user
+    /// message: drop anything after it, then re-stream from the kept history.
+    /// A no-op if the message no longer exists.
+    func deleteMessagesAfter(id: UUID) async throws
+
     /// Tombstone the conversation (set `deletedAt`) and hard-delete its messages
     /// + attachments, reclaiming the heavy data while leaving a slim tombstone.
     func deleteConversation(id: UUID) async throws

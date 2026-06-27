@@ -225,11 +225,13 @@ struct ChatView: View {
                             message: message,
                             isEditing: editingMessageID == message.id,
                             canEdit: message.message.role == "user" && !vm.isStreaming,
+                            canResend: message.message.role == "user" && !vm.isStreaming,
                             canRegenerate: message.message.role == "assistant" && !vm.isStreaming,
                             editText: $editingText,
                             onBeginEdit: { beginEditing(message) },
                             onSubmitEdit: { submitEdit() },
                             onCancelEdit: { editingMessageID = nil },
+                            onResend: { vm.resend(messageID: message.id) },
                             onRegenerate: { vm.regenerate(messageID: message.id) }
                         )
                     }
