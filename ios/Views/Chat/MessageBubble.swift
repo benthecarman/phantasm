@@ -185,7 +185,7 @@ struct StreamingBubble: View {
                     ThinkingDisclosure(text: reasoning)
                 }
                 if text.isEmpty && reasoning.isEmpty && (status == nil) {
-                    ProgressView()
+                    ConjuringLoader(seed: startedAt)
                 } else if !text.isEmpty {
                     MarkdownMessageView(text: text)
                 }
