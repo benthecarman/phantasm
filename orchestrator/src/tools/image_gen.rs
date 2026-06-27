@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
-use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
+use crate::orchestrator::tools::{tool_envelope, ToolOutcome, TurnContext};
 use crate::orchestrator::TurnEvent;
 use crate::tools::comfy;
+use crate::tools::image_delivery::deliver_image;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ImageGenArgs {
@@ -50,6 +51,7 @@ pub async fn run(
     http: &reqwest::Client,
     call: &ToolCall,
     call_id: &str,
+    ctx: &TurnContext,
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
@@ -66,14 +68,17 @@ pub async fn run(
     };
 
     match result {
-        Ok(data_uri) => ToolOutcome {
-            message: ChatMessage::tool_result(
-                call_id,
-                "image_generation",
-                "Image generated successfully and shown to the user.",
-            ),
-            append_to_answer: Some(format!("![generated]({data_uri})")),
-        },
+        Ok((bytes, mime)) => {
+            let markdown = deliver_image(ctx, &bytes, &mime, "generated").await;
+            ToolOutcome {
+                message: ChatMessage::tool_result(
+                    call_id,
+                    "image_generation",
+                    "Image generated successfully and shown to the user.",
+                ),
+                append_to_answer: Some(markdown),
+            }
+        }
         Err(detail) => {
             // The detail never contains message content (NFR-O7) — only the
             // backend failure cause — so log it so operators can diagnose
@@ -103,7 +108,7 @@ async fn generate(
     http: &reqwest::Client,
     args: &ImageGenArgs,
     tx: &mpsc::Sender<TurnEvent>,
-) -> Result<String, String> {
+) -> Result<(Vec<u8>, String), String> {
     let mut workflow = load_workflow(cfg.comfy_gen_workflow.as_ref()).await?;
     inject_inputs(cfg, &mut workflow, args)?;
     comfy::run_workflow(cfg, http, workflow, tx).await

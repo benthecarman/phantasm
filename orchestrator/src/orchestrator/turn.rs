@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use base64::Engine;
 use futures_util::future::join_all;
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
@@ -86,6 +87,8 @@ pub async fn run_turn<B, T>(
     enabled_tools: Option<Vec<String>>,
     app_tools: Vec<Value>,
     preset: Option<&'static ResearchPreset>,
+    images: Option<crate::images::BlobStore>,
+    image_refs: bool,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
 ) where
@@ -172,9 +175,15 @@ pub async fn run_turn<B, T>(
     }
 
     let mut appends: Vec<String> = Vec::new();
+    // URL delivery requires both a configured store and a client that opted in;
+    // otherwise images stay inline (back-compat). The store is still used for
+    // *resolving* references in incoming history regardless of the opt-in.
+    let deliver_image_refs = image_refs && images.is_some();
     let mut ctx = TurnContext {
-        input_images: latest_input_images(&messages),
+        input_images: latest_input_images(&messages, images.as_ref()).await,
         research: false,
+        images,
+        deliver_image_refs,
         ..Default::default()
     };
 
@@ -291,11 +300,17 @@ pub async fn run_turn<B, T>(
                         // A generated/edited image becomes the most recent image
                         // in the conversation, so a later tool in this same turn
                         // (e.g. image_edit right after image_generation) can act
-                        // on it. The data URI rides only the streamed answer, never
-                        // the message history latest_input_images() scans, so feed
-                        // its payload into the turn context directly.
-                        ctx.input_images
-                            .extend(MessageContent::Text(extra.clone()).image_payloads());
+                        // on it. The image rides only the streamed answer, never
+                        // the message history latest_input_images() scans — and in
+                        // URL-delivery mode it's a `/v1/images/<id>` ref, not bytes
+                        // — so resolve it into the turn context directly.
+                        ctx.input_images.extend(
+                            resolve_images(
+                                &MessageContent::Text(extra.clone()),
+                                ctx.images.as_ref(),
+                            )
+                            .await,
+                        );
                         appends.push(extra);
                     }
                 }
@@ -361,24 +376,45 @@ fn held_result_message(outcome: ToolOutcome) -> ChatMessage {
     message
 }
 
-/// Collect the image payloads from the most recent message that carries any —
-/// whether the user attached it (`image_url` part) or the assistant generated
-/// it earlier (embedded `data:` URI), most recent last. Lets the edit tool act
-/// on "the image we were just looking at" without the model having to thread it
-/// through tool arguments.
-fn latest_input_images(messages: &[ChatMessage]) -> Vec<String> {
-    messages
-        .iter()
-        .rev()
-        .find_map(|m| {
-            let images = m
-                .content
-                .as_ref()
-                .map(|c| c.image_payloads())
-                .unwrap_or_default();
-            (!images.is_empty()).then_some(images)
-        })
-        .unwrap_or_default()
+/// Resolve a single message's editable images to base64, most recent last: both
+/// inline `data:` payloads (user attachments, inline-delivered generations) and
+/// server-hosted `/v1/images/<id>` references, the latter read from `store`.
+/// References resolve to nothing when no store is available (older history,
+/// store disabled) — they're then simply not editable.
+async fn resolve_images(
+    content: &MessageContent,
+    store: Option<&crate::images::BlobStore>,
+) -> Vec<String> {
+    let mut out = content.image_payloads();
+    if let Some(store) = store {
+        for id in content.store_image_ids() {
+            if let Some(blob) = store.get(&id).await {
+                out.push(base64::engine::general_purpose::STANDARD.encode(&blob.bytes));
+            }
+        }
+    }
+    out
+}
+
+/// Collect editable images from the most recent message that carries any —
+/// whether the user attached it (`image_url` part), the assistant generated it
+/// earlier (embedded `data:` URI), or it was delivered as a server-hosted URL —
+/// most recent last. Lets the edit tool act on "the image we were just looking
+/// at" without the model having to thread it through tool arguments.
+async fn latest_input_images(
+    messages: &[ChatMessage],
+    store: Option<&crate::images::BlobStore>,
+) -> Vec<String> {
+    for m in messages.iter().rev() {
+        let Some(content) = m.content.as_ref() else {
+            continue;
+        };
+        let images = resolve_images(content, store).await;
+        if !images.is_empty() {
+            return images;
+        }
+    }
+    Vec::new()
 }
 
 /// Issue a streaming call (without tools) and relay tokens, then append any
@@ -545,8 +581,8 @@ mod tests {
         }]))
     }
 
-    #[test]
-    fn latest_input_images_finds_generated_image_in_assistant_message() {
+    #[tokio::test]
+    async fn latest_input_images_finds_generated_image_in_assistant_message() {
         // gen-then-edit: the image lives in the assistant message as markdown,
         // and the trailing user turn has no attachment.
         let history = vec![
@@ -554,22 +590,52 @@ mod tests {
             assistant("here you go ![generated](data:image/png;base64,GENGEN)"),
             user(MessageContent::Text("make it night".into())),
         ];
-        assert_eq!(latest_input_images(&history), vec!["GENGEN".to_string()]);
+        assert_eq!(
+            latest_input_images(&history, None).await,
+            vec!["GENGEN".to_string()]
+        );
     }
 
-    #[test]
-    fn latest_input_images_prefers_most_recent_across_roles() {
+    #[tokio::test]
+    async fn latest_input_images_prefers_most_recent_across_roles() {
         let history = vec![
             assistant("![generated](data:image/png;base64,OLD)"),
             user_with_image("NEW"),
         ];
-        assert_eq!(latest_input_images(&history), vec!["NEW".to_string()]);
+        assert_eq!(
+            latest_input_images(&history, None).await,
+            vec!["NEW".to_string()]
+        );
     }
 
-    #[test]
-    fn latest_input_images_empty_when_no_image_anywhere() {
+    #[tokio::test]
+    async fn latest_input_images_empty_when_no_image_anywhere() {
         let history = vec![user(MessageContent::Text("hi".into())), assistant("hello")];
-        assert!(latest_input_images(&history).is_empty());
+        assert!(latest_input_images(&history, None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn latest_input_images_resolves_stored_reference() {
+        // A prior turn delivered its image as a server-hosted URL. Cross-turn edit
+        // must resolve that ref back to bytes via the store.
+        let tmp = tempfile::tempdir().unwrap();
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 4, 2];
+        let store =
+            crate::images::BlobStore::new(tmp.path().to_path_buf(), "k", 3600, 3600, 1 << 20, None)
+                .unwrap();
+        let id = store.put(png).await.unwrap();
+        let history = vec![
+            assistant(&format!("here ![generated]({})", store.signed_ref(&id))),
+            user(MessageContent::Text("make it night".into())),
+        ];
+
+        let want = base64::engine::general_purpose::STANDARD.encode(png);
+        assert_eq!(
+            latest_input_images(&history, Some(&store)).await,
+            vec![want]
+        );
+        // Without the store the reference is unresolvable (not editable).
+        assert!(latest_input_images(&history, None).await.is_empty());
     }
 
     fn assistant_calling(tool: &str) -> ChatMessage {
@@ -750,6 +816,8 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -785,6 +853,8 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -830,6 +900,8 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -878,6 +950,8 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -922,6 +996,8 @@ mod tests {
             None,
             Vec::new(),
             preset,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -959,6 +1035,8 @@ mod tests {
             None,
             Vec::new(),
             None,
+            None,
+            false,
             tx,
             cancel,
         )
@@ -1049,6 +1127,8 @@ mod tests {
             None,
             vec![app_schema("ask_user")],
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -1093,6 +1173,8 @@ mod tests {
             None,
             vec![app_schema("web_search")],
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -1136,6 +1218,8 @@ mod tests {
             None,
             vec![app_schema("ask_user")],
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -1188,6 +1272,8 @@ mod tests {
             None,
             vec![app_schema("ask_user")],
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )
@@ -1257,6 +1343,8 @@ mod tests {
             Some(vec![]),
             Vec::new(),
             None,
+            None,
+            false,
             tx,
             CancellationToken::new(),
         )

@@ -1,6 +1,7 @@
 pub mod calculator;
 pub mod comfy;
 pub mod github;
+pub mod image_delivery;
 pub mod image_edit;
 pub mod image_gen;
 pub mod maps_places;

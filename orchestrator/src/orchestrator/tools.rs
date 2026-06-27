@@ -54,8 +54,18 @@ pub struct TurnCache {
 /// within-turn dedup cache so repeated queries/page-fetches are served once.
 #[derive(Clone, Default)]
 pub struct TurnContext {
+    /// Editable images for this turn, most recent last, as raw base64 (data-URI
+    /// prefixes stripped). Server-hosted `/v1/images/<id>` references in history
+    /// are resolved to bytes here, so consuming tools (`image_edit`, `ocr`) see
+    /// plain base64 regardless of how the image was delivered.
     pub input_images: Vec<String>,
     pub research: bool,
+    /// The server-hosted image store, when configured. Image tools persist to it
+    /// and the turn loop resolves references against it. `None` => inline-only.
+    pub images: Option<crate::images::BlobStore>,
+    /// Whether to deliver generated images as store URLs rather than inline
+    /// base64 — true only when a store exists *and* the client opted in.
+    pub deliver_image_refs: bool,
     /// Within-turn fetch/query dedup cache (see [`TurnCache`]). Cloning a
     /// `TurnContext` shares the same cache (it's an `Arc`), so sub-agents that
     /// receive a cloned context still dedup against each other.
@@ -184,7 +194,7 @@ impl ToolExecutor for ToolRegistry {
                 ocr::run(&self.cfg, call, &call_id, ctx, &tx, &cancel).await
             }
             "image_generation" if self.cfg.image_gen_usable() => {
-                image_gen::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
+                image_gen::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
             }
             "image_edit" if self.cfg.image_edit_usable() => {
                 image_edit::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await

@@ -79,13 +79,14 @@ pub async fn upload_temp_image(
 }
 
 /// Submit a fully-prepared workflow, relay progress, and return the produced
-/// image as a `data:<mime>;base64,…` URI.
+/// image as raw bytes plus its content type. The caller decides delivery —
+/// inline base64 data URI, or persist to the blob store and hand back a URL.
 pub async fn run_workflow(
     cfg: &Config,
     http: &reqwest::Client,
     mut workflow: Value,
     tx: &mpsc::Sender<TurnEvent>,
-) -> Result<String, String> {
+) -> Result<(Vec<u8>, String), String> {
     force_temporary_outputs(&mut workflow);
 
     let client_id = uuid::Uuid::new_v4().simple().to_string();
@@ -140,9 +141,13 @@ pub async fn run_workflow(
 
     // Fetch the produced image.
     let _ = tx.send(TurnEvent::Status("retrieving image…".into())).await;
-    let (bytes, mime) = fetch_image(cfg, http, &prompt_id).await?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:{mime};base64,{b64}"))
+    fetch_image(cfg, http, &prompt_id).await
+}
+
+/// Encode produced bytes as a `data:<mime>;base64,…` URI (inline delivery).
+pub fn to_data_uri(bytes: &[u8], mime: &str) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("data:{mime};base64,{b64}")
 }
 
 fn temp_image_ref(name: &str, subfolder: &str) -> String {

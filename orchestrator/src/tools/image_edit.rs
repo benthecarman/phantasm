@@ -18,6 +18,7 @@ use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome, TurnContext};
 use crate::orchestrator::TurnEvent;
 use crate::tools::comfy;
+use crate::tools::image_delivery::deliver_image;
 use crate::tools::image_gen::seed_value;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -74,14 +75,17 @@ pub async fn run(
     };
 
     match result {
-        Ok(data_uri) => ToolOutcome {
-            message: ChatMessage::tool_result(
-                call_id,
-                "image_edit",
-                "Image edited successfully and shown to the user.",
-            ),
-            append_to_answer: Some(format!("![edited]({data_uri})")),
-        },
+        Ok((bytes, mime)) => {
+            let markdown = deliver_image(ctx, &bytes, &mime, "edited").await;
+            ToolOutcome {
+                message: ChatMessage::tool_result(
+                    call_id,
+                    "image_edit",
+                    "Image edited successfully and shown to the user.",
+                ),
+                append_to_answer: Some(markdown),
+            }
+        }
         Err(detail) => {
             tracing::warn!(error = %detail, "image_edit failed");
             let _ = tx
@@ -109,7 +113,7 @@ async fn edit(
     args: &ImageEditArgs,
     input_b64: &str,
     tx: &mpsc::Sender<TurnEvent>,
-) -> Result<String, String> {
+) -> Result<(Vec<u8>, String), String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(input_b64)
         .map_err(|e| format!("input image is not valid base64: {e}"))?;
