@@ -1,7 +1,9 @@
 //! Bearer-token authentication middleware (FR-O7).
 //!
-//! Every route is gated. A missing or non-matching `Authorization: Bearer <token>`
-//! header is rejected with 401 before any handler runs.
+//! When a token is configured, every gated route requires it: a missing or
+//! non-matching `Authorization: Bearer <token>` header is rejected with 401
+//! before any handler runs. When no token is configured (`auth_token` is
+//! `None`), auth is disabled and every request passes through unauthenticated.
 
 use axum::extract::State;
 use axum::http::{header::AUTHORIZATION, Request};
@@ -16,8 +18,12 @@ pub async fn require_bearer(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let Some(expected) = state.cfg.auth_token.as_deref() else {
+        // Auth disabled (no token configured): accept everything.
+        return next.run(req).await;
+    };
     match extract_token(&req) {
-        Some(token) if constant_time_eq(token, &state.cfg.auth_token) => next.run(req).await,
+        Some(token) if constant_time_eq(token, expected) => next.run(req).await,
         _ => AppError::Unauthorized.into_response(),
     }
 }

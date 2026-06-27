@@ -38,16 +38,16 @@ struct ProfileEditView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Connection") {
+                Section {
                     TextField("Name", text: $name)
                     TextField("Base URL (e.g. https://ollama.example.ts.net)", text: $urlString)
                         .textInputAutocapitalization(.never)
                     HStack {
                         Group {
                             if revealToken {
-                                TextField("Bearer token", text: $token)
+                                TextField("Bearer token (optional)", text: $token)
                             } else {
-                                SecureField("Bearer token", text: $token)
+                                SecureField("Bearer token (optional)", text: $token)
                             }
                         }
                         .textInputAutocapitalization(.never)
@@ -64,6 +64,10 @@ struct ProfileEditView: View {
                             .accessibilityLabel(revealToken ? "Hide token" : "Reveal token")
                         }
                     }
+                } header: {
+                    Text("Connection")
+                } footer: {
+                    Text("Leave the token blank for a backend that doesn't require auth (e.g. local Ollama or an orchestrator with auth disabled).")
                 }
 
                 Section {

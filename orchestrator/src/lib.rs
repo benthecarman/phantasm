@@ -295,11 +295,17 @@ pub fn build_state(
     };
     // Stand up the server-hosted image store when configured. A configured-but-
     // unwritable directory degrades to inline delivery (logged) rather than
-    // taking down startup.
+    // taking down startup. The signed-URL HMAC key is the auth token when one is
+    // set; with auth disabled there's no token, so derive a random per-process
+    // key (blobs are ephemeral, so a key that resets on restart is fine).
+    let image_signing_key = cfg
+        .auth_token
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let images = cfg.image_store_dir.as_ref().and_then(|dir| {
         match images::BlobStore::new(
             dir.clone(),
-            &cfg.auth_token,
+            &image_signing_key,
             cfg.image_store_ttl_s,
             cfg.comfy_max_image_bytes,
             cfg.public_base_url.as_ref(),

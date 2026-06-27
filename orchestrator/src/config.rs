@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +45,10 @@ impl NodeInput {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
-    pub auth_token: String,
+    /// Bearer token the app must present on every gated route. `None` disables
+    /// auth entirely — every request is accepted unauthenticated. Unset/empty
+    /// `PHANTASM_AUTH_TOKEN` => `None` (opt-in to an open server).
+    pub auth_token: Option<String>,
     /// Browser CORS allow-list. Empty => CORS disabled (no `Access-Control-*`
     /// headers, no preflight handling) — the default, since the iOS app is not a
     /// browser and needs none. A single `*` entry allows any origin; otherwise
@@ -190,10 +193,16 @@ impl Config {
             .parse()
             .context("PHANTASM_BIND must be a socket address like 0.0.0.0:8080")?;
 
+        // Unset or empty => auth disabled (open server). Set => bearer-gated.
         let auth_token = std::env::var("PHANTASM_AUTH_TOKEN")
-            .map_err(|_| anyhow!("PHANTASM_AUTH_TOKEN is required"))?;
-        if auth_token.trim().is_empty() {
-            return Err(anyhow!("PHANTASM_AUTH_TOKEN must not be empty"));
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        if auth_token.is_none() {
+            tracing::warn!(
+                "PHANTASM_AUTH_TOKEN is unset or empty: bearer auth is DISABLED, all \
+                 requests will be accepted unauthenticated"
+            );
         }
 
         let ollama_base = parse_url("OLLAMA_BASE_URL", "http://localhost:11434")?;
@@ -447,7 +456,7 @@ pub mod tests_support {
     pub fn minimal() -> Config {
         Config {
             bind_addr: "0.0.0.0:0".parse().unwrap(),
-            auth_token: "test-token".into(),
+            auth_token: Some("test-token".into()),
             cors_allowed_origins: vec![],
             ollama_base: "http://localhost:11434".parse().unwrap(),
             upstream_api_key: None,

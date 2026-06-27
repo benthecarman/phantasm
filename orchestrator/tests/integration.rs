@@ -150,7 +150,7 @@ fn mock_openai_compatible_erroring() -> Router {
 fn test_config(ollama_base: &str) -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
-        auth_token: TOKEN.into(),
+        auth_token: Some(TOKEN.into()),
         cors_allowed_origins: vec![],
         ollama_base: ollama_base.parse().unwrap(),
         upstream_api_key: None,
@@ -630,6 +630,25 @@ async fn missing_token_is_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_disabled_accepts_unauthenticated_requests() {
+    let ollama = spawn(mock_ollama()).await;
+    let mut cfg = test_config(&ollama);
+    cfg.auth_token = None; // auth disabled
+    let cfg = Arc::new(cfg);
+    let capabilities = Arc::new(test_capabilities());
+    let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
+    let base = spawn(routes::router(state)).await;
+
+    // No Authorization header => still served (200), not 401.
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/v1/capabilities"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 #[tokio::test]
