@@ -14,7 +14,8 @@
 //!     token): the fetch route is exempt from bearer auth — markdown image
 //!     loaders can't send an `Authorization` header — so a valid, unexpired
 //!     signature is what authorizes a read. The content-hash id is the primary
-//!     guard; the signature + `IMAGE_URL_TTL_S` expiry are defense-in-depth.
+//!     guard; the signature + expiry (the URL expires with the blob, governed by
+//!     `IMAGE_STORE_TTL_S`) are defense-in-depth.
 //!   * **Lifecycle**: the app deletes a blob when its conversation is deleted
 //!     (`DELETE /v1/files/<id>`); a lazy TTL pruner (`IMAGE_STORE_TTL_S`) is the
 //!     backstop for deletes that never arrive (uninstall, lost request).
@@ -45,7 +46,6 @@ struct Inner {
     /// and the content-hash id still gates access.
     key: Vec<u8>,
     store_ttl_s: u64,
-    url_ttl_s: u64,
     max_bytes: usize,
     /// Absolute origin for minted links, or `None` to emit site-relative paths.
     public_base: Option<String>,
@@ -65,7 +65,6 @@ impl BlobStore {
         dir: PathBuf,
         key: &str,
         store_ttl_s: u64,
-        url_ttl_s: u64,
         max_bytes: usize,
         public_base: Option<&url::Url>,
     ) -> std::io::Result<Self> {
@@ -75,7 +74,6 @@ impl BlobStore {
                 dir,
                 key: key.as_bytes().to_vec(),
                 store_ttl_s,
-                url_ttl_s,
                 max_bytes,
                 // Trim a trailing slash so we can join with "/v1/..." uniformly.
                 public_base: public_base.map(|u| u.as_str().trim_end_matches('/').to_string()),
@@ -141,9 +139,10 @@ impl BlobStore {
 
     /// The signed reference to embed for `id` (OpenAI Files-style content path):
     /// `<base>/v1/files/<id>/content?exp=&sig=`, site-relative when no public base
-    /// is configured.
+    /// is configured. The URL expires with the blob (`store_ttl_s`) — one
+    /// lifetime, since a link to a pruned blob is useless anyway.
     pub fn signed_ref(&self, id: &str) -> String {
-        let exp = now_s() + self.inner.url_ttl_s;
+        let exp = now_s() + self.inner.store_ttl_s;
         let sig = self.sign(id, exp);
         let base = self.inner.public_base.as_deref().unwrap_or("");
         format!("{base}/v1/files/{id}/content?exp={exp}&sig={sig}")
@@ -270,7 +269,7 @@ mod tests {
     use super::*;
 
     fn store(dir: PathBuf) -> BlobStore {
-        BlobStore::new(dir, "test-key", 3600, 3600, 16 * 1024 * 1024, None).unwrap()
+        BlobStore::new(dir, "test-key", 3600, 16 * 1024 * 1024, None).unwrap()
     }
 
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
@@ -300,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_oversized_put() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = BlobStore::new(tmp.path().to_path_buf(), "k", 3600, 3600, 4, None).unwrap();
+        let s = BlobStore::new(tmp.path().to_path_buf(), "k", 3600, 4, None).unwrap();
         assert!(s.put(PNG).await.is_err(), "11 bytes over a 4-byte cap");
     }
 
@@ -346,15 +345,7 @@ mod tests {
 
         // Absolute (trailing slash trimmed) when configured.
         let base = url::Url::parse("https://host.example/").unwrap();
-        let s2 = BlobStore::new(
-            tmp.path().to_path_buf(),
-            "k",
-            3600,
-            3600,
-            1 << 20,
-            Some(&base),
-        )
-        .unwrap();
+        let s2 = BlobStore::new(tmp.path().to_path_buf(), "k", 3600, 1 << 20, Some(&base)).unwrap();
         assert!(s2.has_public_base());
         assert!(s2
             .signed_ref("abc")
@@ -364,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn prune_removes_expired_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = BlobStore::new(tmp.path().to_path_buf(), "k", 5, 3600, 1 << 20, None).unwrap();
+        let s = BlobStore::new(tmp.path().to_path_buf(), "k", 5, 1 << 20, None).unwrap();
 
         // A fresh blob survives.
         let fresh = s.put(PNG).await.unwrap();

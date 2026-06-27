@@ -237,7 +237,6 @@ pub fn build_state(
             dir.clone(),
             &cfg.auth_token,
             cfg.image_store_ttl_s,
-            cfg.image_url_ttl_s,
             cfg.comfy_max_image_bytes,
             cfg.public_base_url.as_ref(),
         ) {

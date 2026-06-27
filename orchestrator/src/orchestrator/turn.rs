@@ -622,7 +622,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 4, 2];
         let store =
-            crate::images::BlobStore::new(tmp.path().to_path_buf(), "k", 3600, 3600, 1 << 20, None)
+            crate::images::BlobStore::new(tmp.path().to_path_buf(), "k", 3600, 1 << 20, None)
                 .unwrap();
         let id = store.put(png).await.unwrap();
         let history = vec![

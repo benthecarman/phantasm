@@ -183,7 +183,6 @@ fn test_config(ollama_base: &str) -> Config {
         comfy_max_image_bytes: 16 * 1024 * 1024,
         image_store_dir: None,
         image_store_ttl_s: 7 * 24 * 60 * 60,
-        image_url_ttl_s: 24 * 60 * 60,
         public_base_url: None,
         comfy_gen_workflow: None,
         comfy_gen_prompt: None,
@@ -647,7 +646,6 @@ async fn image_fetch_is_signed_and_auth_exempt() {
         tmp.path().to_path_buf(),
         TOKEN,
         3600,
-        3600,
         16 * 1024 * 1024,
         None,
     )
@@ -687,7 +685,6 @@ async fn image_delete_requires_auth_then_removes() {
     let seeder = BlobStore::new(
         tmp.path().to_path_buf(),
         TOKEN,
-        3600,
         3600,
         16 * 1024 * 1024,
         None,

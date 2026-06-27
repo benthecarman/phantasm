@@ -36,7 +36,7 @@ mod tests {
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 7, 7];
 
     fn store(dir: std::path::PathBuf) -> BlobStore {
-        BlobStore::new(dir, "k", 3600, 3600, 1 << 20, None).unwrap()
+        BlobStore::new(dir, "k", 3600, 1 << 20, None).unwrap()
     }
 
     #[tokio::test]
