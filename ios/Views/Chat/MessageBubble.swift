@@ -54,17 +54,8 @@ struct MessageBubble: View {
                     }
                     if !content.isEmpty {
                         MarkdownMessageView(text: content, cachedImages: cachedImages)
-                            .contextMenu {
-                                copyButton
-                                speakButton
-                                if canRegenerate {
-                                    Button(action: onRegenerate) {
-                                        Label("Regenerate", systemImage: "arrow.clockwise")
-                                    }
-                                }
-                            }
                     }
-                    timestamp
+                    footer
                 }
             }
             if !isUser { Spacer(minLength: 40) }
@@ -105,22 +96,51 @@ struct MessageBubble: View {
                     .padding(10)
                     .background(Color.accentColor.opacity(0.15))
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .contextMenu {
-                        copyButton
-                        if canEdit {
-                            Button(action: onBeginEdit) {
-                                Label("Edit", systemImage: "pencil")
-                            }
-                        }
-                        if canResend {
-                            Button(action: onResend) {
-                                Label("Resend", systemImage: "arrow.clockwise")
-                            }
-                        }
-                    }
             }
-            timestamp
+            footer
         }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 6) {
+            timestamp
+            if !content.isEmpty {
+                actionMenu
+            }
+        }
+    }
+
+    private var actionMenu: some View {
+        Menu {
+            copyButton
+            if isUser {
+                if canEdit {
+                    Button(action: onBeginEdit) {
+                        Label("Edit", systemImage: "pencil")
+                    }
+                }
+                if canResend {
+                    Button(action: onResend) {
+                        Label("Resend", systemImage: "arrow.clockwise")
+                    }
+                }
+            } else {
+                speakButton
+                if canRegenerate {
+                    Button(action: onRegenerate) {
+                        Label("Regenerate", systemImage: "arrow.clockwise")
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Message actions")
     }
 
     private var timestamp: some View {

@@ -16,11 +16,117 @@ struct MarkdownMessageView: View {
         let resolved = ServerImageRef.inlineCached(text, cache: cachedImages)
         let extracted = Base64ImageExtractor().extractCached(resolved)
         Markdown(extracted.markdown)
+            .markdownTheme(.phantasmChat)
             .markdownImageProvider(PhantasmImageProvider(images: extracted.images))
             .markdownBlockStyle(\.codeBlock) { configuration in
                 CodeBlockView(configuration: configuration)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .textSelection(.enabled)
+    }
+}
+
+private extension Theme {
+    static let phantasmChat = Theme()
+        .text {
+            ForegroundColor(.primary)
+            FontSize(16)
+        }
+        .code {
+            FontFamilyVariant(.monospaced)
+            FontSize(.em(0.9))
+            BackgroundColor(Color(.secondarySystemBackground))
+        }
+        .strong {
+            FontWeight(.semibold)
+        }
+        .link {
+            ForegroundColor(.accentColor)
+        }
+        .heading1 { configuration in
+            compactHeading(configuration, scale: 1.22)
+        }
+        .heading2 { configuration in
+            compactHeading(configuration, scale: 1.14)
+        }
+        .heading3 { configuration in
+            compactHeading(configuration, scale: 1.08)
+        }
+        .heading4 { configuration in
+            compactHeading(configuration, scale: 1)
+        }
+        .heading5 { configuration in
+            compactHeading(configuration, scale: 0.96)
+        }
+        .heading6 { configuration in
+            compactHeading(configuration, scale: 0.92)
+        }
+        .paragraph { configuration in
+            configuration.label
+                .fixedSize(horizontal: false, vertical: true)
+                .relativeLineSpacing(.em(0.16))
+                .markdownMargin(top: .zero, bottom: .em(0.45))
+        }
+        .blockquote { configuration in
+            HStack(alignment: .top, spacing: 8) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.secondary.opacity(0.35))
+                    .frame(width: 3)
+                configuration.label
+                    .markdownTextStyle {
+                        ForegroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .markdownMargin(top: .em(0.25), bottom: .em(0.45))
+        }
+        .image { configuration in
+            configuration.label
+                .markdownMargin(top: .em(0.25), bottom: .em(0.5))
+        }
+        .list { configuration in
+            configuration.label
+                .markdownMargin(top: .em(0.15), bottom: .em(0.45))
+        }
+        .listItem { configuration in
+            configuration.label
+                .markdownMargin(top: .em(0.12))
+        }
+        .table { configuration in
+            ScrollView(.horizontal, showsIndicators: false) {
+                configuration.label
+                    .fixedSize(horizontal: true, vertical: true)
+            }
+            .markdownMargin(top: .em(0.25), bottom: .em(0.5))
+        }
+        .tableCell { configuration in
+            configuration.label
+                .markdownTextStyle {
+                    if configuration.row == 0 {
+                        FontWeight(.semibold)
+                    }
+                    BackgroundColor(nil)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .relativeLineSpacing(.em(0.12))
+        }
+        .thematicBreak {
+            Divider()
+                .markdownMargin(top: .em(0.6), bottom: .em(0.6))
+        }
+
+    static func compactHeading(_ configuration: BlockConfiguration, scale: CGFloat) -> some View {
+        configuration.label
+            .fixedSize(horizontal: false, vertical: true)
+            .relativeLineSpacing(.em(0.08))
+            .markdownTextStyle {
+                FontWeight(.semibold)
+                FontSize(.em(scale))
+            }
+            .markdownMargin(top: .em(0.65), bottom: .em(0.28))
     }
 }
 
@@ -51,10 +157,17 @@ private struct CodeBlockView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 configuration.label
                     .padding(12)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .relativeLineSpacing(.em(0.12))
+                    .markdownTextStyle {
+                        FontFamilyVariant(.monospaced)
+                        FontSize(.em(0.9))
+                    }
             }
         }
         .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .markdownMargin(top: .em(0.25), bottom: .em(0.5))
     }
 }
 
