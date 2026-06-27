@@ -13,11 +13,19 @@ struct ConjuringLoader: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var sweep = false
 
-    private let verbs = ["Conjuring…", "Summoning…", "Materializing…", "Channeling…"]
+    private let verbs = [
+        "Conjuring", "Summoning", "Materializing", "Channeling",
+        "Divining", "Manifesting", "Invoking", "Weaving", "Enchanting",
+        "Scrying", "Incanting", "Spellbinding", "Bewitching", "Brewing",
+        "Whispering", "Concentrating", "Imagining",
+        "Haunting", "Hexing", "Charming",
+        "Dreaming", "Pondering", "Musing", "Envisioning", "Composing",
+        "Crafting", "Concocting", "Devising",
+    ]
 
     private var verb: String {
         let bucket = Int(seed.timeIntervalSinceReferenceDate.rounded())
-        return verbs[abs(bucket) % verbs.count]
+        return verbs[abs(bucket) % verbs.count] + "…"
     }
 
     var body: some View {
