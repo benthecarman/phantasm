@@ -1,16 +1,16 @@
 import Foundation
 
-/// Helpers for the server-hosted image references the orchestrator embeds when
-/// the client opts into URL delivery (spec §2.2b): markdown links whose target
-/// is `/v1/images/<id>?exp=…&sig=…` (relative) or an absolute URL with that
-/// path. The `<id>` is the server's content hash — used to clean the blob up
-/// (`DELETE /v1/images/<id>`) when its conversation is deleted.
+/// Helpers for the server-hosted image references the orchestrator embeds under
+/// URL delivery (spec §2.2b): markdown links whose target is an absolute
+/// `…/v1/files/<id>/content?exp=…&sig=…` URL. The `<id>` is the server's content
+/// hash — used to clean the blob up (`DELETE /v1/files/<id>`) when its
+/// conversation is deleted.
 public enum ServerImageRef {
-    private static let marker = "/v1/images/"
+    private static let marker = "/v1/files/"
 
-    /// Every distinct `<id>` referenced by `/v1/images/<id>` occurrences in
-    /// `text`, in first-seen order. The id is the run of base64url characters
-    /// after the marker (terminated by `?`, `)`, `/`, quote, whitespace, …),
+    /// Every distinct `<id>` referenced by `/v1/files/<id>/content` occurrences
+    /// in `text`, in first-seen order. The id is the run of base64url characters
+    /// after the marker (terminated by `/`, `?`, `)`, quote, whitespace, …),
     /// matching the server's own id charset.
     public static func ids(in text: String) -> [String] {
         var out: [String] = []

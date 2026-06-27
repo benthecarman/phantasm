@@ -1,6 +1,6 @@
 import Foundation
 
-/// Deletes server-hosted image blobs (`DELETE /v1/images/<id>`, bearer-authed)
+/// Deletes server-hosted image blobs (`DELETE /v1/files/<id>`, bearer-authed)
 /// when their conversation is deleted, so the app owns the images' lifecycle
 /// (spec §2.2b). Best-effort: failures are swallowed because the server's TTL
 /// pruner is the backstop for blobs that never get an explicit delete.
@@ -21,7 +21,7 @@ public struct ImageClient: Sendable {
     }
 
     private func deleteOne(_ id: String, base: URL, token: String) async {
-        var req = URLRequest(url: base.appendingPathComponent("v1/images/\(id)"))
+        var req = URLRequest(url: base.appendingPathComponent("v1/files/\(id)"))
         req.httpMethod = "DELETE"
         if !token.isEmpty {
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

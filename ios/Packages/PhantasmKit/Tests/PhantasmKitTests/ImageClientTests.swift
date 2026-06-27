@@ -52,8 +52,8 @@ final class ImageClientTests: XCTestCase {
         XCTAssertEqual(
             Set(hits.map(\.url)),
             [
-                "https://host.example/v1/images/abc123",
-                "https://host.example/v1/images/DEF-_4",
+                "https://host.example/v1/files/abc123",
+                "https://host.example/v1/files/DEF-_4",
             ])
     }
 }

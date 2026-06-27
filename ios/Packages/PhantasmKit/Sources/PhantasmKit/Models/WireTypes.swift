@@ -103,21 +103,6 @@ public struct ChatRequest: Encodable, Sendable {
     public var tools: [ToolSpec]?
     /// Standard OpenAI `tool_choice`. Set to `"none"` to force plain chat.
     public var toolChoice: String?
-    /// Additive opt-in (spec §2.2b): tells the server it may deliver generated
-    /// images as `/v1/images/<id>` URL references instead of inline base64, so
-    /// re-sent history stays small. Always true — this client resolves, caches,
-    /// and cleans up references. Standard clients omit it and get inline images.
-    public var imageURLs: Bool
-
-    /// Explicit keys so `x_image_urls` lands verbatim (the encoder's snake-case
-    /// pass is idempotent on these already-snake names).
-    enum CodingKeys: String, CodingKey {
-        case model, messages, stream
-        case reasoningEffort = "reasoning_effort"
-        case tools
-        case toolChoice = "tool_choice"
-        case imageURLs = "x_image_urls"
-    }
 
     public init(
         model: String,
@@ -131,7 +116,6 @@ public struct ChatRequest: Encodable, Sendable {
         self.messages = messages
         self.stream = stream
         self.reasoningEffort = reasoningEffort
-        self.imageURLs = true
         // Translate the per-turn selection into standard OpenAI fields. Server
         // tools ride as name-only selectors; app-hosted tools ride as full
         // schemas the server forwards back to us. `tool_choice:"none"` only when

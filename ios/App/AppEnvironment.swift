@@ -78,7 +78,7 @@ final class AppEnvironment {
 
     /// Delete the server-hosted image blobs a conversation referenced, so the
     /// app owns their lifecycle (spec §2.2b). Best-effort and fire-before-delete:
-    /// must run while the messages still exist to read their `/v1/images/<id>`
+    /// must run while the messages still exist to read their `/v1/files/<id>`
     /// references. A failure is harmless — the server's TTL pruner is the
     /// backstop. Uses the conversation's own backend profile (falling back to the
     /// active one) for the base URL + token.

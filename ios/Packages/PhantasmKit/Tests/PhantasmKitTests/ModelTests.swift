@@ -73,13 +73,13 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertNil(json["tools"], "plain-chat selection sends only tool_choice:none")
     }
 
-    func testChatRequestOptsIntoImageURLs() throws {
+    func testChatRequestStaysStandardWithNoCustomFields() throws {
+        // Image URL delivery is a server-side choice — the request carries no
+        // bespoke field for it, staying byte-for-byte standard.
         let request = ChatRequest(model: "m", messages: [WireMessage(role: "user", content: "hi")])
         let json = try encodedKeys(request)
-        XCTAssertEqual(
-            json["x_image_urls"] as? Bool, true,
-            "the client always opts into server-hosted image URL delivery"
-        )
+        XCTAssertNil(json["x_image_urls"])
+        XCTAssertEqual(Set(json.keys), ["model", "messages", "stream"])
     }
 
     func testChatRequestNeverEmitsResearchFlag() throws {

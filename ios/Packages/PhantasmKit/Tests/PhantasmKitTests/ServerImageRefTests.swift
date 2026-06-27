@@ -5,14 +5,15 @@ import XCTest
 final class ServerImageRefTests: XCTestCase {
     func testExtractsRelativeAndAbsoluteIDs() {
         let md = """
-        Here you go ![generated](/v1/images/abc123?exp=9&sig=zz)
-        and another ![edited](https://host.example/v1/images/DEF-_4?exp=1&sig=q)
+        Here you go ![generated](/v1/files/abc123/content?exp=9&sig=zz)
+        and another ![edited](https://host.example/v1/files/DEF-_4/content?exp=1&sig=q)
         """
         XCTAssertEqual(ServerImageRef.ids(in: md), ["abc123", "DEF-_4"])
     }
 
     func testDeduplicatesAndPreservesOrder() {
-        let md = "![a](/v1/images/one?sig=x) ![b](/v1/images/two?sig=y) ![c](/v1/images/one?sig=z)"
+        let md =
+            "![a](/v1/files/one/content?sig=x) ![b](/v1/files/two/content) ![c](/v1/files/one/content)"
         XCTAssertEqual(ServerImageRef.ids(in: md), ["one", "two"])
     }
 
