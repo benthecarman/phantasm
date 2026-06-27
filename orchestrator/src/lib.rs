@@ -98,7 +98,6 @@ pub async fn probe_capabilities(
 
     let brave_web_search = cfg.web_search_usable();
     let web_fetch = cfg.web_fetch_usable();
-    let current_time = cfg.current_time_usable();
     let calculator = cfg.calculator_usable();
     let unit_convert = cfg.unit_convert_usable();
     let weather = cfg.weather_usable();
@@ -142,7 +141,6 @@ pub async fn probe_capabilities(
         tools: ToolFlags {
             web_search,
             web_fetch,
-            current_time,
             calculator,
             unit_convert,
             weather,

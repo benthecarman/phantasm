@@ -98,7 +98,6 @@ pub struct ToolFlags {
     /// an individual schema if Brave is not configured.
     pub web_search: bool,
     pub web_fetch: bool,
-    pub current_time: bool,
     pub calculator: bool,
     pub unit_convert: bool,
     pub weather: bool,

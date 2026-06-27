@@ -376,8 +376,10 @@ final class ChatRequestEncodingTests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertNil(json["tool_choice"], "app tools present => not plain chat")
         let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 1)
-        XCTAssertEqual((tools[0]["function"] as? [String: Any])?["name"] as? String, ToolName.askUser)
+        XCTAssertEqual(tools.count, AppTools.all.count)
+        let names = tools.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+        XCTAssertTrue(names.contains(ToolName.askUser))
+        XCTAssertTrue(names.contains(ToolName.currentTime))
     }
 }
 
@@ -633,6 +635,84 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(wire[0].role, "assistant")
         XCTAssertEqual(wire[1], WireMessage(toolResult: "call_7", name: ToolName.askUser, content: "(dismissed)"))
         XCTAssertEqual(wire[2], WireMessage(role: "user", content: "never mind"))
+    }
+
+    func testWireHistoryMixedBatchEmitsResultPerCall() async throws {
+        // One assistant message calling two app tools (current_time auto-resolved +
+        // ask_user interactive). The auto result is persisted; the interactive one
+        // is left unanswered and the user moves on. Each call must get a result:
+        // the stored time result, plus a synthesized dismissed for the prompt.
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+
+        let batch = [
+            WireToolCall(index: 0, id: "ct", type: "function",
+                         function: .init(name: ToolName.currentTime, arguments: "{}")),
+            WireToolCall(index: 1, id: "au", type: "function",
+                         function: .init(name: ToolName.askUser,
+                                         arguments: #"{"questions":[{"question":"Q","options":["A","B"]}]}"#)),
+        ]
+        let json = try XCTUnwrap(String(data: Wire.encoder().encode(batch), encoding: .utf8))
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "assistant", content: "",
+                    createdAt: t0, isComplete: true, toolCalls: json),
+            attachments: []
+        )
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "tool", content: "Current time: …",
+                    createdAt: t0.addingTimeInterval(1), isComplete: true,
+                    toolCallId: "ct", name: ToolName.currentTime),
+            attachments: []
+        )
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "user", content: "never mind",
+                    createdAt: t0.addingTimeInterval(2)),
+            attachments: []
+        )
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        let wire = try XCTUnwrap(detail?.wireHistory())
+        XCTAssertEqual(wire.count, 4)
+        XCTAssertEqual(wire[0].toolCalls?.count, 2)
+        XCTAssertEqual(wire[1], WireMessage(toolResult: "ct", name: ToolName.currentTime, content: "Current time: …"))
+        XCTAssertEqual(wire[2], WireMessage(toolResult: "au", name: ToolName.askUser, content: "(dismissed)"))
+        XCTAssertEqual(wire[3], WireMessage(role: "user", content: "never mind"))
+    }
+
+    func testActiveToolCallBatchTracksAnsweredCalls() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let batch = [
+            WireToolCall(index: 0, id: "ct", type: "function",
+                         function: .init(name: ToolName.currentTime, arguments: "{}")),
+            WireToolCall(index: 1, id: "au", type: "function",
+                         function: .init(name: ToolName.askUser,
+                                         arguments: #"{"questions":[{"question":"Q","options":["A","B"]}]}"#)),
+        ]
+        let json = try XCTUnwrap(String(data: Wire.encoder().encode(batch), encoding: .utf8))
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "assistant", content: "",
+                    createdAt: t0, isComplete: true, toolCalls: json),
+            attachments: []
+        )
+        try await store.insertMessage(
+            Message(conversationId: convo.id, role: "tool", content: "time",
+                    createdAt: t0.addingTimeInterval(1), isComplete: true,
+                    toolCallId: "ct", name: ToolName.currentTime),
+            attachments: []
+        )
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        let active = try XCTUnwrap(detail?.messages.activeToolCallBatch())
+        XCTAssertEqual(active.calls.count, 2)
+        XCTAssertEqual(active.answered, ["ct"])
+        // The interactive call is the one still needing the user.
+        let prompt = AppToolRegistry.firstUnansweredPrompt(
+            calls: active.calls, answered: active.answered
+        )
+        XCTAssertEqual(prompt?.toolCallId, "au")
     }
 
     func testCompleteToolCallMessageStoresCallsAndCompletes() async throws {

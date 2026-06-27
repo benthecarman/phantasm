@@ -44,7 +44,18 @@ struct ChatView: View {
     }
 
     private var visibleMessages: [ChatMessage] {
-        messages.filter { $0.message.isComplete }
+        messages.filter { item in
+            guard item.message.isComplete else { return false }
+            let m = item.message
+            // Hide protocol-plumbing rows that carry no user-facing prose: the
+            // forwarded app-tool call (an empty assistant body that rides
+            // `tool_calls`) and any auto-resolved tool's result (raw data meant for
+            // the model, not the transcript). An interactive answer — e.g. an
+            // `ask_user` pick — still shows.
+            if m.role == "assistant", m.toolCalls != nil, m.content.isEmpty { return false }
+            if m.role == "tool", AppToolRegistry.isAutoResolved(name: m.name) { return false }
+            return true
+        }
     }
 
     private var isEmpty: Bool { visibleMessages.isEmpty && !vm.hasAssistantPreview }
@@ -85,9 +96,14 @@ struct ChatView: View {
             // strip with the page background filling the gap behind the keyboard.
             .safeAreaInset(edge: .bottom) {
               VStack(spacing: 8) {
-                if let choice = vm.pendingChoice {
-                    ChoicePromptView(choice: choice) { vm.answerPendingChoice($0) }
-                        .id(choice.toolCallId)
+                if let prompt = vm.pendingPrompt {
+                    // One view per interactive app-tool prompt kind. A new
+                    // interactive tool adds a case here (and an `AppToolPrompt` one).
+                    switch prompt {
+                    case .multipleChoice(let choice):
+                        ChoicePromptView(choice: choice) { vm.answerPendingPrompt($0) }
+                            .id(choice.toolCallId)
+                    }
                 }
                 ComposerView(
                     input: $input,

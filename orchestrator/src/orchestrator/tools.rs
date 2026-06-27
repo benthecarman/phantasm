@@ -16,8 +16,8 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::TurnEvent;
 use crate::tools::{
-    calculator, current_time, github, image_edit, image_gen, maps_places, market_data, ocr,
-    unit_convert, weather, web_fetch, web_search,
+    calculator, github, image_edit, image_gen, maps_places, market_data, ocr, unit_convert,
+    weather, web_fetch, web_search,
 };
 
 /// Result of executing one tool call: the `tool`-role message to feed back to
@@ -98,9 +98,6 @@ impl ToolExecutor for ToolRegistry {
         if self.cfg.web_fetch_usable() {
             out.push(web_fetch::schema());
         }
-        if self.cfg.current_time_usable() {
-            out.push(current_time::schema());
-        }
         if self.cfg.calculator_usable() {
             out.push(calculator::schema());
         }
@@ -147,9 +144,6 @@ impl ToolExecutor for ToolRegistry {
             }
             "web_fetch" if self.cfg.web_fetch_usable() => {
                 web_fetch::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
-            }
-            "current_time" if self.cfg.current_time_usable() => {
-                current_time::run(call, &call_id, &tx, &cancel).await
             }
             "calculator" if self.cfg.calculator_usable() => {
                 calculator::run(call, &call_id, &tx, &cancel).await

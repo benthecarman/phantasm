@@ -1,8 +1,8 @@
 import Foundation
 
 /// A multiple-choice prompt parsed from an `ask_user` tool call (the app-hosted
-/// tool, see `AppTools.askUser`). Carries one or more questions answered together
-/// in a single form. Pure value type so the parser is host-testable.
+/// tool, see `AskUserTool`). Carries one or more questions answered together in a
+/// single form. Pure value type so the parser is host-testable.
 public struct MultipleChoice: Sendable, Equatable, Identifiable {
     /// How the user answers a question.
     public enum QuestionType: String, Sendable, Equatable {

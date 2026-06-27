@@ -116,7 +116,6 @@ fn test_config(ollama_base: &str) -> Config {
         tool_user_agent: "Phantasm/test".into(),
         web_fetch_enabled: false,
         web_fetch_context_chars: 8000,
-        current_time_enabled: false,
         calculator_enabled: false,
         unit_convert_enabled: false,
         weather_enabled: false,

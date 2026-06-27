@@ -96,7 +96,6 @@ pub struct Config {
     pub tool_user_agent: String,
     pub web_fetch_enabled: bool,
     pub web_fetch_context_chars: usize,
-    pub current_time_enabled: bool,
     pub calculator_enabled: bool,
     pub unit_convert_enabled: bool,
     pub weather_enabled: bool,
@@ -212,7 +211,6 @@ impl Config {
             ),
             web_fetch_enabled: env_bool("TOOL_WEB_FETCH", false),
             web_fetch_context_chars: env_parse("WEB_FETCH_CONTEXT_CHARS", 8000usize).max(500),
-            current_time_enabled: env_bool("TOOL_CURRENT_TIME", false),
             calculator_enabled: env_bool("TOOL_CALCULATOR", false),
             unit_convert_enabled: env_bool("TOOL_UNIT_CONVERT", false),
             weather_enabled: env_bool("TOOL_WEATHER", false),
@@ -291,10 +289,6 @@ impl Config {
         self.web_fetch_enabled
     }
 
-    pub fn current_time_usable(&self) -> bool {
-        self.current_time_enabled
-    }
-
     pub fn calculator_usable(&self) -> bool {
         self.calculator_enabled
     }
@@ -330,7 +324,6 @@ impl Config {
     pub fn information_tools_usable(&self) -> bool {
         self.web_search_usable()
             || self.web_fetch_usable()
-            || self.current_time_usable()
             || self.calculator_usable()
             || self.unit_convert_usable()
             || self.weather_usable()
@@ -442,7 +435,6 @@ pub mod tests_support {
             tool_user_agent: "Phantasm/test".into(),
             web_fetch_enabled: false,
             web_fetch_context_chars: 8000,
-            current_time_enabled: false,
             calculator_enabled: false,
             unit_convert_enabled: false,
             weather_enabled: false,

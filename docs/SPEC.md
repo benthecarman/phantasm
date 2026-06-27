@@ -40,7 +40,6 @@ image generation on top of plain inference.
   "tools": {
     "web_search": true,
     "web_fetch": true,
-    "current_time": true,
     "calculator": true,
     "unit_convert": true,
     "weather": true,
@@ -152,15 +151,19 @@ standard OpenAI function-calling and is invisible to the app:
    back to the app as ordinary SSE chunks.
 
 **App-hosted (client-executed) tools.** The app may also host its own tools —
-ones it executes itself by rendering UI (the first is `ask_user_input`, a
-multiple-choice prompt). It advertises them by sending **full** function schemas
+ones it executes itself. Two kinds exist today: `ask_user_input` (a
+multiple-choice prompt the app renders, resolved by the user) and `current_time`
+(the device answers from its own clock + timezone, resolved automatically with no
+UI). It advertises them by sending **full** function schemas
 (name + description + `parameters`) in the standard `tools` array. The
 orchestrator merges these with its configured server tools and offers all to the
 model, but it does **not** execute an app tool: when the model calls one, the
 orchestrator streams that call back to the app as a standard `delta.tool_calls`
 chunk terminated by `finish_reason: "tool_calls"`, then ends the turn. The app
 fulfills the call, appends a `tool`-role result (with the matching
-`tool_call_id`) to its history, and the model resumes on the next request. This
+`tool_call_id`) to its history, and the model resumes on the next request — for a
+device-resolved tool like `current_time` the app continues the turn itself
+without waiting for the user. This
 stays stateless (XR-2): the assistant `tool_calls` message and the `tool` result
 both live in the app's history and are re-sent; every assistant `tool_calls`
 message MUST be followed by a matching `tool` result (the app synthesizes a

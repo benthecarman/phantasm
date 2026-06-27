@@ -35,8 +35,8 @@ use crate::orchestrator::{ResearchPreset, TurnEvent};
 fn capability_name(tool: &str) -> &str {
     match tool {
         "image_edit" => "image_generation",
-        "web_fetch" | "current_time" | "calculator" | "unit_convert" | "weather"
-        | "maps_places" | "market_data" | "github" | "ocr" => "web_search",
+        "web_fetch" | "calculator" | "unit_convert" | "weather" | "maps_places" | "market_data"
+        | "github" | "ocr" => "web_search",
         other => other,
     }
 }

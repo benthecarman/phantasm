@@ -20,13 +20,12 @@ final class ChatViewModel {
     private(set) var streamingReasoning = ""
     private(set) var statusText: String?
     var errorMessage: String?
-    /// A pending `ask_user` prompt awaiting the user's answer (the model called
-    /// the app-hosted `ask_user` tool). The composer + `ChoicePromptView` resolve
-    /// it via `answerPendingChoice`. Nil when there's nothing to answer.
-    private(set) var pendingChoice: MultipleChoice?
-    /// Tool calls forwarded this turn, captured during streaming so `finish` can
-    /// persist them onto the assistant row.
-    private var pendingToolCalls: [WireToolCall]?
+    /// A pending interactive app-tool prompt (e.g. `ask_user`'s multiple choice)
+    /// awaiting the user. The composer + prompt views resolve it via
+    /// `answerPendingPrompt`. Nil when there's nothing to answer. Auto-resolved
+    /// tools (e.g. `current_time`) never set this — they continue the turn on
+    /// their own (`resolveToolBatch`).
+    private(set) var pendingPrompt: AppToolPrompt?
 
     private var env: AppEnvironment?
     private var store: ChatStore?
@@ -235,12 +234,12 @@ final class ChatViewModel {
     }
 
     func send(_ rawText: String, attachments: [PendingAttachment] = []) {
-        // A typed message while an `ask_user` prompt is pending IS the answer (it
+        // A typed message while an interactive prompt is pending IS the answer (it
         // must be returned as the tool result before the turn can continue).
-        if pendingChoice != nil {
+        if pendingPrompt != nil {
             let answer = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !answer.isEmpty {
-                answerPendingChoice(answer)
+                answerPendingPrompt(answer)
                 return
             }
         }
@@ -483,6 +482,9 @@ final class ChatViewModel {
             ? env.ollamaChatClient.stream(request, base: base, token: token)
             : env.chatClient.stream(request, base: base, token: token)
 
+        // App-hosted tool calls forwarded this turn, captured so the post-stream
+        // step can resolve them (the turn ends once the model calls one).
+        var batchedCalls: [WireToolCall]?
         do {
             for try await event in stream {
                 switch event {
@@ -494,15 +496,18 @@ final class ChatViewModel {
                 case .status(let s): statusText = s
                 case .toolCalls(let calls):
                     statusText = nil
-                    pendingToolCalls = calls
-                    pendingChoice = AskUserParser.firstChoice(in: calls)
+                    batchedCalls = calls
                 case .done: break
                 }
             }
-            // The model called an app-hosted tool: commit the tool_call row and
-            // wait for the user's answer (handled in `finish`).
-            if pendingToolCalls != nil {
-                finish(error: nil)
+            // The model called app-hosted tools: resolve the batch (auto tools on
+            // device, interactive ones via a prompt) and either continue the turn
+            // or wait for the user.
+            if let calls = batchedCalls, !calls.isEmpty {
+                resolveToolBatch(
+                    calls, conversationId: conversationId, model: model,
+                    base: base, token: token, env: env, store: store
+                )
                 return
             }
             let emptyResponse = streamingText.isEmpty
@@ -534,15 +539,16 @@ final class ChatViewModel {
               let base = env.activeProfile?.baseURL else { return }
         guard let detail = try? await store.conversationDetail(id: conversation.id) else { return }
 
-        // Restore an unanswered `ask_user` prompt. Its assistant tool_call row is
-        // *complete*, so the streaming-recovery path below won't catch it.
-        if pendingChoice == nil, let last = detail.messages.last,
-           last.message.role == "assistant", last.message.isComplete,
-           let json = last.message.toolCalls,
-           let data = json.data(using: .utf8),
-           let calls = try? Wire.decoder().decode([WireToolCall].self, from: data),
-           let choice = AskUserParser.firstChoice(in: calls) {
-            pendingChoice = choice
+        // Restore an unanswered interactive prompt from the active tool-call batch.
+        // Its rows are *complete* (the assistant tool_call row + any auto-resolved
+        // results already persisted), so the streaming-recovery path below won't
+        // catch it. Works for a mixed batch too: the autos are in `answered`, the
+        // interactive call isn't, so its prompt comes back up.
+        if pendingPrompt == nil, let batch = detail.messages.activeToolCallBatch(),
+           let prompt = AppToolRegistry.firstUnansweredPrompt(
+               calls: batch.calls, answered: batch.answered
+           ) {
+            pendingPrompt = prompt
             return
         }
 
@@ -614,13 +620,13 @@ final class ChatViewModel {
         }
     }
 
-    /// Answer a pending `ask_user` prompt: persist the choice as a `tool`-role
+    /// Answer a pending interactive prompt: persist the answer as a `tool`-role
     /// result for the forwarded call, then stream the model's continuation. The
     /// answer is the tapped option(s) or free-typed text — either way it must be
     /// returned as the tool result before the turn can resume.
-    func answerPendingChoice(_ answer: String) {
+    func answerPendingPrompt(_ answer: String) {
         let text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let choice = pendingChoice, !isStreaming,
+        guard !text.isEmpty, let prompt = pendingPrompt, !isStreaming,
               let env, let store, let conversation,
               let base = env.activeProfile?.baseURL else { return }
         guard let model = env.backendMode.resolvedChatModel(
@@ -628,14 +634,14 @@ final class ChatViewModel {
             defaultModel: env.preferredModel
         ) else { return }
 
-        pendingChoice = nil
+        pendingPrompt = nil
         let toolMessage = Message(
             conversationId: conversation.id,
             role: "tool",
             content: text,
             isComplete: true,
-            toolCallId: choice.toolCallId,
-            name: ToolName.askUser
+            toolCallId: prompt.toolCallId,
+            name: prompt.toolName
         )
 
         isStreaming = true
@@ -668,6 +674,121 @@ final class ChatViewModel {
                 base: base, token: token, env: env, store: store
             )
         }
+    }
+
+    /// Resolve a forwarded batch of app-tool calls. Commits the calls onto the
+    /// assistant row, then handles each in order: an `AutoResolvedTool` answers
+    /// on-device and its `tool`-role result is persisted immediately; the first
+    /// `InteractiveTool` call becomes the pending prompt (its result is persisted
+    /// later, when the user answers). Any extra interactive calls or unknown tools
+    /// in the same batch get a "(dismissed)" result so every call is answered
+    /// (OpenAI-valid). With no prompt pending — a pure auto batch — the turn
+    /// continues automatically; otherwise it parks until the user responds.
+    private func resolveToolBatch(
+        _ calls: [WireToolCall],
+        conversationId: UUID,
+        model: String,
+        base: URL,
+        token: String,
+        env: AppEnvironment,
+        store: ChatStore
+    ) {
+        let json = Self.encodeToolCalls(calls)
+        let pendingID = pendingAssistantMessageID
+        pendingAssistantMessageID = nil
+        pendingAssistantPreviewMessageID = nil
+        streamingText = ""
+        streamingReasoning = ""
+
+        task = Task { [weak self] in
+            // Commit the assistant tool_call row first, so every result that
+            // follows is attributed to this batch.
+            do {
+                if let pendingID {
+                    try await store.completeToolCallMessage(id: pendingID, toolCalls: json)
+                }
+            } catch {
+                self?.finish(error: AppError.from(error))
+                return
+            }
+
+            var prompt: AppToolPrompt?
+            for call in calls {
+                guard let id = call.id else { continue }
+                let result: String?
+                switch AppToolRegistry.match(call) {
+                case .auto(let tool):
+                    self?.statusText = tool.statusText
+                    result = await tool.resolve(call)
+                case .interactive(let tool):
+                    if prompt == nil, let raised = tool.prompt(for: call) {
+                        prompt = raised
+                        continue // the user answers this one later
+                    }
+                    result = "(dismissed)" // a second interactive call, or unparseable
+                case .unknown:
+                    result = "(dismissed)"
+                }
+                if let result {
+                    let message = Message(
+                        conversationId: conversationId, role: "tool",
+                        content: result, isComplete: true,
+                        toolCallId: id, name: call.function?.name
+                    )
+                    do {
+                        try await store.insertMessage(message, attachments: [])
+                    } catch {
+                        self?.finish(error: AppError.from(error))
+                        return
+                    }
+                }
+                if Task.isCancelled {
+                    self?.finishAfterStreamFailure(CancellationError())
+                    return
+                }
+            }
+
+            // An interactive prompt remains: park the turn and wait for the user.
+            if let prompt {
+                self?.pendingPrompt = prompt
+                self?.enterPromptWait(conversationId: conversationId, store: store)
+                return
+            }
+
+            // Every call resolved on-device: continue the turn.
+            guard await self?.insertPendingAssistantMessage(
+                conversationId: conversationId, store: store
+            ) != nil else { return }
+            if Task.isCancelled {
+                self?.finishAfterStreamFailure(CancellationError())
+                return
+            }
+            await self?.streamReply(
+                conversationId: conversationId, model: model,
+                base: base, token: token, env: env, store: store
+            )
+        }
+    }
+
+    /// Stop streaming and wait for the user to answer a pending interactive
+    /// prompt. The assistant tool_call row and any auto-resolved results are
+    /// already committed, so this only parks the streaming state — it commits no
+    /// row (unlike `finish`, which would try to flush empty streamed text).
+    private func enterPromptWait(conversationId: UUID, store: ChatStore) {
+        isStreaming = false
+        statusText = nil
+        task = nil
+        streamingText = ""
+        streamingReasoning = ""
+        pendingAssistantMessageID = nil
+        pendingAssistantPreviewMessageID = nil
+        suspendedByScene = false
+        Task {
+            try? await store.updateConversation(
+                id: conversationId, title: nil, modelID: nil, updatedAt: .now
+            )
+        }
+        endBackgroundStreamingTask()
     }
 
     /// JSON-encode forwarded tool calls for durable storage on the assistant row.
@@ -708,30 +829,9 @@ final class ChatViewModel {
             suspendedByScene = false
         }
 
-        // App-hosted tool call: commit the pending assistant row as a tool_call
-        // message (no streamed text) and keep `pendingChoice` up. The user's
-        // answer (tap or free-type) starts the next turn.
-        if error == nil, let calls = pendingToolCalls, !calls.isEmpty {
-            pendingToolCalls = nil
-            let pendingID = pendingAssistantMessageID
-            pendingAssistantMessageID = nil
-            pendingAssistantPreviewMessageID = nil
-            streamingText = ""
-            streamingReasoning = ""
-            let json = Self.encodeToolCalls(calls)
-            if let store, let conversation, let pendingID {
-                Task { [weak self] in
-                    try? await store.completeToolCallMessage(id: pendingID, toolCalls: json)
-                    try? await store.updateConversation(
-                        id: conversation.id, title: nil, modelID: nil, updatedAt: .now
-                    )
-                    self?.endBackgroundStreamingTask()
-                }
-            } else {
-                endBackgroundStreamingTask()
-            }
-            return
-        }
+        // Note: app-hosted tool batches don't flow through here — `resolveToolBatch`
+        // commits the tool_call row itself and either continues the turn or parks
+        // via `enterPromptWait`.
 
         // Commit any streamed text as one complete assistant message.
         let committed = streamingText

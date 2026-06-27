@@ -253,40 +253,86 @@ public extension Array where Element == ChatMessage {
     /// Full history mapped to the wire format (stateless server, XR-2). Only
     /// completed messages are sent. Assistant messages that forwarded app-tool
     /// calls and their `tool`-role results round-trip so the model sees the
-    /// call/result pair; every assistant tool_call is guaranteed to be followed
-    /// by a matching tool result (a synthetic "(dismissed)" one is inserted for
-    /// an unanswered call), keeping the history OpenAI-valid.
+    /// call/result pair. Every call in a forwarded batch is guaranteed a matching
+    /// result: the stored `tool` rows that follow are emitted, and any call still
+    /// without one (a dismissed prompt, or an unanswered call in a partially
+    /// resolved mixed batch) gets a synthetic "(dismissed)" result — keeping the
+    /// history OpenAI-valid per-call, not just per-message.
     func wireHistory() -> [WireMessage] {
         let completed = filter { $0.message.isComplete }
         var out: [WireMessage] = []
-        for (index, item) in completed.enumerated() {
+        var index = 0
+        while index < completed.count {
+            let item = completed[index]
             let m = item.message
+
             if m.role == "tool", let toolCallId = m.toolCallId {
                 out.append(WireMessage(
                     toolResult: toolCallId,
                     name: m.name ?? ToolName.askUser,
                     content: m.content
                 ))
+                index += 1
                 continue
             }
+
             if let calls = decodeToolCalls(m.toolCalls), !calls.isEmpty {
                 out.append(WireMessage(assistantToolCalls: calls))
-                let nextIsResult = completed[safe: index + 1]?.message.role == "tool"
-                if !nextIsResult {
-                    for call in calls {
-                        out.append(WireMessage(
-                            toolResult: call.id ?? "",
-                            name: call.function?.name ?? ToolName.askUser,
-                            content: "(dismissed)"
-                        ))
-                    }
+                // Emit every stored `tool` result that follows this batch, tracking
+                // which call ids got answered.
+                var answered = Set<String>()
+                var next = index + 1
+                while next < completed.count,
+                      completed[next].message.role == "tool",
+                      let id = completed[next].message.toolCallId {
+                    let result = completed[next].message
+                    out.append(WireMessage(
+                        toolResult: id,
+                        name: result.name ?? ToolName.askUser,
+                        content: result.content
+                    ))
+                    answered.insert(id)
+                    next += 1
                 }
+                // Fill in any call the model made that never got a result.
+                for call in calls where !(call.id.map(answered.contains) ?? false) {
+                    out.append(WireMessage(
+                        toolResult: call.id ?? "",
+                        name: call.function?.name ?? ToolName.askUser,
+                        content: "(dismissed)"
+                    ))
+                }
+                index = next
                 continue
             }
-            guard !(m.content.isEmpty && item.attachments.isEmpty) else { continue }
-            out.append(WireMessage(role: m.role, content: item.wireContent()))
+
+            if !(m.content.isEmpty && item.attachments.isEmpty) {
+                out.append(WireMessage(role: m.role, content: item.wireContent()))
+            }
+            index += 1
         }
         return out
+    }
+
+    /// The trailing app-tool-call batch still awaiting results, if the most recent
+    /// activity is an assistant `tool_calls` message followed *only* by `tool`
+    /// results (i.e. the turn hasn't continued past it). Returns the forwarded
+    /// calls plus the set of call ids already answered — used after a relaunch to
+    /// restore a pending interactive prompt (including one in a mixed batch whose
+    /// auto-resolved results were already persisted). Nil if there's no such batch
+    /// or the turn already moved on.
+    func activeToolCallBatch() -> (calls: [WireToolCall], answered: Set<String>)? {
+        let completed = filter { $0.message.isComplete }
+        guard let k = completed.lastIndex(where: {
+            $0.message.role == "assistant" && $0.message.toolCalls != nil
+        }) else { return nil }
+        let after = completed[(k + 1)...]
+        guard after.allSatisfy({ $0.message.role == "tool" }) else { return nil }
+        guard let calls = decodeToolCalls(completed[k].message.toolCalls), !calls.isEmpty else {
+            return nil
+        }
+        let answered = Set(after.compactMap { $0.message.toolCallId })
+        return (calls, answered)
     }
 
     private func decodeToolCalls(_ json: String?) -> [WireToolCall]? {
