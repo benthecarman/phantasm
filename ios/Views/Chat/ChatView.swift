@@ -601,7 +601,7 @@ struct ComposerView: View {
 
     private var stopButton: some View {
         Button(action: onStop) {
-            controlIcon("stop.fill", background: Color.red)
+            controlIcon("stop.fill", background: Color.primary)
         }
         .accessibilityLabel("Stop")
     }
