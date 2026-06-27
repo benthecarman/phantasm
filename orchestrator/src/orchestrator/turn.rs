@@ -172,7 +172,7 @@ pub async fn run_turn<B, T>(
     }
 
     let mut appends: Vec<String> = Vec::new();
-    let ctx = TurnContext {
+    let mut ctx = TurnContext {
         input_images: latest_input_images(&messages),
         research: false,
         ..Default::default()
@@ -288,6 +288,14 @@ pub async fn run_turn<B, T>(
                 for outcome in outcomes {
                     messages.push(outcome.message);
                     if let Some(extra) = outcome.append_to_answer {
+                        // A generated/edited image becomes the most recent image
+                        // in the conversation, so a later tool in this same turn
+                        // (e.g. image_edit right after image_generation) can act
+                        // on it. The data URI rides only the streamed answer, never
+                        // the message history latest_input_images() scans, so feed
+                        // its payload into the turn context directly.
+                        ctx.input_images
+                            .extend(MessageContent::Text(extra.clone()).image_payloads());
                         appends.push(extra);
                     }
                 }
@@ -650,6 +658,54 @@ mod tests {
         }
     }
 
+    // A tool executor mimicking the image tools: generation/edit embed their
+    // result as a `data:` URI in `append_to_answer` (never in the model-visible
+    // message), and edit records the `input_images` it was handed so a test can
+    // assert it saw a same-turn generated image.
+    #[derive(Clone)]
+    struct ImageTools {
+        edit_saw: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ToolExecutor for ImageTools {
+        fn schemas(&self) -> Vec<Value> {
+            vec![serde_json::json!({"type":"function"})]
+        }
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            ctx: &TurnContext,
+            _tx: mpsc::Sender<TurnEvent>,
+            _cancel: CancellationToken,
+        ) -> ToolOutcome {
+            match call.function.name.as_str() {
+                "image_generation" => ToolOutcome {
+                    message: ChatMessage::tool_result(
+                        "call_1",
+                        "image_generation",
+                        "Image generated successfully and shown to the user.",
+                    ),
+                    append_to_answer: Some("![generated](data:image/png;base64,GENIMG)".into()),
+                },
+                "image_edit" => {
+                    *self.edit_saw.lock().unwrap() = ctx.input_images.clone();
+                    ToolOutcome {
+                        message: ChatMessage::tool_result(
+                            "call_1",
+                            "image_edit",
+                            "Image edited successfully and shown to the user.",
+                        ),
+                        append_to_answer: Some("![edited](data:image/png;base64,EDITIMG)".into()),
+                    }
+                }
+                other => ToolOutcome {
+                    message: ChatMessage::tool_result("call_1", other, "ok"),
+                    append_to_answer: None,
+                },
+            }
+        }
+    }
+
     async fn drain(mut rx: mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
         let mut out = Vec::new();
         while let Some(e) = rx.recv().await {
@@ -741,6 +797,61 @@ mod tests {
         // chat_once called twice: once -> tool_call, twice -> no tools (final)
         assert_eq!(*backend.once_calls.lock().unwrap(), 2);
         assert_eq!(collect_text(&events), "answer");
+    }
+
+    #[tokio::test]
+    async fn generated_image_is_editable_in_same_turn() {
+        // gen-then-edit in one turn, with no user attachment: the freshly
+        // generated image (which lives only in the streamed answer, never in the
+        // message history) must still reach image_edit as its most-recent input,
+        // and both the generated and edited images must stream into the answer.
+        let backend = ScriptedBackend::new(
+            vec![
+                assistant_calling("image_generation"),
+                assistant_calling("image_edit"),
+            ],
+            vec!["here you go".into()],
+        );
+        let edit_saw = Arc::new(Mutex::new(vec![]));
+        let tools = ImageTools {
+            edit_saw: edit_saw.clone(),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![user(MessageContent::Text(
+                "draw a cat then make it night".into(),
+            ))],
+            "m".into(),
+            Map::new(),
+            None,
+            Vec::new(),
+            None,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let events = drain(rx).await;
+
+        // The edit operated on the just-generated image, not an empty context.
+        assert_eq!(
+            edit_saw.lock().unwrap().as_slice(),
+            &["GENIMG".to_string()],
+            "image_edit must see the same-turn generated image as its input"
+        );
+        // Both images are delivered to the app in the final answer.
+        let text = collect_text(&events);
+        assert!(
+            text.contains("data:image/png;base64,GENIMG"),
+            "generated image missing from answer: {text}"
+        );
+        assert!(
+            text.contains("data:image/png;base64,EDITIMG"),
+            "edited image missing from answer: {text}"
+        );
     }
 
     #[tokio::test]
