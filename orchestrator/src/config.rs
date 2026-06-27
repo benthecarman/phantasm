@@ -46,6 +46,11 @@ impl NodeInput {
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub auth_token: String,
+    /// Browser CORS allow-list. Empty => CORS disabled (no `Access-Control-*`
+    /// headers, no preflight handling) — the default, since the iOS app is not a
+    /// browser and needs none. A single `*` entry allows any origin; otherwise
+    /// it's an exact-match list of origins (e.g. `https://chat.example`).
+    pub cors_allowed_origins: Vec<String>,
 
     // Ollama (upstream model host)
     pub ollama_base: Url,
@@ -211,6 +216,7 @@ impl Config {
         Ok(Config {
             bind_addr,
             auth_token,
+            cors_allowed_origins: csv("PHANTASM_CORS_ALLOWED_ORIGINS"),
             ollama_base,
             upstream_api_key,
             default_model,
@@ -458,6 +464,7 @@ pub mod tests_support {
         Config {
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             auth_token: "test-token".into(),
+            cors_allowed_origins: vec![],
             ollama_base: "http://localhost:11434".parse().unwrap(),
             upstream_api_key: None,
             default_model: "m".into(),

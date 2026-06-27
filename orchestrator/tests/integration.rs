@@ -135,6 +135,7 @@ fn test_config(ollama_base: &str) -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: TOKEN.into(),
+        cors_allowed_origins: vec![],
         ollama_base: ollama_base.parse().unwrap(),
         upstream_api_key: None,
         default_model: "m".into(),
@@ -609,6 +610,85 @@ async fn capabilities_requires_auth_and_reports_models() {
     assert_eq!(v["streaming"], "sse");
     assert_eq!(v["models"][0], "m");
     assert_eq!(v["tools"]["web_search"], false);
+}
+
+/// Spawn the orchestrator with a CORS allow-list configured.
+async fn spawn_orchestrator_with_cors(ollama_base: &str, origins: Vec<String>) -> String {
+    let mut cfg = test_config(ollama_base);
+    cfg.cors_allowed_origins = origins;
+    let cfg = Arc::new(cfg);
+    let capabilities = Arc::new(CapabilitySnapshot {
+        version: "test".into(),
+        chat: true,
+        models: vec!["m".into()],
+        vision_models: vec![],
+        tool_models: vec![],
+        tools: ToolFlags::default(),
+        modes: vec![],
+        streaming: "sse",
+    });
+    let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
+    spawn(routes::router(state)).await
+}
+
+/// With no allow-list (the default), CORS is off: a browser preflight gets no
+/// `Access-Control-Allow-Origin`, so the browser blocks the cross-origin call.
+#[tokio::test]
+async fn cors_disabled_by_default() {
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator(&ollama).await;
+
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base}/v1/chat/completions"),
+        )
+        .header("Origin", "https://chat.example")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+}
+
+/// With an allow-list, an in-list origin is reflected and the preflight is
+/// answered without bearer auth (preflights carry no `Authorization`).
+#[tokio::test]
+async fn cors_allows_configured_origin() {
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator_with_cors(&ollama, vec!["https://chat.example".into()]).await;
+
+    let preflight = reqwest::Client::new()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base}/v1/chat/completions"),
+        )
+        .header("Origin", "https://chat.example")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await
+        .unwrap();
+    assert!(preflight.status().is_success());
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://chat.example"
+    );
+
+    // A different origin is not reflected back.
+    let other = reqwest::Client::new()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base}/v1/chat/completions"),
+        )
+        .header("Origin", "https://evil.example")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await
+        .unwrap();
+    assert!(other.headers().get("access-control-allow-origin").is_none());
 }
 
 /// Spawn the orchestrator with a server-hosted image store rooted at `dir`. The
