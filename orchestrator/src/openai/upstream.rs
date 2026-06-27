@@ -4,11 +4,9 @@
 //! native `/api/tags`. The downstream app contract remains our own
 //! OpenAI-compatible endpoint; this client is only for model-host traffic.
 
-use async_openai::config::Config as AsyncOpenAIConfig;
-use async_openai::Client;
 use async_stream::try_stream;
+use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
-use reqwest13::header::{HeaderMap, AUTHORIZATION};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -22,14 +20,32 @@ const REASONING_EFFORT_NONE: &str = "none";
 
 #[derive(Clone)]
 pub struct OpenAICompatibleClient {
-    client: Client<OptionalAuthConfig>,
+    http: reqwest::Client,
+    /// Already normalized to end in `/v1` (no trailing slash) by [`openai_api_base`].
+    api_base: String,
+    /// Bearer token sent on every request, when the deployment requires one.
+    api_key: Option<SecretString>,
 }
 
 impl OpenAICompatibleClient {
-    pub fn new(base: &Url, api_key: Option<&str>) -> Self {
-        let config = OptionalAuthConfig::new(openai_api_base(base), api_key);
+    pub fn new(http: reqwest::Client, base: &Url, api_key: Option<&str>) -> Self {
+        let api_key = api_key
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| SecretString::from(s.to_string()));
         OpenAICompatibleClient {
-            client: Client::with_config(config),
+            http,
+            api_base: openai_api_base(base),
+            api_key,
+        }
+    }
+
+    /// A POST builder carrying the bearer token when one is configured.
+    fn authed_post(&self, url: &str) -> reqwest::RequestBuilder {
+        let req = self.http.post(url);
+        match &self.api_key {
+            Some(key) => req.bearer_auth(key.expose_secret()),
+            None => req,
         }
     }
 
@@ -80,6 +96,10 @@ impl OpenAICompatibleClient {
         }
         Value::Object(body)
     }
+
+    fn chat_url(&self) -> String {
+        format!("{}/chat/completions", self.api_base)
+    }
 }
 
 fn remove_noop_reasoning_suppression(options: &mut Map<String, Value>) {
@@ -102,55 +122,6 @@ fn remove_noop_reasoning_suppression(options: &mut Map<String, Value>) {
     }
 }
 
-#[derive(Clone, Debug)]
-struct OptionalAuthConfig {
-    api_base: String,
-    api_key: SecretString,
-    has_api_key: bool,
-}
-
-impl OptionalAuthConfig {
-    fn new(api_base: String, api_key: Option<&str>) -> Self {
-        let api_key = api_key.map(str::trim).filter(|s| !s.is_empty());
-        OptionalAuthConfig {
-            api_base,
-            api_key: SecretString::from(api_key.unwrap_or_default().to_string()),
-            has_api_key: api_key.is_some(),
-        }
-    }
-}
-
-impl AsyncOpenAIConfig for OptionalAuthConfig {
-    fn headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        if self.has_api_key {
-            headers.insert(
-                AUTHORIZATION,
-                format!("Bearer {}", self.api_key.expose_secret())
-                    .parse()
-                    .unwrap(),
-            );
-        }
-        headers
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.api_base, path)
-    }
-
-    fn query(&self) -> Vec<(&str, &str)> {
-        vec![]
-    }
-
-    fn api_base(&self) -> &str {
-        &self.api_base
-    }
-
-    fn api_key(&self) -> &SecretString {
-        &self.api_key
-    }
-}
-
 impl ChatBackend for OpenAICompatibleClient {
     async fn chat_once(
         &self,
@@ -160,12 +131,21 @@ impl ChatBackend for OpenAICompatibleClient {
         options: &Map<String, Value>,
     ) -> Result<ChatMessage, AppError> {
         let request = Self::build_request(model, messages, tools, options, false);
-        let response: Value = self
-            .client
-            .chat()
-            .create_byot(request)
+        let resp = self
+            .authed_post(&self.chat_url())
+            .json(&request)
+            .send()
             .await
-            .map_err(map_openai_error)?;
+            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+        }
+        let response: Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::OllamaError(e.to_string()))?;
 
         response
             .get("choices")
@@ -184,26 +164,59 @@ impl ChatBackend for OpenAICompatibleClient {
         options: &Map<String, Value>,
     ) -> Result<DeltaStream, AppError> {
         let request = Self::build_request(model, messages, &[], options, true);
-        let stream = self
-            .client
-            .chat()
-            .create_stream_byot(request)
+        let resp = self
+            .authed_post(&self.chat_url())
+            .json(&request)
+            .send()
             .await
-            .map_err(map_openai_error)?;
-        Ok(Box::pin(openai_chunks_to_deltas(stream)))
+            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+        }
+        Ok(Box::pin(sse_bytes_to_deltas(resp.bytes_stream())))
     }
 }
 
-fn openai_chunks_to_deltas<S>(mut stream: S) -> impl Stream<Item = Result<StreamDelta, AppError>>
+/// Turn the raw byte stream of an OpenAI `text/event-stream` response into
+/// `StreamDelta`s, buffering partial lines across chunk boundaries. We only care
+/// about `data:` lines; the `data: [DONE]` sentinel ends the stream, and blank
+/// separators / comments (`:`) / other SSE fields (`event:`, `id:`) are ignored.
+fn sse_bytes_to_deltas<S>(mut bytes: S) -> impl Stream<Item = Result<StreamDelta, AppError>>
 where
-    S: Stream<Item = Result<Value, async_openai::error::OpenAIError>> + Unpin,
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
     try_stream! {
-        while let Some(next) = stream.next().await {
-            let chunk = next.map_err(map_openai_error)?;
-            yield delta_from_openai_chunk(&chunk);
+        let mut buf = BytesMut::new();
+        'read: while let Some(next) = bytes.next().await {
+            let chunk = next.map_err(|e| AppError::OllamaError(e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = buf.split_to(pos + 1);
+                let Some(payload) = sse_data_payload(line.as_ref()) else {
+                    continue;
+                };
+                if payload == b"[DONE]" {
+                    break 'read;
+                }
+                let value: Value = serde_json::from_slice(payload)
+                    .map_err(|e| AppError::OllamaError(format!("bad SSE data line: {e}")))?;
+                yield delta_from_openai_chunk(&value);
+            }
         }
     }
+}
+
+/// The payload of an SSE `data:` line (trimmed), or `None` for a blank
+/// separator, a `:` comment, or any non-`data` field line.
+fn sse_data_payload(line: &[u8]) -> Option<&[u8]> {
+    let line = line.trim_ascii();
+    if line.is_empty() || line.starts_with(b":") {
+        return None;
+    }
+    line.strip_prefix(b"data:").map(<[u8]>::trim_ascii)
 }
 
 fn delta_from_openai_chunk(chunk: &Value) -> StreamDelta {
@@ -268,10 +281,6 @@ pub fn openai_api_base(base: &Url) -> String {
     }
 }
 
-fn map_openai_error(error: async_openai::error::OpenAIError) -> AppError {
-    AppError::OllamaError(error.to_string())
-}
-
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelEntry>,
@@ -296,6 +305,65 @@ mod tests {
     fn openai_api_base_preserves_existing_v1_path() {
         let base = Url::parse("https://api.example.test/custom/v1/").unwrap();
         assert_eq!(openai_api_base(&base), "https://api.example.test/custom/v1");
+    }
+
+    #[test]
+    fn sse_data_payload_extracts_and_ignores() {
+        // A data line, with and without the optional space after the colon.
+        assert_eq!(
+            sse_data_payload(b"data: {\"a\":1}\n"),
+            Some(&b"{\"a\":1}"[..])
+        );
+        assert_eq!(
+            sse_data_payload(b"data:{\"a\":1}\n"),
+            Some(&b"{\"a\":1}"[..])
+        );
+        // The terminating sentinel is surfaced verbatim for the caller to detect.
+        assert_eq!(sse_data_payload(b"data: [DONE]\n"), Some(&b"[DONE]"[..]));
+        // Blank separators, comments, and non-`data` fields are skipped.
+        assert_eq!(sse_data_payload(b"\n"), None);
+        assert_eq!(sse_data_payload(b": keep-alive comment\n"), None);
+        assert_eq!(sse_data_payload(b"event: message\n"), None);
+        assert_eq!(sse_data_payload(b"id: 42\n"), None);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_buffers_lines_split_across_chunks() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        // A single SSE data line deliberately split mid-JSON across two byte
+        // chunks, then a finish chunk and the [DONE] sentinel arriving together.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"He")),
+            Ok(Bytes::from_static(
+                b"llo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )),
+        ];
+        let deltas: Vec<StreamDelta> = sse_bytes_to_deltas(stream::iter(chunks))
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+
+        // [DONE] yields nothing, so exactly two deltas: the reassembled content
+        // and the terminal finish.
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].content, "Hello");
+        assert!(!deltas[0].done);
+        assert!(deltas[1].done);
+        assert_eq!(deltas[1].done_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_surfaces_malformed_data_line() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let chunks: Vec<reqwest::Result<Bytes>> =
+            vec![Ok(Bytes::from_static(b"data: {not json}\n\n"))];
+        let mut got = Box::pin(sse_bytes_to_deltas(stream::iter(chunks)));
+        let first = got.next().await.expect("one item");
+        assert!(matches!(first, Err(AppError::OllamaError(_))));
     }
 
     #[test]

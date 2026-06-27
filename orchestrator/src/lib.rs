@@ -225,9 +225,13 @@ pub fn build_state(
             http.clone(),
             cfg.ollama_base.clone(),
         )),
-        UpstreamKind::OpenAICompatible => UpstreamChatBackend::OpenAICompatible(
-            OpenAICompatibleClient::new(&cfg.ollama_base, cfg.upstream_api_key.as_deref()),
-        ),
+        UpstreamKind::OpenAICompatible => {
+            UpstreamChatBackend::OpenAICompatible(OpenAICompatibleClient::new(
+                http.clone(),
+                &cfg.ollama_base,
+                cfg.upstream_api_key.as_deref(),
+            ))
+        }
     };
     // Stand up the server-hosted image store when configured. A configured-but-
     // unwritable directory degrades to inline delivery (logged) rather than

@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
@@ -124,6 +125,21 @@ fn mock_openai_compatible() -> Router {
                     .into_response()
                 }
             }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { axum::Json(serde_json::json!({"data":[{"id":"m"}]})) }),
+        )
+}
+
+/// Like [`mock_openai_compatible`] but `/v1/chat/completions` fails with a 500
+/// and a detail body, so we can assert the orchestrator surfaces the upstream
+/// error rather than masking it.
+fn mock_openai_compatible_erroring() -> Router {
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "upstream boom").into_response() }),
         )
         .route(
             "/v1/models",
@@ -498,6 +514,34 @@ async fn openai_compatible_upstream_streams_tokens() {
     }
     assert_eq!(content, "Hello world");
     assert!(saw_done, "expected a [DONE] sentinel");
+}
+
+#[tokio::test]
+async fn openai_compatible_upstream_error_surfaces_as_bad_gateway() {
+    let openai = spawn(mock_openai_compatible_erroring()).await;
+    let base = spawn_orchestrator_with_kind(&openai, UpstreamKind::OpenAICompatible).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // OllamaError maps to 502, and the upstream status + detail ride through.
+    assert_eq!(resp.status().as_u16(), 502);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "upstream_error");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("500") && message.contains("upstream boom"),
+        "expected upstream status + detail in error message, got: {message}"
+    );
 }
 
 #[tokio::test]
