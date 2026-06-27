@@ -76,10 +76,9 @@ struct ChatView: View {
         env.supportsTools(currentModelID)
     }
 
-    /// The server tools the active backend advertises, or nil if it exposes no
-    /// tool manifest (raw Ollama / generic OpenAI) — then the tool selector hides.
-    private var backendTools: Capabilities.Tools? {
-        env.backendMode.capabilities?.tools
+    /// The active orchestrator manifest, or nil for raw Ollama / generic OpenAI.
+    private var backendCapabilities: Capabilities? {
+        env.backendMode.capabilities
     }
 
     /// Whether app-hosted tools (e.g. location) can ride this turn: only against
@@ -126,8 +125,8 @@ struct ChatView: View {
                     toolModels: env.toolModels,
                     defaultModel: env.defaultModelID,
                     allowsImageAttachments: allowsImageAttachments,
-                    supportsWebSearch: backendTools?.webSearch ?? false,
-                    supportsImageGeneration: backendTools?.imageGeneration ?? false,
+                    supportsWebSearch: backendCapabilities?.hasToolSelector(ToolSelectorName.information) ?? false,
+                    supportsImageGeneration: backendCapabilities?.hasToolSelector(ToolSelectorName.imageGeneration) ?? false,
                     supportsLocation: supportsAppTools,
                     modelSupportsTools: modelSupportsTools,
                     webSearchEnabled: Binding(

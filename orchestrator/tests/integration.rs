@@ -11,7 +11,7 @@ use axum::Router;
 use phantasm_orchestrator::config::{Config, LogFormat};
 use phantasm_orchestrator::ollama::UpstreamKind;
 use phantasm_orchestrator::routes;
-use phantasm_orchestrator::state::{CapabilitySnapshot, ToolFlags};
+use phantasm_orchestrator::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo};
 use tokio::sync::Mutex;
 
 const TOKEN: &str = "test-token";
@@ -224,22 +224,34 @@ fn test_config(ollama_base: &str) -> Config {
     }
 }
 
+fn test_capabilities() -> CapabilitySnapshot {
+    CapabilitySnapshot {
+        version: "test".into(),
+        models: vec![ModelInfo {
+            id: "m".into(),
+            capabilities: Some(ModelCapabilities {
+                completion: true,
+                vision: false,
+                audio: false,
+                tools: false,
+                insert: false,
+                thinking: false,
+                embedding: false,
+            }),
+            context_length: Some(4096),
+        }],
+        tool_selectors: vec![],
+        modes: vec![],
+    }
+}
+
 async fn spawn_orchestrator(ollama_base: &str) -> String {
     spawn_orchestrator_with_kind(ollama_base, UpstreamKind::NativeOllama).await
 }
 
 async fn spawn_orchestrator_with_kind(ollama_base: &str, upstream_kind: UpstreamKind) -> String {
     let cfg = Arc::new(test_config(ollama_base));
-    let capabilities = Arc::new(CapabilitySnapshot {
-        version: "test".into(),
-        chat: true,
-        models: vec!["m".into()],
-        vision_models: vec![],
-        tool_models: vec![],
-        tools: ToolFlags::default(),
-        modes: vec![],
-        streaming: "sse",
-    });
+    let capabilities = Arc::new(test_capabilities());
     let state = phantasm_orchestrator::build_state(cfg, capabilities, upstream_kind);
     spawn(routes::router(state)).await
 }
@@ -250,16 +262,7 @@ async fn spawn_orchestrator_with_calculator(ollama_base: &str) -> String {
     let mut cfg = test_config(ollama_base);
     cfg.calculator_enabled = true;
     let cfg = Arc::new(cfg);
-    let capabilities = Arc::new(CapabilitySnapshot {
-        version: "test".into(),
-        chat: true,
-        models: vec!["m".into()],
-        vision_models: vec![],
-        tool_models: vec![],
-        tools: ToolFlags::default(),
-        modes: vec![],
-        streaming: "sse",
-    });
+    let capabilities = Arc::new(test_capabilities());
     let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
     spawn(routes::router(state)).await
 }
@@ -650,10 +653,19 @@ async fn capabilities_requires_auth_and_reports_models() {
         .unwrap();
     assert!(ok.status().is_success());
     let v: serde_json::Value = ok.json().await.unwrap();
-    assert_eq!(v["chat"], true);
-    assert_eq!(v["streaming"], "sse");
-    assert_eq!(v["models"][0], "m");
-    assert_eq!(v["tools"]["web_search"], false);
+    assert_eq!(v["models"][0]["id"], "m");
+    assert_eq!(v["models"][0]["capabilities"]["completion"], true);
+    assert_eq!(v["models"][0]["capabilities"]["vision"], false);
+    assert_eq!(v["models"][0]["capabilities"]["audio"], false);
+    assert_eq!(v["models"][0]["capabilities"]["tools"], false);
+    assert_eq!(v["models"][0]["capabilities"]["insert"], false);
+    assert_eq!(v["models"][0]["capabilities"]["thinking"], false);
+    assert_eq!(v["models"][0]["capabilities"]["embedding"], false);
+    assert_eq!(v["models"][0]["context_length"], 4096);
+    assert_eq!(v["tool_selectors"], serde_json::json!([]));
+    assert!(v.get("chat").is_none());
+    assert!(v.get("streaming").is_none());
+    assert!(v.get("tools").is_none());
 }
 
 /// Spawn the orchestrator with a CORS allow-list configured.
@@ -661,16 +673,7 @@ async fn spawn_orchestrator_with_cors(ollama_base: &str, origins: Vec<String>) -
     let mut cfg = test_config(ollama_base);
     cfg.cors_allowed_origins = origins;
     let cfg = Arc::new(cfg);
-    let capabilities = Arc::new(CapabilitySnapshot {
-        version: "test".into(),
-        chat: true,
-        models: vec!["m".into()],
-        vision_models: vec![],
-        tool_models: vec![],
-        tools: ToolFlags::default(),
-        modes: vec![],
-        streaming: "sse",
-    });
+    let capabilities = Arc::new(test_capabilities());
     let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
     spawn(routes::router(state)).await
 }
@@ -742,16 +745,7 @@ async fn spawn_orchestrator_with_images(ollama_base: &str, dir: std::path::PathB
     let mut cfg = test_config(ollama_base);
     cfg.image_store_dir = Some(dir);
     let cfg = Arc::new(cfg);
-    let capabilities = Arc::new(CapabilitySnapshot {
-        version: "test".into(),
-        chat: true,
-        models: vec!["m".into()],
-        vision_models: vec![],
-        tool_models: vec![],
-        tools: ToolFlags::default(),
-        modes: vec![],
-        streaming: "sse",
-    });
+    let capabilities = Arc::new(test_capabilities());
     let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
     spawn(routes::router(state)).await
 }

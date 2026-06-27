@@ -214,7 +214,7 @@ final class AppEnvironment {
     ) async -> (vision: Set<String>?, tools: Set<String>?) {
         switch mode {
         case .full(let caps):
-            return (caps.visionModels.map(Set.init), caps.toolModels.map(Set.init))
+            return (caps.visionModelIDs, caps.toolModelIDs)
         case .ollamaNative(let models):
             let vision = await capabilitiesClient.fetchOllamaVisionModels(
                 base: base, token: token, models: models

@@ -5,6 +5,8 @@
 //! has reliable streaming + tool calling. Conversions to/from our OpenAI
 //! `ChatMessage` live here so the rest of the codebase speaks one dialect.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -82,6 +84,43 @@ pub struct TagsResponse {
 pub struct ShowResponse {
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub model_info: HashMap<String, Value>,
+}
+
+#[derive(Debug)]
+pub struct ModelMetadata {
+    pub capabilities: Vec<String>,
+    pub context_length: Option<u64>,
+}
+
+impl From<ShowResponse> for ModelMetadata {
+    fn from(show: ShowResponse) -> Self {
+        Self {
+            capabilities: show.capabilities,
+            context_length: context_length(&show.model_info),
+        }
+    }
+}
+
+fn context_length(model_info: &HashMap<String, Value>) -> Option<u64> {
+    model_info.iter().find_map(|(key, value)| {
+        key.ends_with(".context_length")
+            .then(|| numeric_u64(value))
+            .flatten()
+    })
+}
+
+fn numeric_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0)
+                .map(|n| n as u64)
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +242,20 @@ mod tests {
     fn show_response_without_capabilities_is_empty() {
         let show: ShowResponse = serde_json::from_str(r#"{"template":"x"}"#).unwrap();
         assert!(show.capabilities.is_empty());
+    }
+
+    #[test]
+    fn show_response_extracts_context_length() {
+        let json = r#"{"model_info":{"qwen3.context_length":40960}}"#;
+        let metadata = ModelMetadata::from(serde_json::from_str::<ShowResponse>(json).unwrap());
+        assert_eq!(metadata.context_length, Some(40960));
+    }
+
+    #[test]
+    fn show_response_without_context_length_is_unknown() {
+        let json = r#"{"model_info":{"qwen3.embedding_length":5120}}"#;
+        let metadata = ModelMetadata::from(serde_json::from_str::<ShowResponse>(json).unwrap());
+        assert_eq!(metadata.context_length, None);
     }
 
     #[test]

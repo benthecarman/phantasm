@@ -359,10 +359,9 @@ impl Config {
         self.ocr_enabled
     }
 
-    /// App-facing "information tools" group. Older app builds can request the
-    /// existing `web_search` capability and still get newly-added read-only
-    /// utility/network tools; research-mode gating still checks real Brave
-    /// search separately.
+    /// App-facing "information tools" group. The capabilities manifest exposes
+    /// these as concrete tool names under one UI bucket; research-mode gating
+    /// still checks real Brave search separately.
     pub fn information_tools_usable(&self) -> bool {
         self.web_search_usable()
             || self.web_fetch_usable()

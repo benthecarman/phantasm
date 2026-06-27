@@ -25,13 +25,44 @@ async fn main() -> anyhow::Result<()> {
         .context("building HTTP client")?;
     let upstream = detect_upstream(&cfg, &probe_http).await;
     let capabilities = Arc::new(probe_capabilities(&cfg, &probe_http, &upstream).await);
+    let vision_models = capabilities
+        .models
+        .iter()
+        .filter(|model| {
+            model
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.vision)
+        })
+        .count();
+    let tool_models = capabilities
+        .models
+        .iter()
+        .filter(|model| {
+            model
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.tools)
+        })
+        .count();
+    let completion_models = capabilities
+        .models
+        .iter()
+        .filter(|model| {
+            model
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.completion)
+        })
+        .count();
     info!(
         upstream = ?upstream.kind,
         models = capabilities.models.len(),
-        vision_models = capabilities.vision_models.len(),
-        tool_models = capabilities.tool_models.len(),
-        web_search = capabilities.tools.web_search,
-        image_generation = capabilities.tools.image_generation,
+        completion_models,
+        vision_models,
+        tool_models,
+        information = capabilities.has_tool_selector("information"),
+        image_generation = capabilities.has_tool_selector("image_generation"),
         "capabilities resolved"
     );
 

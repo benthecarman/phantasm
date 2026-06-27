@@ -501,7 +501,7 @@ final class ChatViewModel {
                 disabledEffort: env.disabledReasoningEffortForCurrentBackend()
             ),
             enabledTools: detail.conversation.requestedToolNames(
-                supporting: env.backendMode.capabilities?.tools
+                supporting: env.backendMode.capabilities?.toolSelectors
             ),
             appTools: appTools
         )

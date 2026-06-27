@@ -26,7 +26,7 @@ public struct ToolSpec: Encodable, Sendable {
     public var type: String
     public var function: Function
 
-    /// A name-only server-tool selector.
+    /// A name-only concrete server-tool selection.
     public init(name: String) {
         self.type = "function"
         self.function = Function(name: name, description: nil, parameters: nil)
@@ -117,7 +117,7 @@ public struct ChatRequest: Encodable, Sendable {
         self.stream = stream
         self.reasoningEffort = reasoningEffort
         // Translate the per-turn selection into standard OpenAI fields. Server
-        // tools ride as name-only selectors; app-hosted tools ride as full
+        // tools ride as name-only concrete names; app-hosted tools ride as full
         // schemas the server forwards back to us. `tool_choice:"none"` only when
         // there are truly no tools (server selection [] AND no app tools).
         var specs: [ToolSpec] = []
@@ -298,65 +298,136 @@ public extension ChatChunk.Choice.Delta {
 
 /// The capabilities manifest (spec §2.1).
 public struct Capabilities: Decodable, Sendable, Equatable {
-    public struct Tools: Decodable, Sendable, Equatable {
-        public let webSearch: Bool
-        public let imageGeneration: Bool
+    public struct Model: Decodable, Sendable, Equatable, Identifiable {
+        public let id: String
+        public let capabilities: ModelCapabilities?
+        public let contextLength: Int?
 
-        public init(webSearch: Bool, imageGeneration: Bool) {
-            self.webSearch = webSearch
-            self.imageGeneration = imageGeneration
+        public init(id: String, capabilities: ModelCapabilities? = nil, contextLength: Int? = nil) {
+            self.id = id
+            self.capabilities = capabilities
+            self.contextLength = contextLength
         }
     }
+
+    public struct ModelCapabilities: Decodable, Sendable, Equatable {
+        public let completion: Bool
+        public let vision: Bool
+        public let audio: Bool
+        public let tools: Bool
+        public let insert: Bool
+        public let thinking: Bool
+        public let embedding: Bool
+
+        public init(
+            completion: Bool,
+            vision: Bool,
+            audio: Bool,
+            tools: Bool,
+            insert: Bool,
+            thinking: Bool,
+            embedding: Bool
+        ) {
+            self.completion = completion
+            self.vision = vision
+            self.audio = audio
+            self.tools = tools
+            self.insert = insert
+            self.thinking = thinking
+            self.embedding = embedding
+        }
+    }
+
+    public struct ToolSelector: Decodable, Sendable, Equatable, Identifiable {
+        public let id: String
+        public let label: String
+        /// Concrete server tool schema names selected by this app-facing bucket.
+        public let tools: [String]
+
+        public init(id: String, label: String, tools: [String]) {
+            self.id = id
+            self.label = label
+            self.tools = tools
+        }
+    }
+
     /// One advertised turn mode (spec §2.3 `modes`). The app composes
-    /// `model + ":" + id` for a turn, gated on `needs ⊆ available tools` and a
-    /// tool-capable base model. Modes are server-side data; the app only mirrors
-    /// the manifest, never hardcodes the table.
+    /// `model + ":" + id` for a turn, gated on `requiredTools ⊆ toolSelectors`
+    /// and a tool-capable base model. Modes are server-side data; the app only
+    /// mirrors the manifest, never hardcodes the table.
     public struct Mode: Decodable, Sendable, Equatable, Identifiable {
         public let id: String
         public let label: String
-        public let needs: [String]
+        public let requiredTools: [String]
 
-        public init(id: String, label: String, needs: [String]) {
+        public init(id: String, label: String, requiredTools: [String]) {
             self.id = id
             self.label = label
-            self.needs = needs
+            self.requiredTools = requiredTools
         }
     }
+
     public let version: String
-    public let chat: Bool
-    public let models: [String]
-    /// Subset of `models` that accept image input. `nil` when the manifest omits
-    /// the field (older orchestrator) — vision is then treated as unknown.
-    public let visionModels: [String]?
-    /// Subset of `models` that support tool/function calling. The server tools
-    /// can only be driven by a model in this list, so tool toggles gate on both.
-    /// `nil` when the manifest omits the field — tool support is then unknown.
-    public let toolModels: [String]?
-    public let tools: Tools?
-    /// Advertised turn modes (e.g. Deep Research), present only when their needed
-    /// tools are usable. `nil` when the manifest omits the field (older
-    /// orchestrator) — the app then shows no research UI (graceful, FR-A2).
-    public let modes: [Mode]?
-    public let streaming: String?
+    public let modelEntries: [Model]
+    public let toolSelectors: [ToolSelector]
+    public let modes: [Mode]
+
+    /// Model ids to offer in the chat picker. Unknown capabilities stay
+    /// optimistic; known non-completion models are hidden.
+    public var models: [String] {
+        modelEntries
+            .filter { $0.capabilities?.completion ?? true }
+            .map(\.id)
+    }
+
+    /// `nil` means at least one model has unknown capabilities, so the UI should
+    /// stay optimistic instead of treating missing support as false.
+    public var visionModelIDs: Set<String>? {
+        supportedModels(where: \.vision)
+    }
+
+    /// `nil` means tool support is unknown for this backend.
+    public var toolModelIDs: Set<String>? {
+        supportedModels(where: \.tools)
+    }
 
     public init(
         version: String,
-        chat: Bool,
-        models: [String],
-        visionModels: [String]? = nil,
-        toolModels: [String]? = nil,
-        tools: Tools?,
-        modes: [Mode]? = nil,
-        streaming: String?
+        modelEntries: [Model],
+        toolSelectors: [ToolSelector] = [],
+        modes: [Mode] = []
     ) {
         self.version = version
-        self.chat = chat
-        self.models = models
-        self.visionModels = visionModels
-        self.toolModels = toolModels
-        self.tools = tools
+        self.modelEntries = modelEntries
+        self.toolSelectors = toolSelectors
         self.modes = modes
-        self.streaming = streaming
+    }
+
+    public func hasToolSelector(_ id: String) -> Bool {
+        toolSelectors.contains { $0.id == id }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case models
+        case toolSelectors
+        case modes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(String.self, forKey: .version)
+        modelEntries = try container.decode([Model].self, forKey: .models)
+        toolSelectors = try container.decodeIfPresent([ToolSelector].self, forKey: .toolSelectors) ?? []
+        modes = try container.decodeIfPresent([Mode].self, forKey: .modes) ?? []
+    }
+
+    private func supportedModels(where predicate: (ModelCapabilities) -> Bool) -> Set<String>? {
+        guard modelEntries.allSatisfy({ $0.capabilities != nil }) else { return nil }
+        return Set(modelEntries.compactMap { model in
+            guard let capabilities = model.capabilities, predicate(capabilities) else { return nil }
+            return model.id
+        })
     }
 }
 
@@ -377,6 +448,13 @@ public enum ToolName {
     /// from the device (CoreLocation + reverse geocoding) and continues the turn
     /// automatically. Off by default and toggled per chat. See `LocationTool`.
     public static let location = "get_current_location"
+}
+
+/// App-facing capability bucket ids from `capabilities.tool_selectors`.
+/// These are UI selectors, not server tool schema names.
+public enum ToolSelectorName {
+    public static let information = "information"
+    public static let imageGeneration = "image_generation"
 }
 
 /// Tools the **app** hosts: it sends their full schemas each turn and executes
@@ -413,24 +491,17 @@ public enum BackendMode: Sendable, Equatable {
     }
 
     public var showsTools: Bool {
-        guard let tools = capabilities?.tools else { return false }
-        return tools.webSearch || tools.imageGeneration
+        guard let capabilities else { return false }
+        return capabilities.hasToolSelector(ToolSelectorName.information)
+            || capabilities.hasToolSelector(ToolSelectorName.imageGeneration)
     }
 
-    /// Turn modes (e.g. Deep Research) advertised by the backend whose needed
-    /// tools are actually usable. Empty for non-orchestrator backends or when the
-    /// manifest omits `modes` — the composer hides the research UI then.
+    /// Turn modes (e.g. Deep Research) advertised by the backend whose required
+    /// tool selectors are available. Empty for non-orchestrator backends.
     public var availableModes: [Capabilities.Mode] {
-        guard let caps = capabilities, let modes = caps.modes else { return [] }
-        let tools = caps.tools
-        return modes.filter { mode in
-            mode.needs.allSatisfy { need in
-                switch need {
-                case ToolName.webSearch: return tools?.webSearch == true
-                case ToolName.imageGeneration: return tools?.imageGeneration == true
-                default: return false
-                }
-            }
+        guard let caps = capabilities else { return [] }
+        return caps.modes.filter { mode in
+            mode.requiredTools.allSatisfy { caps.hasToolSelector($0) }
         }
     }
 

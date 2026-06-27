@@ -4,33 +4,52 @@ import XCTest
 final class CapabilityDecodeTests: XCTestCase {
     func testFullManifestDecodes() throws {
         let json = """
-        {"version":"0.1.0","chat":true,"models":["llama3.1","qwen2.5:14b"],
-         "tools":{"web_search":true,"image_generation":false},"streaming":"sse"}
+        {"version":"0.3.0",
+         "models":[
+           {"id":"llama3.1","context_length":8192,
+            "capabilities":{"completion":true,"vision":false,"audio":false,"tools":false,"insert":false,"thinking":false,"embedding":false}},
+           {"id":"qwen2.5:14b","context_length":32768,
+            "capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":true,"embedding":false}},
+           {"id":"nomic-embed-text:latest",
+            "capabilities":{"completion":false,"vision":false,"audio":false,"tools":false,"insert":false,"thinking":false,"embedding":true}}
+         ],
+         "tool_selectors":[
+           {"id":"information","label":"Information","tools":["web_search","calculator"]}
+         ]}
         """
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertEqual(caps.models, ["llama3.1", "qwen2.5:14b"])
-        XCTAssertEqual(caps.tools?.webSearch, true)
-        XCTAssertEqual(caps.tools?.imageGeneration, false)
+        XCTAssertEqual(caps.modelEntries.first?.contextLength, 8192)
+        XCTAssertTrue(caps.hasToolSelector(ToolSelectorName.information))
+        XCTAssertFalse(caps.hasToolSelector(ToolSelectorName.imageGeneration))
+        XCTAssertEqual(caps.toolModelIDs, ["qwen2.5:14b"])
 
         let mode = BackendMode.full(caps)
         XCTAssertTrue(mode.showsTools)
         XCTAssertEqual(mode.models.count, 2)
     }
 
-    func testManifestDecodesVisionModels() throws {
+    func testManifestDecodesModelCapabilities() throws {
         let json = """
-        {"version":"0.1.0","chat":true,"models":["llava","qwen"],
-         "vision_models":["llava"],"tools":{"web_search":false,"image_generation":false},
-         "streaming":"sse"}
+        {"version":"0.3.0",
+         "models":[
+           {"id":"llava","capabilities":{"completion":true,"vision":true,"audio":true,"tools":false,"insert":false,"thinking":false,"embedding":false}},
+           {"id":"qwen","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":true,"thinking":true,"embedding":false}}
+         ],
+         "tool_selectors":[]}
         """
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
-        XCTAssertEqual(caps.visionModels, ["llava"])
+        XCTAssertEqual(caps.visionModelIDs, ["llava"])
+        XCTAssertEqual(caps.toolModelIDs, ["qwen"])
+        XCTAssertEqual(caps.modelEntries.first?.capabilities?.audio, true)
+        XCTAssertEqual(caps.modelEntries.last?.capabilities?.insert, true)
     }
 
-    func testManifestWithoutVisionModelsIsNil() throws {
-        let json = #"{"version":"x","chat":true,"models":["m"],"streaming":"sse"}"#
+    func testManifestWithoutModelCapabilitiesIsUnknown() throws {
+        let json = #"{"version":"x","models":[{"id":"m"}],"tool_selectors":[]}"#
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
-        XCTAssertNil(caps.visionModels)
+        XCTAssertNil(caps.visionModelIDs)
+        XCTAssertNil(caps.toolModelIDs)
     }
 
     // MARK: - Per-chat tool selection (standard OpenAI tools/tool_choice)
@@ -38,6 +57,10 @@ final class CapabilityDecodeTests: XCTestCase {
     private func encodedKeys(_ request: ChatRequest) throws -> [String: Any] {
         let data = try Wire.encoder().encode(request)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    private func toolSelectors(_ ids: String...) -> [Capabilities.ToolSelector] {
+        ids.map { Capabilities.ToolSelector(id: $0, label: $0, tools: [$0]) }
     }
 
     func testChatRequestOmitsToolFieldsWhenNil() throws {
@@ -98,38 +121,40 @@ final class CapabilityDecodeTests: XCTestCase {
 
     func testManifestDecodesModes() throws {
         let json = """
-        {"version":"0.2.0","chat":true,"models":["qwen2.5:14b"],
-         "tool_models":["qwen2.5:14b"],
-         "tools":{"web_search":true,"image_generation":true},
-         "modes":[
-           {"id":"deep-research","label":"Deep Research","needs":["web_search"]},
-           {"id":"quick-research","label":"Quick Research","needs":["web_search"]}
+        {"version":"0.3.0",
+         "models":[{"id":"qwen2.5:14b","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":false,"embedding":false}}],
+         "tool_selectors":[
+           {"id":"information","label":"Information","tools":["web_search"]},
+           {"id":"image_generation","label":"Images","tools":["image_generation"]}
          ],
-         "streaming":"sse"}
+         "modes":[
+           {"id":"deep-research","label":"Deep Research","required_tools":["information"]},
+           {"id":"quick-research","label":"Quick Research","required_tools":["information"]}
+         ]}
         """
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
-        XCTAssertEqual(caps.modes?.count, 2)
-        XCTAssertEqual(caps.modes?.first?.id, "deep-research")
-        XCTAssertEqual(caps.modes?.first?.label, "Deep Research")
-        XCTAssertEqual(caps.modes?.first?.needs, ["web_search"])
+        XCTAssertEqual(caps.modes.count, 2)
+        XCTAssertEqual(caps.modes.first?.id, "deep-research")
+        XCTAssertEqual(caps.modes.first?.label, "Deep Research")
+        XCTAssertEqual(caps.modes.first?.requiredTools, ["information"])
     }
 
-    func testManifestWithoutModesIsNil() throws {
-        let json = #"{"version":"x","chat":true,"models":["m"],"streaming":"sse"}"#
+    func testManifestWithoutModesIsEmpty() throws {
+        let json = #"{"version":"x","models":[{"id":"m"}],"tool_selectors":[]}"#
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
-        XCTAssertNil(caps.modes, "older servers omit modes; the app shows no research UI")
+        XCTAssertTrue(caps.modes.isEmpty)
     }
 
     func testAvailableModesGateOnNeededTools() throws {
         // web_search available, image_generation not.
         let json = """
-        {"version":"0.2.0","chat":true,"models":["m"],
-         "tools":{"web_search":true,"image_generation":false},
+        {"version":"0.3.0",
+         "models":[{"id":"m","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":false,"embedding":false}}],
+         "tool_selectors":[{"id":"information","label":"Information","tools":["web_search"]}],
          "modes":[
-           {"id":"deep-research","label":"Deep Research","needs":["web_search"]},
-           {"id":"image-mode","label":"Image","needs":["image_generation"]}
-         ],
-         "streaming":"sse"}
+           {"id":"deep-research","label":"Deep Research","required_tools":["information"]},
+           {"id":"image-mode","label":"Image","required_tools":["image_generation"]}
+         ]}
         """
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         let modes = BackendMode.full(caps).availableModes
@@ -143,7 +168,13 @@ final class CapabilityDecodeTests: XCTestCase {
 
     func testWireModelAppendsModeSuffixWhenAdvertisedAndToolCapable() {
         let convo = Conversation(modeID: "deep-research")
-        let modes = [Capabilities.Mode(id: "deep-research", label: "Deep Research", needs: ["web_search"])]
+        let modes = [
+            Capabilities.Mode(
+                id: "deep-research",
+                label: "Deep Research",
+                requiredTools: ["information"]
+            )
+        ]
         XCTAssertEqual(
             convo.wireModel(base: "qwen2.5:14b", availableModes: modes, baseModelIsToolCapable: true),
             "qwen2.5:14b:deep-research"
@@ -152,7 +183,13 @@ final class CapabilityDecodeTests: XCTestCase {
 
     func testWireModelStaysBareWhenModeUnselected() {
         let convo = Conversation(modeID: nil)
-        let modes = [Capabilities.Mode(id: "deep-research", label: "Deep Research", needs: ["web_search"])]
+        let modes = [
+            Capabilities.Mode(
+                id: "deep-research",
+                label: "Deep Research",
+                requiredTools: ["information"]
+            )
+        ]
         XCTAssertEqual(
             convo.wireModel(base: "qwen2.5:14b", availableModes: modes, baseModelIsToolCapable: true),
             "qwen2.5:14b"
@@ -169,7 +206,13 @@ final class CapabilityDecodeTests: XCTestCase {
 
     func testWireModelStaysBareWhenBaseModelNotToolCapable() {
         let convo = Conversation(modeID: "deep-research")
-        let modes = [Capabilities.Mode(id: "deep-research", label: "Deep Research", needs: ["web_search"])]
+        let modes = [
+            Capabilities.Mode(
+                id: "deep-research",
+                label: "Deep Research",
+                requiredTools: ["information"]
+            )
+        ]
         XCTAssertEqual(
             convo.wireModel(base: "qwen2.5:14b", availableModes: modes, baseModelIsToolCapable: false),
             "qwen2.5:14b"
@@ -182,21 +225,39 @@ final class CapabilityDecodeTests: XCTestCase {
     }
 
     func testRequestedToolNamesIntersectsBackendAndChatToggles() {
-        // Backend offers both; chat disabled image gen -> only web search requested.
-        let tools = Capabilities.Tools(webSearch: true, imageGeneration: true)
+        // Backend offers an Information bucket with concrete tools; chat disabled
+        // image gen -> only the concrete information tools are requested.
+        let tools = [
+            Capabilities.ToolSelector(
+                id: ToolSelectorName.information,
+                label: "Information",
+                tools: [ToolName.webSearch, "calculator"]
+            ),
+            Capabilities.ToolSelector(
+                id: ToolSelectorName.imageGeneration,
+                label: "Images",
+                tools: [ToolName.imageGeneration, "image_edit"]
+            ),
+        ]
         let convo = Conversation(webSearchEnabled: true, imageGenerationEnabled: false)
-        XCTAssertEqual(convo.requestedToolNames(supporting: tools), ["web_search"])
+        XCTAssertEqual(convo.requestedToolNames(supporting: tools), ["web_search", "calculator"])
     }
 
     func testRequestedToolNamesDropsUnsupportedTool() {
         // Chat wants image gen but backend doesn't offer it -> excluded.
-        let tools = Capabilities.Tools(webSearch: true, imageGeneration: false)
+        let tools = [
+            Capabilities.ToolSelector(
+                id: ToolSelectorName.information,
+                label: "Information",
+                tools: [ToolName.webSearch]
+            )
+        ]
         let convo = Conversation(webSearchEnabled: true, imageGenerationEnabled: true)
-        XCTAssertEqual(convo.requestedToolNames(supporting: tools), ["web_search"])
+        XCTAssertEqual(convo.requestedToolNames(supporting: tools), [ToolName.webSearch])
     }
 
     func testRequestedToolNamesEmptyWhenAllDisabled() {
-        let tools = Capabilities.Tools(webSearch: true, imageGeneration: true)
+        let tools = toolSelectors(ToolSelectorName.information, ToolSelectorName.imageGeneration)
         let convo = Conversation(webSearchEnabled: false, imageGenerationEnabled: false)
         XCTAssertEqual(convo.requestedToolNames(supporting: tools), [])
     }
@@ -296,7 +357,7 @@ final class CapabilityDecodeTests: XCTestCase {
     }
 
     func testManifestWithoutToolsBlock() throws {
-        let json = #"{"version":"x","chat":true,"models":[],"streaming":"sse"}"#
+        let json = #"{"version":"x","models":[]}"#
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertFalse(BackendMode.full(caps).showsTools)
     }
@@ -341,7 +402,7 @@ final class ChatRequestEncodingTests: XCTestCase {
 
     func testAppToolsRideInToolsArrayWithFullSchema() throws {
         // An app-hosted tool sends a full schema (parameters), which is what marks
-        // it app-side to the orchestrator. Server selectors stay name-only.
+            // it app-side to the orchestrator. Server tool selections stay name-only.
         let req = ChatRequest(
             model: "m",
             messages: [WireMessage(role: "user", content: "hi")],
@@ -353,7 +414,7 @@ final class ChatRequestEncodingTests: XCTestCase {
         let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
         let functions = tools.compactMap { $0["function"] as? [String: Any] }
 
-        // The server selector is name-only.
+        // The server tool selection is name-only.
         let webSearch = try XCTUnwrap(functions.first { $0["name"] as? String == ToolName.webSearch })
         XCTAssertNil(webSearch["parameters"])
 

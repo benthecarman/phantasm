@@ -142,20 +142,36 @@ Advertise modes so the app discovers them instead of inferring research from
 
 ```jsonc
 {
-  "version": "0.2.0", "chat": true,
-  "models": ["qwen2.5:14b"], "tool_models": ["qwen2.5:14b"],
-  "tools": { "web_search": true, "image_generation": true },
-  "modes": [
-    { "id": "deep-research",  "label": "Deep Research",  "needs": ["web_search"] },
-    { "id": "quick-research", "label": "Quick Research", "needs": ["web_search"] }
+  "version": "0.3.0",
+  "models": [
+    {
+      "id": "qwen2.5:14b",
+      "context_length": 32768,
+      "capabilities": {
+        "completion": true,
+        "vision": false,
+        "audio": false,
+        "tools": true,
+        "insert": false,
+        "thinking": true,
+        "embedding": false
+      }
+    }
   ],
-  "streaming": "sse"
+  "tool_selectors": [
+    { "id": "information", "label": "Information", "tools": ["web_search"] },
+    { "id": "image_generation", "label": "Images", "tools": ["image_generation"] }
+  ],
+  "modes": [
+    { "id": "deep-research",  "label": "Deep Research",  "required_tools": ["information"] },
+    { "id": "quick-research", "label": "Quick Research", "required_tools": ["information"] }
+  ]
 }
 ```
 
-The app composes `model + ":" + mode.id` for a turn, gated on `needs` ⊆ available
-tools **and** base model ∈ `tool_models` (same gating logic the tool toggles
-already use).
+The app composes `model + ":" + mode.id` for a turn, gated on
+`required_tools` ⊆ available tool selectors **and** base model
+`capabilities.tools == true` (same gating logic the tool toggles use).
 
 `/v1/models` keeps listing real base ids only — standard OpenAI clients see a
 normal model list; modes live in the Phantasm-aware superset, consistent with how

@@ -31,19 +31,6 @@ use crate::openai::types::{ChatMessage, MessageContent, ToolCall};
 use crate::orchestrator::tools::{ToolExecutor, ToolOutcome, TurnContext};
 use crate::orchestrator::{ResearchPreset, TurnEvent};
 
-/// Map an internal server tool name to the app-facing capability that gates it.
-/// Most tools map to themselves. `image_edit` rides under `image_generation`;
-/// read-only utility/network tools ride under `web_search` so older app builds
-/// that only know the broad web-tools toggle can still use newly-added tools.
-fn capability_name(tool: &str) -> &str {
-    match tool {
-        "image_edit" => "image_generation",
-        "web_fetch" | "calculator" | "unit_convert" | "weather" | "maps_places" | "market_data"
-        | "github" | "ocr" => "web_search",
-        other => other,
-    }
-}
-
 /// Narrow a set of tool schemas to those the client asked for this turn.
 ///
 /// `enabled` is the request's `x_tools` field: `None` => keep every schema
@@ -61,7 +48,7 @@ pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec
             s.get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
-                .is_some_and(|name| allow.iter().any(|a| a == capability_name(name)))
+                .is_some_and(|name| allow.iter().any(|allowed| allowed == name))
         })
         .collect()
 }
@@ -1288,21 +1275,21 @@ mod tests {
     }
 
     #[test]
-    fn select_schemas_maps_information_tools_to_web_search_capability() {
+    fn select_schemas_filters_information_tools_by_concrete_name() {
         let schemas = vec![
+            named_schema("web_search"),
             named_schema("web_fetch"),
             named_schema("calculator"),
             named_schema("weather"),
             named_schema("image_generation"),
         ];
-        let kept = select_schemas(schemas, &Some(vec!["web_search".into()]));
+        let kept = select_schemas(
+            schemas,
+            &Some(vec!["web_search".into(), "calculator".into()]),
+        );
         assert_eq!(
             kept,
-            vec![
-                named_schema("web_fetch"),
-                named_schema("calculator"),
-                named_schema("weather"),
-            ]
+            vec![named_schema("web_search"), named_schema("calculator")]
         );
     }
 

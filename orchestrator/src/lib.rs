@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::config::Config;
 use crate::ollama::{OllamaClient, UpstreamChatBackend, UpstreamKind};
 use crate::openai::OpenAICompatibleClient;
-use crate::state::{CapabilitySnapshot, ToolFlags};
+use crate::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo, ToolSelector};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const OLLAMA_READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -87,36 +87,34 @@ pub async fn probe_capabilities(
     };
 
     // Per-model vision + tool support is only knowable for native Ollama (via
-    // `/api/show`). For an OpenAI-compatible upstream we can't tell, so we
-    // advertise none and the app treats both as unknown (optimistic).
-    let (vision_models, tool_models) = match upstream.kind {
+    // `/api/show`). For an OpenAI-compatible upstream we omit model capabilities
+    // so clients can distinguish unknown from known-unsupported.
+    let model_metadata = match upstream.kind {
         UpstreamKind::NativeOllama => {
             let client = OllamaClient::new(http.clone(), cfg.ollama_base.clone());
-            detect_model_capabilities(&client, &models).await
+            detect_model_metadata(&client, &models).await
         }
-        UpstreamKind::OpenAICompatible => (Vec::new(), Vec::new()),
+        UpstreamKind::OpenAICompatible => vec![(None, None); models.len()],
     };
+    let models: Vec<ModelInfo> = models
+        .into_iter()
+        .zip(model_metadata)
+        .map(|(id, (capabilities, context_length))| ModelInfo {
+            id,
+            capabilities,
+            context_length,
+        })
+        .collect();
 
     let brave_web_search = cfg.web_search_usable();
-    let web_fetch = cfg.web_fetch_usable();
-    let calculator = cfg.calculator_usable();
-    let unit_convert = cfg.unit_convert_usable();
-    let weather = cfg.weather_usable();
-    let maps_places = cfg.maps_places_usable();
-    let market_data = cfg.market_data_usable();
-    let github = cfg.github_usable();
-    let ocr = cfg.ocr_usable();
-    let web_search = cfg.information_tools_usable();
-    // One app-facing "image generation" capability covers both server tools
-    // (generation + editing); editing rides under it (tools are invisible to
-    // the app). Advertise it when either is usable and ComfyUI is reachable.
-    let image_generation = (cfg.image_gen_usable() || cfg.image_edit_usable())
-        && probe_reachable(http, cfg.comfy_base.as_str(), "/system_stats").await;
+    let tool_selectors = tool_selectors(cfg, http).await;
+    let image_generation = tool_selectors
+        .iter()
+        .any(|selector| selector.id == "image_generation");
 
     // Advertise research modes only when their required tools are usable. Each
-    // preset declares its `needs` (web_search only, today); a mode is offered
-    // when every needed tool is usable. Empty otherwise — the app shows no
-    // research UI (graceful for older/leaner deployments).
+    // preset declares concrete server tools (web_search only, today); a mode is
+    // offered when every required tool is usable.
     let modes = cfg
         .presets()
         .all()
@@ -129,34 +127,81 @@ pub async fn probe_capabilities(
         .map(|p| crate::state::ModeInfo {
             id: p.id.to_string(),
             label: p.label.to_string(),
-            needs: p.tools.iter().map(|t| t.to_string()).collect(),
+            required_tools: p
+                .tools
+                .iter()
+                .map(|t| tool_selector_id(t).unwrap_or(*t).to_string())
+                .collect(),
         })
         .collect();
 
     CapabilitySnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        chat: true,
         models,
-        vision_models,
-        tool_models,
-        tools: ToolFlags {
-            web_search,
-            web_fetch,
-            calculator,
-            unit_convert,
-            weather,
-            maps_places,
-            market_data,
-            github,
-            ocr,
-            image_generation,
-        },
+        tool_selectors,
         modes,
-        streaming: "sse",
     }
 }
 
-/// Whether a tool name a preset `needs` maps to a currently-usable capability.
+async fn tool_selectors(cfg: &Config, http: &reqwest::Client) -> Vec<ToolSelector> {
+    let mut selectors = Vec::new();
+
+    let mut information_tools = Vec::new();
+    if cfg.web_search_usable() {
+        information_tools.push("web_search".to_string());
+    }
+    if cfg.web_fetch_usable() {
+        information_tools.push("web_fetch".to_string());
+    }
+    if cfg.calculator_usable() {
+        information_tools.push("calculator".to_string());
+    }
+    if cfg.unit_convert_usable() {
+        information_tools.push("unit_convert".to_string());
+    }
+    if cfg.weather_usable() {
+        information_tools.push("weather".to_string());
+    }
+    if cfg.maps_places_usable() {
+        information_tools.push("maps_places".to_string());
+    }
+    if cfg.market_data_usable() {
+        information_tools.push("market_data".to_string());
+    }
+    if cfg.github_usable() {
+        information_tools.push("github".to_string());
+    }
+    if cfg.ocr_usable() {
+        information_tools.push("ocr".to_string());
+    }
+    if !information_tools.is_empty() {
+        selectors.push(ToolSelector {
+            id: "information".to_string(),
+            label: "Information".to_string(),
+            tools: information_tools,
+        });
+    }
+
+    let comfy_reachable = probe_reachable(http, cfg.comfy_base.as_str(), "/system_stats").await;
+    let mut image_tools = Vec::new();
+    if comfy_reachable && cfg.image_gen_usable() {
+        image_tools.push("image_generation".to_string());
+    }
+    if comfy_reachable && cfg.image_edit_usable() {
+        image_tools.push("image_edit".to_string());
+    }
+    if !image_tools.is_empty() {
+        selectors.push(ToolSelector {
+            id: "image_generation".to_string(),
+            label: "Images".to_string(),
+            tools: image_tools,
+        });
+    }
+
+    selectors
+}
+
+/// Whether a preset tool name maps to a currently usable server capability.
 fn tool_usable(tool: &str, web_search: bool, image_generation: bool) -> bool {
     match tool {
         "web_search" => web_search,
@@ -165,35 +210,31 @@ fn tool_usable(tool: &str, web_search: bool, image_generation: bool) -> bool {
     }
 }
 
-/// Probe each model's `/api/show` capabilities once (concurrent, best-effort,
-/// short timeout) and partition them into `(vision, tools)` — the models that
-/// declare `"vision"` and those that declare `"tools"` (a model can be in both).
-async fn detect_model_capabilities(
+fn tool_selector_id(tool: &str) -> Option<&'static str> {
+    match tool {
+        "web_search" => Some("information"),
+        "image_generation" => Some("image_generation"),
+        _ => None,
+    }
+}
+
+/// Probe each model's `/api/show` metadata once (concurrent, best-effort, short
+/// timeout). Capability field names mirror the upstream names (e.g.
+/// `"completion"`, `"vision"`, `"tools"`, `"thinking"`).
+async fn detect_model_metadata(
     client: &OllamaClient,
     models: &[String],
-) -> (Vec<String>, Vec<String>) {
+) -> Vec<(Option<ModelCapabilities>, Option<u64>)> {
     let checks = models.iter().map(|model| async move {
-        match tokio::time::timeout(PROBE_TIMEOUT, client.model_capabilities(model)).await {
-            Ok(Ok(caps)) => {
-                let vision = caps.iter().any(|c| c == "vision");
-                let tools = caps.iter().any(|c| c == "tools");
-                (vision, tools)
-            }
-            _ => (false, false),
+        match tokio::time::timeout(PROBE_TIMEOUT, client.model_metadata(model)).await {
+            Ok(Ok(metadata)) => (
+                Some(ModelCapabilities::from_names(&metadata.capabilities)),
+                metadata.context_length,
+            ),
+            _ => (None, None),
         }
     });
-    let results = futures_util::future::join_all(checks).await;
-    let mut vision_models = Vec::new();
-    let mut tool_models = Vec::new();
-    for (model, (vision, tools)) in models.iter().zip(results) {
-        if vision {
-            vision_models.push(model.clone());
-        }
-        if tools {
-            tool_models.push(model.clone());
-        }
-    }
-    (vision_models, tool_models)
+    futures_util::future::join_all(checks).await
 }
 
 /// Cheap reachability check with a short timeout; failures are non-fatal.

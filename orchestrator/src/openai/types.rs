@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn app_tools_extracts_only_schema_bearing_entries() {
-        // A name-only entry is a server-tool selector; an entry with `parameters`
+        // A name-only entry selects a server tool; an entry with `parameters`
         // is an app-hosted tool definition.
         let r = req(r#"{"messages":[],"tools":[
                 {"type":"function","function":{"name":"web_search"}},
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(app[0]["function"]["name"], "ask_user");
         assert_eq!(app[0]["function"]["description"], "ask");
         assert!(app[0]["function"]["parameters"]["properties"]["q"].is_object());
-        // The name-only selector is still surfaced via tool_selection (server side).
+        // The name-only server tool is still surfaced via tool_selection.
         assert_eq!(
             r.tool_selection(),
             Some(vec!["web_search".to_string(), "ask_user".to_string()])

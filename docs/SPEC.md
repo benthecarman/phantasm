@@ -33,29 +33,74 @@ image generation on top of plain inference.
 ```json
 {
   "version": "0.1.0",
-  "chat": true,
-  "models": ["llama3.3:70b", "qwen2.5:14b"],
-  "vision_models": ["llama3.3:70b"],
-  "tool_models": ["qwen2.5:14b"],
-  "tools": {
-    "web_search": true,
-    "web_fetch": true,
-    "calculator": true,
-    "unit_convert": true,
-    "weather": true,
-    "maps_places": true,
-    "market_data": false,
-    "github": true,
-    "ocr": true,
-    "image_generation": true
-  },
-  "streaming": "sse"
+  "models": [
+    {
+      "id": "llama3.3:70b",
+      "context_length": 8192,
+      "capabilities": {
+        "completion": true,
+        "vision": true,
+        "audio": false,
+        "tools": false,
+        "insert": false,
+        "thinking": false,
+        "embedding": false
+      }
+    },
+    {
+      "id": "qwen2.5:14b",
+      "context_length": 32768,
+      "capabilities": {
+        "completion": true,
+        "vision": false,
+        "audio": false,
+        "tools": true,
+        "insert": true,
+        "thinking": true,
+        "embedding": false
+      }
+    },
+    {
+      "id": "nomic-embed-text:latest",
+      "capabilities": {
+        "completion": false,
+        "vision": false,
+        "audio": false,
+        "tools": false,
+        "insert": false,
+        "thinking": false,
+        "embedding": true
+      }
+    }
+  ],
+  "tool_selectors": [
+    {
+      "id": "information",
+      "label": "Information",
+      "tools": [
+        "web_search",
+        "web_fetch",
+        "calculator",
+        "unit_convert",
+        "weather",
+        "maps_places",
+        "github",
+        "ocr"
+      ]
+    },
+    {
+      "id": "image_generation",
+      "label": "Images",
+      "tools": ["image_generation", "image_edit"]
+    }
+  ]
 }
 ```
 
 A bare Ollama won't serve this route; the app MUST treat 404/connection failure
-as "plain chat only" and degrade gracefully. The `tools` block is advisory — it
-only tells the app whether to *show* affordances. The app never executes tools.
+as "plain chat only" and degrade gracefully. `tool_selectors` is advisory — it
+only tells the app which app-facing tool buckets it may offer for a turn. The
+app never executes server tools.
 
 The orchestrator also serves the standard `GET /v1/models` (OpenAI list shape)
 backed by the same probe, so any standard OpenAI client can discover models;
@@ -65,35 +110,40 @@ model list — while research **modes** live in the capabilities superset as the
 Phantasm-aware detail (see below).
 
 An optional `modes` array advertises the research modes the deployment offers
-(see §2.3). It is present **only** when `web_search` is usable; older clients
-tolerate its absence (a missing/`nil` field simply means no research UI):
+(see §2.3). It is present **only** when those modes' required server tools are
+usable:
 
 ```jsonc
 {
   // …the fields above, plus:
   "modes": [
-    { "id": "deep-research",  "label": "Deep Research",  "needs": ["web_search"] },
-    { "id": "quick-research", "label": "Quick Research", "needs": ["web_search"] }
+    { "id": "deep-research",  "label": "Deep Research",  "required_tools": ["information"] },
+    { "id": "quick-research", "label": "Quick Research", "required_tools": ["information"] }
   ]
 }
 ```
 
 Each entry carries a mode `id` (the suffix the app composes onto a base model id,
-§2.3), a human `label`, and a `needs` list of capabilities the mode requires. The
-app shows a mode only when its `needs` ⊆ the advertised tools **and** the chosen
-base model is in `tool_models` — the same gating the per-tool toggles already use.
+§2.3), a human `label`, and a `required_tools` list of tool selector ids the mode
+requires. The app shows a mode only when all required selectors are advertised
+**and** the chosen base model has `tools: true`.
 
-`vision_models` and `tool_models` are subsets of `models` reporting which models
-accept image input and which can drive tool/function calls (probed server-side
-via Ollama `/api/show`; both optional, omitted/empty ⇒ the app treats that
-capability as unknown and allows it optimistically). Because the server tools
-are invoked by the model, a tool is usable only when `tools` advertises it **and**
-the chosen model is in `tool_models` — the app gates the per-tool toggles on both.
-For compatibility with older Phantasm app builds, the `web_search` flag is the
-app-facing **read-only information tools** group: if any read-only information
-tool is available, `web_search` may be true so the app can offer the broad tools
-toggle. Individual booleans name the exact configured tools. Research modes are
-advertised only when the actual Brave-backed `web_search` schema is usable.
+Each `models[]` entry reports one base model id. Its `capabilities` object is
+omitted when the server cannot determine per-model support for the upstream; the
+app treats omitted capabilities as unknown and allows them optimistically. When
+present, capability field names mirror upstream Ollama names: `completion` gates
+chat model selection, `vision` gates image attachments, `audio` reports audio
+input support, `tools` gates all server and app-hosted tool affordances, `insert`
+reports fill-in-the-middle support, `thinking` reports model reasoning support,
+and `embedding` identifies embedding-only models. `context_length` is model
+metadata, not a capability, so it lives beside `capabilities`.
+
+Each `tool_selectors[]` entry names one app-facing UI bucket. When a bucket is
+enabled, the app sends the concrete server-side schema names listed in that
+entry's `tools[]` as standard OpenAI `tools[].function.name` entries; for
+example, the app-facing `information` selector may send both `web_search` and
+`calculator` when both concrete tools are listed. Research modes are advertised
+only when the actual Brave-backed `web_search` schema is usable.
 
 ### 2.2 Chat (single OpenAI-compatible endpoint)
 
@@ -172,9 +222,9 @@ string on the wire. Standard OpenAI clients that don't host the tool simply neve
 send its schema, so it's never offered to them.
 
 **Classification + collisions.** A `tools` entry is app-hosted iff it carries a
-`function.parameters` schema; a name-only entry is a server-tool selector
-(below). On a name collision the **server** tool wins — the app's same-named
-entry is dropped and the call is executed server-side.
+`function.parameters` schema; a name-only entry selects a concrete server tool.
+On a name collision the **server** tool wins — the app's same-named entry is
+dropped and the call is executed server-side.
 
 **Mixed batches (server + app calls in one response).** A model may emit
 server-side and app-hosted tool calls in the *same* assistant response (e.g.

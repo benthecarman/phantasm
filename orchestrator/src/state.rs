@@ -148,54 +148,81 @@ impl CapabilitiesCache {
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilitySnapshot {
     pub version: String,
-    pub chat: bool,
-    pub models: Vec<String>,
-    /// Subset of `models` that accept image input (probed via Ollama `/api/show`).
-    /// Lets the app gate image attachments per model. Empty when undetectable
-    /// (e.g. an OpenAI-compatible upstream that doesn't advertise vision).
-    #[serde(default)]
-    pub vision_models: Vec<String>,
-    /// Subset of `models` that support tool/function calling (probed via Ollama
-    /// `/api/show`). The server tools in `tools` can only be driven by a model in
-    /// this list, so the app gates the web-search / image-generation toggles on
-    /// both. Empty when undetectable (e.g. an OpenAI-compatible upstream) — the
-    /// app then treats tool support as unknown (optimistic).
-    #[serde(default)]
-    pub tool_models: Vec<String>,
-    pub tools: ToolFlags,
+    pub models: Vec<ModelInfo>,
+    pub tool_selectors: Vec<ToolSelector>,
     /// Research modes (mode-suffixed model ids) the app may offer, populated from
     /// the server-side preset table — but only when their required tools are
-    /// usable (currently `web_search`). Empty otherwise; older clients tolerate
-    /// its absence / emptiness (no research UI). Additive, ignorable by standard
-    /// OpenAI clients.
+    /// usable (currently `web_search`). Empty otherwise. Additive, ignorable by
+    /// standard OpenAI clients.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modes: Vec<ModeInfo>,
-    pub streaming: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct ToolFlags {
-    /// App-facing information-tools group. True when at least one read-only
-    /// web/utility tool is available; `web_search` itself may still be false as
-    /// an individual schema if Brave is not configured.
-    pub web_search: bool,
-    pub web_fetch: bool,
-    pub calculator: bool,
-    pub unit_convert: bool,
-    pub weather: bool,
-    pub maps_places: bool,
-    pub market_data: bool,
-    pub github: bool,
-    pub ocr: bool,
-    pub image_generation: bool,
+impl CapabilitySnapshot {
+    pub fn has_tool_selector(&self, id: &str) -> bool {
+        self.tool_selectors.iter().any(|selector| selector.id == id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Omitted when the server cannot determine per-model support for this
+    /// upstream (for example, an OpenAI-compatible server that only exposes
+    /// `/v1/models`). Consumers should treat omitted capabilities as unknown, not
+    /// unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ModelCapabilities>,
+    /// Model context window in tokens, when the upstream reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelCapabilities {
+    pub completion: bool,
+    pub vision: bool,
+    pub audio: bool,
+    pub tools: bool,
+    pub insert: bool,
+    pub thinking: bool,
+    pub embedding: bool,
+}
+
+impl ModelCapabilities {
+    pub fn from_names(names: &[String]) -> Self {
+        Self {
+            completion: has_capability(names, "completion"),
+            vision: has_capability(names, "vision"),
+            audio: has_capability(names, "audio"),
+            tools: has_capability(names, "tools"),
+            insert: has_capability(names, "insert"),
+            thinking: has_capability(names, "thinking"),
+            embedding: has_capability(names, "embedding"),
+        }
+    }
+}
+
+fn has_capability(names: &[String], name: &str) -> bool {
+    names.iter().any(|candidate| candidate == name)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolSelector {
+    /// The name the app sends in the standard OpenAI `tools` array to enable this
+    /// bucket for a turn. It may map to multiple concrete server-side tools.
+    pub id: String,
+    pub label: String,
+    /// Concrete server tool schema names currently included in this selector.
+    pub tools: Vec<String>,
 }
 
 /// One advertised research mode, mirroring the `capabilities.modes` JSON: a
-/// stable `id` (the model-suffix mode), a human `label`, and the capabilities it
-/// `needs` to be usable (the app gates the mode on `needs ⊆ available tools`).
+/// stable `id` (the model-suffix mode), a human `label`, and the tool selector
+/// ids required to use it.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModeInfo {
     pub id: String,
     pub label: String,
-    pub needs: Vec<String>,
+    pub required_tools: Vec<String>,
 }

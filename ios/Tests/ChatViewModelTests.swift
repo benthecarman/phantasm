@@ -265,11 +265,28 @@ final class ChatViewModelTests: XCTestCase {
     private static func fullCapabilities() -> Capabilities {
         Capabilities(
             version: "test",
-            chat: true,
-            models: ["m"],
-            toolModels: ["m"],
-            tools: .init(webSearch: true, imageGeneration: true),
-            streaming: "sse"
+            modelEntries: [
+                .init(
+                    id: "m",
+                    capabilities: .init(
+                        completion: true,
+                        vision: false,
+                        audio: false,
+                        tools: true,
+                        insert: false,
+                        thinking: false,
+                        embedding: false
+                    )
+                )
+            ],
+            toolSelectors: [
+                .init(id: ToolSelectorName.information, label: "Information", tools: [ToolName.webSearch]),
+                .init(
+                    id: ToolSelectorName.imageGeneration,
+                    label: "Images",
+                    tools: [ToolName.imageGeneration]
+                )
+            ]
         )
     }
 }
@@ -307,7 +324,7 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
 
     func supportsTools(_ model: String?) -> Bool {
         guard let model else { return false }
-        return backendMode.capabilities?.toolModels.map { Set($0).contains(model) } ?? true
+        return backendMode.capabilities?.toolModelIDs?.contains(model) ?? true
     }
 
     func thinkingEnabled(for model: String?) -> Bool { false }

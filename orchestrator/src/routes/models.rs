@@ -27,9 +27,9 @@ pub async fn models(State(state): State<AppState>) -> Json<Value> {
     let data: Vec<Value> = snapshot
         .models
         .iter()
-        .map(|id| {
+        .map(|model| {
             json!({
-                "id": id,
+                "id": model.id,
                 "object": "model",
                 "created": created,
                 "owned_by": "phantasm",

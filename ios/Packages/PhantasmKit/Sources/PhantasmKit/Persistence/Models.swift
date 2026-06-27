@@ -72,15 +72,18 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
 
 public extension Conversation {
     /// Names of the tools this chat wants offered this turn, intersected against
-    /// what the backend advertises (`capabilities.tools`). Returns `nil` when the
-    /// backend exposes no tool manifest, so the caller omits the `tools` selection
-    /// entirely and keeps the request standard; otherwise the (possibly empty)
-    /// selection, which the caller encodes as standard `tools`/`tool_choice`.
-    func requestedToolNames(supporting tools: Capabilities.Tools?) -> [String]? {
-        guard let tools else { return nil }
+    /// what the backend advertises (`capabilities.toolSelectors`). Returns `nil`
+    /// when the backend exposes no orchestrator manifest, so the caller omits the
+    /// `tools` selection entirely and keeps the request standard; otherwise the
+    /// possibly empty selection encodes as standard `tools`/`tool_choice`.
+    func requestedToolNames(supporting toolSelectors: [Capabilities.ToolSelector]?) -> [String]? {
+        guard let toolSelectors else { return nil }
+        func tools(for id: String) -> [String] {
+            toolSelectors.first { $0.id == id }?.tools ?? []
+        }
         var names: [String] = []
-        if tools.webSearch, webSearchEnabled { names.append(ToolName.webSearch) }
-        if tools.imageGeneration, imageGenerationEnabled { names.append(ToolName.imageGeneration) }
+        if webSearchEnabled { names.append(contentsOf: tools(for: ToolSelectorName.information)) }
+        if imageGenerationEnabled { names.append(contentsOf: tools(for: ToolSelectorName.imageGeneration)) }
         return names
     }
 

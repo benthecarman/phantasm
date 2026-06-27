@@ -180,7 +180,8 @@ struct ProfileEditView: View {
             Haptics.notify(.success)
             switch mode {
             case .full(let caps):
-                let tools = (caps.tools?.webSearch ?? false) || (caps.tools?.imageGeneration ?? false)
+                let tools = caps.hasToolSelector(ToolSelectorName.information)
+                    || caps.hasToolSelector(ToolSelectorName.imageGeneration)
                 let toolNote = tools ? " Web search / image tools available." : " Chat only — no tools advertised."
                 testResult = .success("Connected. \(modelCount(caps.models.count)).\(toolNote)")
             case .ollamaNative(let models):
