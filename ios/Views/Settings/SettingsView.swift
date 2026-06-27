@@ -21,6 +21,7 @@ struct SettingsView: View {
                 Section {
                     ForEach(env.profiles) { profile in
                         Button {
+                            if profile.id != env.activeProfileID { Haptics.selection() }
                             env.setActive(profile.id)
                         } label: {
                             HStack {
@@ -35,6 +36,7 @@ struct SettingsView: View {
                                 }
                                 Spacer()
                                 Button {
+                                    Haptics.selection()
                                     editing = profile
                                 } label: {
                                     Image(systemName: "info.circle")
@@ -43,10 +45,16 @@ struct SettingsView: View {
                             }
                         }
                         .swipeActions {
-                            Button(role: .destructive) { env.delete(profile) } label: {
+                            Button(role: .destructive) {
+                                Haptics.notify(.warning)
+                                env.delete(profile)
+                            } label: {
                                 Label("Delete", systemImage: "trash")
                             }
-                            Button { editing = profile } label: {
+                            Button {
+                                Haptics.selection()
+                                editing = profile
+                            } label: {
                                 Label("Edit", systemImage: "pencil")
                             }
                             .tint(.blue)
@@ -60,6 +68,7 @@ struct SettingsView: View {
 
                 Section {
                     Button {
+                        Haptics.selection()
                         isCreating = true
                     } label: {
                         Label("Add Backend", systemImage: "plus")
@@ -78,6 +87,7 @@ struct SettingsView: View {
 
                 Section {
                     Button(role: .destructive) {
+                        Haptics.notify(.warning)
                         isConfirmingDeleteAll = true
                     } label: {
                         Label("Delete All Chat History", systemImage: "trash")
@@ -106,6 +116,7 @@ struct SettingsView: View {
                 isPresented: $isConfirmingDeleteAll,
             ) {
                 Button("Delete All", role: .destructive) {
+                    Haptics.notify(.warning)
                     let store = env.store
                     Task {
                         try? await store.deleteAllConversations()

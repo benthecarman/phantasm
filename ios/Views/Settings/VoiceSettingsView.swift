@@ -38,6 +38,7 @@ struct VoiceSettingsView: View {
         Binding(
             get: { selectedVoiceID },
             set: { newValue in
+                if selectedVoiceID != newValue { Haptics.selection() }
                 selectedVoiceID = newValue
                 env.voicePreferenceStore.voiceIdentifier = newValue
                 env.speechSynthesizer.preview(voiceIdentifier: newValue)
@@ -50,7 +51,10 @@ struct VoiceSettingsView: View {
             Section {
                 Toggle("Auto-speak responses", isOn: Binding(
                     get: { env.voicePreferenceStore.autoSpeak },
-                    set: { env.voicePreferenceStore.autoSpeak = $0 }
+                    set: {
+                        Haptics.selection()
+                        env.voicePreferenceStore.autoSpeak = $0
+                    }
                 ))
             } footer: {
                 Text("Reads each assistant reply aloud automatically when it finishes.")
@@ -64,6 +68,7 @@ struct VoiceSettingsView: View {
                     }
                 }
                 Button {
+                    Haptics.selection()
                     env.speechSynthesizer.preview(voiceIdentifier: env.voicePreferenceStore.voiceIdentifier)
                 } label: {
                     Label("Test Voice", systemImage: "play.circle")
@@ -136,6 +141,7 @@ struct VoiceSettingsView: View {
     /// app's own Settings page; the footer tells the user the path from there.
     private func openSettings() {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        Haptics.selection()
         UIApplication.shared.open(url)
     }
 }

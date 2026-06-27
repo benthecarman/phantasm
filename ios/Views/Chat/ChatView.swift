@@ -152,7 +152,10 @@ struct ChatView: View {
                         set: { env.setThinkingEnabled($0, for: currentModelID) }
                     ),
                     onSend: send,
-                    onStop: { vm.stop() }
+                    onStop: {
+                        Haptics.impact(.light)
+                        vm.stop()
+                    }
                 )
               }
             }
@@ -193,6 +196,9 @@ struct ChatView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
+        .onChange(of: vm.errorMessage) { _, message in
+            if message != nil { Haptics.notify(.error) }
+        }
     }
 
     private var emptyState: some View {
@@ -230,9 +236,18 @@ struct ChatView: View {
                             editText: $editingText,
                             onBeginEdit: { beginEditing(message) },
                             onSubmitEdit: { submitEdit() },
-                            onCancelEdit: { editingMessageID = nil },
-                            onResend: { vm.resend(messageID: message.id) },
-                            onRegenerate: { vm.regenerate(messageID: message.id) }
+                            onCancelEdit: {
+                                Haptics.selection()
+                                editingMessageID = nil
+                            },
+                            onResend: {
+                                Haptics.impact(.medium)
+                                vm.resend(messageID: message.id)
+                            },
+                            onRegenerate: {
+                                Haptics.impact(.medium)
+                                vm.regenerate(messageID: message.id)
+                            }
                         )
                     }
                     if vm.shouldShowAssistantPreview(alongside: messages) {
@@ -289,7 +304,10 @@ struct ChatView: View {
         }
         if !isEmpty {
             ToolbarItem(placement: .topBarTrailing) {
-                Button(action: onNewChat) {
+                Button {
+                    Haptics.selection()
+                    onNewChat()
+                } label: {
                     Image(systemName: "square.and.pencil")
                 }
                 .accessibilityLabel("New chat")
@@ -323,6 +341,7 @@ struct ChatView: View {
 
     private func send() {
         env.dictationController.stop()
+        Haptics.impact(.medium)
         let animateLogo = isEmpty
         let text = input
         let pending = attachments
@@ -339,6 +358,7 @@ struct ChatView: View {
     }
 
     private func beginEditing(_ message: ChatMessage) {
+        Haptics.selection()
         editingText = message.message.content
         editingMessageID = message.id
         composerFocused = false
@@ -347,6 +367,7 @@ struct ChatView: View {
     /// Commit the inline edit: truncate after this message and re-ask the model.
     private func submitEdit() {
         guard let id = editingMessageID else { return }
+        Haptics.impact(.medium)
         let text = editingText
         editingMessageID = nil
         vm.resend(afterEditing: id, newText: text)
@@ -546,6 +567,7 @@ struct ComposerView: View {
     /// Opens the "+" options sheet (attachments, tools, model).
     private var addButton: some View {
         Button {
+            Haptics.selection()
             showOptions = true
         } label: {
             Image(systemName: "plus")
@@ -565,6 +587,7 @@ struct ComposerView: View {
     private var modelPicker: some View {
         if !availableModels.isEmpty {
             Button {
+                Haptics.selection()
                 showModelPicker = true
             } label: {
                 HStack(spacing: 4) {
@@ -652,7 +675,7 @@ struct ComposerView: View {
     private func lockRecording() {
         dictationLocked = true
         dictationLockProgress = 1
-        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        Haptics.impact(.rigid)
     }
 
     /// Release while held → stop and transcribe; the result lands in the composer.

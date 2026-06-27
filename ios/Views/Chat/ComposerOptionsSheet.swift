@@ -140,6 +140,7 @@ struct ComposerOptionsSheet: View {
             CameraPicker { image in
                 if let attachment = AttachmentLoader.image(from: image) {
                     attachments.append(attachment)
+                    Haptics.notify(.success)
                     dismiss()
                 }
             }
@@ -158,7 +159,10 @@ struct ComposerOptionsSheet: View {
         disabledReason: String,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
+        Button {
+            Haptics.selection()
+            action()
+        } label: {
             HStack(spacing: 12) {
                 icon(systemImage, tint: enabled ? .accentColor : .secondary)
                 VStack(alignment: .leading, spacing: 1) {
@@ -193,7 +197,7 @@ struct ComposerOptionsSheet: View {
             : nil
         return HStack(spacing: 12) {
             icon(systemImage, tint: available ? .accentColor : .secondary)
-            Toggle(isOn: available ? isOn : .constant(false)) {
+            Toggle(isOn: available ? feedbackBinding(isOn) : .constant(false)) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title)
                         .foregroundStyle(available ? Color.primary : Color.secondary)
@@ -232,7 +236,7 @@ struct ComposerOptionsSheet: View {
         )
         return HStack(spacing: 12) {
             icon("text.magnifyingglass", tint: available ? .accentColor : .secondary)
-            Toggle(isOn: available ? binding : .constant(false)) {
+            Toggle(isOn: available ? feedbackBinding(binding) : .constant(false)) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(mode.label)
                         .foregroundStyle(available ? Color.primary : Color.secondary)
@@ -251,6 +255,7 @@ struct ComposerOptionsSheet: View {
         let available = modelSupportsTools || id == nil
         let selected = modeID.wrappedValue == id
         return Button {
+            if !selected { Haptics.selection() }
             modeID.wrappedValue = id
         } label: {
             HStack(spacing: 12) {
@@ -277,7 +282,7 @@ struct ComposerOptionsSheet: View {
     ) -> some View {
         HStack(spacing: 12) {
             icon(systemImage, tint: .accentColor)
-            Toggle(title, isOn: isOn)
+            Toggle(title, isOn: feedbackBinding(isOn))
         }
     }
 
@@ -286,6 +291,16 @@ struct ComposerOptionsSheet: View {
             .font(.system(size: 18))
             .frame(width: 28)
             .foregroundStyle(tint)
+    }
+
+    private func feedbackBinding(_ binding: Binding<Bool>) -> Binding<Bool> {
+        Binding(
+            get: { binding.wrappedValue },
+            set: { newValue in
+                if binding.wrappedValue != newValue { Haptics.selection() }
+                binding.wrappedValue = newValue
+            }
+        )
     }
 
     // MARK: Loading
@@ -301,6 +316,7 @@ struct ComposerOptionsSheet: View {
             }
             await MainActor.run {
                 attachments.append(contentsOf: loaded)
+                if !loaded.isEmpty { Haptics.notify(.success) }
                 photoItems = []
                 dismiss()
             }
@@ -318,6 +334,7 @@ struct ComposerOptionsSheet: View {
             }
             guard !loaded.isEmpty else { return }
             attachments.append(contentsOf: loaded)
+            Haptics.notify(.success)
             dismiss()
         }
     }
@@ -341,6 +358,7 @@ struct ModelPickerSheet: View {
         NavigationStack {
             List(models, id: \.self) { model in
                 Button {
+                    if selection.wrappedValue != model { Haptics.selection() }
                     selection.wrappedValue = model
                     dismiss()
                 } label: {

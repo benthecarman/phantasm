@@ -65,6 +65,7 @@ struct MessageBubble: View {
     private var copyButton: some View {
         Button {
             UIPasteboard.general.string = content
+            Haptics.notify(.success)
         } label: {
             Label("Copy", systemImage: "doc.on.doc")
         }
@@ -75,6 +76,7 @@ struct MessageBubble: View {
     private var speakButton: some View {
         let isSpeaking = env.speechSynthesizer.speakingMessageID == message.message.id
         return Button {
+            Haptics.selection()
             env.speechSynthesizer.toggle(content, messageID: message.message.id)
         } label: {
             if isSpeaking {

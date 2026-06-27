@@ -47,7 +47,10 @@ struct PendingAttachmentChip: View {
     var body: some View {
         ZStack(alignment: .topTrailing) {
             content
-            Button(action: onRemove) {
+            Button {
+                Haptics.selection()
+                onRemove()
+            } label: {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 18))
                     .foregroundStyle(.white, .black.opacity(0.55))

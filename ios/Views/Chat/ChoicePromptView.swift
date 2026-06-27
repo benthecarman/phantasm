@@ -70,6 +70,7 @@ struct ChoicePromptView: View {
             HStack {
                 if index > 0 {
                     Button {
+                        Haptics.selection()
                         withAnimation(.easeInOut(duration: 0.25)) { index -= 1 }
                     } label: {
                         Label("Back", systemImage: "chevron.left")
@@ -78,7 +79,7 @@ struct ChoicePromptView: View {
                 }
                 Spacer()
                 if needsAdvanceButton {
-                    Button(isLast ? "Send" : "Next", action: advanceOrSend)
+                    Button(isLast ? "Send" : "Next") { advanceOrSend() }
                         .buttonStyle(.borderedProminent)
                         .disabled(!currentComplete)
                 }
@@ -161,10 +162,26 @@ struct ChoicePromptView: View {
     private func tap(oIndex: Int, question: MultipleChoice.Question) {
         select(qIndex: index, oIndex: oIndex, type: question.type)
         // A single choice is a complete answer — move on immediately.
-        if question.type == .singleSelect { advanceOrSend() }
+        if question.type == .singleSelect {
+            if isLast {
+                Haptics.impact(.medium)
+            } else {
+                Haptics.selection()
+            }
+            advanceOrSend(feedback: false)
+        } else {
+            Haptics.selection()
+        }
     }
 
-    private func advanceOrSend() {
+    private func advanceOrSend(feedback: Bool = true) {
+        if feedback {
+            if isLast {
+                Haptics.impact(.medium)
+            } else {
+                Haptics.selection()
+            }
+        }
         if isLast {
             send()
         } else {

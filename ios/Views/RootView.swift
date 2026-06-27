@@ -182,11 +182,15 @@ struct RootView: View {
 
     private func openDrawer() {
         dragOffset = 0
+        guard !isDrawerOpen else { return }
+        Haptics.selection()
         isDrawerOpen = true
     }
 
     private func closeDrawer() {
         dragOffset = 0
+        guard isDrawerOpen else { return }
+        Haptics.selection()
         isDrawerOpen = false
     }
 }

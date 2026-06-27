@@ -54,6 +54,7 @@ struct ProfileEditView: View {
                         .autocorrectionDisabled()
                         if !token.isEmpty {
                             Button {
+                                Haptics.selection()
                                 revealToken.toggle()
                             } label: {
                                 Image(systemName: revealToken ? "eye.slash" : "eye")
@@ -71,6 +72,7 @@ struct ProfileEditView: View {
                         ForEach(pickerOptions, id: \.self) { Text($0).tag($0) }
                     }
                     Button {
+                        Haptics.selection()
                         Task { await loadModels() }
                     } label: {
                         HStack {
@@ -96,6 +98,7 @@ struct ProfileEditView: View {
 
                 Section {
                     Button {
+                        Haptics.selection()
                         Task { await test() }
                     } label: {
                         HStack {
@@ -174,6 +177,7 @@ struct ProfileEditView: View {
         switch result {
         case .success(let mode):
             models = mode.models
+            Haptics.notify(.success)
             switch mode {
             case .full(let caps):
                 let tools = (caps.tools?.webSearch ?? false) || (caps.tools?.imageGeneration ?? false)
@@ -188,6 +192,7 @@ struct ProfileEditView: View {
             }
         case .failure(let error):
             testResult = .failure(error.userMessage)
+            Haptics.notify(.error)
         }
     }
 
@@ -205,6 +210,7 @@ struct ProfileEditView: View {
         )
         let token = normalizedToken
         env.upsert(profile, token: token.isEmpty ? nil : token)
+        Haptics.notify(.success)
         dismiss()
     }
 }

@@ -57,6 +57,7 @@ struct HistoryDrawer: View {
                 .autocorrectionDisabled()
             if !$results.searchText.wrappedValue.isEmpty {
                 Button {
+                    Haptics.selection()
                     $results.searchText.wrappedValue = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -105,6 +106,7 @@ struct HistoryDrawer: View {
                 )
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button(role: .destructive) {
+                        Haptics.notify(.warning)
                         deleteConversation(result.conversation)
                     } label: {
                         Label("Delete", systemImage: "trash")

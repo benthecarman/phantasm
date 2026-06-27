@@ -50,7 +50,7 @@ final class DictationController {
         readyState = .preparing
         generation += 1
         let gen = generation
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        Haptics.impact(.medium)
 
         Task {
             let engine = makeDictationEngine()
@@ -87,7 +87,7 @@ final class DictationController {
     func stop() {
         guard isRecording else { return }
         isRecording = false
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        Haptics.impact(.light)
         // If the engine hasn't finished starting yet, `engine` is nil; the
         // in-flight start() sees `isRecording == false` and tears itself down.
         guard let engine else { return }
@@ -109,7 +109,7 @@ final class DictationController {
         guard isRecording else { return }
         isRecording = false
         isTranscribing = false
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        Haptics.impact(.light)
         generation += 1 // invalidate any in-flight start/finish/partials
         liveTranscript = ""
         let engine = self.engine
