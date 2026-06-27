@@ -170,7 +170,10 @@ struct StreamingBubble: View {
     let text: String
     let reasoning: String
     let status: String?
-    @State private var startedAt = Date.now
+    /// When the turn began. VM-owned so it's fresh each turn — a view-local
+    /// `@State` here gets reused by SwiftUI for the recycled bubble and would show
+    /// the previous turn's time.
+    let startedAt: Date
 
     var body: some View {
         HStack {

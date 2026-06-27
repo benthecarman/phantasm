@@ -239,7 +239,8 @@ struct ChatView: View {
                         StreamingBubble(
                             text: vm.streamingText,
                             reasoning: vm.streamingReasoning,
-                            status: vm.statusText
+                            status: vm.statusText,
+                            startedAt: vm.streamingStartedAt
                         )
                     }
                     Color.clear.frame(height: 1).id(bottomID)

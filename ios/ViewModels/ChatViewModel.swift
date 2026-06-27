@@ -18,6 +18,11 @@ final class ChatViewModel {
     private(set) var isStreaming = false
     private(set) var streamingText = ""
     private(set) var streamingReasoning = ""
+    /// When the in-flight turn began — the timestamp shown on the streaming
+    /// preview. VM-owned (not view `@State`) so it's reset every turn rather than
+    /// reused by SwiftUI for the recycled bubble, and so it matches the committed
+    /// message's `createdAt` (no jump when the preview becomes a persisted bubble).
+    private(set) var streamingStartedAt = Date.now
     private(set) var statusText: String?
     var errorMessage: String?
     /// A pending interactive app-tool prompt (e.g. `ask_user`'s multiple choice)
@@ -310,6 +315,7 @@ final class ChatViewModel {
         }
 
         isStreaming = true
+        streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
@@ -448,6 +454,7 @@ final class ChatViewModel {
         }
 
         isStreaming = true
+        streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
@@ -601,6 +608,7 @@ final class ChatViewModel {
         ) else { return }
 
         isStreaming = true
+        streamingStartedAt = pending.message.createdAt
         streamingText = pending.message.content
         streamingReasoning = pending.message.reasoning
         statusText = nil
@@ -645,6 +653,7 @@ final class ChatViewModel {
             conversationId: conversationId,
             role: "assistant",
             content: "",
+            createdAt: streamingStartedAt,
             isComplete: false
         )
         do {
@@ -682,6 +691,7 @@ final class ChatViewModel {
         )
 
         isStreaming = true
+        streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
@@ -918,7 +928,8 @@ final class ChatViewModel {
             } else {
                 let assistant = Message(
                     conversationId: conversation.id, role: "assistant",
-                    content: committed, reasoning: committedReasoning, isComplete: true
+                    content: committed, reasoning: committedReasoning,
+                    createdAt: streamingStartedAt, isComplete: true
                 )
                 pendingAssistantPreviewMessageID = assistant.id
                 if shouldAutoSpeak { env?.speechSynthesizer.speak(committed, messageID: assistant.id) }
