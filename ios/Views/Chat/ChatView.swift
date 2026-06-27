@@ -82,6 +82,13 @@ struct ChatView: View {
         env.backendMode.capabilities?.tools
     }
 
+    /// Whether app-hosted tools (e.g. location) can ride this turn: only against
+    /// an orchestrator backend, which forwards the calls back to us. The model
+    /// must also be tool-capable (`modelSupportsTools`), checked in the composer.
+    private var supportsAppTools: Bool {
+        env.backendMode.capabilities != nil
+    }
+
     var body: some View {
         NavigationStack {
             Group {
@@ -121,6 +128,7 @@ struct ChatView: View {
                     allowsImageAttachments: allowsImageAttachments,
                     supportsWebSearch: backendTools?.webSearch ?? false,
                     supportsImageGeneration: backendTools?.imageGeneration ?? false,
+                    supportsLocation: supportsAppTools,
                     modelSupportsTools: modelSupportsTools,
                     webSearchEnabled: Binding(
                         get: { vm.webSearchEnabled },
@@ -129,6 +137,10 @@ struct ChatView: View {
                     imageGenerationEnabled: Binding(
                         get: { vm.imageGenerationEnabled },
                         set: { vm.setImageGenerationEnabled($0) }
+                    ),
+                    locationEnabled: Binding(
+                        get: { vm.locationEnabled },
+                        set: { vm.setLocationEnabled($0) }
                     ),
                     availableModes: vm.availableModes,
                     modeID: Binding(
@@ -367,10 +379,14 @@ struct ComposerView: View {
     /// usable when the backend advertises it *and* the model can drive tools.
     let supportsWebSearch: Bool
     let supportsImageGeneration: Bool
+    /// Whether app-hosted tools (e.g. location) can ride — i.e. the backend is an
+    /// orchestrator that forwards them. Combined with `modelSupportsTools`.
+    let supportsLocation: Bool
     /// Whether the selected model supports tool/function calling.
     let modelSupportsTools: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
+    let locationEnabled: Binding<Bool>
     /// Research modes the backend advertises (e.g. Deep Research). Empty ⇒ the
     /// composer hides the research UI (graceful, older/non-orchestrator backends).
     let availableModes: [Capabilities.Mode]
@@ -490,9 +506,11 @@ struct ComposerView: View {
                 allowsImageAttachments: allowsImageAttachments,
                 supportsWebSearch: supportsWebSearch,
                 supportsImageGeneration: supportsImageGeneration,
+                supportsLocation: supportsLocation,
                 modelSupportsTools: modelSupportsTools,
                 webSearchEnabled: webSearchEnabled,
                 imageGenerationEnabled: imageGenerationEnabled,
+                locationEnabled: locationEnabled,
                 availableModes: availableModes,
                 modeID: modeID,
                 thinkingEnabled: thinkingEnabled

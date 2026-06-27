@@ -141,6 +141,15 @@ public final class AppDatabase: Sendable {
                 t.add(column: "name", .text)
             }
         }
+
+        // Per-chat opt-in for the app-hosted location tool. Off by default
+        // (privacy-sensitive, triggers a permission prompt); the composer's tool
+        // selector flips it per chat.
+        migrator.registerMigration("v7_location_tool") { db in
+            try db.alter(table: "conversation") { t in
+                t.add(column: "locationEnabled", .boolean).notNull().defaults(to: false)
+            }
+        }
         return migrator
     }
 }
@@ -220,12 +229,14 @@ extension AppDatabase: ChatStore {
         id: UUID,
         webSearchEnabled: Bool,
         imageGenerationEnabled: Bool,
+        locationEnabled: Bool,
         modeID: String?
     ) async throws {
         try await dbWriter.write { db in
             guard var convo = try Conversation.fetchOne(db, key: id) else { return }
             convo.webSearchEnabled = webSearchEnabled
             convo.imageGenerationEnabled = imageGenerationEnabled
+            convo.locationEnabled = locationEnabled
             convo.modeID = modeID
             try convo.update(db)
         }

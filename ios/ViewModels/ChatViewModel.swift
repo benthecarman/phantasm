@@ -151,6 +151,9 @@ final class ChatViewModel {
     /// fresh draft mirrors a tools-enabled backend's out-of-the-box behavior.
     var webSearchEnabled: Bool { conversation?.webSearchEnabled ?? true }
     var imageGenerationEnabled: Bool { conversation?.imageGenerationEnabled ?? true }
+    /// Per-chat opt-in for the app-hosted location tool. Off by default — it's
+    /// privacy-sensitive and triggers a system permission prompt.
+    var locationEnabled: Bool { conversation?.locationEnabled ?? false }
     /// The selected research mode for this chat (e.g. `"deep-research"`), or `nil`
     /// for an ordinary turn. It only reaches the wire as a model-id suffix at send
     /// time (redesign §7), gated on the backend advertising it.
@@ -164,6 +167,7 @@ final class ChatViewModel {
         setOptions(
             webSearch: on,
             imageGeneration: imageGenerationEnabled,
+            location: locationEnabled,
             modeID: modeID
         )
     }
@@ -172,6 +176,21 @@ final class ChatViewModel {
         setOptions(
             webSearch: webSearchEnabled,
             imageGeneration: on,
+            location: locationEnabled,
+            modeID: modeID
+        )
+    }
+
+    func setLocationEnabled(_ on: Bool) {
+        // Surface the iOS permission prompt the moment the user enables the tool,
+        // not lazily on the model's first call. No-op once already decided.
+        if on { env?.locationProvider.requestAuthorizationWhenInUse() }
+        // Remember the choice as the sticky default for future new chats.
+        env?.toolPreferenceStore.locationEnabledDefault = on
+        setOptions(
+            webSearch: webSearchEnabled,
+            imageGeneration: imageGenerationEnabled,
+            location: on,
             modeID: modeID
         )
     }
@@ -180,6 +199,7 @@ final class ChatViewModel {
         setOptions(
             webSearch: webSearchEnabled,
             imageGeneration: imageGenerationEnabled,
+            location: locationEnabled,
             modeID: modeID
         )
     }
@@ -187,10 +207,13 @@ final class ChatViewModel {
     /// Update the conversation's tool/research selection and persist it. For an
     /// unsent draft the store write is a no-op and the selection rides along on
     /// the first send (the draft is inserted whole), mirroring `setModel`.
-    private func setOptions(webSearch: Bool, imageGeneration: Bool, modeID: String?) {
+    private func setOptions(
+        webSearch: Bool, imageGeneration: Bool, location: Bool, modeID: String?
+    ) {
         guard var conversation else { return }
         conversation.webSearchEnabled = webSearch
         conversation.imageGenerationEnabled = imageGeneration
+        conversation.locationEnabled = location
         conversation.modeID = modeID
         self.conversation = conversation
         let id = conversation.id
@@ -199,6 +222,7 @@ final class ChatViewModel {
                 id: id,
                 webSearchEnabled: webSearch,
                 imageGenerationEnabled: imageGeneration,
+                locationEnabled: location,
                 modeID: modeID
             )
         }
@@ -462,8 +486,14 @@ final class ChatViewModel {
         // App-hosted tools (e.g. ask_user) ride as full schemas the orchestrator
         // forwards back to us — only against an orchestrator with a tool-capable
         // model (a raw-Ollama backend has nothing to forward through).
+        // App-hosted tools ride only against an orchestrator with a tool-capable
+        // model. Location is gated further by this chat's per-conversation opt-in
+        // (off by default); the always-on app tools (ask_user, current_time) ride
+        // unconditionally.
         let appTools = (env.backendMode.capabilities != nil && env.supportsTools(model))
-            ? AppTools.all
+            ? AppTools.all.filter {
+                $0.function.name != ToolName.location || detail.conversation.locationEnabled
+            }
             : []
         let request = ChatRequest(
             model: wireModel,

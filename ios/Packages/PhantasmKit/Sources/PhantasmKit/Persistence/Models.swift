@@ -31,6 +31,10 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     public var webSearchEnabled: Bool
     /// Whether this chat wants the server's image-generation tool offered.
     public var imageGenerationEnabled: Bool
+    /// Whether this chat wants the app-hosted location tool offered (when the
+    /// backend forwards app tools). Off by default — it's privacy-sensitive and
+    /// triggers a system permission prompt; the composer's tool selector flips it.
+    public var locationEnabled: Bool
     /// The selected research/turn mode for this chat (e.g. `"deep-research"`), or
     /// `nil` for an ordinary turn. It's the *UI preference*; at send time it
     /// reaches the wire only as a suffix on the `model` id (`<base>:<modeID>`),
@@ -47,6 +51,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         profileID: UUID? = nil,
         webSearchEnabled: Bool = true,
         imageGenerationEnabled: Bool = true,
+        locationEnabled: Bool = false,
         modeID: String? = nil
     ) {
         self.id = id
@@ -58,6 +63,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         self.profileID = profileID
         self.webSearchEnabled = webSearchEnabled
         self.imageGenerationEnabled = imageGenerationEnabled
+        self.locationEnabled = locationEnabled
         self.modeID = modeID
     }
 

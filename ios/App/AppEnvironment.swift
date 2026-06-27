@@ -15,11 +15,18 @@ final class AppEnvironment {
     let profileStore = ProfileStore()
     let modelPreferenceStore = ModelPreferenceStore()
     let voicePreferenceStore = VoicePreferenceStore()
+    /// Sticky defaults for the per-chat tool selectors (e.g. location), so a tool
+    /// the user enables stays on for subsequent new chats.
+    let toolPreferenceStore = ToolPreferenceStore()
     let keychain = KeychainStore()
     /// On-device speech: dictation (STT, via the platform speech models) and
     /// read-aloud (TTS, via the system `AVSpeechSynthesizer`). No bundled models.
     let speechSynthesizer: SpeechSynthesizer
     let dictationController: DictationController
+    /// Device-backed provider for the app-hosted location tool. Held here (and
+    /// wired into `AppToolRegistry` at launch) so the tool's CoreLocation
+    /// dependency stays in the app target.
+    let locationProvider = LocationProvider()
     let chatClient = ChatClient()
     let ollamaChatClient = OllamaNativeChatClient()
     let capabilitiesClient = CapabilitiesClient()
@@ -46,6 +53,9 @@ final class AppEnvironment {
         database = try! AppDatabase.makeShared()
         speechSynthesizer = SpeechSynthesizer(voicePrefs: voicePreferenceStore)
         dictationController = DictationController()
+        // Wire the app-hosted location tool's provider into the registry so a
+        // forwarded `get_current_location` call resolves on-device.
+        AppToolRegistry.configureLocation(provider: locationProvider)
         profiles = profileStore.load()
         thinkingPreferences = modelPreferenceStore.loadThinkingPreferences()
         // Keychain tokens outlive an app uninstall but the UserDefaults profile

@@ -18,9 +18,14 @@ struct ComposerOptionsSheet: View {
     /// reason (server vs. model) rather than hidden.
     let supportsWebSearch: Bool
     let supportsImageGeneration: Bool
+    /// Whether the backend forwards app-hosted tools (i.e. it's an orchestrator).
+    /// Like the server-tool flags, combined with `modelSupportsTools` to decide if
+    /// the Location row is usable.
+    let supportsLocation: Bool
     let modelSupportsTools: Bool
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
+    let locationEnabled: Binding<Bool>
     /// Research modes the backend advertises (e.g. Deep Research), already gated on
     /// their needed tools being usable. Empty ⇒ the Research section is hidden.
     let availableModes: [Capabilities.Mode]
@@ -86,6 +91,12 @@ struct ComposerOptionsSheet: View {
                         systemImage: "wand.and.stars",
                         backendSupports: supportsImageGeneration,
                         isOn: imageGenerationEnabled
+                    )
+                    toolRow(
+                        "Location",
+                        systemImage: "location",
+                        backendSupports: supportsLocation,
+                        isOn: locationEnabled
                     )
                 }
 

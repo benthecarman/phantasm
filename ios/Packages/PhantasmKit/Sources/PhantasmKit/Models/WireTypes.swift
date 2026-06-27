@@ -373,6 +373,10 @@ public enum ToolName {
     /// the device's own clock + timezone and continues the turn automatically (no
     /// UI, no user interaction). See `CurrentTimeTool`.
     public static let currentTime = "current_time"
+    /// App-hosted: the model asks for the user's current location. The app answers
+    /// from the device (CoreLocation + reverse geocoding) and continues the turn
+    /// automatically. Off by default and toggled per chat. See `LocationTool`.
+    public static let location = "get_current_location"
 }
 
 /// Tools the **app** hosts: it sends their full schemas each turn and executes

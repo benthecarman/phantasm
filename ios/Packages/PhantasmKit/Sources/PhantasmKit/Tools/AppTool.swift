@@ -147,16 +147,44 @@ public struct AskUserTool: InteractiveTool {
 /// `specs` (what to advertise); the view model reads `match`/`firstUnansweredPrompt`
 /// to route forwarded calls. Adding a tool is one entry here.
 public enum AppToolRegistry {
-    /// Every hosted tool. `ask_user` is first so a forwarded interactive prompt is
-    /// preferred when a batch mixes it with auto-resolved calls.
-    public static let tools: [any AppTool] = [AskUserTool(), CurrentTimeTool()]
+    /// The always-available, dependency-free hosted tools. `ask_user` is first so a
+    /// forwarded interactive prompt is preferred when a batch mixes it with
+    /// auto-resolved calls.
+    private static let baseTools: [any AppTool] = [AskUserTool(), CurrentTimeTool()]
+
+    /// The location tool, wired in at app launch with a device-backed provider.
+    /// Guarded by a lock so the (non-isolated) accessors below stay usable from
+    /// host tests, which simply never configure it — `get_current_location` is
+    /// then neither advertised nor routed. CoreLocation lives in the app target,
+    /// so it can't be constructed here.
+    private static let lock = NSLock()
+    private static var configuredLocationTool: LocationTool?
+
+    /// Wire the device-backed location tool into the registry. Call once at app
+    /// launch (idempotent — replaces any prior provider).
+    public static func configureLocation(provider: any LocationProviding) {
+        lock.lock()
+        defer { lock.unlock() }
+        configuredLocationTool = LocationTool(provider: provider)
+    }
+
+    private static var locationTool: LocationTool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return configuredLocationTool
+    }
+
+    /// Every hosted tool currently available (location only once configured).
+    public static var tools: [any AppTool] {
+        baseTools + (locationTool.map { [$0] } ?? [])
+    }
 
     /// Schemas to advertise this turn (the `tools` array).
     public static var specs: [ToolSpec] { tools.map(\.spec) }
 
-    private static let byName: [String: any AppTool] = Dictionary(
-        uniqueKeysWithValues: tools.map { ($0.name, $0) }
-    )
+    private static func tool(named name: String) -> (any AppTool)? {
+        tools.first { $0.name == name }
+    }
 
     /// How a forwarded call should be handled.
     public enum Match {
@@ -167,7 +195,7 @@ public enum AppToolRegistry {
     }
 
     public static func match(_ call: WireToolCall) -> Match {
-        guard let name = call.function?.name, let tool = byName[name] else { return .unknown }
+        guard let name = call.function?.name, let tool = tool(named: name) else { return .unknown }
         if let auto = tool as? any AutoResolvedTool { return .auto(auto) }
         if let interactive = tool as? any InteractiveTool { return .interactive(interactive) }
         return .unknown
@@ -176,7 +204,7 @@ public enum AppToolRegistry {
     /// Whether a `tool`-role result row came from an auto-resolved tool — used to
     /// keep its (model-facing, non-prose) output out of the transcript.
     public static func isAutoResolved(name: String?) -> Bool {
-        guard let name, let tool = byName[name] else { return false }
+        guard let name, let tool = tool(named: name) else { return false }
         return tool is any AutoResolvedTool
     }
 
