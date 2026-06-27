@@ -34,7 +34,9 @@ pub struct MapsPlacesArgs {
     pub query: String,
     /// Location to search around, e.g. "downtown Austin" or "200 Congress Ave,
     /// Austin TX". When set, results are POIs near this location ordered by
-    /// distance. Omit to just geocode `query` itself.
+    /// distance. Omit to just geocode `query` itself. Must be a real place name
+    /// or address — for "near me"/"nearby" requests, get the user's location with
+    /// get_current_location first and pass its city/place here, never "me".
     #[serde(default)]
     pub near: Option<String>,
     /// Optional cuisine to narrow a food search to, e.g. "thai", "pizza",
@@ -64,7 +66,10 @@ pub fn schema() -> Value {
          (\"restaurant\", \"coffee\", \"pharmacy\") and the location in `near`; results come \
          back ordered by distance. To find food of a specific cuisine (\"thai near me\"), \
          set `query` to \"restaurant\" and `cuisine` to the cuisine (\"thai\"). To locate a \
-         single named place or address, set just `query`. Returns names, categories, \
+         single named place or address, set just `query`. When the user refers to where \
+         they are (\"near me\", \"nearby\", \"around here\") and you don't already know their \
+         location, call get_current_location first, then pass the city or place it returns \
+         as `near` — do not pass \"me\" or \"here\" as `near`. Returns names, categories, \
          addresses, distances, and coordinates.",
         params,
     )
