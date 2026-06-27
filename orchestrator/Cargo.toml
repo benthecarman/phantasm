@@ -44,13 +44,14 @@ tempfile = "3"
 sd-notify = "0.4"
 
 [features]
-default = []
-# Opt-in HTTP response compression. Turns on reqwest's gzip handling so it
-# negotiates Accept-Encoding itself and auto-decompresses responses. Off by
-# default: snippet responses are a few KB and RTT-bound, so compression buys no
-# latency there and only adds a decompress step. The real win is the thorough
-# (full-page-fetch) search path, so pair it with that. Requires that we never
-# hand-set Accept-Encoding (doing so disables reqwest's auto-decompress).
+default = ["gzip"]
+# HTTP response compression. Turns on reqwest's gzip handling so it negotiates
+# Accept-Encoding itself and auto-decompresses responses. On by default: the
+# thorough (full-page-fetch) search path pulls down whole HTML pages where
+# compression is a clear win; snippet responses are a few KB and RTT-bound, so it
+# only adds a cheap decompress step there. Requires that we never hand-set
+# Accept-Encoding (doing so disables reqwest's auto-decompress). Disable with
+# `--no-default-features` if a deployment never fetches pages.
 gzip = ["reqwest/gzip"]
 
 [dev-dependencies]
