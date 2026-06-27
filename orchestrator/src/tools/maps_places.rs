@@ -37,6 +37,12 @@ pub struct MapsPlacesArgs {
     /// distance. Omit to just geocode `query` itself.
     #[serde(default)]
     pub near: Option<String>,
+    /// Optional cuisine to narrow a food search to, e.g. "thai", "pizza",
+    /// "sushi", "mexican". Use this for "thai near me"-style queries: set
+    /// `query` to "restaurant" and `cuisine` to "thai". Only applies to nearby
+    /// (`near`) searches.
+    #[serde(default)]
+    pub cuisine: Option<String>,
     /// Search radius in meters around `near`. Defaults to 1500, max 25000.
     #[serde(default)]
     pub radius_m: Option<u32>,
@@ -56,8 +62,10 @@ pub fn schema() -> Value {
         "Find places and points of interest. To search for businesses near a location \
          (e.g. \"restaurants near downtown Austin\"), put a plain category in `query` \
          (\"restaurant\", \"coffee\", \"pharmacy\") and the location in `near`; results come \
-         back ordered by distance. To locate a single named place or address, set just \
-         `query`. Returns names, categories, addresses, distances, and coordinates.",
+         back ordered by distance. To find food of a specific cuisine (\"thai near me\"), \
+         set `query` to \"restaurant\" and `cuisine` to the cuisine (\"thai\"). To locate a \
+         single named place or address, set just `query`. Returns names, categories, \
+         addresses, distances, and coordinates.",
         params,
     )
 }
@@ -113,6 +121,13 @@ impl MapsPlacesArgs {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     }
+
+    fn cuisine_filter(&self) -> Option<&str> {
+        self.cuisine
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 async fn search(
@@ -156,7 +171,7 @@ async fn search_nearby(
     // 2. Ask Overpass for POIs of the category within the radius.
     let radius = args.radius_m.unwrap_or(1500).clamp(100, 25_000);
     let limit = args.limit.unwrap_or(5).clamp(1, 10) as usize;
-    let oq = build_overpass_query(term, lat, lon, radius);
+    let oq = build_overpass_query(term, args.cuisine_filter(), lat, lon, radius);
     let elements = overpass(cfg, http, &oq).await?;
 
     Ok(format_nearby(
@@ -173,12 +188,35 @@ async fn search_nearby(
 /// Build an OverpassQL union. Maps common category words to OSM tags, and always
 /// also matches the raw term against `name`/`cuisine` (and, for unmapped terms,
 /// `amenity`/`shop`/`leisure`/`tourism`) so specific cuisines and business names
-/// still surface.
-fn build_overpass_query(term: &str, lat: f64, lon: f64, radius_m: u32) -> String {
+/// still surface. When `cuisine` is given, the search is narrowed to food venues
+/// of that cuisine instead.
+fn build_overpass_query(
+    term: &str,
+    cuisine: Option<&str>,
+    lat: f64,
+    lon: f64,
+    radius_m: u32,
+) -> String {
     let around = format!("around:{radius_m},{lat},{lon}");
-    let re = escape_overpass_regex(term.trim());
     let mut clauses: Vec<String> = Vec::new();
 
+    if let Some(cuisine) = cuisine {
+        // Cuisine search: anything tagged with the cuisine (subsumes the
+        // category — cuisine tags are food-specific), plus food venues whose
+        // name matches the cuisine but that lack a cuisine tag (e.g. "Thai
+        // Spice"), without pulling in non-food matches like "Thai Massage".
+        let cre = escape_overpass_regex(cuisine);
+        clauses.push(format!("nwr({around})[\"cuisine\"~\"{cre}\",i];"));
+        clauses.push(format!(
+            "nwr({around})[\"amenity\"~\"^(restaurant|fast_food|cafe|bar|pub)$\"][\"name\"~\"{cre}\",i];"
+        ));
+        return format!(
+            "[out:json][timeout:25];({});out center tags 80;",
+            clauses.join("")
+        );
+    }
+
+    let re = escape_overpass_regex(term.trim());
     let mapped = category_tags(term);
     for filt in &mapped {
         clauses.push(format!("nwr({around}){filt};"));
@@ -578,7 +616,7 @@ mod tests {
 
     #[test]
     fn overpass_query_is_bounded_and_typed() {
-        let q = build_overpass_query("coffee", 30.26, -97.74, 1500);
+        let q = build_overpass_query("coffee", None, 30.26, -97.74, 1500);
         assert!(q.contains("around:1500,30.26,-97.74"));
         assert!(q.contains("[\"amenity\"=\"cafe\"]"));
         assert!(q.contains("out center tags"));
@@ -586,8 +624,22 @@ mod tests {
 
     #[test]
     fn overpass_query_escapes_regex_metachars() {
-        let q = build_overpass_query("a+b(c)", 0.0, 0.0, 100);
+        let q = build_overpass_query("a+b(c)", None, 0.0, 0.0, 100);
         assert!(q.contains(r"a\+b\(c\)"));
+    }
+
+    #[test]
+    fn cuisine_narrows_to_cuisine_tag_not_all_restaurants() {
+        let q = build_overpass_query("restaurant", Some("thai"), 30.26, -97.74, 1500);
+        // Must constrain by the cuisine tag...
+        assert!(q.contains("[\"cuisine\"~\"thai\",i]"));
+        // ...and a bare `amenity=restaurant` clause that would return *every*
+        // restaurant must not appear.
+        assert!(!q.contains("nwr(around:1500,30.26,-97.74)[\"amenity\"=\"restaurant\"];"));
+        // Named-but-untagged food venues still match, gated to food amenities.
+        assert!(q.contains(
+            "[\"amenity\"~\"^(restaurant|fast_food|cafe|bar|pub)$\"][\"name\"~\"thai\",i]"
+        ));
     }
 
     #[test]
