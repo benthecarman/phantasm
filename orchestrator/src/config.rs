@@ -142,12 +142,12 @@ pub struct Config {
     // references (`/v1/images/<id>`) instead of inline base64 — keeping re-sent
     // history small. Unset => disabled, and images stay inline (back-compat).
     pub image_store_dir: Option<PathBuf>,
-    /// How long a generated image is reachable: both the on-disk blob's lifetime
-    /// (the pruner evicts past it) and the signed URL's expiry — one lifetime,
-    /// since a link to a pruned blob is useless. The edit tool reads the blob
-    /// directly when editing a referenced image, and it backstops app deletes
-    /// that never arrive. The unguessable content-hash id is the primary access
-    /// guard; the signature + expiry are defense-in-depth.
+    /// How long a generated image is reachable (default 90 days): both the
+    /// on-disk blob's lifetime (the pruner evicts past it) and the signed URL's
+    /// expiry — one lifetime, since a link to a pruned blob is useless. The edit
+    /// tool reads the blob directly when editing a referenced image, and it
+    /// backstops app deletes that never arrive. The unguessable content-hash id
+    /// is the primary access guard; the signature + expiry are defense-in-depth.
     pub image_store_ttl_s: u64,
     /// Public origin the app reaches this server at, used to mint absolute image
     /// URLs. Unset => emit site-relative `/v1/images/<id>` and let the app
@@ -275,7 +275,7 @@ impl Config {
             comfy_timeout_s: env_parse("COMFYUI_TIMEOUT_S", 120u64),
             comfy_max_image_bytes: env_parse("COMFYUI_MAX_IMAGE_BYTES", 16 * 1024 * 1024),
             image_store_dir: env_path("IMAGE_STORE_DIR"),
-            image_store_ttl_s: env_parse("IMAGE_STORE_TTL_S", 365 * 24 * 60 * 60),
+            image_store_ttl_s: env_parse("IMAGE_STORE_TTL_S", 90 * 24 * 60 * 60),
             public_base_url: parse_opt_url("PUBLIC_BASE_URL")?,
             comfy_gen_workflow: env_path("COMFYUI_GEN_WORKFLOW"),
             comfy_gen_prompt: env_node("COMFYUI_GEN_PROMPT"),
