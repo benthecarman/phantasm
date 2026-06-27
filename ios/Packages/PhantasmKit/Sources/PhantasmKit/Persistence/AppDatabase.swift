@@ -196,13 +196,15 @@ extension AppDatabase: ChatStore {
         id: UUID,
         content: String,
         reasoning: String,
-        isComplete: Bool
+        isComplete: Bool,
+        createdAt: Date?
     ) async throws {
         try await dbWriter.write { db in
             guard var message = try Message.fetchOne(db, key: id) else { return }
             message.content = content
             message.reasoning = reasoning
             message.isComplete = isComplete
+            if let createdAt { message.createdAt = createdAt }
             message.updatedAt = Date()
             try message.update(db)
         }

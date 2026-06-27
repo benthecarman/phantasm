@@ -18,10 +18,11 @@ final class ChatViewModel {
     private(set) var isStreaming = false
     private(set) var streamingText = ""
     private(set) var streamingReasoning = ""
-    /// When the in-flight turn began — the timestamp shown on the streaming
-    /// preview. VM-owned (not view `@State`) so it's reset every turn rather than
-    /// reused by SwiftUI for the recycled bubble, and so it matches the committed
-    /// message's `createdAt` (no jump when the preview becomes a persisted bubble).
+    /// When the in-flight turn began. Seeds the loader's verb and the early
+    /// pending-row `createdAt` for ordering; the preview shows no timestamp (that
+    /// appears only once the turn completes, restamped to the completion time).
+    /// VM-owned (not view `@State`) so it's reset every turn rather than reused by
+    /// SwiftUI for the recycled bubble.
     private(set) var streamingStartedAt = Date.now
     private(set) var statusText: String?
     var errorMessage: String?
@@ -908,7 +909,8 @@ final class ChatViewModel {
                             id: pendingID,
                             content: committed,
                             reasoning: committedReasoning,
-                            isComplete: true
+                            isComplete: true,
+                            createdAt: .now
                         )
                         self?.cacheServerImages(messageID: pendingID, content: committed)
                         try await store.updateConversation(
@@ -929,7 +931,7 @@ final class ChatViewModel {
                 let assistant = Message(
                     conversationId: conversation.id, role: "assistant",
                     content: committed, reasoning: committedReasoning,
-                    createdAt: streamingStartedAt, isComplete: true
+                    createdAt: .now, isComplete: true
                 )
                 pendingAssistantPreviewMessageID = assistant.id
                 if shouldAutoSpeak { env?.speechSynthesizer.speak(committed, messageID: assistant.id) }

@@ -170,9 +170,10 @@ struct StreamingBubble: View {
     let text: String
     let reasoning: String
     let status: String?
-    /// When the turn began. VM-owned so it's fresh each turn — a view-local
-    /// `@State` here gets reused by SwiftUI for the recycled bubble and would show
-    /// the previous turn's time.
+    /// When the turn began — used only to seed the loader's verb (deterministic
+    /// per turn). The preview shows no timestamp; that appears once the turn is
+    /// complete and the bubble becomes a persisted `MessageBubble`. VM-owned so
+    /// it's fresh each turn rather than reused by SwiftUI for the recycled bubble.
     let startedAt: Date
 
     var body: some View {
@@ -184,28 +185,17 @@ struct StreamingBubble: View {
                 if !reasoning.isEmpty {
                     ThinkingDisclosure(text: reasoning)
                 }
-                if text.isEmpty && reasoning.isEmpty && (status == nil) {
+                // Show the loader until there's something to render. Gate on an
+                // empty-or-nil status (not just nil) so a blank `x_status` value
+                // doesn't leave the bubble with no indicator at all.
+                if text.isEmpty && reasoning.isEmpty && (status?.isEmpty ?? true) {
                     ConjuringLoader(seed: startedAt)
                 } else if !text.isEmpty {
                     MarkdownMessageView(text: text)
                 }
-                timestamp
             }
             Spacer(minLength: 40)
         }
-    }
-
-    private var timestamp: some View {
-        Text(startedAt, format: .dateTime.hour().minute())
-            .font(.system(size: 10))
-            .foregroundStyle(.secondary)
-            .monospacedDigit()
-            .accessibilityLabel(
-                Text(
-                    startedAt,
-                    format: .dateTime.weekday(.wide).month(.wide).day().year().hour().minute()
-                )
-            )
     }
 }
 

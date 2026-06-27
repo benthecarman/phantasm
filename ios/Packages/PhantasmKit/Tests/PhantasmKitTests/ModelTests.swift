@@ -545,10 +545,12 @@ final class PersistenceTests: XCTestCase {
         let store = try AppDatabase.empty()
         let convo = Conversation(title: "T")
         try await store.insertConversation(convo)
+        let turnStart = Date(timeIntervalSince1970: 1_000)
         let pending = Message(
             conversationId: convo.id,
             role: "assistant",
             content: "",
+            createdAt: turnStart,
             isComplete: false
         )
         try await store.insertMessage(pending, attachments: [])
@@ -557,11 +559,13 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(detail?.messages.count, 1)
         XCTAssertEqual(detail?.wireHistory(), [])
 
+        let completedAt = Date(timeIntervalSince1970: 2_000)
         try await store.updateMessage(
             id: pending.id,
             content: "final answer",
             reasoning: "hidden plan",
-            isComplete: true
+            isComplete: true,
+            createdAt: completedAt
         )
 
         detail = try await store.conversationDetail(id: convo.id)
@@ -569,6 +573,8 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(detail?.messages.first?.message.content, "final answer")
         XCTAssertEqual(detail?.messages.first?.message.reasoning, "hidden plan")
         XCTAssertEqual(detail?.messages.first?.message.isComplete, true)
+        // The pending row is restamped to its completion time, not the turn start.
+        XCTAssertEqual(detail?.messages.first?.message.createdAt, completedAt)
         XCTAssertEqual(detail?.wireHistory(), [WireMessage(role: "assistant", content: "final answer")])
     }
 

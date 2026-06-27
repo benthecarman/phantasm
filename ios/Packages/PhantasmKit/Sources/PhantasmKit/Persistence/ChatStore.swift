@@ -47,12 +47,15 @@ public protocol ChatStore: Sendable {
 
     /// Replace a message's streamed body and completion flag. Used to create a
     /// durable pending assistant row at turn start, then complete that same row
-    /// once the buffered stream finishes.
+    /// once the buffered stream finishes. `createdAt`, when supplied, restamps
+    /// the row to its completion time (the pending row is inserted at turn start,
+    /// but the displayed timestamp should reflect when the whole message arrived).
     func updateMessage(
         id: UUID,
         content: String,
         reasoning: String,
-        isComplete: Bool
+        isComplete: Bool,
+        createdAt: Date?
     ) async throws
 
     /// Attach rows to an already-persisted message (post-commit). Used to cache
