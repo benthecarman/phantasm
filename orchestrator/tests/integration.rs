@@ -62,6 +62,44 @@ fn mock_ollama_with_recorder(requests: Option<RecordedRequests>) -> Router {
         )
 }
 
+/// A mock Ollama for the mixed app+server tool-call flow. The first turn (no
+/// `tool`-role message in the history) returns an assistant calling BOTH a
+/// server tool (`calculator`) and an app tool (`ask_user`). Once the history
+/// carries a `tool` result (the resumed continuation), it returns a plain
+/// answer; streaming requests stream "Hello world".
+fn mock_ollama_mixed_tools(requests: RecordedRequests) -> Router {
+    Router::new()
+        .route(
+            "/api/chat",
+            post(move |body: axum::extract::Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    let streaming =
+                        body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let resumed = body.0["messages"]
+                        .as_array()
+                        .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
+                    requests.lock().await.push(body.0.clone());
+                    if streaming {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n\
+                         {\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+                    } else if resumed {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"resolved\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+                    } else {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
+                           {\"function\":{\"name\":\"calculator\",\"arguments\":{\"expression\":\"1+1\"}}},\
+                           {\"function\":{\"name\":\"ask_user\",\"arguments\":{\"question\":\"which?\"}}}\
+                         ]},\"done\":true,\"done_reason\":\"stop\"}\n"
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/tags",
+            get(|| async { axum::Json(serde_json::json!({"models":[{"name":"m"}]})) }),
+        )
+}
+
 /// A mock OpenAI-compatible backend: no `/api/tags`, yes `/v1/models` and
 /// `/v1/chat/completions`.
 fn mock_openai_compatible() -> Router {
@@ -181,6 +219,161 @@ async fn spawn_orchestrator_with_kind(ollama_base: &str, upstream_kind: Upstream
     });
     let state = phantasm_orchestrator::build_state(cfg, capabilities, upstream_kind);
     spawn(routes::router(state)).await
+}
+
+/// Like `spawn_orchestrator`, but with the `calculator` server tool enabled so
+/// the mixed app+server tool-call flow has a real server tool to execute.
+async fn spawn_orchestrator_with_calculator(ollama_base: &str) -> String {
+    let mut cfg = test_config(ollama_base);
+    cfg.calculator_enabled = true;
+    let cfg = Arc::new(cfg);
+    let capabilities = Arc::new(CapabilitySnapshot {
+        version: "test".into(),
+        chat: true,
+        models: vec!["m".into()],
+        vision_models: vec![],
+        tool_models: vec![],
+        tools: ToolFlags::default(),
+        modes: vec![],
+        streaming: "sse",
+    });
+    let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
+    spawn(routes::router(state)).await
+}
+
+/// When a turn mixes a server tool call (`calculator`) and an app tool call
+/// (`ask_user`), the server call runs *now*, only the app call is forwarded, and
+/// the resolved history is held server-side. The continuation request — carrying
+/// the app's answer — resumes from that held history, so the server work is
+/// preserved (not dropped, not re-run by the model).
+#[tokio::test]
+async fn mixed_tool_calls_hold_server_work_and_resume() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ollama = spawn(mock_ollama_mixed_tools(requests.clone())).await;
+    let base = spawn_orchestrator_with_calculator(&ollama).await;
+    let client = reqwest::Client::new();
+
+    let tools = serde_json::json!([
+        { "type": "function", "function": { "name": "calculator" } },
+        { "type": "function", "function": {
+            "name": "ask_user", "description": "ask the user",
+            "parameters": { "type": "object", "properties": {} }
+        }},
+    ]);
+
+    // Turn 1: model calls calculator + ask_user. Only ask_user is forwarded.
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+
+    // Parse the forwarded app tool call from the SSE stream.
+    let mut forwarded_id = None;
+    let mut forwarded_names = Vec::new();
+    let mut finish_reason = None;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        if let Some(calls) = v["choices"][0]["delta"]["tool_calls"].as_array() {
+            for c in calls {
+                forwarded_names.push(c["function"]["name"].as_str().unwrap().to_string());
+                forwarded_id = c["id"].as_str().map(String::from);
+            }
+        }
+        if let Some(r) = v["choices"][0]["finish_reason"].as_str() {
+            finish_reason = Some(r.to_string());
+        }
+    }
+    assert_eq!(
+        forwarded_names,
+        vec!["ask_user".to_string()],
+        "only the app tool is forwarded; calculator stays server-side"
+    );
+    assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
+    let call_id = forwarded_id.expect("forwarded app call carries an id");
+
+    // Turn 2: the app answers ask_user and re-sends. The orchestrator must resume
+    // from the held history (which already contains the calculator result).
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m", "stream": true,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": serde_json::Value::Null, "tool_calls": [
+                    {"id": call_id, "type": "function",
+                     "function": {"name": "ask_user", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": call_id, "name": "ask_user", "content": "option A"},
+            ],
+            "tools": tools,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    let mut content = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+    }
+    assert_eq!(
+        content, "Hello world",
+        "the resumed turn streams a final answer"
+    );
+
+    // The resumed upstream resolution request must carry BOTH the held server
+    // tool result (calculator) and the app's answer — proof the server work was
+    // preserved across the turn boundary rather than dropped or re-run.
+    // Native Ollama carries a tool result's function name in `tool_name`.
+    let requests = requests.lock().await;
+    let resumed = requests
+        .iter()
+        .find(|r| {
+            r["messages"]
+                .as_array()
+                .is_some_and(|ms| ms.iter().any(|m| m["tool_name"] == "calculator"))
+        })
+        .expect("a resumed upstream request includes the held calculator result");
+    let tool_names: Vec<&str> = resumed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["tool_name"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        tool_names.contains(&"calculator"),
+        "held calculator result is replayed upstream: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"ask_user"),
+        "the app's answer is appended: {tool_names:?}"
+    );
 }
 
 #[tokio::test]

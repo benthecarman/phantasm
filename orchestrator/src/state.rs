@@ -1,5 +1,6 @@
 //! Shared application state, cheaply cloneable (`Arc` internals).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,18 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::Config;
 use crate::ollama::UpstreamChatBackend;
+use crate::openai::types::ChatMessage;
+
+/// How long a stashed continuation (a turn paused on an app-hosted tool call,
+/// holding co-occurring server-call results) survives before eviction. Sized for
+/// a user answering a forwarded prompt within a session; a miss degrades
+/// gracefully — the model just re-issues the dropped server calls.
+pub const CONTINUATION_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Cap on simultaneously held continuations. Each entry holds a full turn
+/// history (potentially several MB of base64 image data), so the cap bounds
+/// worst-case memory; the oldest is evicted past it.
+pub const CONTINUATION_MAX: usize = 128;
 
 /// How long a probed capabilities snapshot is served before the next request
 /// triggers a fresh upstream re-probe. Bounds probe load (and concurrent
@@ -23,6 +36,72 @@ pub struct AppState {
     /// Bounds simultaneous in-flight upstream generations (NFR-O2 downstream limit).
     pub upstream_sem: Arc<Semaphore>,
     pub capabilities: CapabilitiesCache,
+    /// Intra-turn continuation store: holds the resolved history of a turn paused
+    /// on an app-hosted tool call when server calls co-occurred, so the
+    /// follow-up request resumes without re-running (or losing) that server work.
+    pub continuations: ContinuationCache,
+}
+
+/// Server-side store for turns paused mid-flight on an app-hosted tool call.
+///
+/// The orchestrator is otherwise stateless across requests (XR-2). The one
+/// exception: when a model issues server *and* app tool calls in one response,
+/// the server runs its calls, then must end the turn to let the app run its
+/// own. Rather than push those server results into the app's history (keeping
+/// server tools invisible to it), we stash the resolved history here, keyed by
+/// the forwarded app `tool_call_id` the app echoes back, and resume from it on
+/// the continuation request. Entries are one-shot, TTL'd, and bounded; a miss
+/// (restart, expiry) degrades gracefully to the model re-issuing the calls.
+#[derive(Clone, Default)]
+pub struct ContinuationCache(Arc<Mutex<HashMap<String, HeldTurn>>>);
+
+struct HeldTurn {
+    messages: Vec<ChatMessage>,
+    stored_at: Instant,
+}
+
+impl ContinuationCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stash a paused turn's resolved history under `key` (a forwarded app
+    /// `tool_call_id`). Purges expired entries and bounds total count first.
+    pub async fn stash(&self, key: String, messages: Vec<ChatMessage>) {
+        let mut map = self.0.lock().await;
+        map.retain(|_, e| e.stored_at.elapsed() < CONTINUATION_TTL);
+        if map.len() >= CONTINUATION_MAX {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, e)| e.stored_at)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(
+            key,
+            HeldTurn {
+                messages,
+                stored_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Take (one-shot) the held history matching any of `keys` — the
+    /// `tool_call_id`s on the continuation request's trailing tool results.
+    /// `None` if absent or expired.
+    pub async fn take(&self, keys: &[String]) -> Option<Vec<ChatMessage>> {
+        let mut map = self.0.lock().await;
+        for key in keys {
+            if let Some(entry) = map.remove(key) {
+                if entry.stored_at.elapsed() < CONTINUATION_TTL {
+                    return Some(entry.messages);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// TTL-cached capabilities snapshot. Seeded at startup, then refreshed lazily

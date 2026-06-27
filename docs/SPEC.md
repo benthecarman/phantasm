@@ -176,6 +176,23 @@ send its schema, so it's never offered to them.
 (below). On a name collision the **server** tool wins — the app's same-named
 entry is dropped and the call is executed server-side.
 
+**Mixed batches (server + app calls in one response).** A model may emit
+server-side and app-hosted tool calls in the *same* assistant response (e.g.
+`maps_places` + `get_current_location`). Every call is honored: the orchestrator
+executes the server calls immediately, then ends the turn forwarding **only** the
+app calls (the server calls stay invisible to the app, per the rest of §2.3). To
+avoid losing the server work across the turn boundary, the orchestrator keeps a
+short-lived, server-side **continuation**: the resolved history (the assistant
+`tool_calls` message plus the server `tool` results) is held, keyed by the
+forwarded app `tool_call_id`. When the app re-sends with its `tool` result, the
+orchestrator matches that id, resumes from the held history with the app's answer
+appended, and continues — so the model never re-issues or loses the server calls.
+This is the one bounded exception to XR-2's pure statelessness (see XR-2); it is
+best-effort: a miss (server restart, TTL expiry) degrades gracefully to the model
+re-issuing the dropped server calls. It needs no app cooperation and no wire
+change — the keying rides the standard OpenAI `tool_call_id` the app already
+echoes.
+
 **Per-request tool selection (standard OpenAI fields).** The app scopes which
 server tools a turn may use via the **standard** OpenAI `tools` / `tool_choice`
 request fields — no custom field. The `tools` array merely *names* the wanted
@@ -280,7 +297,11 @@ start (NFR-A5), optional multiple backend profiles (NFR-A6).
 - **XR-1 Graceful degradation** — every tool is optional; plain chat works
   against any OpenAI-compatible endpoint including raw Ollama.
 - **XR-2 Stateless server, stateful client** — the app sends full history each
-  turn.
+  turn. One bounded exception: a turn paused on an app-hosted tool call while
+  server calls co-occurred holds its resolved history server-side until the
+  app's follow-up (see §2.3 "Mixed batches"). It is in-memory, TTL'd, capped,
+  one-shot, and lossy-safe — a miss just re-runs the server calls — so the server
+  stays effectively stateless across conversations.
 - **XR-3 Versioning** — the capabilities manifest carries a version.
 - **XR-4 No tool persistence** — server tools do not write local state or index
   local files; per-turn in-memory caches are allowed only as an optimization.

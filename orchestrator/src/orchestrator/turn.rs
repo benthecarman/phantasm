@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use futures_util::future::join_all;
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, Semaphore};
@@ -24,8 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::ollama::ChatBackend;
-use crate::openai::types::{ChatMessage, ToolCall};
-use crate::orchestrator::tools::{ToolExecutor, TurnContext};
+use crate::openai::sse::ensure_call_id;
+use crate::openai::types::{ChatMessage, MessageContent, ToolCall};
+use crate::orchestrator::tools::{ToolExecutor, ToolOutcome, TurnContext};
 use crate::orchestrator::{ResearchPreset, TurnEvent};
 
 /// Map an internal server tool name to the app-facing capability that gates it.
@@ -214,21 +216,63 @@ pub async fn run_turn<B, T>(
                     "model requested tool calls"
                 );
                 // App-hosted tool calls are handed back to the app to execute;
-                // the turn ends here. The app owns persistence of the assistant
-                // tool_call message and the tool result, re-sending them next
-                // turn (stateless, XR-2). Any co-occurring server calls are
-                // dropped — the model re-issues them next turn once it has the
-                // app's answer.
-                let app_calls: Vec<ToolCall> = calls
+                // the turn ends here so the app can run them and resume next
+                // request. Normally that's stateless (XR-2): the app re-sends its
+                // own complete history. But when the model issues server calls in
+                // the *same* response, dropping them would lose that work — so we
+                // honor every call: run the server ones now and stash the full
+                // history (with their results) server-side as `held`, keyed off
+                // the forwarded app call. The continuation request resumes from it
+                // and the server tools stay invisible to the app.
+                let mut calls = calls;
+                for c in &mut calls {
+                    // Normalize ids so the held assistant message, the forwarded
+                    // app calls (the cache key), and the app's echoed
+                    // `tool_call_id` all agree.
+                    c.id = Some(ensure_call_id(c));
+                }
+                let (app_calls, server_calls): (Vec<ToolCall>, Vec<ToolCall>) = calls
                     .iter()
-                    .filter(|c| app_names.contains(&c.function.name))
                     .cloned()
-                    .collect();
+                    .partition(|c| app_names.contains(&c.function.name));
                 if !app_calls.is_empty() {
+                    let held = if server_calls.is_empty() {
+                        None
+                    } else {
+                        // Hold the assistant message (carrying *every* call) plus a
+                        // `tool` result per executed server call, atop the history
+                        // so far — exactly what resuming the loop needs.
+                        let mut resp = resp;
+                        resp.tool_calls = Some(calls.clone());
+                        messages.push(resp);
+                        let Some(outcomes) =
+                            execute_calls(&tools, &server_calls, &ctx, &tx, &cancel).await
+                        else {
+                            return;
+                        };
+                        for outcome in outcomes {
+                            messages.push(held_result_message(outcome));
+                        }
+                        Some(std::mem::take(&mut messages))
+                    };
                     let forwarded: Vec<&str> =
                         app_calls.iter().map(|c| c.function.name.as_str()).collect();
-                    tracing::info!(tools = ?forwarded, "forwarding app-hosted tool calls to client");
-                    let _ = tx.send(TurnEvent::ToolCalls(app_calls)).await;
+                    let server_ran: Vec<&str> = server_calls
+                        .iter()
+                        .map(|c| c.function.name.as_str())
+                        .collect();
+                    tracing::info!(
+                        app = ?forwarded,
+                        server = ?server_ran,
+                        held = held.is_some(),
+                        "forwarding app-hosted tool calls; co-occurring server calls executed inline"
+                    );
+                    let _ = tx
+                        .send(TurnEvent::ToolCalls {
+                            app: app_calls,
+                            held,
+                        })
+                        .await;
                     let _ = tx
                         .send(TurnEvent::Done {
                             reason: "tool_calls".into(),
@@ -238,11 +282,10 @@ pub async fn run_turn<B, T>(
                 }
 
                 messages.push(resp); // assistant message carrying the tool_calls
-                for call in &calls {
-                    if cancel.is_cancelled() {
-                        return;
-                    }
-                    let outcome = tools.execute(call, &ctx, tx.clone(), cancel.clone()).await;
+                let Some(outcomes) = execute_calls(&tools, &calls, &ctx, &tx, &cancel).await else {
+                    return;
+                };
+                for outcome in outcomes {
                     messages.push(outcome.message);
                     if let Some(extra) = outcome.append_to_answer {
                         appends.push(extra);
@@ -259,6 +302,55 @@ pub async fn run_turn<B, T>(
     );
     let _ = tx.send(TurnEvent::Status("finishing up…".into())).await;
     stream_final(&backend, &model, &messages, &options, appends, &tx, &cancel).await;
+}
+
+/// Execute a batch of tool calls concurrently, returning outcomes in call
+/// order. A model issues multiple calls in one response precisely because it
+/// treats them as independent (OpenAI "parallel function calling"); results are
+/// matched by `tool_call_id`, not position, so order of execution is immaterial
+/// and we run them at once. Returns `None` if the turn is cancelled mid-flight —
+/// the caller should abandon the turn (each tool already `select!`s on `cancel`,
+/// so in-flight work stops promptly when the join future is dropped).
+async fn execute_calls<T: ToolExecutor>(
+    tools: &T,
+    calls: &[ToolCall],
+    ctx: &TurnContext,
+    tx: &mpsc::Sender<TurnEvent>,
+    cancel: &CancellationToken,
+) -> Option<Vec<ToolOutcome>> {
+    let runs = calls
+        .iter()
+        .map(|call| tools.execute(call, ctx, tx.clone(), cancel.clone()));
+    tokio::select! {
+        outcomes = join_all(runs) => Some(outcomes),
+        _ = cancel.cancelled() => None,
+    }
+}
+
+/// The `tool`-role result message to hold for a server call executed while a
+/// turn ends early on app-hosted calls. Normally that's just the tool's own
+/// result message; `append_to_answer` (e.g. the image markdown an image tool
+/// would otherwise stream into the final answer) is folded into the content so
+/// nothing the tool produced is lost — the model sees it on the resumed turn.
+fn held_result_message(outcome: ToolOutcome) -> ChatMessage {
+    let ToolOutcome {
+        mut message,
+        append_to_answer,
+    } = outcome;
+    if let Some(extra) = append_to_answer {
+        let existing = message
+            .content
+            .take()
+            .and_then(|c| c.into_text_and_images().0)
+            .unwrap_or_default();
+        let combined = if existing.is_empty() {
+            extra
+        } else {
+            format!("{existing}\n\n{extra}")
+        };
+        message.content = Some(MessageContent::Text(combined));
+    }
+    message
 }
 
 /// Collect the image payloads from the most recent message that carries any —
@@ -804,17 +896,25 @@ mod tests {
         }
     }
 
-    /// The names in the first `ToolCalls` event, if any.
+    /// The app-call names in the first `ToolCalls` event, if any.
     fn forwarded_names(events: &[TurnEvent]) -> Vec<String> {
         events
             .iter()
             .find_map(|e| match e {
-                TurnEvent::ToolCalls(calls) => {
-                    Some(calls.iter().map(|c| c.function.name.clone()).collect())
+                TurnEvent::ToolCalls { app, .. } => {
+                    Some(app.iter().map(|c| c.function.name.clone()).collect())
                 }
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    /// The held continuation history from the first `ToolCalls` event, if any.
+    fn held_history(events: &[TurnEvent]) -> Option<Vec<ChatMessage>> {
+        events.iter().find_map(|e| match e {
+            TurnEvent::ToolCalls { held, .. } => held.clone(),
+            _ => None,
+        })
     }
 
     #[tokio::test]
@@ -899,9 +999,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_app_and_server_calls_forward_only_app() {
-        // One assistant message calls both a server tool and an app tool: only the
-        // app tool is forwarded; the server call is dropped this turn.
+    async fn mixed_app_and_server_calls_run_server_and_hold_continuation() {
+        // One assistant message calls both a server tool and an app tool: the app
+        // tool is forwarded AND the server tool is executed now, with the resolved
+        // history (assistant message + server result) handed back as `held` so the
+        // continuation request can resume from it. No server work is dropped.
         let backend = ScriptedBackend::new(
             vec![assistant_calling_many(&["web_search", "ask_user"])],
             vec!["unused".into()],
@@ -929,13 +1031,59 @@ mod tests {
         .await;
         let events = drain(rx).await;
         assert_eq!(forwarded_names(&events), vec!["ask_user".to_string()]);
+        assert_eq!(
+            executed.lock().unwrap().as_slice(),
+            &["web_search".to_string()],
+            "the co-occurring server call runs this turn"
+        );
+        let held = held_history(&events).expect("server calls present => held history");
+        // [ assistant("hi"), assistant(tool_calls=[web_search, ask_user]),
+        //   tool(web_search result) ] — ready to append the app's answer.
         assert!(
-            executed.lock().unwrap().is_empty(),
-            "co-occurring server call is dropped this turn"
+            held.iter()
+                .any(|m| m.role == "assistant"
+                    && m.tool_calls.as_ref().is_some_and(|c| c.len() == 2)),
+            "held assistant message carries every call"
+        );
+        assert!(
+            held.iter()
+                .any(|m| m.role == "tool" && m.name.as_deref() == Some("web_search")),
+            "held history includes the server tool result"
         );
         assert!(
             matches!(events.last(), Some(TurnEvent::Done { reason }) if reason == "tool_calls")
         );
+    }
+
+    #[tokio::test]
+    async fn pure_app_call_holds_nothing() {
+        // No server call co-occurs => the app's own re-sent history is complete,
+        // so there is nothing to hold (the stateless fast path is preserved).
+        let backend =
+            ScriptedBackend::new(vec![assistant_calling("ask_user")], vec!["unused".into()]);
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![named_schema("web_search")]),
+            executed: Arc::new(Mutex::new(vec![])),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend,
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            None,
+            vec![app_schema("ask_user")],
+            None,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let events = drain(rx).await;
+        assert_eq!(forwarded_names(&events), vec!["ask_user".to_string()]);
+        assert!(held_history(&events).is_none(), "nothing to hold");
     }
 
     #[test]

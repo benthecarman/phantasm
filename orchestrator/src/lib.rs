@@ -234,5 +234,6 @@ pub fn build_state(
         http,
         upstream,
         capabilities,
+        continuations: state::ContinuationCache::new(),
     }
 }

@@ -17,10 +17,19 @@ pub enum TurnEvent {
     Reasoning(String),
     /// A token of the final assistant answer.
     Token(String),
-    /// App-hosted tool calls handed back to the app to execute. Emitted in place
+    /// App-hosted tool calls handed back to the app to execute, emitted in place
     /// of a final answer and immediately followed by `Done { reason:
-    /// "tool_calls" }`; the app fulfills them and resumes the turn next request.
-    ToolCalls(Vec<crate::openai::types::ToolCall>),
+    /// "tool_calls" }`. The app fulfills them and resumes the turn next request.
+    ///
+    /// `held` carries the full turn history *with* any co-occurring server calls
+    /// already executed and their results appended — stashed server-side so the
+    /// continuation request can resume from it (the server tools stay invisible
+    /// to the app). `None` when no server calls co-occurred: the app's own
+    /// re-sent history is already complete, so nothing needs holding.
+    ToolCalls {
+        app: Vec<crate::openai::types::ToolCall>,
+        held: Option<Vec<crate::openai::types::ChatMessage>>,
+    },
     /// The turn finished; carries the OpenAI `finish_reason`.
     Done { reason: String },
     /// A terminal error after streaming began (cannot change HTTP status now).

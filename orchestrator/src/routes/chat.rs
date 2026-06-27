@@ -20,9 +20,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 use crate::openai::sse::{done_event, ChunkFactory};
-use crate::openai::types::{ChatRequest, ToolCall};
+use crate::openai::types::{ChatMessage, ChatRequest, ToolCall};
 use crate::orchestrator::{run_turn, TurnEvent};
-use crate::state::AppState;
+use crate::state::{AppState, ContinuationCache};
 
 pub async fn chat_completions(
     State(state): State<AppState>,
@@ -44,10 +44,28 @@ pub async fn chat_completions(
     let ChatRequest {
         model,
         stream,
-        messages,
+        mut messages,
         extra: options,
         ..
     } = req;
+
+    // Intra-turn continuation (see `ContinuationCache`): if this request answers
+    // a batch we paused because server calls co-occurred with the app call,
+    // resume from the stashed history so that server work isn't lost. The app's
+    // answers are the trailing `tool`-role results; we splice them onto the held
+    // history (which already carries the assistant message + server results) in
+    // place of the app's own — shorter — re-sent tail.
+    let tail_start = trailing_tool_results_start(&messages);
+    let tail_ids: Vec<String> = messages[tail_start..]
+        .iter()
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    if !tail_ids.is_empty() {
+        if let Some(mut held) = state.continuations.take(&tail_ids).await {
+            held.extend(messages.split_off(tail_start));
+            messages = held;
+        }
+    }
     let requested_model = model.unwrap_or_else(|| state.cfg.default_model.clone());
     // Deep Research is selected by the model id, not a request flag: split the
     // requested model into its base model and an optional research preset.
@@ -111,16 +129,28 @@ pub async fn chat_completions(
     }
 
     if stream {
-        stream_response(model_name, rx, cancel)
+        stream_response(model_name, rx, cancel, state.continuations.clone())
     } else {
-        collect_response(model_name, rx).await
+        collect_response(model_name, rx, state.continuations.clone()).await
     }
+}
+
+/// Index of the trailing run of `tool`-role messages — the answers to the most
+/// recent forwarded tool-call batch. Everything from here to the end is the
+/// continuation tail; `messages.len()` when the last message isn't a tool result.
+fn trailing_tool_results_start(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(|m| m.role != "tool")
+        .map(|i| i + 1)
+        .unwrap_or(0)
 }
 
 fn stream_response(
     model: String,
     mut rx: mpsc::Receiver<TurnEvent>,
     cancel: CancellationToken,
+    continuations: ContinuationCache,
 ) -> Response {
     let factory = ChunkFactory::new(model);
     // When the client disconnects, axum drops this stream, dropping the guard,
@@ -135,7 +165,18 @@ fn stream_response(
                 TurnEvent::Status(s) => yield factory.status(&s),
                 TurnEvent::Reasoning(r) => yield factory.reasoning(&r),
                 TurnEvent::Token(t) => yield factory.token(&t),
-                TurnEvent::ToolCalls(calls) => yield factory.tool_calls(&calls),
+                TurnEvent::ToolCalls { app, held } => {
+                    // Stash the paused turn (server results + assistant message)
+                    // keyed by the forwarded app call the app echoes back next
+                    // request, then hand the app its calls. `held` is None when no
+                    // server calls co-occurred — nothing to resume.
+                    if let Some(held) = held {
+                        if let Some(key) = app.first().and_then(|c| c.id.clone()) {
+                            continuations.stash(key, held).await;
+                        }
+                    }
+                    yield factory.tool_calls(&app);
+                }
                 TurnEvent::Error(e) => {
                     yield factory.status(&format!("error: {e}"));
                     yield factory.token(&format!("\n\n⚠️ {e}"));
@@ -158,7 +199,11 @@ fn stream_response(
         .into_response()
 }
 
-async fn collect_response(model: String, mut rx: mpsc::Receiver<TurnEvent>) -> Response {
+async fn collect_response(
+    model: String,
+    mut rx: mpsc::Receiver<TurnEvent>,
+    continuations: ContinuationCache,
+) -> Response {
     let mut content = String::new();
     let mut reason = "stop".to_string();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -166,7 +211,14 @@ async fn collect_response(model: String, mut rx: mpsc::Receiver<TurnEvent>) -> R
     while let Some(ev) = rx.recv().await {
         match ev {
             TurnEvent::Token(t) => content.push_str(&t),
-            TurnEvent::ToolCalls(calls) => tool_calls = calls,
+            TurnEvent::ToolCalls { app, held } => {
+                if let Some(held) = held {
+                    if let Some(key) = app.first().and_then(|c| c.id.clone()) {
+                        continuations.stash(key, held).await;
+                    }
+                }
+                tool_calls = app;
+            }
             TurnEvent::Done { reason: r } => {
                 reason = r;
                 break;
