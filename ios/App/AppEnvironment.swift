@@ -76,6 +76,23 @@ final class AppEnvironment {
         activeProfile.flatMap { keychain.token(for: $0.id) }
     }
 
+    /// Delete the server-hosted image blobs a conversation referenced, so the
+    /// app owns their lifecycle (spec §2.2b). Best-effort and fire-before-delete:
+    /// must run while the messages still exist to read their `/v1/images/<id>`
+    /// references. A failure is harmless — the server's TTL pruner is the
+    /// backstop. Uses the conversation's own backend profile (falling back to the
+    /// active one) for the base URL + token.
+    func purgeServerImages(conversationID: UUID) async {
+        guard let detail = try? await store.conversationDetail(id: conversationID) else { return }
+        let ids = detail.messages.flatMap { ServerImageRef.ids(in: $0.message.content) }
+        guard !ids.isEmpty else { return }
+        let profile = profiles.first { $0.id == detail.conversation.profileID } ?? activeProfile
+        guard let profile, let base = profile.baseURL,
+              let token = keychain.token(for: profile.id)
+        else { return }
+        await ImageClient().delete(ids: ids, base: base, token: token)
+    }
+
     /// Models to offer in the picker for the active backend. Prefers the live
     /// probe result, falls back to the per-backend cache (so the full list shows
     /// instantly on launch, before the probe completes). The saved default is

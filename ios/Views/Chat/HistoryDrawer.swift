@@ -165,6 +165,9 @@ struct HistoryDrawer: View {
         let store = env.store
         Task {
             for id in ids {
+                // Clean up server-hosted images first — it reads the messages
+                // that deleteConversation then hard-deletes.
+                await env.purgeServerImages(conversationID: id)
                 try? await store.deleteConversation(id: id)
             }
         }
