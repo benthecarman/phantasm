@@ -30,8 +30,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
-      - name: Build (gzip feature)
-        run: cargo build --features gzip
+      - name: Build (no default features)
+        # gzip is a default feature, so clippy/test above already cover it;
+        # this guards the off path (deployments that never fetch pages).
+        run: cargo build --no-default-features
 
   ios:
     name: iOS (PhantasmKit + app build)
