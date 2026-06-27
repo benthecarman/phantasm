@@ -365,6 +365,16 @@ public struct Capabilities: Decodable, Sendable, Equatable {
             self.label = label
             self.requiredTools = requiredTools
         }
+
+        /// Modes the app recognizes for presentation (e.g. distinct icons).
+        /// This is *not* the available-modes table — that stays server-driven;
+        /// unknown ids simply have no `known` value and fall back to defaults.
+        public enum Known: String, Sendable {
+            case deepResearch = "deep-research"
+            case quickResearch = "quick-research"
+        }
+
+        public var known: Known? { Known(rawValue: id) }
     }
 
     public let version: String

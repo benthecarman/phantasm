@@ -240,7 +240,7 @@ struct ComposerOptionsSheet: View {
             set: { modeID.wrappedValue = $0 ? mode.id : nil }
         )
         return HStack(spacing: 12) {
-            icon("text.magnifyingglass", tint: available ? .accentColor : .secondary)
+            icon(Self.researchIcon(for: mode.id), tint: available ? .accentColor : .secondary)
             Toggle(isOn: available ? feedbackBinding(binding) : .constant(false)) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(mode.label)
@@ -265,7 +265,7 @@ struct ComposerOptionsSheet: View {
         } label: {
             HStack(spacing: 12) {
                 icon(
-                    id == nil ? "slash.circle" : "text.magnifyingglass",
+                    id == nil ? "slash.circle" : Self.researchIcon(for: id),
                     tint: available ? .accentColor : .secondary
                 )
                 Text(label)
@@ -304,6 +304,16 @@ struct ComposerOptionsSheet: View {
                 }
             }
             .disabled(!available)
+        }
+    }
+
+    /// Distinct SF Symbol per research mode so Deep and Quick read differently
+    /// at a glance. Unknown/other modes fall back to a generic search glyph.
+    static func researchIcon(for id: String?) -> String {
+        switch id.flatMap(Capabilities.Mode.Known.init(rawValue:)) {
+        case .deepResearch: return "sparkle.magnifyingglass"
+        case .quickResearch: return "magnifyingglass"
+        case nil: return "text.magnifyingglass"
         }
     }
 
