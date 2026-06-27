@@ -135,6 +135,41 @@ pub struct Config {
     pub ocr_context_chars: usize,
     pub tesseract_bin: String,
 
+    // Code execution tool. Runs untrusted, model-authored code in a per-execution
+    // hardened container (default rootless podman). A long-lived warm pool of
+    // pre-started containers lives in `AppState`; each container serves exactly
+    // one execution and is then recycled, so no state or artifacts leak between
+    // runs. Disabled unless `TOOL_CODE_EXEC` is set. Network egress is filtered
+    // by a deployment-configured firewall on `code_exec_network` (internet yes,
+    // internal/metadata no) — the orchestrator only attaches `--network`.
+    pub code_exec_enabled: bool,
+    /// Container CLI to shell out to (`podman` rootless by default, or `docker`).
+    /// The flags used are identical across both runtimes.
+    pub code_exec_runtime: String,
+    /// Universal sandbox image bundling the supported interpreters + dispatcher.
+    pub code_exec_image: String,
+    /// Preconfigured, egress-firewalled network name passed as `--network`.
+    /// `None` => the runtime default (no internal-egress filtering; dev/test only).
+    pub code_exec_network: Option<String>,
+    /// Languages the deployed image can run. Feeds the tool schema `language`
+    /// enum and gates the tool. Empty => tool unusable.
+    pub code_exec_languages: Vec<String>,
+    /// Number of warm containers kept ready (and the max concurrent executions).
+    pub code_exec_pool_size: usize,
+    pub code_exec_timeout_s: u64,
+    /// `--memory` value (e.g. "256m").
+    pub code_exec_memory: String,
+    /// `--cpus` value (a CFS ceiling, not a reservation; e.g. "2.0").
+    pub code_exec_cpus: String,
+    /// `--pids-limit` value (caps fork bombs).
+    pub code_exec_pids_limit: u32,
+    /// `--user` value the code runs as (e.g. "65534:65534", nobody).
+    pub code_exec_run_user: String,
+    /// Cap on captured stdout+stderr chars folded into the tool message.
+    pub code_exec_output_chars: usize,
+    /// Cap on accepted source size before a container is even touched.
+    pub code_exec_max_code_bytes: usize,
+
     // Image tools (ComfyUI). Generation and editing are independent tools, each
     // backed by its own API-format workflow and gated by its own toggle.
     pub image_gen_enabled: bool,
@@ -284,6 +319,31 @@ impl Config {
             ocr_timeout_s: env_parse("OCR_TIMEOUT_S", 20u64),
             ocr_context_chars: env_parse("OCR_CONTEXT_CHARS", 8000usize).max(500),
             tesseract_bin: env_or("TESSERACT_BIN", "tesseract"),
+            code_exec_enabled: env_bool("TOOL_CODE_EXEC", false),
+            code_exec_runtime: env_or("CODE_EXEC_RUNTIME", "podman"),
+            code_exec_image: env_or("CODE_EXEC_IMAGE", "phantasm/code-exec:latest"),
+            code_exec_network: std::env::var("CODE_EXEC_NETWORK")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            code_exec_languages: {
+                let langs = csv("CODE_EXEC_LANGUAGES");
+                if langs.is_empty() {
+                    ["python", "node", "bash", "ruby"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                } else {
+                    langs
+                }
+            },
+            code_exec_pool_size: env_parse("CODE_EXEC_POOL_SIZE", 2usize).max(1),
+            code_exec_timeout_s: env_parse("CODE_EXEC_TIMEOUT_S", 30u64),
+            code_exec_memory: env_or("CODE_EXEC_MEMORY", "256m"),
+            code_exec_cpus: env_or("CODE_EXEC_CPUS", "2.0"),
+            code_exec_pids_limit: env_parse("CODE_EXEC_PIDS_LIMIT", 128u32),
+            code_exec_run_user: env_or("CODE_EXEC_USER", "65534:65534"),
+            code_exec_output_chars: env_parse("CODE_EXEC_OUTPUT_CHARS", 16_000usize).max(500),
+            code_exec_max_code_bytes: env_parse("CODE_EXEC_MAX_CODE_BYTES", 256 * 1024),
             image_gen_enabled,
             image_edit_enabled,
             comfy_base,
@@ -366,6 +426,14 @@ impl Config {
 
     pub fn ocr_usable(&self) -> bool {
         self.ocr_enabled
+    }
+
+    /// Whether the code-execution tool can run: toggle on + at least one language
+    /// configured. The warm pool's actual availability (runtime binary + image)
+    /// is checked separately at startup; an unavailable pool degrades the tool to
+    /// `None` so its schema is never offered.
+    pub fn code_exec_usable(&self) -> bool {
+        self.code_exec_enabled && !self.code_exec_languages.is_empty()
     }
 
     /// Whether the image-generation tool can run: toggle on + a workflow and a
@@ -506,6 +574,19 @@ pub mod tests_support {
             ocr_timeout_s: 20,
             ocr_context_chars: 8000,
             tesseract_bin: "tesseract".into(),
+            code_exec_enabled: false,
+            code_exec_runtime: "podman".into(),
+            code_exec_image: "phantasm/code-exec:latest".into(),
+            code_exec_network: None,
+            code_exec_languages: vec!["python".into(), "bash".into()],
+            code_exec_pool_size: 2,
+            code_exec_timeout_s: 30,
+            code_exec_memory: "256m".into(),
+            code_exec_cpus: "2.0".into(),
+            code_exec_pids_limit: 128,
+            code_exec_run_user: "65534:65534".into(),
+            code_exec_output_chars: 16_000,
+            code_exec_max_code_bytes: 256 * 1024,
             image_gen_enabled: false,
             image_edit_enabled: false,
             comfy_base: "http://localhost:8188".parse().unwrap(),

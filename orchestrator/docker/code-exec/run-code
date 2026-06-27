@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Dispatcher for the code_exec sandbox image. The orchestrator invokes:
+#   <runtime> exec -i <container> /usr/local/bin/run-code <language>
+# with the program source piped on stdin. We run it and let stdout/stderr/exit
+# code flow back. Each container is single-use, so no cleanup is needed here.
+#
+# Adding a language: add a case below, install its runtime in the Dockerfile, and
+# add it to CODE_EXEC_LANGUAGES. Keep names in sync with the orchestrator's enum.
+set -euo pipefail
+
+lang="${1:?language required}"
+
+# A writable working dir on the tmpfs (/tmp), since the rootfs is mounted
+# read-only. HOME points here too so interpreters that touch $HOME don't fail.
+work="$(mktemp -d /tmp/run.XXXXXX)"
+cd "$work"
+export HOME="$work"
+
+case "$lang" in
+    python|python3)
+        exec python3 -
+        ;;
+    node|javascript)
+        # node executes a program piped on stdin when given no script file.
+        exec node
+        ;;
+    bash|sh)
+        exec bash -s
+        ;;
+    ruby)
+        # ruby reads its program from stdin when given no script file.
+        exec ruby
+        ;;
+    *)
+        echo "unsupported language: $lang" >&2
+        exit 64
+        ;;
+esac

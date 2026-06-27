@@ -53,6 +53,29 @@ pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec
         .collect()
 }
 
+/// Server tools that reach the internet and are gated by the app's "Web access"
+/// toggle. Their presence in a turn's selection is the signal that web access is
+/// on — which is what upgrades the single `code_exec` tool to its internet-capable
+/// lane (the same-named tool lives in both the utilities and web-access buckets, so
+/// its name alone can't carry that signal).
+const WEB_ACCESS_TOOLS: &[&str] = &[
+    "web_search",
+    "web_fetch",
+    "weather",
+    "maps_places",
+    "market_data",
+    "github",
+];
+
+/// Whether web access is enabled for this turn. `None` (older clients that select
+/// no tools) means "offer everything", so treat it as on.
+pub fn web_access_enabled(enabled: &Option<Vec<String>>) -> bool {
+    match enabled {
+        None => true,
+        Some(list) => list.iter().any(|t| WEB_ACCESS_TOOLS.contains(&t.as_str())),
+    }
+}
+
 /// Read `function.name` out of an OpenAI tool-schema `Value`.
 fn schema_name(schema: &Value) -> Option<String> {
     schema
@@ -170,6 +193,7 @@ pub async fn run_turn<B, T>(
     let mut ctx = TurnContext {
         input_images: latest_input_images(&messages, images.as_ref()).await,
         research: false,
+        web_access: web_access_enabled(&enabled_tools),
         images,
         deliver_image_refs,
         ..Default::default()
@@ -1297,6 +1321,24 @@ mod tests {
     fn select_schemas_empty_list_keeps_none() {
         let schemas = vec![named_schema("web_search")];
         assert!(select_schemas(schemas, &Some(vec![])).is_empty());
+    }
+
+    #[test]
+    fn web_access_detected_from_web_bucket_tools() {
+        // None (older clients) => offer-all => treat web access as on.
+        assert!(web_access_enabled(&None));
+        // A web-bucket tool present => web access on (code_exec runs online).
+        assert!(web_access_enabled(&Some(vec![
+            "calculator".into(),
+            "code_exec".into(),
+            "web_search".into(),
+        ])));
+        // Only utilities + code_exec (web off) => offline lane.
+        assert!(!web_access_enabled(&Some(vec![
+            "calculator".into(),
+            "code_exec".into(),
+        ])));
+        assert!(!web_access_enabled(&Some(vec![])));
     }
 
     #[tokio::test]

@@ -16,8 +16,8 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::TurnEvent;
 use crate::tools::{
-    calculator, github, image_edit, image_gen, maps_places, market_data, ocr, unit_convert,
-    weather, web_fetch, web_search,
+    calculator, code_exec, code_exec_pool::CodeExecPools, github, image_edit, image_gen,
+    maps_places, market_data, ocr, unit_convert, weather, web_fetch, web_search,
 };
 
 /// Result of executing one tool call: the `tool`-role message to feed back to
@@ -60,6 +60,10 @@ pub struct TurnContext {
     /// plain base64 regardless of how the image was delivered.
     pub input_images: Vec<String>,
     pub research: bool,
+    /// Whether web access is enabled for this turn. Selects the code-exec lane: the
+    /// internet-capable container when on, the no-network one when off. Defaults to
+    /// off so a context built without it stays safe.
+    pub web_access: bool,
     /// The server-hosted image store, when configured. Image tools persist to it
     /// and the turn loop resolves references against it. `None` => inline-only.
     pub images: Option<crate::images::BlobStore>,
@@ -91,11 +95,18 @@ pub trait ToolExecutor: Send + Sync + Clone + 'static {
 pub struct ToolRegistry {
     cfg: Arc<Config>,
     http: reqwest::Client,
+    /// Shared warm pools (offline + online lanes) for the code-exec tools (cloned
+    /// in from `AppState`, never built here). `None` when disabled/unavailable.
+    code_exec: Option<CodeExecPools>,
 }
 
 impl ToolRegistry {
-    pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> Self {
-        ToolRegistry { cfg, http }
+    pub fn new(cfg: Arc<Config>, http: reqwest::Client, code_exec: Option<CodeExecPools>) -> Self {
+        ToolRegistry {
+            cfg,
+            http,
+            code_exec,
+        }
     }
 }
 
@@ -128,6 +139,13 @@ impl ToolExecutor for ToolRegistry {
         }
         if self.cfg.ocr_usable() {
             out.push(ocr::schema());
+        }
+        if self.cfg.code_exec_usable() && self.code_exec.is_some() {
+            // A single `code_exec` tool, advertised in both the utilities and
+            // web-access buckets. Whether the run gets internet is decided per turn
+            // from whether web access is on (see `TurnContext::web_access`), not
+            // from the tool name.
+            out.push(code_exec::schema(&self.cfg.code_exec_languages));
         }
         if self.cfg.image_gen_usable() {
             out.push(image_gen::schema());
@@ -193,6 +211,26 @@ impl ToolExecutor for ToolRegistry {
             "ocr" if self.cfg.ocr_usable() => {
                 ocr::run(&self.cfg, call, &call_id, ctx, &tx, &cancel).await
             }
+            "code_exec" if self.cfg.code_exec_usable() => match &self.code_exec {
+                Some(pools) => {
+                    // Internet only when web access is on this turn; otherwise the
+                    // no-network lane.
+                    let pool = if ctx.web_access {
+                        &pools.online
+                    } else {
+                        &pools.offline
+                    };
+                    code_exec::run(&self.cfg, pool, call, &call_id, &tx, &cancel).await
+                }
+                None => ToolOutcome {
+                    message: ChatMessage::tool_result(
+                        &call_id,
+                        "code_exec",
+                        "code execution is not available",
+                    ),
+                    append_to_answer: None,
+                },
+            },
             "image_generation" if self.cfg.image_gen_usable() => {
                 image_gen::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
             }

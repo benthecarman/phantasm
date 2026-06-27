@@ -101,6 +101,42 @@ fn mock_ollama_mixed_tools(requests: RecordedRequests) -> Router {
         )
 }
 
+/// A mock Ollama for the code-execution flow. The first turn (no `tool`-role
+/// message) returns an assistant calling the server-side `code_exec` tool; once a
+/// `tool` result is present it stops calling tools, and streaming requests stream
+/// "Hello world" as the final answer.
+fn mock_ollama_code_exec(requests: RecordedRequests) -> Router {
+    Router::new()
+        .route(
+            "/api/chat",
+            post(move |body: axum::extract::Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    let streaming =
+                        body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let resumed = body.0["messages"]
+                        .as_array()
+                        .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
+                    requests.lock().await.push(body.0.clone());
+                    if streaming {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n\
+                         {\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+                    } else if resumed {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+                    } else {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
+                           {\"function\":{\"name\":\"code_exec\",\"arguments\":{\"language\":\"python\",\"code\":\"print(1)\"}}}\
+                         ]},\"done\":true,\"done_reason\":\"stop\"}\n"
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/tags",
+            get(|| async { axum::Json(serde_json::json!({"models":[{"name":"m"}]})) }),
+        )
+}
+
 /// A mock OpenAI-compatible backend: no `/api/tags`, yes `/v1/models` and
 /// `/v1/chat/completions`.
 fn mock_openai_compatible() -> Router {
@@ -193,6 +229,19 @@ fn test_config(ollama_base: &str) -> Config {
         ocr_timeout_s: 20,
         ocr_context_chars: 8000,
         tesseract_bin: "tesseract".into(),
+        code_exec_enabled: false,
+        code_exec_runtime: "podman".into(),
+        code_exec_image: "phantasm/code-exec:latest".into(),
+        code_exec_network: None,
+        code_exec_languages: vec!["python".into(), "bash".into()],
+        code_exec_pool_size: 2,
+        code_exec_timeout_s: 30,
+        code_exec_memory: "256m".into(),
+        code_exec_cpus: "2.0".into(),
+        code_exec_pids_limit: 128,
+        code_exec_run_user: "65534:65534".into(),
+        code_exec_output_chars: 16_000,
+        code_exec_max_code_bytes: 256 * 1024,
         image_gen_enabled: false,
         image_edit_enabled: false,
         comfy_base: "http://localhost:8188".parse().unwrap(),
@@ -265,6 +314,87 @@ async fn spawn_orchestrator_with_calculator(ollama_base: &str) -> String {
     let capabilities = Arc::new(test_capabilities());
     let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
     spawn(routes::router(state)).await
+}
+
+/// Like `spawn_orchestrator`, but with the `code_exec` server tool enabled. The
+/// runtime binary is intentionally bogus so the warm pool's container launches
+/// fail fast — no real Docker/Podman is needed in CI. This exercises the wiring
+/// and the non-fatal failure path (NFR-O6): the tool folds its error into the
+/// `tool` message and the turn still completes.
+async fn spawn_orchestrator_with_code_exec(ollama_base: &str) -> String {
+    let mut cfg = test_config(ollama_base);
+    cfg.code_exec_enabled = true;
+    cfg.code_exec_runtime = "/nonexistent/phantasm-codeexec-runtime".into();
+    cfg.code_exec_languages = vec!["python".into()];
+    cfg.code_exec_pool_size = 1;
+    let cfg = Arc::new(cfg);
+    let capabilities = Arc::new(test_capabilities());
+    let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
+    spawn(routes::router(state)).await
+}
+
+/// A model `code_exec` call is executed server-side and never forwarded to the
+/// app; when the sandbox backend is unavailable the tool failure is folded into
+/// the `tool` message (non-fatal) and the turn still streams a final answer.
+#[tokio::test]
+async fn code_exec_runs_server_side_and_failure_is_non_fatal() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ollama = spawn(mock_ollama_code_exec(requests.clone())).await;
+    let base = spawn_orchestrator_with_code_exec(&ollama).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m", "stream": true,
+            "messages": [{"role": "user", "content": "run some code"}],
+            "tools": [{ "type": "function", "function": { "name": "code_exec" } }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+
+    // The turn completes with a streamed answer; the code_exec call is resolved
+    // server-side, so nothing is forwarded to the app as a tool call.
+    let mut content = String::new();
+    let mut forwarded_tool_calls = 0;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+        if v["choices"][0]["delta"]["tool_calls"].is_array() {
+            forwarded_tool_calls += 1;
+        }
+    }
+    assert_eq!(content, "Hello world", "the turn streams a final answer");
+    assert_eq!(
+        forwarded_tool_calls, 0,
+        "code_exec is a server tool and is never forwarded to the app"
+    );
+
+    // A resolution request carried the folded code_exec tool result (native Ollama
+    // puts the tool's function name in `tool_name`), proving it was dispatched and
+    // its failure was handled non-fatally rather than aborting the turn.
+    let requests = requests.lock().await;
+    let resolved = requests.iter().any(|r| {
+        r["messages"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().any(|m| m["tool_name"] == "code_exec"))
+    });
+    assert!(
+        resolved,
+        "a resolution request includes the folded code_exec tool result"
+    );
 }
 
 /// When a turn mixes a server tool call (`calculator`) and an app tool call

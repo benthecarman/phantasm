@@ -91,7 +91,11 @@ pub async fn chat_completions(
         use crate::orchestrator::tools::{ToolExecutor, ToolRegistry};
         let cfg = state.cfg.clone();
         let backend = state.upstream.clone();
-        let tools = ToolRegistry::new(state.cfg.clone(), state.http.clone());
+        let tools = ToolRegistry::new(
+            state.cfg.clone(),
+            state.http.clone(),
+            state.code_exec.clone(),
+        );
         let sem = state.upstream_sem.clone();
         let images = state.images.clone();
         let cancel = cancel.clone();

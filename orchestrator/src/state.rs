@@ -43,6 +43,11 @@ pub struct AppState {
     /// Server-hosted image blobs, present only when `IMAGE_STORE_DIR` is set.
     /// When absent, image tools fall back to inline base64 delivery.
     pub images: Option<crate::images::BlobStore>,
+    /// Warm container pools backing the code-execution tools (offline + online
+    /// lanes). Built once at startup when the tool is enabled and the runtime is
+    /// available; `None` otherwise (the tools are then not offered). Long-lived —
+    /// must not be rebuilt per request.
+    pub code_exec: Option<crate::tools::code_exec_pool::CodeExecPools>,
 }
 
 /// Server-side store for turns paused mid-flight on an app-hosted tool call.

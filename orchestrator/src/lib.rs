@@ -181,6 +181,11 @@ fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
             (cfg.maps_places_usable(), "maps_places"),
             (cfg.market_data_usable(), "market_data"),
             (cfg.github_usable(), "github"),
+            // `code_exec` appears in BOTH this bucket and utilities (same name). It
+            // is always available (via utilities); listing it here too means that
+            // when web access is on, its run gets internet — the server reads the
+            // web-access signal from the other tools in this bucket, not the name.
+            (cfg.code_exec_usable(), "code_exec"),
         ],
     ) {
         selectors.push(web);
@@ -192,6 +197,9 @@ fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
             (cfg.calculator_usable(), "calculator"),
             (cfg.unit_convert_usable(), "unit_convert"),
             (cfg.ocr_usable(), "ocr"),
+            // Always-on like the other utilities; with web access off it runs with
+            // no network at all (so it carries no web risk).
+            (cfg.code_exec_usable(), "code_exec"),
         ],
     ) {
         selectors.push(utilities);
@@ -231,7 +239,9 @@ fn tool_selector_id(tool: &str) -> Option<&'static str> {
         "web_search" | "web_fetch" | "weather" | "maps_places" | "market_data" | "github" => {
             Some("web_search")
         }
-        "calculator" | "unit_convert" | "ocr" => Some("utilities"),
+        // `code_exec` lives in both utilities and web_search; report its always-on
+        // home (utilities) for mode-requirement resolution.
+        "calculator" | "unit_convert" | "ocr" | "code_exec" => Some("utilities"),
         "image_generation" | "image_edit" => Some("image_generation"),
         _ => None,
     }
@@ -321,6 +331,28 @@ pub fn build_state(
             }
         }
     });
+    // Stand up the code-exec warm pool when the tool is enabled. A failure to
+    // construct it (e.g. an empty runtime) disables the tool rather than taking
+    // down startup; warm-up itself runs in the background and degrades to cold
+    // fallback, so this never blocks boot on container launches.
+    let code_exec = if cfg.code_exec_usable() {
+        match crate::tools::code_exec_pool::CodeExecPools::new(cfg.clone()) {
+            Ok(pools) => {
+                tracing::info!(
+                    runtime = %cfg.code_exec_runtime,
+                    pool_size = cfg.code_exec_pool_size,
+                    "code execution tools enabled (offline + online lanes)"
+                );
+                Some(pools)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "code-exec pools unavailable; tool disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
     state::AppState {
         upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.ollama_concurrency)),
         cfg,
@@ -329,6 +361,7 @@ pub fn build_state(
         capabilities,
         continuations: state::ContinuationCache::new(),
         images,
+        code_exec,
     }
 }
 
@@ -353,8 +386,9 @@ mod tests {
                 "{tool} should gate under web_search"
             );
         }
-        // Offline tools live in their own always-on bucket, never gated by web access.
-        for tool in ["calculator", "unit_convert", "ocr"] {
+        // Offline tools live in their own always-on bucket. `code_exec` reports
+        // utilities (its always-on home) even though it also appears in web_search.
+        for tool in ["calculator", "unit_convert", "ocr", "code_exec"] {
             assert_eq!(
                 tool_selector_id(tool),
                 Some("utilities"),

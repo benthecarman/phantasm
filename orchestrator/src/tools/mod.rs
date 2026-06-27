@@ -1,4 +1,6 @@
 pub mod calculator;
+pub mod code_exec;
+pub mod code_exec_pool;
 pub mod comfy;
 pub mod github;
 pub mod image_delivery;
