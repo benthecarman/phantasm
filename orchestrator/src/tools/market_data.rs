@@ -70,7 +70,10 @@ pub async fn run(
             message: ChatMessage::tool_result(call_id, "market_data", text),
             append_to_answer: None,
         },
-        Err(e) => error_outcome(call_id, e),
+        Err(e) => {
+            tracing::warn!(error = %e, "market_data failed");
+            error_outcome(call_id, e)
+        }
     }
 }
 

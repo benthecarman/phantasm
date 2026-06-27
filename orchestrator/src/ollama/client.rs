@@ -128,17 +128,21 @@ impl ChatBackend for OllamaClient {
     ) -> Result<ChatMessage, AppError> {
         let url = self.endpoint("/api/chat")?;
         let body = self.build_request(model, messages, tools, options, false, None);
-        let resp = self
-            .http
-            .post(url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+        tracing::debug!(
+            model = %model,
+            messages = messages.len(),
+            tools = tools.len(),
+            "upstream chat_once (/api/chat, non-streaming)"
+        );
+        let resp = self.http.post(url).json(&body).send().await.map_err(|e| {
+            tracing::warn!(model = %model, error = %e, "Ollama unreachable (chat_once)");
+            AppError::OllamaUnreachable(e.to_string())
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(model = %model, %status, "Ollama returned error status (chat_once)");
             return Err(AppError::OllamaError(format!("{status}: {detail}")));
         }
 
@@ -157,17 +161,20 @@ impl ChatBackend for OllamaClient {
     ) -> Result<DeltaStream, AppError> {
         let url = self.endpoint("/api/chat")?;
         let body = self.build_request(model, messages, &[], options, true, None);
-        let resp = self
-            .http
-            .post(url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+        tracing::debug!(
+            model = %model,
+            messages = messages.len(),
+            "upstream chat_stream (/api/chat, streaming)"
+        );
+        let resp = self.http.post(url).json(&body).send().await.map_err(|e| {
+            tracing::warn!(model = %model, error = %e, "Ollama unreachable (chat_stream)");
+            AppError::OllamaUnreachable(e.to_string())
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(model = %model, %status, "Ollama returned error status (chat_stream)");
             return Err(AppError::OllamaError(format!("{status}: {detail}")));
         }
 

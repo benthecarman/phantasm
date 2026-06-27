@@ -75,7 +75,10 @@ pub async fn run(
             message: ChatMessage::tool_result(call_id, "github", text),
             append_to_answer: None,
         },
-        Err(e) => error_outcome(call_id, e),
+        Err(e) => {
+            tracing::warn!(error = %e, "github failed");
+            error_outcome(call_id, e)
+        }
     }
 }
 

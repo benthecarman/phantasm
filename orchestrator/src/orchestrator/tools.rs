@@ -138,7 +138,24 @@ impl ToolExecutor for ToolRegistry {
         let call_id = call.id.clone().unwrap_or_default();
         let name = call.function.name.as_str();
 
-        match name {
+        // Per-tool-call observability (NFR-O7 safe): log the call, its argument
+        // size, and the wall-clock it took. The argument *values* are only logged
+        // when content logging is explicitly enabled, since they can echo user
+        // input. Individual tools add their own `warn!` for the failure *cause*;
+        // this records that the call happened and how long it took, uniformly.
+        let started = std::time::Instant::now();
+        let arg_bytes = call.function.arguments.to_json_string().len();
+        tracing::info!(tool = %name, call_id = %call_id, arg_bytes, "tool call started");
+        if self.cfg.log_content {
+            tracing::debug!(
+                tool = %name,
+                call_id = %call_id,
+                args = %call.function.arguments.to_json_string(),
+                "tool call arguments"
+            );
+        }
+
+        let outcome = match name {
             "web_search" if self.cfg.web_search_usable() => {
                 web_search::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
             }
@@ -174,13 +191,25 @@ impl ToolExecutor for ToolRegistry {
             }
             other => {
                 // Unknown / disabled tool: tell the model so it can recover.
+                tracing::warn!(
+                    tool = %other,
+                    "model called an unknown or disabled tool"
+                );
                 let msg = format!("tool `{other}` is not available");
                 ToolOutcome {
-                    message: ChatMessage::tool_result(call_id, other, msg),
+                    message: ChatMessage::tool_result(&call_id, other, msg),
                     append_to_answer: None,
                 }
             }
-        }
+        };
+
+        tracing::info!(
+            tool = %name,
+            call_id = %call_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "tool call finished"
+        );
+        outcome
     }
 }
 

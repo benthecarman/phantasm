@@ -125,6 +125,12 @@ pub async fn run_research<B, T>(
     // ---- Stage 2: RESEARCH (isolated sub-agents) -----------------------------
     let n = plan.sub_questions.len();
     let concurrency = preset.fanout.min(cfg.research_fanout_concurrency).max(1);
+    tracing::info!(
+        mode = preset.id,
+        sub_questions = n,
+        concurrency,
+        "research plan ready; fanning out sub-agents"
+    );
     let shared_ctx = TurnContext {
         research: true,
         ..Default::default()
@@ -184,11 +190,20 @@ pub async fn run_research<B, T>(
     if findings.is_empty() {
         // No sub-questions yielded a finding (should not happen — every
         // sub-agent returns one — but stay defensive).
+        tracing::warn!("research produced no findings");
         let _ = tx
             .send(TurnEvent::Error("research produced no findings".into()))
             .await;
         return;
     }
+
+    let total_sources: usize = findings.iter().map(|f| f.sources.len()).sum();
+    tracing::info!(
+        findings = findings.len(),
+        total_sources,
+        partial = cancel.is_cancelled(),
+        "research gathered; synthesizing"
+    );
 
     // ---- Stages 3 & 4: SYNTHESIZE (+ optional VERIFY) ------------------------
     // On a cancel observed after research, do a best-effort PARTIAL synthesis
@@ -273,8 +288,13 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
         let resp =
             match chat_once_permit(backend, sem, model, &msgs, schemas, options, cancel).await {
                 Some(Ok(m)) => m,
-                Some(Err(_)) => break, // backend error: distill whatever we have
-                None => break,         // cancelled
+                Some(Err(e)) => {
+                    // Backend error: distill whatever we have. Log it — otherwise
+                    // a sub-agent failure is invisible (its finding just shrinks).
+                    tracing::warn!(error = %e, "research sub-agent chat_once failed");
+                    break;
+                }
+                None => break, // cancelled
             };
         match resp.tool_calls.clone().filter(|c| !c.is_empty()) {
             None => {

@@ -176,7 +176,7 @@ pub async fn run_turn<B, T>(
         ..Default::default()
     };
 
-    for _ in 0..cfg.max_tool_iters {
+    for iter in 0..cfg.max_tool_iters {
         if cancel.is_cancelled() {
             return;
         }
@@ -189,6 +189,9 @@ pub async fn run_turn<B, T>(
         let resp = match resp {
             Ok(m) => m,
             Err(e) => {
+                // Surface upstream failures server-side too — otherwise they only
+                // ride to the client as a TurnEvent::Error and vanish from logs.
+                tracing::error!(iter, model = %model, error = %e, "tool-resolution chat_once failed");
                 let _ = tx.send(TurnEvent::Error(e.to_string())).await;
                 return;
             }
@@ -197,10 +200,19 @@ pub async fn run_turn<B, T>(
         match resp.tool_calls.clone().filter(|c| !c.is_empty()) {
             None => {
                 // Model produced a final answer — re-issue as a stream for live tokens.
+                tracing::debug!(iter, "model produced final answer; streaming");
                 stream_final(&backend, &model, &messages, &options, appends, &tx, &cancel).await;
                 return;
             }
             Some(calls) => {
+                // Tool names are identifiers, not message content — safe to log.
+                let requested: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+                tracing::info!(
+                    iter,
+                    count = calls.len(),
+                    tools = ?requested,
+                    "model requested tool calls"
+                );
                 // App-hosted tool calls are handed back to the app to execute;
                 // the turn ends here. The app owns persistence of the assistant
                 // tool_call message and the tool result, re-sending them next
@@ -213,6 +225,9 @@ pub async fn run_turn<B, T>(
                     .cloned()
                     .collect();
                 if !app_calls.is_empty() {
+                    let forwarded: Vec<&str> =
+                        app_calls.iter().map(|c| c.function.name.as_str()).collect();
+                    tracing::info!(tools = ?forwarded, "forwarding app-hosted tool calls to client");
                     let _ = tx.send(TurnEvent::ToolCalls(app_calls)).await;
                     let _ = tx
                         .send(TurnEvent::Done {
@@ -238,6 +253,10 @@ pub async fn run_turn<B, T>(
     }
 
     // Iteration cap reached — stream whatever the model gives now (no tools).
+    tracing::warn!(
+        max_tool_iters = cfg.max_tool_iters,
+        "tool-resolution hit the iteration cap; forcing final answer"
+    );
     let _ = tx.send(TurnEvent::Status("finishing up…".into())).await;
     stream_final(&backend, &model, &messages, &options, appends, &tx, &cancel).await;
 }
@@ -311,6 +330,7 @@ async fn stream_relay_inner<B: ChatBackend>(
     let mut stream = match stream {
         Ok(s) => s,
         Err(e) => {
+            tracing::error!(model = %model, error = %e, "opening final-answer stream failed");
             let _ = tx.send(TurnEvent::Error(e.to_string())).await;
             return;
         }
@@ -345,6 +365,7 @@ async fn stream_relay_inner<B: ChatBackend>(
                 }
             }
             Some(Err(e)) => {
+                tracing::error!(model = %model, error = %e, "final-answer stream errored mid-flight");
                 let _ = tx.send(TurnEvent::Error(e.to_string())).await;
                 return;
             }

@@ -57,7 +57,10 @@ pub async fn run(
             message: ChatMessage::tool_result(call_id, "maps_places", text),
             append_to_answer: None,
         },
-        Err(e) => error_outcome(call_id, e),
+        Err(e) => {
+            tracing::warn!(error = %e, "maps_places failed");
+            error_outcome(call_id, e)
+        }
     }
 }
 
