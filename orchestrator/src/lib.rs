@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod images;
 pub mod ollama;
 pub mod openai;
 pub mod orchestrator;
@@ -228,6 +229,29 @@ pub fn build_state(
             OpenAICompatibleClient::new(&cfg.ollama_base, cfg.upstream_api_key.as_deref()),
         ),
     };
+    // Stand up the server-hosted image store when configured. A configured-but-
+    // unwritable directory degrades to inline delivery (logged) rather than
+    // taking down startup.
+    let images = cfg.image_store_dir.as_ref().and_then(|dir| {
+        match images::BlobStore::new(
+            dir.clone(),
+            &cfg.auth_token,
+            cfg.image_store_ttl_s,
+            cfg.image_url_ttl_s,
+            cfg.comfy_max_image_bytes,
+            cfg.public_base_url.as_ref(),
+        ) {
+            Ok(store) => {
+                tracing::info!(dir = %dir.display(), "server-hosted image store enabled");
+                Some(store)
+            }
+            Err(e) => {
+                tracing::error!(dir = %dir.display(), error = %e,
+                    "image store unavailable; falling back to inline image delivery");
+                None
+            }
+        }
+    });
     state::AppState {
         upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.ollama_concurrency)),
         cfg,
@@ -235,5 +259,6 @@ pub fn build_state(
         upstream,
         capabilities,
         continuations: state::ContinuationCache::new(),
+        images,
     }
 }

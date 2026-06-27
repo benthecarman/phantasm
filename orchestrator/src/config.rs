@@ -137,6 +137,23 @@ pub struct Config {
     /// against a misconfigured/4K output stalling or bloating the turn.
     pub comfy_max_image_bytes: usize,
 
+    // Server-hosted image blobs. When `image_store_dir` is set, generated/edited
+    // images are persisted there and delivered to the app as signed URL
+    // references (`/v1/images/<id>`) instead of inline base64 — keeping re-sent
+    // history small. Unset => disabled, and images stay inline (back-compat).
+    pub image_store_dir: Option<PathBuf>,
+    /// Lifespan of a stored blob before the lazy pruner evicts it. A backstop:
+    /// the app deletes blobs explicitly when its conversation is deleted, but a
+    /// missed delete (uninstall, lost request) must not leak disk forever.
+    pub image_store_ttl_s: u64,
+    /// Validity window of a signed image URL. Short — the app fetches right after
+    /// receiving the turn — so a leaked link stops resolving quickly.
+    pub image_url_ttl_s: u64,
+    /// Public origin the app reaches this server at, used to mint absolute image
+    /// URLs. Unset => emit site-relative `/v1/images/<id>` and let the app
+    /// resolve against the base URL it already dials.
+    pub public_base_url: Option<Url>,
+
     // Generation workflow + its input-node mappings (`<node>.<key>`).
     pub comfy_gen_workflow: Option<PathBuf>,
     pub comfy_gen_prompt: Option<NodeInput>,
@@ -257,6 +274,10 @@ impl Config {
             comfy_base,
             comfy_timeout_s: env_parse("COMFYUI_TIMEOUT_S", 120u64),
             comfy_max_image_bytes: env_parse("COMFYUI_MAX_IMAGE_BYTES", 16 * 1024 * 1024),
+            image_store_dir: env_path("IMAGE_STORE_DIR"),
+            image_store_ttl_s: env_parse("IMAGE_STORE_TTL_S", 7 * 24 * 60 * 60),
+            image_url_ttl_s: env_parse("IMAGE_URL_TTL_S", 24 * 60 * 60),
+            public_base_url: parse_opt_url("PUBLIC_BASE_URL")?,
             comfy_gen_workflow: env_path("COMFYUI_GEN_WORKFLOW"),
             comfy_gen_prompt: env_node("COMFYUI_GEN_PROMPT"),
             comfy_gen_negative: env_node("COMFYUI_GEN_NEGATIVE"),
@@ -416,6 +437,19 @@ fn parse_url(key: &str, default: &str) -> Result<Url> {
     Url::parse(&raw).with_context(|| format!("{key} must be a valid URL (got {raw:?})"))
 }
 
+/// Parse an optional URL env var: absent/blank => `None`; present-but-invalid is
+/// a hard startup error rather than a silent fallback.
+fn parse_opt_url(key: &str) -> Result<Option<Url>> {
+    match std::env::var(key).ok().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => {
+            Ok(Some(Url::parse(&raw).with_context(|| {
+                format!("{key} must be a valid URL (got {raw:?})")
+            })?))
+        }
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 pub mod tests_support {
     use super::*;
@@ -478,6 +512,10 @@ pub mod tests_support {
             comfy_base: "http://localhost:8188".parse().unwrap(),
             comfy_timeout_s: 120,
             comfy_max_image_bytes: 16 * 1024 * 1024,
+            image_store_dir: None,
+            image_store_ttl_s: 7 * 24 * 60 * 60,
+            image_url_ttl_s: 24 * 60 * 60,
+            public_base_url: None,
             comfy_gen_workflow: None,
             comfy_gen_prompt: None,
             comfy_gen_negative: None,

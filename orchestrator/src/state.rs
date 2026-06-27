@@ -40,6 +40,9 @@ pub struct AppState {
     /// on an app-hosted tool call when server calls co-occurred, so the
     /// follow-up request resumes without re-running (or losing) that server work.
     pub continuations: ContinuationCache,
+    /// Server-hosted image blobs, present only when `IMAGE_STORE_DIR` is set.
+    /// When absent, image tools fall back to inline base64 delivery.
+    pub images: Option<crate::images::BlobStore>,
 }
 
 /// Server-side store for turns paused mid-flight on an app-hosted tool call.

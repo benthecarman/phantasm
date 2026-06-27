@@ -181,6 +181,10 @@ fn test_config(ollama_base: &str) -> Config {
         comfy_base: "http://localhost:8188".parse().unwrap(),
         comfy_timeout_s: 120,
         comfy_max_image_bytes: 16 * 1024 * 1024,
+        image_store_dir: None,
+        image_store_ttl_s: 7 * 24 * 60 * 60,
+        image_url_ttl_s: 24 * 60 * 60,
+        public_base_url: None,
         comfy_gen_workflow: None,
         comfy_gen_prompt: None,
         comfy_gen_negative: None,
@@ -606,4 +610,113 @@ async fn capabilities_requires_auth_and_reports_models() {
     assert_eq!(v["streaming"], "sse");
     assert_eq!(v["models"][0], "m");
     assert_eq!(v["tools"]["web_search"], false);
+}
+
+/// Spawn the orchestrator with a server-hosted image store rooted at `dir`. The
+/// store's signing key is the server auth token, so a `BlobStore` the test
+/// builds against the same dir + token mints URLs the server will accept.
+async fn spawn_orchestrator_with_images(ollama_base: &str, dir: std::path::PathBuf) -> String {
+    let mut cfg = test_config(ollama_base);
+    cfg.image_store_dir = Some(dir);
+    let cfg = Arc::new(cfg);
+    let capabilities = Arc::new(CapabilitySnapshot {
+        version: "test".into(),
+        chat: true,
+        models: vec!["m".into()],
+        vision_models: vec![],
+        tool_models: vec![],
+        tools: ToolFlags::default(),
+        modes: vec![],
+        streaming: "sse",
+    });
+    let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
+    spawn(routes::router(state)).await
+}
+
+const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+
+#[tokio::test]
+async fn image_fetch_is_signed_and_auth_exempt() {
+    use phantasm_orchestrator::images::BlobStore;
+
+    let ollama = spawn(mock_ollama()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // A store sharing the server's dir + signing key (the auth token) to seed a
+    // blob and mint matching signed URLs.
+    let seeder = BlobStore::new(
+        tmp.path().to_path_buf(),
+        TOKEN,
+        3600,
+        3600,
+        16 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    let id = seeder.put(PNG).await.unwrap();
+    let signed = seeder.signed_ref(&id); // "/v1/images/<id>?exp=..&sig=.."
+
+    let base = spawn_orchestrator_with_images(&ollama, tmp.path().to_path_buf()).await;
+    let client = reqwest::Client::new();
+
+    // Valid signature, NO Authorization header => served.
+    let ok = client.get(format!("{base}{signed}")).send().await.unwrap();
+    assert!(ok.status().is_success());
+    assert_eq!(ok.headers()[CONTENT_TYPE], "image/png");
+    assert_eq!(ok.bytes().await.unwrap().as_ref(), PNG);
+
+    // Tampered signature => forbidden.
+    let bad = signed.replace("sig=", "sig=zzz");
+    let forbidden = client.get(format!("{base}{bad}")).send().await.unwrap();
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Missing signature params => 400 (Query extractor rejects).
+    let no_sig = client
+        .get(format!("{base}/v1/images/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_sig.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn image_delete_requires_auth_then_removes() {
+    use phantasm_orchestrator::images::BlobStore;
+
+    let ollama = spawn(mock_ollama()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let seeder = BlobStore::new(
+        tmp.path().to_path_buf(),
+        TOKEN,
+        3600,
+        3600,
+        16 * 1024 * 1024,
+        None,
+    )
+    .unwrap();
+    let id = seeder.put(PNG).await.unwrap();
+    let signed = seeder.signed_ref(&id);
+
+    let base = spawn_orchestrator_with_images(&ollama, tmp.path().to_path_buf()).await;
+    let client = reqwest::Client::new();
+
+    // DELETE without bearer => 401.
+    let unauthed = client
+        .delete(format!("{base}/v1/images/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthed.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // DELETE with bearer => 204, and the blob is gone afterward (404 even with a
+    // still-valid signature).
+    let deleted = client
+        .delete(format!("{base}/v1/images/{id}"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let gone = client.get(format!("{base}{signed}")).send().await.unwrap();
+    assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND);
 }
