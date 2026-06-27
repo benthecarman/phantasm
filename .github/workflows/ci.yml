@@ -43,6 +43,11 @@ jobs:
         working-directory: ios
     steps:
       - uses: actions/checkout@v4
+      # SpeechAnalyzer/SpeechTranscriber are iOS 26 SDK symbols; the default
+      # Xcode on macos-latest can lag behind, so pin to the newest available.
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
       - name: PhantasmKit tests
         run: swift test --package-path Packages/PhantasmKit
       - name: Install xcodegen
