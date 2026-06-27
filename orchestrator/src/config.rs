@@ -56,6 +56,17 @@ pub struct Config {
     pub max_tool_iters: u8,
     pub ollama_concurrency: usize,
 
+    // Request guards (DoS surface). The body limit is the coarse cap on the whole
+    // request; the image caps are the finer ones — many small inline images, or a
+    // single oversized one that still fits under the body limit.
+    /// Max bytes accepted for an entire request body (`DefaultBodyLimit`).
+    pub max_request_body_bytes: usize,
+    /// Max number of inline images (attached `image_url` parts + `data:` URIs
+    /// embedded in message text) accepted across one request's history.
+    pub max_request_images: usize,
+    /// Max decoded bytes accepted for a single inline image.
+    pub max_request_image_bytes: usize,
+
     // Research mode presets. Mode ids/labels/tools are server-side data
     // (orchestrator::presets); these knobs override the per-tier numeric/boolean
     // defaults. Used by `PresetTable::from_config`. `research_fanout_concurrency`
@@ -189,6 +200,9 @@ impl Config {
             models,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
             ollama_concurrency: env_parse("OLLAMA_MAX_CONCURRENCY", 4usize).max(1),
+            max_request_body_bytes: env_parse("MAX_REQUEST_BODY_BYTES", 32 * 1024 * 1024),
+            max_request_images: env_parse("MAX_REQUEST_IMAGES", 16usize),
+            max_request_image_bytes: env_parse("MAX_REQUEST_IMAGE_BYTES", 16 * 1024 * 1024),
             research_deep_fanout: env_parse("RESEARCH_DEEP_FANOUT", 4usize),
             research_deep_searches_per_subq: env_parse("RESEARCH_DEEP_SEARCHES_PER_SUBQ", 3usize),
             research_deep_verify: env_bool("RESEARCH_DEEP_VERIFY", true),
@@ -417,6 +431,9 @@ pub mod tests_support {
             models: vec![],
             max_tool_iters: 5,
             ollama_concurrency: 4,
+            max_request_body_bytes: 32 * 1024 * 1024,
+            max_request_images: 16,
+            max_request_image_bytes: 16 * 1024 * 1024,
             research_deep_fanout: 4,
             research_deep_searches_per_subq: 3,
             research_deep_verify: true,

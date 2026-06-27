@@ -32,6 +32,14 @@ pub async fn chat_completions(
         return AppError::BadRequest("`messages` must not be empty".into()).into_response();
     }
 
+    if let Err(e) = validate_image_limits(
+        &req.messages,
+        state.cfg.max_request_images,
+        state.cfg.max_request_image_bytes,
+    ) {
+        return e.into_response();
+    }
+
     // Resolve the per-turn tool selection and any app-hosted tool definitions
     // from the standard `tools`/`tool_choice` fields before we move the rest of
     // the request apart.
@@ -133,6 +141,43 @@ pub async fn chat_completions(
     } else {
         collect_response(model_name, rx, state.continuations.clone()).await
     }
+}
+
+/// Reject a request carrying too many or too-large inline images before we spend
+/// the turn's memory on it. The body-size limit (`DefaultBodyLimit`) is the coarse
+/// guard; this is the finer one — many small images, or a single oversized image
+/// that still fits under the body cap. Counts both attached `image_url` parts and
+/// `data:` URIs embedded in message text (the form generated images take in
+/// re-sent history). Reference URLs (no `;base64,`) measure short and pass the
+/// size check, so this stays correct once images move to server-hosted URLs.
+fn validate_image_limits(
+    messages: &[ChatMessage],
+    max_images: usize,
+    max_bytes_each: usize,
+) -> Result<(), AppError> {
+    let mut count = 0usize;
+    for m in messages {
+        let Some(content) = m.content.as_ref() else {
+            continue;
+        };
+        for payload in content.image_payloads() {
+            count += 1;
+            if count > max_images {
+                return Err(AppError::PayloadTooLarge(format!(
+                    "too many images in request (max {max_images})"
+                )));
+            }
+            // base64 decodes to ~3/4 its length; estimate rather than decode the
+            // (potentially multi-MB) payload just to measure it.
+            let approx_bytes = payload.len() / 4 * 3;
+            if approx_bytes > max_bytes_each {
+                return Err(AppError::PayloadTooLarge(format!(
+                    "an image exceeds the per-image cap of {max_bytes_each} bytes"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Index of the trailing run of `tool`-role messages — the answers to the most
@@ -279,4 +324,86 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openai::types::{ContentPart, ImageUrl, MessageContent};
+
+    fn data_uri(payload_len: usize) -> String {
+        format!("data:image/png;base64,{}", "A".repeat(payload_len))
+    }
+
+    fn user_text(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text(text.into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn user_attached(payload_len: usize) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: data_uri(payload_len),
+                },
+            }])),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn within_limits_passes() {
+        let messages = vec![
+            user_attached(40),
+            user_text(&format!("![generated]({})", data_uri(40))),
+        ];
+        assert!(validate_image_limits(&messages, 16, 16 * 1024 * 1024).is_ok());
+    }
+
+    #[test]
+    fn too_many_images_rejected() {
+        // Three images (one attached + two embedded in text) against a cap of 2.
+        let messages = vec![
+            user_attached(8),
+            user_text(&format!("![a]({}) ![b]({})", data_uri(8), data_uri(8))),
+        ];
+        let err = validate_image_limits(&messages, 2, 16 * 1024 * 1024).unwrap_err();
+        assert!(matches!(err, AppError::PayloadTooLarge(_)));
+    }
+
+    #[test]
+    fn oversized_single_image_rejected() {
+        // 400 base64 chars ≈ 300 decoded bytes, over a 100-byte cap.
+        let messages = vec![user_attached(400)];
+        let err = validate_image_limits(&messages, 16, 100).unwrap_err();
+        assert!(matches!(err, AppError::PayloadTooLarge(_)));
+    }
+
+    #[test]
+    fn reference_url_passes_size_check() {
+        // A server-hosted image reference (`image_url` with an http URL, no
+        // `;base64,`) is counted as an image but measures short, so it must not
+        // trip even a tiny per-image byte cap — keeping the guard correct once
+        // images move to URL references.
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://host/images/abc123.png".into(),
+                },
+            }])),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        assert!(validate_image_limits(&messages, 16, 100).is_ok());
+    }
 }
