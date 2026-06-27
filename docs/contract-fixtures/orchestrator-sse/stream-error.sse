@@ -1,0 +1,9 @@
+data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{}}],"x_status":"error: upstream boom"}
+
+data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"\n\nWARNING: upstream boom"}}]}
+
+data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]

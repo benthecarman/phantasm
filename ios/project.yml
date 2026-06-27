@@ -62,3 +62,27 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         DEVELOPMENT_TEAM: "6JWFWV65BL"
         CODE_SIGN_STYLE: Automatic
+  PhantasmTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: Phantasm
+      - package: PhantasmKit
+    info:
+      path: Tests/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.phantasm.app.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Phantasm.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Phantasm"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  Phantasm:
+    build:
+      targets:
+        Phantasm: all
+    test:
+      targets:
+        - PhantasmTests

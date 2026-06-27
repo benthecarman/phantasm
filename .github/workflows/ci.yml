@@ -62,3 +62,11 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
             build
+      - name: App target tests
+        run: |
+          xcodebuild \
+            -project Phantasm.xcodeproj \
+            -scheme Phantasm \
+            -destination 'platform=iOS Simulator,name=iPhone 17' \
+            CODE_SIGNING_ALLOWED=NO \
+            test

@@ -2,7 +2,6 @@ import Foundation
 import Observation
 import PhantasmKit
 import UIKit
-import UserNotifications
 
 /// Drives one conversation: sends turns, accumulates streamed tokens in memory,
 /// and commits a single complete assistant message when the turn ends
@@ -33,7 +32,7 @@ final class ChatViewModel {
     /// their own (`resolveToolBatch`).
     private(set) var pendingPrompt: AppToolPrompt?
 
-    private var env: AppEnvironment?
+    private var env: (any ChatViewModelEnvironment)?
     private var store: ChatStore?
     /// The active conversation's metadata (a value, not the stored history). For a
     /// new chat this is an in-memory draft that isn't written until the first send.
@@ -44,15 +43,36 @@ final class ChatViewModel {
     private var isSceneActive = true
     private var isViewVisible = false
     private var suspendedByScene = false
-    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    private var backgroundTaskID: UIBackgroundTaskIdentifier
+    private let backgroundTasks: any BackgroundTaskManaging
+    private let notifications: any NotificationManaging
+    private let imageFetcher: any ImageFetching
 
     private enum EmptyPendingDisposition {
         case delete
         case keepForRecovery
     }
 
+    init() {
+        self.backgroundTasks = UIApplicationBackgroundTaskManager()
+        self.notifications = UserNotificationManager()
+        self.imageFetcher = ImageClient()
+        self.backgroundTaskID = backgroundTasks.invalidTaskID
+    }
+
+    init(
+        backgroundTasks: any BackgroundTaskManaging,
+        notifications: any NotificationManaging,
+        imageFetcher: any ImageFetching
+    ) {
+        self.backgroundTasks = backgroundTasks
+        self.notifications = notifications
+        self.imageFetcher = imageFetcher
+        self.backgroundTaskID = backgroundTasks.invalidTaskID
+    }
+
     func configure(
-        env: AppEnvironment,
+        env: any ChatViewModelEnvironment,
         store: ChatStore,
         conversation: Conversation,
         sceneIsActive: Bool
@@ -92,62 +112,24 @@ final class ChatViewModel {
     }
 
     private func beginBackgroundStreamingTaskIfNeeded() {
-        guard backgroundTaskID == .invalid else { return }
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(
-            withName: "Chat response"
-        ) { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.expireBackgroundStreamingTask()
-            }
+        guard backgroundTaskID == backgroundTasks.invalidTaskID else { return }
+        backgroundTaskID = backgroundTasks.beginBackgroundTask(named: "Chat response") { [weak self] in
+            self?.expireBackgroundStreamingTask()
         }
     }
 
     private func expireBackgroundStreamingTask() {
-        guard backgroundTaskID != .invalid else { return }
+        guard backgroundTaskID != backgroundTasks.invalidTaskID else { return }
         suspendedByScene = true
         task?.cancel()
         endBackgroundStreamingTask()
     }
 
     private func endBackgroundStreamingTask() {
-        guard backgroundTaskID != .invalid else { return }
+        guard backgroundTaskID != backgroundTasks.invalidTaskID else { return }
         let id = backgroundTaskID
-        backgroundTaskID = .invalid
-        UIApplication.shared.endBackgroundTask(id)
-    }
-
-    private func requestNotificationAuthorizationIfNeeded() async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .notDetermined else { return }
-        _ = try? await center.requestAuthorization(options: [.alert, .sound])
-    }
-
-    private func scheduleBackgroundCompletionNotification() async {
-        guard !isSceneActive else { return }
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        let isAuthorized: Bool
-        switch settings.authorizationStatus {
-        case .authorized, .provisional, .ephemeral:
-            isAuthorized = true
-        case .notDetermined:
-            isAuthorized = (try? await center.requestAuthorization(options: [.alert, .sound])) == true
-        case .denied:
-            isAuthorized = false
-        @unknown default:
-            isAuthorized = false
-        }
-        guard isAuthorized else { return }
-
-        let content = UNMutableNotificationContent()
-        content.title = "Phantasm"
-        content.body = "Your response is ready."
-        content.sound = .default
-
-        let id = conversation.map { "chat-response-\($0.id.uuidString)" } ?? UUID().uuidString
-        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
-        try? await center.add(request)
+        backgroundTaskID = backgroundTasks.invalidTaskID
+        backgroundTasks.endBackgroundTask(id)
     }
 
     /// The model the composer should display / preselect for this conversation.
@@ -190,9 +172,9 @@ final class ChatViewModel {
     func setLocationEnabled(_ on: Bool) {
         // Surface the iOS permission prompt the moment the user enables the tool,
         // not lazily on the model's first call. No-op once already decided.
-        if on { env?.locationProvider.requestAuthorizationWhenInUse() }
+        if on { env?.requestLocationAuthorizationWhenInUse() }
         // Remember the choice as the sticky default for future new chats.
-        env?.toolPreferenceStore.locationEnabledDefault = on
+        env?.setDefaultLocationEnabled(on)
         setOptions(
             webSearch: webSearchEnabled,
             imageGeneration: imageGenerationEnabled,
@@ -324,7 +306,7 @@ final class ChatViewModel {
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
         errorMessage = nil
-        Task { await requestNotificationAuthorizationIfNeeded() }
+        Task { await notifications.requestAuthorizationIfNeeded() }
 
         let snapshot = conversation
         task = Task { [weak self] in
@@ -350,7 +332,7 @@ final class ChatViewModel {
         model: String,
         base: URL,
         token: String,
-        env: AppEnvironment,
+        env: any ChatViewModelEnvironment,
         store: ChatStore
     ) async {
         do {
@@ -408,7 +390,7 @@ final class ChatViewModel {
         let model: String
         let base: URL
         let token: String
-        let env: AppEnvironment
+        let env: any ChatViewModelEnvironment
         let store: ChatStore
 
         /// Run `mutate` (truncate/edit the history), then stream a fresh reply.
@@ -463,7 +445,7 @@ final class ChatViewModel {
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
         errorMessage = nil
-        Task { await requestNotificationAuthorizationIfNeeded() }
+        Task { await notifications.requestAuthorizationIfNeeded() }
 
         return TurnContext(
             vm: self, convoID: conversation.id, model: model,
@@ -479,7 +461,7 @@ final class ChatViewModel {
         model: String,
         base: URL,
         token: String,
-        env: AppEnvironment,
+        env: any ChatViewModelEnvironment,
         store: ChatStore
     ) async {
         guard let detail = try? await store.conversationDetail(id: conversationId) else {
@@ -524,8 +506,8 @@ final class ChatViewModel {
             appTools: appTools
         )
         let stream = env.backendMode.usesOllamaNativeChat
-            ? env.ollamaChatClient.stream(request, base: base, token: token)
-            : env.chatClient.stream(request, base: base, token: token)
+            ? env.ollamaStreamingClient.stream(request, base: base, token: token)
+            : env.chatStreamingClient.stream(request, base: base, token: token)
 
         // App-hosted tool calls forwarded this turn, captured so the post-stream
         // step can resolve them (the turn ends once the model calls one).
@@ -738,7 +720,7 @@ final class ChatViewModel {
         model: String,
         base: URL,
         token: String,
-        env: AppEnvironment,
+        env: any ChatViewModelEnvironment,
         store: ChatStore
     ) {
         let json = Self.encodeToolCalls(calls)
@@ -892,7 +874,7 @@ final class ChatViewModel {
         // Read the reply aloud when the user opted into auto-speak — but only for
         // a clean, foreground completion (don't blast audio in the background).
         let shouldAutoSpeak = error == nil && isSceneActive
-            && !committed.isEmpty && env?.voicePreferenceStore.autoSpeak == true
+            && !committed.isEmpty && env?.autoSpeakEnabled == true
 
         if shouldKeepPendingForRecovery {
             streamingText = ""
@@ -902,7 +884,7 @@ final class ChatViewModel {
         } else if let store, let conversation, !committed.isEmpty {
             if let pendingID {
                 pendingAssistantPreviewMessageID = pendingID
-                if shouldAutoSpeak { env?.speechSynthesizer.speak(committed, messageID: pendingID) }
+                if shouldAutoSpeak { env?.speak(committed, messageID: pendingID) }
                 Task { [weak self] in
                     do {
                         try await store.updateMessage(
@@ -917,7 +899,9 @@ final class ChatViewModel {
                             id: conversation.id, title: nil, modelID: nil, updatedAt: .now
                         )
                         if shouldNotifyWhenCommitted {
-                            await self?.scheduleBackgroundCompletionNotification()
+                            await self?.notifications.scheduleBackgroundCompletion(
+                                conversationID: conversation.id
+                            )
                         } else {
                             await self?.maybeGenerateTitle()
                         }
@@ -934,7 +918,7 @@ final class ChatViewModel {
                     createdAt: .now, isComplete: true
                 )
                 pendingAssistantPreviewMessageID = assistant.id
-                if shouldAutoSpeak { env?.speechSynthesizer.speak(committed, messageID: assistant.id) }
+                if shouldAutoSpeak { env?.speak(committed, messageID: assistant.id) }
                 Task { [weak self] in
                     do {
                         try await store.insertMessage(assistant, attachments: [])
@@ -943,7 +927,9 @@ final class ChatViewModel {
                             id: conversation.id, title: nil, modelID: nil, updatedAt: .now
                         )
                         if shouldNotifyWhenCommitted {
-                            await self?.scheduleBackgroundCompletionNotification()
+                            await self?.notifications.scheduleBackgroundCompletion(
+                                conversationID: conversation.id
+                            )
                         } else {
                             await self?.maybeGenerateTitle()
                         }
@@ -985,10 +971,9 @@ final class ChatViewModel {
         let refs = ServerImageRef.references(in: content)
         guard !refs.isEmpty, let store else { return }
         Task {
-            let client = ImageClient()
             var attachments: [Attachment] = []
             for ref in refs {
-                guard let url = URL(string: ref.url), let img = await client.fetch(url) else {
+                guard let url = URL(string: ref.url), let img = await imageFetcher.fetch(url) else {
                     continue
                 }
                 attachments.append(
@@ -1020,9 +1005,9 @@ final class ChatViewModel {
                   defaultModel: env.preferredModel
               ) else { return }
         let token = env.activeToken ?? ""
-        let client: ChatClienting = env.backendMode.usesOllamaNativeChat
-            ? env.ollamaChatClient
-            : env.chatClient
+        let client: any ChatClienting = env.backendMode.usesOllamaNativeChat
+            ? env.ollamaStreamingClient
+            : env.chatStreamingClient
         let request = ChatRequest(
             model: model,
             messages: history + [WireMessage(role: "user", content: Self.titlePrompt)],
