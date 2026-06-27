@@ -123,6 +123,7 @@ fn test_config(ollama_base: &str) -> Config {
         open_meteo_geocoding_base: "https://geocoding-api.open-meteo.com".parse().unwrap(),
         maps_places_enabled: false,
         nominatim_base: "https://nominatim.openstreetmap.org".parse().unwrap(),
+        overpass_base: "https://overpass-api.de".parse().unwrap(),
         market_data_enabled: false,
         alpha_vantage_base: "https://www.alphavantage.co".parse().unwrap(),
         alpha_vantage_token: None,

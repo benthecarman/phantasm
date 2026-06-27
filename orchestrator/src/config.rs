@@ -103,6 +103,7 @@ pub struct Config {
     pub open_meteo_geocoding_base: Url,
     pub maps_places_enabled: bool,
     pub nominatim_base: Url,
+    pub overpass_base: Url,
     pub market_data_enabled: bool,
     pub alpha_vantage_base: Url,
     pub alpha_vantage_token: Option<String>,
@@ -221,6 +222,7 @@ impl Config {
             )?,
             maps_places_enabled: env_bool("TOOL_MAPS_PLACES", false),
             nominatim_base: parse_url("NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org")?,
+            overpass_base: parse_url("OVERPASS_BASE_URL", "https://overpass-api.de")?,
             market_data_enabled: env_bool("TOOL_MARKET_DATA", false),
             alpha_vantage_base: parse_url("ALPHA_VANTAGE_BASE_URL", "https://www.alphavantage.co")?,
             alpha_vantage_token: std::env::var("ALPHA_VANTAGE_API_KEY")
@@ -442,6 +444,7 @@ pub mod tests_support {
             open_meteo_geocoding_base: "https://geocoding-api.open-meteo.com".parse().unwrap(),
             maps_places_enabled: false,
             nominatim_base: "https://nominatim.openstreetmap.org".parse().unwrap(),
+            overpass_base: "https://overpass-api.de".parse().unwrap(),
             market_data_enabled: false,
             alpha_vantage_base: "https://www.alphavantage.co".parse().unwrap(),
             alpha_vantage_token: None,
