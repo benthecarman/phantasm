@@ -84,6 +84,25 @@ pub async fn chat_completions(
     }
 }
 
+/// Tracks an attached SSE responder on an `ActiveTurn` for its lifetime, so the
+/// watchdog can tell a backgrounded-but-watched turn from an abandoned one.
+struct AttachGuard {
+    turn: Arc<ActiveTurn>,
+}
+
+impl AttachGuard {
+    fn new(turn: Arc<ActiveTurn>) -> Self {
+        turn.attach();
+        Self { turn }
+    }
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        self.turn.detach();
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CancelRequest {
     /// The turn's `Idempotency-Key` (the app's pending-assistant message id).
@@ -260,6 +279,10 @@ fn attach_response(model: String, active: Arc<ActiveTurn>, start: usize) -> Resp
     let factory = ChunkFactory::new(model);
     let mut len_rx = active.subscribe();
     let body = async_stream::stream! {
+        // Count this responder as attached for as long as the stream lives, so the
+        // abandoned-turn watchdog only reclaims turns with no listener. Dropping
+        // the stream (client disconnect) drops the guard, restarting that clock.
+        let _attach = AttachGuard::new(active.clone());
         yield factory.role_open();
         let mut idx = start;
         loop {

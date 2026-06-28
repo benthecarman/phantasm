@@ -74,6 +74,11 @@ pub struct Config {
     /// entry can hold a full turn (incl. an inline base64 image), so this bounds
     /// worst-case memory like `CONTINUATION_MAX`.
     pub turn_registry_max: usize,
+    /// How long a still-running turn may have no attached client before the
+    /// watchdog cancels it (frees the GPU for an app that was force-killed and
+    /// will never reconnect). `0` disables the watchdog. Terminal turns are
+    /// unaffected — they're retained for `turn_result_ttl_s`.
+    pub turn_abandon_grace_s: u64,
 
     // Request guards (DoS surface). The body limit is the coarse cap on the whole
     // request; the image caps are the finer ones — many small inline images, or a
@@ -280,6 +285,7 @@ impl Config {
             ollama_concurrency: env_parse("OLLAMA_MAX_CONCURRENCY", 4usize).max(1),
             turn_result_ttl_s: env_parse("TURN_RESULT_TTL_S", 24 * 60 * 60),
             turn_registry_max: env_parse("TURN_REGISTRY_MAX", 128usize),
+            turn_abandon_grace_s: env_parse("TURN_ABANDON_GRACE_S", 300u64),
             max_request_body_bytes: env_parse("MAX_REQUEST_BODY_BYTES", 32 * 1024 * 1024),
             max_request_images: env_parse("MAX_REQUEST_IMAGES", 16usize),
             max_request_image_bytes: env_parse("MAX_REQUEST_IMAGE_BYTES", 16 * 1024 * 1024),
@@ -547,6 +553,7 @@ pub mod tests_support {
             ollama_concurrency: 4,
             turn_result_ttl_s: 24 * 60 * 60,
             turn_registry_max: 128,
+            turn_abandon_grace_s: 300,
             max_request_body_bytes: 32 * 1024 * 1024,
             max_request_images: 16,
             max_request_image_bytes: 16 * 1024 * 1024,

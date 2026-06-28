@@ -177,10 +177,12 @@ preferred config for this feature. Bound with `TURN_REGISTRY_MAX` (evict oldest
   finished log so a late reconnect can still fetch it, then evict. The long
   default lets a reconnect recover a generation even long after the app closed;
   memory is bounded by `TURN_REGISTRY_MAX`, not the TTL.
-- `ABANDONED_TTL` / safety cap: a still-running turn whose `attached` count has
-  been 0 since `detached_at` for longer than the grace window → fire `cancel`, so
+- `ABANDONED_TTL` / safety cap (`TURN_ABANDON_GRACE_S`, default 300s; `0`
+  disables): a background watchdog cancels + drops any still-running turn whose
+  `attached` count has been 0 since `detached_at` for longer than the grace, so
   an app that was *killed* (never reconnects, never hits the cancel endpoint)
-  doesn't leave work running. Natural per-tool timeouts (`comfy_timeout_s`,
+  doesn't leave work running. Terminal turns are exempt (they're buffered results
+  awaiting a possible reconnect). Natural per-tool timeouts (`comfy_timeout_s`,
   `max_tool_iters`, upstream request timeouts) already bound runtime; this is a
   backstop behind the explicit cancel (§6), not the primary stop path.
 
@@ -324,8 +326,8 @@ Update `docs/SPEC.md` §2 deliberately (both halves). Note that resume is a
 1. **Cancel endpoint shape** — `POST /v1/chat/cancel {turn_id}` (proposed) vs.
    `DELETE /v1/chat/turns/{turn_id}` vs. piggybacking a flag on the chat
    endpoint. Affects SPEC §2.
-2. **Abandoned-running-turn policy** — rely on per-tool timeouts only, or add the
-   no-attached-responder watchdog (recommended) and its timeout value.
+2. ✅ **Abandoned-running-turn policy** — added the no-attached-responder
+   watchdog; `TURN_ABANDON_GRACE_S` default 300s (`0` disables).
 3. ✅ **`RESULT_TTL` / `TURN_REGISTRY_MAX` values** — `TURN_RESULT_TTL_S` default
    24h, `TURN_REGISTRY_MAX` default 128; both env-configurable.
 4. **Inline vs URL image delivery** — recommend requiring/encouraging
@@ -349,5 +351,10 @@ Update `docs/SPEC.md` §2 deliberately (both halves). Note that resume is a
    empty so the replay rebuilds; `stop()` calls the cancel endpoint. Tested:
    integration `cancel_drops_turn_so_reconnect_reruns` / `cancel_requires_auth`;
    app builds + installs.
-3. Abandoned-TTL watchdog + result-TTL eviction tuning. (Hardening.)
-4. SPEC §2 + docs.
+3. ✅ **Done.** Abandoned-turn watchdog: `ActiveTurn` tracks attached responders
+   (RAII `AttachGuard` in `attach_response`); `TurnRegistry::sweep_abandoned` +
+   `spawn_watchdog` (started in `build_state`) cancel + drop still-running turns
+   with no listener past `TURN_ABANDON_GRACE_S` (default 300s, `0` disables).
+   Tested: `sweep_cancels_detached_running_turns_only`,
+   `detach_rearms_the_abandoned_clock`.
+4. SPEC §2 + docs. (Remaining: fold the contract changes into `docs/SPEC.md`.)

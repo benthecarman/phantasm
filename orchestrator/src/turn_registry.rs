@@ -41,6 +41,14 @@ struct TurnLog {
     done: bool,
     /// When the turn reached a terminal state; drives result-TTL eviction.
     terminal_at: Option<Instant>,
+    /// Number of responders currently attached (streaming the log).
+    attached: usize,
+    /// When `attached` last fell to 0 (or creation, before the first attach).
+    /// `None` while a responder is attached. Drives the abandoned-turn watchdog:
+    /// a still-running turn with no listener for too long is cancelled, so an app
+    /// that was force-killed (never reconnects, never hits cancel) doesn't leave
+    /// work running.
+    detached_at: Option<Instant>,
 }
 
 impl ActiveTurn {
@@ -51,11 +59,41 @@ impl ActiveTurn {
                 events: Vec::new(),
                 done: false,
                 terminal_at: None,
+                attached: 0,
+                // No listener yet — counts as detached from creation, so a turn
+                // whose only client vanishes before attaching is still swept.
+                detached_at: Some(Instant::now()),
             }),
             len_tx,
             cancel,
             created_at: Instant::now(),
         }
+    }
+
+    /// Register a newly attached responder. Clears the detached clock while at
+    /// least one client is streaming.
+    pub fn attach(&self) {
+        let mut log = self.inner.lock().unwrap();
+        log.attached += 1;
+        log.detached_at = None;
+    }
+
+    /// Deregister a responder (its stream was dropped or finished). Restarts the
+    /// detached clock once the last one leaves.
+    pub fn detach(&self) {
+        let mut log = self.inner.lock().unwrap();
+        log.attached = log.attached.saturating_sub(1);
+        if log.attached == 0 {
+            log.detached_at = Some(Instant::now());
+        }
+    }
+
+    /// Whether this turn is still running with no listener for longer than
+    /// `grace` — i.e. abandoned and worth cancelling. Terminal turns are never
+    /// abandoned (they're just buffered results awaiting a possible reconnect).
+    fn is_abandoned(&self, grace: Duration) -> bool {
+        let log = self.inner.lock().unwrap();
+        !log.done && matches!(log.detached_at, Some(t) if t.elapsed() >= grace)
     }
 
     /// Append an event produced by the turn task, marking the turn terminal on a
@@ -152,6 +190,47 @@ impl TurnRegistry {
     /// Drop a turn from the registry (e.g. after an explicit cancel).
     pub fn remove(&self, key: &str) -> Option<Arc<ActiveTurn>> {
         self.map.lock().unwrap().remove(key)
+    }
+
+    /// Cancel and drop every turn that is still running but has had no attached
+    /// responder for longer than `grace` (the abandoned-turn watchdog). Returns
+    /// how many were swept. Cancelling fires each turn's token, which interrupts
+    /// in-flight tool work (incl. a running ComfyUI generation) so the GPU is
+    /// freed promptly rather than after the per-tool timeout.
+    pub fn sweep_abandoned(&self, grace: Duration) -> usize {
+        let mut map = self.map.lock().unwrap();
+        let abandoned: Vec<String> = map
+            .iter()
+            .filter(|(_, t)| t.is_abandoned(grace))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &abandoned {
+            if let Some(turn) = map.remove(key) {
+                turn.cancel.cancel();
+            }
+        }
+        abandoned.len()
+    }
+
+    /// Spawn the background watchdog: every `interval`, sweep turns abandoned for
+    /// longer than `grace`. A no-op (not spawned) when `grace` is zero — the
+    /// caller uses that to disable the watchdog. Runs for the process lifetime.
+    pub fn spawn_watchdog(&self, grace: Duration, interval: Duration) {
+        if grace.is_zero() {
+            return;
+        }
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let swept = registry.sweep_abandoned(grace);
+                if swept > 0 {
+                    tracing::info!(count = swept, "cancelled abandoned resumable turns");
+                }
+            }
+        });
     }
 
     /// Evict finished turns past the result TTL, then enforce the size cap by
@@ -280,6 +359,50 @@ mod tests {
         assert!(reg.map.lock().unwrap().len() <= 2);
         // k3 (the newest) survived.
         assert!(reg.get("k3").is_some());
+    }
+
+    #[test]
+    fn sweep_cancels_detached_running_turns_only() {
+        let reg = registry();
+
+        // Running, detached since creation (never attached) → abandoned.
+        let (abandoned, _) = reg.get_or_create("gone");
+
+        // Running but currently attached → kept.
+        let (attached, _) = reg.get_or_create("live");
+        attached.attach();
+
+        // Terminal (finished) → kept regardless of listeners.
+        let (finished, _) = reg.get_or_create("done");
+        finished.push(TurnEvent::Done {
+            reason: "stop".into(),
+        });
+
+        // grace 0: any detached running turn is abandoned immediately.
+        let swept = reg.sweep_abandoned(Duration::ZERO);
+        assert_eq!(swept, 1, "only the detached running turn is swept");
+        assert!(abandoned.cancel.is_cancelled(), "swept turn is cancelled");
+        assert!(reg.get("gone").is_none(), "swept turn is removed");
+        assert!(reg.get("live").is_some(), "attached turn is kept");
+        assert!(reg.get("done").is_some(), "terminal turn is kept");
+        assert!(!attached.cancel.is_cancelled());
+        assert!(!finished.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn detach_rearms_the_abandoned_clock() {
+        let reg = registry();
+        let (turn, _) = reg.get_or_create("k");
+        turn.attach();
+        assert!(
+            !turn.is_abandoned(Duration::ZERO),
+            "attached turn is never abandoned"
+        );
+        turn.detach();
+        assert!(
+            turn.is_abandoned(Duration::ZERO),
+            "once the last listener leaves, the turn can be reclaimed"
+        );
     }
 
     #[tokio::test]

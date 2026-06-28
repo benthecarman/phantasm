@@ -196,6 +196,7 @@ fn test_config(ollama_base: &str) -> Config {
         ollama_concurrency: 4,
         turn_result_ttl_s: 24 * 60 * 60,
         turn_registry_max: 128,
+        turn_abandon_grace_s: 300,
         max_request_body_bytes: 32 * 1024 * 1024,
         max_request_images: 16,
         max_request_image_bytes: 16 * 1024 * 1024,
