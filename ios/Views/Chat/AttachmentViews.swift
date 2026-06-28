@@ -108,6 +108,9 @@ struct FileChipLabel: View {
 /// text files as chips). Right-aligned to sit above the user's text.
 struct MessageAttachmentsView: View {
     let attachments: [Attachment]
+    /// Tapping an image opens the full-screen viewer; reports its ordinal among
+    /// this message's images (matching the gallery's ordering) and decoded bytes.
+    var onTapImage: (Int, UIImage) -> Void = { _, _ in }
 
     var body: some View {
         let images = attachments.filter { $0.kind == AttachmentKind.image.rawValue }
@@ -115,13 +118,15 @@ struct MessageAttachmentsView: View {
         VStack(alignment: .trailing, spacing: 6) {
             if !images.isEmpty {
                 HStack(spacing: 6) {
-                    ForEach(images) { att in
+                    ForEach(Array(images.enumerated()), id: \.element.id) { index, att in
                         if let ui = UIImage(data: att.data) {
                             Image(uiImage: ui)
                                 .resizable()
                                 .scaledToFill()
                                 .frame(width: 120, height: 120)
                                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .contentShape(Rectangle())
+                                .onTapGesture { onTapImage(index, ui) }
                         }
                     }
                 }

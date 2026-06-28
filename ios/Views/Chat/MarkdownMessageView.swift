@@ -11,13 +11,16 @@ struct MarkdownMessageView: View {
     /// present here renders from local bytes (offline / after URL expiry) instead
     /// of refetching; absent ones still load over the network.
     var cachedImages: [String: ServerImageRef.CachedImage] = [:]
+    /// Tapping an inline image opens the full-screen viewer. Reports the image's
+    /// ordinal within this message (its `phantasm-img://` index) and decoded bytes.
+    var onTapImage: (Int, UIImage) -> Void = { _, _ in }
 
     var body: some View {
         let resolved = ServerImageRef.inlineCached(text, cache: cachedImages)
         let extracted = Base64ImageExtractor().extractCached(resolved)
         Markdown(extracted.markdown)
             .markdownTheme(.phantasmChat)
-            .markdownImageProvider(PhantasmImageProvider(images: extracted.images))
+            .markdownImageProvider(PhantasmImageProvider(images: extracted.images, onTap: onTapImage))
             .markdownBlockStyle(\.codeBlock) { configuration in
                 CodeBlockView(configuration: configuration)
             }
@@ -172,9 +175,14 @@ private struct CodeBlockView: View {
 }
 
 /// Resolves image URLs for MarkdownUI: `phantasm-img://<n>` placeholders from
-/// extracted base64 payloads, and ordinary `http(s)` images via `AsyncImage`.
+/// extracted base64 payloads, and ordinary `http(s)` images loaded to bytes.
 struct PhantasmImageProvider: ImageProvider {
+    /// Sentinel ordinal for a remote image: it has no place in the per-message
+    /// base64 ordering, so a tap on it resolves to the solo-image fallback.
+    static let remoteOrdinal = Int.min
+
     let images: [Int: Data]
+    var onTap: (Int, UIImage) -> Void = { _, _ in }
 
     func makeImage(url: URL?) -> some View {
         Group {
@@ -183,14 +191,15 @@ struct PhantasmImageProvider: ImageProvider {
                let data = images[index],
                let uiImage = UIImage(data: data) {
                 resizable(Image(uiImage: uiImage))
+                    .contentShape(Rectangle())
+                    .onTapGesture { onTap(index, uiImage) }
                     .contextMenu { ImageActions(image: uiImage) }
             } else if let url {
-                // Server-hosted images arrive as absolute URLs (spec §2.2b), so
-                // they load directly; inline base64 is handled above.
-                AsyncImage(url: url) { image in
-                    resizable(image)
-                } placeholder: {
-                    ProgressView()
+                // Server-hosted / external images arrive as absolute URLs (spec
+                // §2.2b). Load them to bytes (not `AsyncImage`) so a tap can hand
+                // the decoded `UIImage` to the viewer; inline base64 is above.
+                RemoteImage(url: url) { uiImage in
+                    onTap(Self.remoteOrdinal, uiImage)
                 }
             } else {
                 EmptyView()
@@ -199,11 +208,57 @@ struct PhantasmImageProvider: ImageProvider {
     }
 
     private func resizable(_ image: Image) -> some View {
-        image
-            .resizable()
+        image.inlineImageStyle()
+    }
+}
+
+private extension Image {
+    /// Shared sizing/clipping for an inline chat image (base64 or remote).
+    func inlineImageStyle() -> some View {
+        resizable()
             .aspectRatio(contentMode: .fit)
             .frame(maxWidth: .infinity)
             .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// An inline `http(s)` image loaded to a `UIImage` (rather than `AsyncImage`) so
+/// a tap can hand the decoded bytes to the full-screen viewer and save/share.
+private struct RemoteImage: View {
+    let url: URL
+    let onTap: (UIImage) -> Void
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .inlineImageStyle()
+                    .contentShape(Rectangle())
+                    .onTapGesture { onTap(image) }
+                    .contextMenu { ImageActions(image: image) }
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .task(id: url) { image = await RemoteImageCache.shared.image(for: url) }
+            }
+        }
+    }
+}
+
+/// Process-wide in-memory cache for fetched remote images, so re-rendering a
+/// row while scrolling doesn't re-download. `NSCache` is thread-safe and evicts
+/// under memory pressure.
+private final class RemoteImageCache: @unchecked Sendable {
+    static let shared = RemoteImageCache()
+    private let cache = NSCache<NSURL, UIImage>()
+
+    func image(for url: URL) async -> UIImage? {
+        if let hit = cache.object(forKey: url as NSURL) { return hit }
+        guard let (data, _) = try? await URLSession.shared.data(from: url),
+              let image = UIImage(data: data) else { return nil }
+        cache.setObject(image, forKey: url as NSURL)
+        return image
     }
 }
 

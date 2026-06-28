@@ -21,6 +21,9 @@ struct MessageBubble: View {
     var onCancelEdit: () -> Void = {}
     var onResend: () -> Void = {}
     var onRegenerate: () -> Void = {}
+    /// Tapping an image (attached or generated) opens the full-screen viewer,
+    /// reporting the source message, the image's ordinal within it, and bytes.
+    var onTapImage: (UUID, Int, UIImage) -> Void = { _, _, _ in }
 
     @Environment(AppEnvironment.self) private var env
     @FocusState private var editorFocused: Bool
@@ -53,7 +56,9 @@ struct MessageBubble: View {
                         ThinkingDisclosure(text: message.message.reasoning)
                     }
                     if !content.isEmpty {
-                        MarkdownMessageView(text: content, cachedImages: cachedImages)
+                        MarkdownMessageView(text: content, cachedImages: cachedImages) { index, image in
+                            onTapImage(message.message.id, index, image)
+                        }
                     }
                     footer
                 }
@@ -90,7 +95,9 @@ struct MessageBubble: View {
     private var userBubble: some View {
         VStack(alignment: .trailing, spacing: 6) {
             if !message.attachments.isEmpty {
-                MessageAttachmentsView(attachments: message.attachments)
+                MessageAttachmentsView(attachments: message.attachments) { index, image in
+                    onTapImage(message.message.id, index, image)
+                }
             }
             if !content.isEmpty {
                 Text(content)

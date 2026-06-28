@@ -23,6 +23,8 @@ struct ChatView: View {
     /// The user message being edited inline, if any (FR-A: edit a previous message).
     @State private var editingMessageID: UUID?
     @State private var editingText = ""
+    /// The full-screen image viewer, when an image has been tapped.
+    @State private var imageViewer: ImageViewerPresentation?
     @FocusState private var composerFocused: Bool
     /// Picked once per chat (the view is rebuilt per conversation via `.id`).
     @State private var greeting = GreetingPrompts.random()
@@ -218,6 +220,25 @@ struct ChatView: View {
         .onChange(of: vm.errorMessage) { _, message in
             if message != nil { Haptics.notify(.error) }
         }
+        .fullScreenCover(item: $imageViewer) { presentation in
+            ImageViewerView(images: presentation.images, startID: presentation.startID)
+        }
+    }
+
+    /// Open the full-screen viewer on the tapped image, with the whole
+    /// conversation's images available to swipe through. Falls back to showing
+    /// just the tapped image if it isn't in the gallery (e.g. a not-yet-cached
+    /// remote image).
+    private func openImageViewer(messageID: UUID, index: Int, image: UIImage) {
+        Haptics.selection()
+        let gallery = ConversationImages.gallery(from: visibleMessages)
+        let targetID = "\(messageID):\(index)"
+        if gallery.contains(where: { $0.id == targetID }) {
+            imageViewer = ImageViewerPresentation(images: gallery, startID: targetID)
+        } else {
+            let solo = GalleryImage(id: targetID, image: image)
+            imageViewer = ImageViewerPresentation(images: [solo], startID: targetID)
+        }
     }
 
     private var emptyState: some View {
@@ -266,7 +287,8 @@ struct ChatView: View {
                             onRegenerate: {
                                 Haptics.impact(.medium)
                                 vm.regenerate(messageID: message.id)
-                            }
+                            },
+                            onTapImage: openImageViewer
                         )
                     }
                     if vm.shouldShowAssistantPreview(alongside: messages) {
