@@ -526,6 +526,12 @@ final class ChatViewModel {
         // App-hosted tool calls forwarded this turn, captured so the post-stream
         // step can resolve them (the turn ends once the model calls one).
         var batchedCalls: [WireToolCall]?
+        // Whether the turn actually finished (a terminal `.done`) versus the
+        // stream just ending because the connection dropped — e.g. the app was
+        // backgrounded and the local task was cancelled. A cancelled
+        // `URLSession.bytes` ends the stream *without throwing*, so this flag, not
+        // the catch below, is what tells a real completion from an interruption.
+        var sawDone = false
         do {
             for try await event in stream {
                 switch event {
@@ -545,7 +551,8 @@ final class ChatViewModel {
                     statusText = nil
                     statusProgress = nil
                     batchedCalls = calls
-                case .done: break
+                case .done:
+                    sawDone = true
                 }
             }
             // The model called app-hosted tools: resolve the batch (auto tools on
@@ -558,8 +565,15 @@ final class ChatViewModel {
                 )
                 return
             }
+            let backgrounded = !isSceneActive || suspendedByScene || !isViewVisible
+            // Interrupted before the turn finished (no `.done`) while in the
+            // background: keep the incomplete pending row and resume the turn on
+            // foreground. Committing the partial here would drop the rest of the
+            // answer (e.g. a still-generating image) AND race recovery, leaving a
+            // duplicate. The resumable server turn replays in full on reconnect.
+            let interruptedInBackground = !sawDone && backgrounded
             let emptyResponse = streamingText.isEmpty
-            if emptyResponse && (!isSceneActive || suspendedByScene) {
+            if interruptedInBackground || (emptyResponse && backgrounded) {
                 suspendedByScene = false
                 finish(error: nil, emptyPendingDisposition: .keepForRecovery)
             } else {
