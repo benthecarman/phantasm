@@ -341,8 +341,13 @@ Update `docs/SPEC.md` §2 deliberately (both halves). Note that resume is a
    `TURN_RESULT_TTL_S`/`TURN_REGISTRY_MAX` config + TTL/size eviction. Tested:
    registry unit tests + integration `resumable_turn_replays_on_reconnect_*`.
    Not yet user-visible — dormant until the iOS app sends the header (phase 2).
-2. Explicit cancel endpoint + iOS stop wiring + ComfyUI interrupt. (Immediate
-   server-side stop for resumable turns + frees the GPU instantly; legacy clients
-   already cancel via disconnect.)
+2. ✅ **Done.** Server: `POST /v1/chat/cancel` (`routes/chat.rs::cancel`,
+   registered in `routes/mod.rs`) + ComfyUI interrupt-on-drop
+   (`tools/comfy.rs::InterruptOnDrop` → `/interrupt` + `/queue` delete). iOS:
+   `ChatClient` sends `Idempotency-Key` (= pending-assistant id) and gains
+   `cancel(...)`; `streamReply` passes the turn id; `recoverPendingTurn` starts
+   empty so the replay rebuilds; `stop()` calls the cancel endpoint. Tested:
+   integration `cancel_drops_turn_so_reconnect_reruns` / `cancel_requires_auth`;
+   app builds + installs.
 3. Abandoned-TTL watchdog + result-TTL eviction tuning. (Hardening.)
 4. SPEC §2 + docs.

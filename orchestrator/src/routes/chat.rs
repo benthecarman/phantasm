@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -81,6 +82,27 @@ pub async fn chat_completions(
     } else {
         collect_response(model_name, rx, state.continuations.clone()).await
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelRequest {
+    /// The turn's `Idempotency-Key` (the app's pending-assistant message id).
+    pub turn_id: String,
+}
+
+/// `POST /v1/chat/cancel` — explicitly cancel a resumable turn by its
+/// `Idempotency-Key`. Fires the turn's cancellation token (which interrupts any
+/// in-flight tool work, including a running ComfyUI generation) and drops it from
+/// the registry. This is the new app's Stop button: a resumable turn no longer
+/// cancels on disconnect, so Stop signals it here to free the GPU immediately.
+/// An unknown id is a no-op — a turn that already finished, was never resumable,
+/// or was started by a legacy client (which cancels by disconnecting). Always
+/// `204` so the app's Stop is fire-and-forget.
+pub async fn cancel(State(state): State<AppState>, Json(req): Json<CancelRequest>) -> Response {
+    if let Some(turn) = state.turns.remove(&req.turn_id) {
+        turn.cancel.cancel();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Read a non-empty, trimmed request header value as a `String`.

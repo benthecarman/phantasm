@@ -18,9 +18,59 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+use url::Url;
 
 use crate::config::{Config, NodeInput};
 use crate::orchestrator::TurnEvent;
+
+/// Tells ComfyUI to abandon a submitted prompt, freeing the GPU. Best-effort:
+/// `POST /interrupt` stops the prompt if it is currently executing, and
+/// `POST /queue {delete:[id]}` removes it if it is still queued. Errors are
+/// ignored — this runs on a cancellation/cleanup path where there is no caller
+/// left to surface them to.
+async fn interrupt_comfy(comfy_base: &Url, http: &reqwest::Client, prompt_id: &str) {
+    if let Ok(url) = comfy_base.join("/interrupt") {
+        let _ = http.post(url).send().await;
+    }
+    if let Ok(url) = comfy_base.join("/queue") {
+        let _ = http
+            .post(url)
+            .json(&serde_json::json!({ "delete": [prompt_id] }))
+            .send()
+            .await;
+    }
+    tracing::info!(prompt_id, "interrupted ComfyUI generation");
+}
+
+/// Drop guard that interrupts a submitted-but-unfinished ComfyUI prompt. The
+/// turn-level tool `select!` (and the image tool's own) cancel a backgrounded or
+/// stopped generation by *dropping* the `run_workflow` future — so the only
+/// reliable place to tell ComfyUI to stop is here, on drop. Without it the GPU
+/// job runs on orphaned. Marked `done` once the image is in hand so a normal
+/// completion doesn't fire a pointless interrupt. The interrupt is spawned
+/// detached because `Drop` is synchronous.
+struct InterruptOnDrop {
+    comfy_base: Url,
+    http: reqwest::Client,
+    prompt_id: Option<String>,
+    done: bool,
+}
+
+impl Drop for InterruptOnDrop {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let Some(prompt_id) = self.prompt_id.take() else {
+            return; // never submitted — nothing to interrupt
+        };
+        let comfy_base = self.comfy_base.clone();
+        let http = self.http.clone();
+        tokio::spawn(async move {
+            interrupt_comfy(&comfy_base, &http, &prompt_id).await;
+        });
+    }
+}
 
 /// Inject `value` into `workflow[target.node]["inputs"][target.key]`.
 pub fn set_input(workflow: &mut Value, target: &NodeInput, value: Value) -> Result<(), String> {
@@ -97,6 +147,16 @@ pub async fn run_workflow(
         .await
         .map_err(|e| format!("cannot open ComfyUI websocket: {e}"))?;
 
+    // From here on, if this future is dropped (turn cancelled / app stopped) or
+    // we bail on timeout/error, tell ComfyUI to abandon the prompt so the GPU is
+    // freed instead of running the generation orphaned.
+    let mut interrupt = InterruptOnDrop {
+        comfy_base: cfg.comfy_base.clone(),
+        http: http.clone(),
+        prompt_id: None,
+        done: false,
+    };
+
     // Submit the workflow.
     let prompt_url = cfg.comfy_base.join("/prompt").map_err(|e| e.to_string())?;
     let submit = serde_json::json!({ "prompt": workflow, "client_id": client_id });
@@ -117,6 +177,7 @@ pub async fn run_workflow(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "ComfyUI did not return a prompt_id".to_string())?
         .to_string();
+    interrupt.prompt_id = Some(prompt_id.clone());
 
     // Consume progress until completion / timeout.
     let deadline = tokio::time::sleep(Duration::from_secs(cfg.comfy_timeout_s));
@@ -138,6 +199,11 @@ pub async fn run_workflow(
         }
     }
     drop(ws);
+
+    // Generation finished (or the WS closed): the image is in ComfyUI's history,
+    // so there's nothing to interrupt. A timeout/WS-error bails earlier with the
+    // guard still armed, which is what frees the GPU on those paths.
+    interrupt.done = true;
 
     // Fetch the produced image.
     let _ = tx.send(TurnEvent::Status("retrieving image…".into())).await;

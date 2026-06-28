@@ -11,7 +11,9 @@ public struct OllamaNativeChatClient: ChatClienting {
         self.session = session
     }
 
-    public func stream(_ request: ChatRequest, base: URL, token: String)
+    // `turnID` is ignored: a raw Ollama backend has no turn registry, so there's
+    // nothing to resume — the connection-bound stream is the only mode.
+    public func stream(_ request: ChatRequest, base: URL, token: String, turnID: String?)
         -> AsyncThrowingStream<ChatStreamEvent, Error>
     {
         AsyncThrowingStream { continuation in

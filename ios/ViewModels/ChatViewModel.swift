@@ -514,9 +514,14 @@ final class ChatViewModel {
             ),
             appTools: appTools
         )
+        // The pending assistant message id keys this turn for resume: it's sent as
+        // the orchestrator's `Idempotency-Key` and reused verbatim on the recovery
+        // resend, so a turn interrupted by backgrounding reconnects to the same
+        // server-side turn instead of starting over.
+        let turnID = pendingAssistantMessageID?.uuidString
         let stream = env.backendMode.usesOllamaNativeChat
-            ? env.ollamaStreamingClient.stream(request, base: base, token: token)
-            : env.chatStreamingClient.stream(request, base: base, token: token)
+            ? env.ollamaStreamingClient.stream(request, base: base, token: token, turnID: turnID)
+            : env.chatStreamingClient.stream(request, base: base, token: token, turnID: turnID)
 
         // App-hosted tool calls forwarded this turn, captured so the post-stream
         // step can resolve them (the turn ends once the model calls one).
@@ -608,8 +613,11 @@ final class ChatViewModel {
 
         isStreaming = true
         streamingStartedAt = pending.message.createdAt
-        streamingText = pending.message.content
-        streamingReasoning = pending.message.reasoning
+        // Start empty: the orchestrator replays the resumed turn from the start
+        // (we omit `Last-Event-ID`), so the replayed tokens rebuild the message —
+        // preseeding the persisted partial here would double-count them.
+        streamingText = ""
+        streamingReasoning = ""
         statusText = nil
         statusProgress = nil
         pendingAssistantMessageID = pending.id
@@ -850,6 +858,17 @@ final class ChatViewModel {
 
     /// Stop button (FR-A9): abort the SSE connection; keep whatever streamed.
     func stop() {
+        // A resumable turn no longer cancels on disconnect, so explicitly tell the
+        // orchestrator to cancel it — freeing server resources and any running
+        // image generation immediately rather than letting it finish unseen.
+        if let env, let turnID = pendingAssistantMessageID?.uuidString,
+           let base = env.activeProfile?.baseURL {
+            let token = env.activeToken ?? ""
+            let client: any ChatClienting = env.backendMode.usesOllamaNativeChat
+                ? env.ollamaStreamingClient
+                : env.chatStreamingClient
+            Task { await client.cancel(turnID: turnID, base: base, token: token) }
+        }
         task?.cancel()
         finish(error: nil, emptyPendingDisposition: .delete)
     }

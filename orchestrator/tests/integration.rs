@@ -713,6 +713,89 @@ async fn resumable_turn_resumes_from_last_event_id() {
     );
 }
 
+/// `POST /v1/chat/cancel` drops a buffered turn, so a later reconnect with the
+/// same key starts fresh (re-runs upstream) rather than replaying. An unknown id
+/// is a no-op `204`.
+#[tokio::test]
+async fn cancel_drops_turn_so_reconnect_reruns() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ollama = spawn(mock_ollama_recording(requests.clone())).await;
+    let base = spawn_orchestrator(&ollama).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": "m",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+
+    // Run + buffer the turn (1 upstream hit).
+    client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("Idempotency-Key", "turn-c")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(requests.lock().await.len(), 1);
+
+    // Cancelling an unknown id is a no-op 204.
+    let unknown = client
+        .post(format!("{base}/v1/chat/cancel"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({ "turn_id": "nope" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // Cancel the real turn.
+    let cancelled = client
+        .post(format!("{base}/v1/chat/cancel"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({ "turn_id": "turn-c" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // Reconnecting with the same key now re-runs the turn (2 upstream hits),
+    // proving the buffered turn was dropped.
+    client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("Idempotency-Key", "turn-c")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        requests.lock().await.len(),
+        2,
+        "cancel removed the buffer, so the reconnect re-ran the turn"
+    );
+}
+
+/// The cancel endpoint is bearer-gated like the rest of the chat surface.
+#[tokio::test]
+async fn cancel_requires_auth() {
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator(&ollama).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/cancel"))
+        .json(&serde_json::json!({ "turn_id": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn regular_native_chat_omits_keep_alive() {
     let requests = Arc::new(Mutex::new(Vec::new()));

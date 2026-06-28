@@ -186,11 +186,30 @@ public func sseLines<Bytes: AsyncSequence & Sendable>(
 // MARK: - Chat client
 
 public protocol ChatClienting: Sendable {
-    func stream(_ request: ChatRequest, base: URL, token: String)
+    /// Stream a turn. `turnID`, when set, is sent as the `Idempotency-Key` header
+    /// so the orchestrator buffers the turn and replays it on reconnect — letting
+    /// a long generation survive the app backgrounding (see `docs/resilient-turns.md`).
+    /// Backends without a turn registry (native Ollama) ignore it.
+    func stream(_ request: ChatRequest, base: URL, token: String, turnID: String?)
         -> AsyncThrowingStream<ChatStreamEvent, Error>
+
+    /// Cancel a resumable turn server-side by its `turnID`. Best-effort and
+    /// fire-and-forget; the default is a no-op for backends that don't support it.
+    func cancel(turnID: String, base: URL, token: String) async
 }
 
 public extension ChatClienting {
+    /// Convenience overload for callers with no turn id — side queries (title
+    /// generation) and the native backend, which aren't resumable.
+    func stream(_ request: ChatRequest, base: URL, token: String)
+        -> AsyncThrowingStream<ChatStreamEvent, Error>
+    {
+        stream(request, base: base, token: token, turnID: nil)
+    }
+
+    /// Default: nothing to cancel (e.g. native Ollama has no turn registry).
+    func cancel(turnID: String, base: URL, token: String) async {}
+
     /// Run a request to completion and return the concatenated assistant text,
     /// ignoring status/progress events. Drains the token stream so it reuses the
     /// same transport + auth as a normal turn (and works for every backend).
@@ -212,7 +231,7 @@ public struct ChatClient: ChatClienting {
         self.session = session
     }
 
-    public func stream(_ request: ChatRequest, base: URL, token: String)
+    public func stream(_ request: ChatRequest, base: URL, token: String, turnID: String?)
         -> AsyncThrowingStream<ChatStreamEvent, Error>
     {
         AsyncThrowingStream { continuation in
@@ -225,6 +244,10 @@ public struct ChatClient: ChatClienting {
                     }
                     urlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     urlReq.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    // Resumable-turn key (transport-only; body stays standard OpenAI).
+                    if let turnID, !turnID.isEmpty {
+                        urlReq.setValue(turnID, forHTTPHeaderField: "Idempotency-Key")
+                    }
                     urlReq.httpBody = try Wire.encoder().encode(request)
 
                     let (bytes, response) = try await session.bytes(for: urlReq)
@@ -247,5 +270,20 @@ public struct ChatClient: ChatClienting {
             // Aborting the SSE connection on cancel (FR-A9).
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Tell the orchestrator to cancel a resumable turn (the Stop button). The
+    /// turn no longer cancels on disconnect, so this frees server resources (and
+    /// any running ComfyUI generation) immediately. Best-effort: failures are
+    /// ignored since Stop already finished the turn locally.
+    public func cancel(turnID: String, base: URL, token: String) async {
+        var req = URLRequest(url: base.appendingPathComponent("v1/chat/cancel"))
+        req.httpMethod = "POST"
+        if !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["turn_id": turnID])
+        _ = try? await session.data(for: req)
     }
 }
