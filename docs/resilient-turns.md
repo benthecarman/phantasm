@@ -164,13 +164,19 @@ between the snapshot and the `notified()` await is retained, so no wakeup is los
 A `Last-Event-ID` past the current log length (client ahead of server — shouldn't
 happen, but be defensive) clamps to the log end and tails from there.
 
-**Memory.** The log buffers the whole turn, including the final
-base64-data-URI image in inline-delivery mode (multi-MB). This is the same
-tradeoff `ContinuationCache` already accepts. In **URL-delivery** mode
-(`IMAGE_STORE_DIR` + public base, `turn.rs:192`) the image is a `/v1/images/<id>`
-ref, not bytes — much cheaper. Recommend documenting URL-delivery as the
-preferred config for this feature. Bound with `TURN_REGISTRY_MAX` (evict oldest
-*terminal* entry first), mirroring `CONTINUATION_MAX`.
+**Memory.** The log never holds image *bytes* when a blob store is configured:
+- **URL-delivery** (`IMAGE_STORE_DIR` + public base): the event already carries a
+  `/v1/files/<id>` ref, so the log is cheap as-is.
+- **Inline-delivery with a store** (`IMAGE_STORE_DIR`, no public base): the pump
+  *spills* the base64 to the store and buffers a `/v1/files/<id>` ref instead
+  (`image_delivery::offload_inline_images`); `attach_response` re-inlines it from
+  the store per stream (`inline_image_refs`), so client delivery is byte-for-byte
+  unchanged — only the in-memory copy is compact.
+- **No store at all**: nowhere to spill, so the base64 stays in the log (bounded
+  by `TURN_REGISTRY_MAX`). Set `IMAGE_STORE_DIR` to keep images off the heap.
+
+Bound with `TURN_REGISTRY_MAX` (evict oldest *terminal* entry first), mirroring
+`CONTINUATION_MAX`.
 
 **TTL.** Two timers:
 - `RESULT_TTL` (`TURN_RESULT_TTL_S`, default 24h): after `terminal_at`, keep the
@@ -330,7 +336,12 @@ Update `docs/SPEC.md` §2 deliberately (both halves). Note that resume is a
    watchdog; `TURN_ABANDON_GRACE_S` default 300s (`0` disables).
 3. ✅ **`RESULT_TTL` / `TURN_REGISTRY_MAX` values** — `TURN_RESULT_TTL_S` default
    24h, `TURN_REGISTRY_MAX` default 128; both env-configurable.
-4. **Inline vs URL image delivery** — recommend requiring/encouraging
+4. ✅ **Inline vs URL image delivery** — the pump now spills inline base64 images
+   to the blob store (when `IMAGE_STORE_DIR` is set) and re-inlines per stream, so
+   the in-memory log holds a ref regardless of public-base config; only a
+   store-less server keeps base64 in memory (bounded by the cap).
+
+   *(historical note)* — recommend requiring/encouraging
    URL-delivery for this feature to keep the log cheap; or accept the inline
    memory cost.
 

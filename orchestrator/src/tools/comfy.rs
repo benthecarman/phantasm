@@ -46,27 +46,30 @@ async fn interrupt_comfy(comfy_base: &Url, http: &reqwest::Client, prompt_id: &s
 /// turn-level tool `select!` (and the image tool's own) cancel a backgrounded or
 /// stopped generation by *dropping* the `run_workflow` future — so the only
 /// reliable place to tell ComfyUI to stop is here, on drop. Without it the GPU
-/// job runs on orphaned. Marked `done` once the image is in hand so a normal
-/// completion doesn't fire a pointless interrupt. The interrupt is spawned
-/// detached because `Drop` is synchronous.
+/// job runs on orphaned. `prompt_id` is the live state: `Some` once submitted,
+/// cleared to `None` on success (so a normal completion fires no pointless
+/// interrupt) or by drop (so the spawned interrupt fires at most once).
 struct InterruptOnDrop {
     comfy_base: Url,
     http: reqwest::Client,
     prompt_id: Option<String>,
-    done: bool,
 }
 
 impl Drop for InterruptOnDrop {
     fn drop(&mut self) {
-        if self.done {
-            return;
-        }
         let Some(prompt_id) = self.prompt_id.take() else {
-            return; // never submitted — nothing to interrupt
+            return; // never submitted, or completed — nothing to interrupt
+        };
+        // Drop is synchronous, so the interrupt is spawned detached. Guard on a
+        // live runtime: during shutdown the drop can run with no runtime, where
+        // `tokio::spawn` would panic. Then the process is exiting anyway, so the
+        // GPU job is the OS/ComfyUI's problem, not a panic-in-Drop → abort.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
         };
         let comfy_base = self.comfy_base.clone();
         let http = self.http.clone();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             interrupt_comfy(&comfy_base, &http, &prompt_id).await;
         });
     }
@@ -154,7 +157,6 @@ pub async fn run_workflow(
         comfy_base: cfg.comfy_base.clone(),
         http: http.clone(),
         prompt_id: None,
-        done: false,
     };
 
     // Submit the workflow.
@@ -201,9 +203,9 @@ pub async fn run_workflow(
     drop(ws);
 
     // Generation finished (or the WS closed): the image is in ComfyUI's history,
-    // so there's nothing to interrupt. A timeout/WS-error bails earlier with the
-    // guard still armed, which is what frees the GPU on those paths.
-    interrupt.done = true;
+    // so disarm the guard. A timeout/WS-error bails earlier with it still armed,
+    // which is what frees the GPU on those paths.
+    interrupt.prompt_id = None;
 
     // Fetch the produced image.
     let _ = tx.send(TurnEvent::Status("retrieving image…".into())).await;

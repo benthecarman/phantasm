@@ -212,33 +212,53 @@ impl TurnRegistry {
         abandoned.len()
     }
 
-    /// Spawn the background watchdog: every `interval`, sweep turns abandoned for
-    /// longer than `grace`. A no-op (not spawned) when `grace` is zero — the
-    /// caller uses that to disable the watchdog. Runs for the process lifetime.
+    /// Evict finished turns whose buffered result has outlived `result_ttl`,
+    /// returning how many were dropped. Called periodically by the watchdog so the
+    /// TTL is honored even on an idle server (otherwise eviction only happens when
+    /// the next request triggers `get_or_create`).
+    pub fn evict_expired(&self) -> usize {
+        let mut map = self.map.lock().unwrap();
+        let before = map.len();
+        Self::drop_expired(&mut map, self.result_ttl);
+        before - map.len()
+    }
+
+    /// Spawn the background maintenance task: every `interval`, evict result-TTL-
+    /// expired finished turns and (when `grace` > 0) cancel turns abandoned for
+    /// longer than `grace`. `grace` of 0 disables only the abandoned-turn sweep;
+    /// TTL eviction still runs. `interval` must be non-zero. Runs for the process
+    /// lifetime.
     pub fn spawn_watchdog(&self, grace: Duration, interval: Duration) {
-        if grace.is_zero() {
-            return;
-        }
         let registry = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                let swept = registry.sweep_abandoned(grace);
-                if swept > 0 {
-                    tracing::info!(count = swept, "cancelled abandoned resumable turns");
+                let expired = registry.evict_expired();
+                let abandoned = if grace.is_zero() {
+                    0
+                } else {
+                    registry.sweep_abandoned(grace)
+                };
+                if expired + abandoned > 0 {
+                    tracing::info!(expired, abandoned, "turn registry maintenance");
                 }
             }
         });
+    }
+
+    /// Drop finished turns past `ttl`. Shared by `evict_expired` (periodic) and
+    /// `purge` (on insert).
+    fn drop_expired(map: &mut HashMap<String, Arc<ActiveTurn>>, ttl: Duration) {
+        map.retain(|_, t| !matches!(t.terminal_age(), Some(age) if age >= ttl));
     }
 
     /// Evict finished turns past the result TTL, then enforce the size cap by
     /// dropping the oldest entries (terminal ones first, so a still-running turn
     /// isn't discarded while a finished one could go instead).
     fn purge(&self, map: &mut HashMap<String, Arc<ActiveTurn>>) {
-        let ttl = self.result_ttl;
-        map.retain(|_, t| !matches!(t.terminal_age(), Some(age) if age >= ttl));
+        Self::drop_expired(map, self.result_ttl);
         while map.len() >= self.max {
             let victim = map
                 .iter()
@@ -387,6 +407,26 @@ mod tests {
         assert!(reg.get("done").is_some(), "terminal turn is kept");
         assert!(!attached.cancel.is_cancelled());
         assert!(!finished.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn evict_expired_drops_only_finished_turns_past_ttl() {
+        // ttl 0 → any terminal turn is immediately expired; running turns stay.
+        let reg = TurnRegistry::new(Duration::ZERO, 128);
+        let (running, _) = reg.get_or_create("run");
+        let (finished, _) = reg.get_or_create("fin");
+        finished.push(TurnEvent::Done {
+            reason: "stop".into(),
+        });
+
+        let dropped = reg.evict_expired();
+        assert_eq!(dropped, 1, "only the finished turn is evicted");
+        assert!(reg.get("fin").is_none());
+        assert!(
+            reg.get("run").is_some(),
+            "a running turn is never TTL-evicted"
+        );
+        let _ = running;
     }
 
     #[test]

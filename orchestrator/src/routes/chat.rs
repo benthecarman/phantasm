@@ -62,15 +62,26 @@ pub async fn chat_completions(
     if let (Some(key), true) = (header_str(&headers, "idempotency-key"), stream) {
         let last_event_id =
             header_str(&headers, "last-event-id").and_then(|s| s.parse::<usize>().ok());
+        // When images are delivered inline (a store exists but mints no absolute
+        // URLs), spill their base64 to the store so the buffered log holds a
+        // compact ref, not megabytes — re-inlined per stream so delivery is
+        // unchanged. With a public base, delivery is already URL-based (no spill);
+        // with no store, there's nowhere to spill (base64 stays, bounded by cap).
+        let spill = state.images.clone().filter(|s| !s.has_public_base());
         let (active, is_new) = state.turns.get_or_create(&key);
         if is_new {
             let rx = spawn_turn(&state, req, active.cancel.clone()).await;
-            spawn_pump(rx, active.clone(), state.continuations.clone());
+            spawn_pump(
+                rx,
+                active.clone(),
+                state.continuations.clone(),
+                spill.clone(),
+            );
         }
         // Replay from the client's cursor (or the start); the iOS app rebuilds
         // from scratch and so omits `Last-Event-ID`.
         let start = last_event_id.map(|n| n + 1).unwrap_or(0);
-        return attach_response(model_name, active, start);
+        return attach_response(model_name, active, start, spill);
     }
 
     // Legacy / standard-client path: the turn is bound to this connection and
@@ -243,13 +254,18 @@ async fn spawn_turn(
 /// disconnects (the resumable path). Co-occurring server tool results carried on
 /// a `ToolCalls` event are stashed into the continuation cache here — once, on
 /// the producing side — then stripped so the buffered log stays small and a
-/// replay never re-stashes. When the turn's channel closes without an explicit
-/// terminal (e.g. a future cancellation), `finish()` releases any waiters.
+/// replay never re-stashes. When `spill` is set, inline base64 images are
+/// offloaded to the blob store so the log holds a compact ref instead of
+/// megabytes (re-inlined by `attach_response`). When the turn's channel closes
+/// without an explicit terminal (e.g. a future cancellation), `finish()` releases
+/// any waiters.
 fn spawn_pump(
     mut rx: mpsc::Receiver<TurnEvent>,
     active: Arc<ActiveTurn>,
     continuations: ContinuationCache,
+    spill: Option<crate::images::BlobStore>,
 ) {
+    use crate::tools::image_delivery::offload_inline_images;
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let ev = match ev {
@@ -260,6 +276,12 @@ fn spawn_pump(
                         }
                     }
                     TurnEvent::ToolCalls { app, held: None }
+                }
+                // A generated image rides the answer as a base64 data-URI token;
+                // offload it so the buffer holds a ref, not the bytes.
+                TurnEvent::Token(t) if spill.is_some() && t.contains("](data:") => {
+                    let store = spill.as_ref().unwrap();
+                    TurnEvent::Token(offload_inline_images(&t, store).await)
                 }
                 other => other,
             };
@@ -275,7 +297,13 @@ fn spawn_pump(
 /// `Last-Event-ID`. Crucially there is **no** drop-guard here — dropping this
 /// stream (the client disconnecting) detaches the responder but leaves the turn
 /// running, which is what lets a backgrounded generation finish.
-fn attach_response(model: String, active: Arc<ActiveTurn>, start: usize) -> Response {
+fn attach_response(
+    model: String,
+    active: Arc<ActiveTurn>,
+    start: usize,
+    spill: Option<crate::images::BlobStore>,
+) -> Response {
+    use crate::tools::image_delivery::inline_image_refs;
     let factory = ChunkFactory::new(model);
     let mut len_rx = active.subscribe();
     let body = async_stream::stream! {
@@ -296,7 +324,17 @@ fn attach_response(model: String, active: Arc<ActiveTurn>, start: usize) -> Resp
                         yield factory.progress(&status, progress).id(id)
                     }
                     TurnEvent::Reasoning(r) => yield factory.reasoning(&r).id(id),
-                    TurnEvent::Token(t) => yield factory.token(&t).id(id),
+                    // Re-inline any image the pump spilled to the store, so the
+                    // client receives the same base64 it would have un-spilled.
+                    TurnEvent::Token(t) => {
+                        let t = match spill.as_ref() {
+                            Some(store) if t.contains("/v1/files/") => {
+                                inline_image_refs(&t, store).await
+                            }
+                            _ => t,
+                        };
+                        yield factory.token(&t).id(id)
+                    }
                     TurnEvent::ToolCalls { app, .. } => yield factory.tool_calls(&app).id(id),
                     TurnEvent::Error(e) => {
                         yield factory.status(&format!("error: {e}")).id(id);

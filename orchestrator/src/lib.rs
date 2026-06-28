@@ -358,11 +358,17 @@ pub fn build_state(
         Duration::from_secs(cfg.turn_result_ttl_s),
         cfg.turn_registry_max,
     );
-    // Watchdog: cancel turns left running with no client (a force-killed app) so
-    // they don't hold the GPU. No-op when the grace is 0. Checked at most once a
-    // minute (or more often for a short grace).
+    // Background maintenance: evict result-TTL-expired finished turns, and cancel
+    // turns left running with no client (a force-killed app) so they don't hold
+    // the GPU. Abandoned-turn cancellation is disabled when the grace is 0; TTL
+    // eviction always runs. Tick at most once a minute (more often for a short
+    // grace), and never zero.
     let abandon_grace = Duration::from_secs(cfg.turn_abandon_grace_s);
-    turns.spawn_watchdog(abandon_grace, abandon_grace.min(Duration::from_secs(60)));
+    let tick = match abandon_grace {
+        Duration::ZERO => Duration::from_secs(60),
+        g => g.min(Duration::from_secs(60)),
+    };
+    turns.spawn_watchdog(abandon_grace, tick);
     state::AppState {
         upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.ollama_concurrency)),
         cfg,
