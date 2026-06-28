@@ -93,16 +93,19 @@ CODE_EXEC_LANGUAGES=python,node,bash,ruby
 With the tool enabled, ask the model to run code that probes the boundary, or test
 the image directly:
 
+# The image ENTRYPOINT is `sleep infinity` (pooled containers idle there); the
+# orchestrator runs code via `exec`. To invoke the dispatcher directly with `run`,
+# override the entrypoint and pass the language as the argument:
 ```sh
 # internet should work:
 echo 'import urllib.request; print(urllib.request.urlopen("https://example.com").status)' \
-  | podman run --rm -i --network phantasm-codeexec phantasm/code-exec:latest \
-      /usr/local/bin/run-code python   # expect: 200
+  | podman run --rm -i --entrypoint /usr/local/bin/run-code --network phantasm-codeexec \
+      phantasm/code-exec:latest python   # expect: 200
 
 # internal/metadata should FAIL (timeout/refused), not print credentials:
 echo 'import urllib.request; print(urllib.request.urlopen("http://169.254.169.254/", timeout=3).read())' \
-  | podman run --rm -i --network phantasm-codeexec phantasm/code-exec:latest \
-      /usr/local/bin/run-code python   # expect: error, not data
+  | podman run --rm -i --entrypoint /usr/local/bin/run-code --network phantasm-codeexec \
+      phantasm/code-exec:latest python   # expect: error, not data
 ```
 
 After a chat that runs code, confirm no containers are left behind:
