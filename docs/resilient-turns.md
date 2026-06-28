@@ -357,4 +357,7 @@ Update `docs/SPEC.md` §2 deliberately (both halves). Note that resume is a
    with no listener past `TURN_ABANDON_GRACE_S` (default 300s, `0` disables).
    Tested: `sweep_cancels_detached_running_turns_only`,
    `detach_rearms_the_abandoned_clock`.
-4. SPEC §2 + docs. (Remaining: fold the contract changes into `docs/SPEC.md`.)
+4. ✅ **Done.** Contract folded into `docs/SPEC.md`: new §2.2c (resumable turns —
+   `Idempotency-Key`/`Last-Event-ID`/SSE `id:` + `POST /v1/chat/cancel`,
+   retention knobs), updated cancellation bullet, FR-O8/FR-A9/new FR-A11, XR-2
+   second exception, and §8 ("transport surface only, bodies stay standard").

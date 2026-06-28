@@ -200,6 +200,37 @@ upstream the server issues a no-message "load" (model resident via a warm-only
 `/api/chat` load instead. Plain OpenAI-compatible backends are not warmed (no
 free preload).
 
+### 2.2c Resumable turns (optional, additive)
+
+A streaming turn can outlive its connection so a long generation survives the app
+backgrounding (iOS cannot hold a streaming connection while suspended). This is a
+pure **transport** extension — request/response *bodies* stay byte-for-byte
+standard OpenAI; a client that ignores it gets the legacy behavior. See
+[`resilient-turns.md`](resilient-turns.md) for the design.
+
+- **Turn identity — `Idempotency-Key` request header.** When a streaming request
+  carries one, the orchestrator runs the turn detached from the connection and
+  buffers its output, keyed by that value. Dropping the connection (backgrounding)
+  no longer cancels the turn. A later request with the **same** key attaches to
+  the running-or-finished turn and replays it rather than starting over. The app
+  uses its pending-assistant message id, reused verbatim on the recovery resend.
+  Absent ⇒ legacy behavior (turn bound to the connection, cancelled on
+  disconnect). Raw Ollama lacks this; the app degrades gracefully.
+- **Replay cursor — SSE `id:` + `Last-Event-ID`.** Each SSE event is stamped with
+  `id: <n>` (a per-turn monotonic sequence). On reconnect a client MAY send
+  `Last-Event-ID: <n>` to resume after that event; omitted ⇒ full replay from the
+  start (what the app does — it rebuilds the message from the replayed stream).
+- **Cancel — `POST /v1/chat/cancel` `{ "turn_id": "<key>" }`** (bearer-authed).
+  Cancels a resumable turn by its `Idempotency-Key`, interrupting in-flight tool
+  work (incl. a running ComfyUI generation). This is the new app's Stop, since a
+  resumable turn no longer cancels on disconnect. Unknown id ⇒ no-op `204`.
+  Legacy clients don't need it (they cancel by disconnecting).
+- **Retention.** A finished turn's buffer is kept for `TURN_RESULT_TTL_S` so a
+  late reconnect still gets the result; total buffered turns are bounded by
+  `TURN_REGISTRY_MAX`. A still-running turn with no connected client past
+  `TURN_ABANDON_GRACE_S` is cancelled by a watchdog (the force-killed-app
+  backstop). All three are server config.
+
 ### 2.3 Tools: server-side (invisible) and app-hosted (forwarded)
 
 Most tool execution happens entirely on the **orchestrator ↔ Ollama** hop using
@@ -326,8 +357,10 @@ Consequences:
   unknown fields; the app reads these `x_` fields. Future custom fields should
   be `x_`-prefixed.
 - Conversation is stateless server-side: the app sends full history each turn.
-- Cancellation: the client aborts the SSE connection; the orchestrator detects
-  the disconnect and halts generation and in-flight tool work.
+- Cancellation: for a plain turn the client aborts the SSE connection and the
+  orchestrator halts generation and in-flight tool work. A **resumable** turn
+  (§2.2c) instead survives disconnect — it is cancelled explicitly via
+  `POST /v1/chat/cancel`, or by the abandoned-turn watchdog.
 
 **Tool privacy / persistence boundary.** Server-side tools MUST NOT persist
 conversation content, tool inputs, tool outputs, fetched pages, generated
@@ -347,8 +380,10 @@ contract update and user-confirmation UI.
 **Functional:** capabilities endpoint (FR-O1), OpenAI-compatible chat with SSE
 (FR-O2), server-side tool loop with iteration cap (FR-O3), Brave web search
 (snippet-first; FR-O4), ComfyUI image gen with progress relay (FR-O5), model
-listing (FR-O6), bearer auth → 401 (FR-O7), cancellation on disconnect (FR-O8),
-optional read-only tools for web fetch, current time, calculator, unit
+listing (FR-O6), bearer auth → 401 (FR-O7), cancellation — on disconnect for a
+plain turn, or via `POST /v1/chat/cancel` for a resumable turn that survives
+disconnect (FR-O8, §2.2c), optional read-only tools for web fetch, current time,
+calculator, unit
 conversion, weather, places/geocoding, market data, GitHub reads, and OCR
 (FR-O9). Local docs/filesystem tools and side-effecting tools are out of scope.
 
@@ -365,8 +400,10 @@ concurrent fetch, small injected context, warm model; NFR-O8).
 graceful degradation (FR-A2), streaming chat (FR-A3), markdown + code blocks
 with copy (FR-A4), conversation management (FR-A5), model selection (FR-A6),
 inline image display + save/share (FR-A7), `x_status` progress UI (FR-A8),
-cancellation (FR-A9), connection handling distinguishing unreachable/auth/model
-errors (FR-A10).
+cancellation — Stop calls `POST /v1/chat/cancel` for a resumable turn (FR-A9,
+§2.2c), resumable turns so a generation survives backgrounding: the app keys each
+turn with `Idempotency-Key` and reconnects to replay it on foreground (FR-A11),
+connection handling distinguishing unreachable/auth/model errors (FR-A10).
 
 **Non-functional:** iOS 17+ (NFR-A1), token in Keychain (NFR-A2), local SwiftData
 persistence (NFR-A3), smooth streaming off the main thread (NFR-A4), fast cold
@@ -377,11 +414,12 @@ start (NFR-A5), optional multiple backend profiles (NFR-A6).
 - **XR-1 Graceful degradation** — every tool is optional; plain chat works
   against any OpenAI-compatible endpoint including raw Ollama.
 - **XR-2 Stateless server, stateful client** — the app sends full history each
-  turn. One bounded exception: a turn paused on an app-hosted tool call while
-  server calls co-occurred holds its resolved history server-side until the
-  app's follow-up (see §2.3 "Mixed batches"). It is in-memory, TTL'd, capped,
-  one-shot, and lossy-safe — a miss just re-runs the server calls — so the server
-  stays effectively stateless across conversations.
+  turn. Two bounded exceptions, both in-memory, TTL'd, capped, and lossy-safe (a
+  miss just re-runs), so the server stays effectively stateless across
+  conversations: (a) a turn paused on an app-hosted tool call while server calls
+  co-occurred holds its resolved history server-side until the app's follow-up
+  (see §2.3 "Mixed batches"); (b) a resumable turn (§2.2c) buffers its output for
+  reconnect — a miss just re-runs the turn.
 - **XR-3 Versioning** — the capabilities manifest carries a version.
 - **XR-4 No tool persistence** — server tools do not write local state or index
   local files; per-turn in-memory caches are allowed only as an optimization.
@@ -401,13 +439,15 @@ MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel
 ## 8. Resolved decisions
 
 - Single OpenAI-compatible SSE endpoint; tools server-side; the only
-  non-standard wire element is the `x_`-prefixed `x_status` (progress) field.
+  non-standard *body* element is the `x_`-prefixed `x_status` (progress) field.
   Deep Research rides the standard `model` id (a `"<base>:<mode>"` suffix
   resolved server-side, §2.3) rather than a proprietary flag, so research stops
   being non-standard wire surface — the headline win. Tool selection rides
   standard `tools`/`tool_choice`; streamed reasoning rides
   `delta.reasoning_content`; `/v1/models` is served alongside
-  `/v1/capabilities`.
+  `/v1/capabilities`. Resumable turns (§2.2c) add only *transport* surface —
+  the `Idempotency-Key`/`Last-Event-ID` headers, SSE `id:`, and a
+  `POST /v1/chat/cancel` endpoint — leaving request/response bodies standard.
 - Upstream native Ollama via **`/api/chat`** when available (Ollama
   OpenAI-compat drops streamed tool_calls), with OpenAI-compatible `/v1`
   fallback for non-Ollama model hosts.
