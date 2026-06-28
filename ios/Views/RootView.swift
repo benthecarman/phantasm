@@ -6,6 +6,7 @@ import SwiftUI
 /// user pulls in from the leading edge or the toolbar button.
 struct RootView: View {
     @Environment(AppEnvironment.self) private var env
+    @Environment(NotificationRouter.self) private var notificationRouter
     @Environment(\.scenePhase) private var scenePhase
 
     /// The displayed conversation. A new chat is an in-memory draft (a value with
@@ -41,11 +42,19 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             chatViewModels.setSceneActive(phase == .active)
         }
+        .onChange(of: notificationRouter.pendingConversationID) { _, id in
+            if let id { openConversation(id: id) }
+        }
         .task {
             if selection == nil {
                 let chat = makeNewChat()
                 initialChatID = chat.id
                 selection = chat
+            }
+            // A tap that cold-launched the app may have set this before the view
+            // appeared, so `.onChange` won't have fired for it.
+            if let id = notificationRouter.pendingConversationID {
+                openConversation(id: id)
             }
         }
     }
@@ -178,6 +187,19 @@ struct RootView: View {
     private func open(_ convo: Conversation) {
         selection = convo
         closeDrawer()
+    }
+
+    /// Navigate to the chat behind a tapped completion notification. The
+    /// conversation must be reloaded from the store (the notification only
+    /// carries its id), and the pending id is cleared so a later tap of the
+    /// same chat registers as a fresh change.
+    private func openConversation(id: UUID) {
+        Task {
+            defer { notificationRouter.pendingConversationID = nil }
+            guard let detail = try? await env.store.conversationDetail(id: id) else { return }
+            selection = detail.conversation
+            closeDrawer()
+        }
     }
 
     private func openDrawer() {

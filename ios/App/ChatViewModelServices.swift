@@ -102,7 +102,7 @@ struct UserNotificationManager: NotificationManaging {
         content.body = "Your response is ready."
         content.sound = .default
 
-        let id = conversationID.map { "chat-response-\($0.uuidString)" } ?? UUID().uuidString
+        let id = ChatCompletionNotification.identifier(for: conversationID)
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         try? await center.add(request)
     }
