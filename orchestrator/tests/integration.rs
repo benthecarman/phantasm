@@ -194,6 +194,8 @@ fn test_config(ollama_base: &str) -> Config {
         models: vec!["m".into()],
         max_tool_iters: 5,
         ollama_concurrency: 4,
+        turn_result_ttl_s: 24 * 60 * 60,
+        turn_registry_max: 128,
         max_request_body_bytes: 32 * 1024 * 1024,
         max_request_images: 16,
         max_request_image_bytes: 16 * 1024 * 1024,
@@ -585,6 +587,130 @@ async fn plain_chat_streams_tokens() {
     assert_eq!(content, "Hello world");
     assert!(saw_finish, "expected a finish_reason:stop chunk");
     assert!(saw_done, "expected a [DONE] sentinel");
+}
+
+/// Concatenate the `delta.content` across an SSE body's chunks.
+fn sse_content(body: &str) -> String {
+    let mut content = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+    }
+    content
+}
+
+/// A streaming turn started with an `Idempotency-Key` is buffered server-side, so
+/// a reconnect with the same key (what the app does after backgrounding) replays
+/// the completed turn in full rather than re-running it upstream.
+#[tokio::test]
+async fn resumable_turn_replays_on_reconnect_without_rerunning() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ollama = spawn(mock_ollama_recording(requests.clone())).await;
+    let base = spawn_orchestrator(&ollama).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": "m",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+
+    // First connection: streams to completion and buffers the turn.
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("Idempotency-Key", "turn-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let first = resp.text().await.unwrap();
+    assert_eq!(sse_content(&first), "Hello world");
+    assert!(
+        first.lines().any(|l| l.starts_with("id: 0")),
+        "events carry monotonic SSE id: lines for Last-Event-ID resume"
+    );
+
+    // Reconnect with the SAME key: the buffered turn is replayed verbatim.
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("Idempotency-Key", "turn-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let replay = resp.text().await.unwrap();
+    assert_eq!(
+        sse_content(&replay),
+        "Hello world",
+        "reconnect replays the buffered turn"
+    );
+    assert!(replay.lines().any(|l| l == "data: [DONE]"));
+
+    // The upstream was hit exactly once: the replay served from the buffer, it
+    // did not re-run the turn.
+    assert_eq!(
+        requests.lock().await.len(),
+        1,
+        "reconnect must not re-issue the turn upstream"
+    );
+}
+
+/// Resume with `Last-Event-ID` replays only the tail past that cursor.
+#[tokio::test]
+async fn resumable_turn_resumes_from_last_event_id() {
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator(&ollama).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": "m",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+
+    // Run the turn to completion so the full log is buffered.
+    let first = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("Idempotency-Key", "turn-xyz")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // The first content delta is event id 0 ("Hello"); resume strictly after it.
+    assert_eq!(sse_content(&first), "Hello world");
+
+    let resumed = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("Idempotency-Key", "turn-xyz")
+        .header("Last-Event-ID", "0")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // Replaying past id 0 omits the first token, so only " world" remains.
+    assert_eq!(
+        sse_content(&resumed),
+        " world",
+        "Last-Event-ID skips already-delivered events"
+    );
 }
 
 #[tokio::test]

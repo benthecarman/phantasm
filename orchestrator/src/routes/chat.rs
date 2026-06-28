@@ -7,9 +7,11 @@
 //! before responding and can therefore return a proper error status.
 
 use std::convert::Infallible;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -23,9 +25,11 @@ use crate::openai::sse::{done_event, ChunkFactory};
 use crate::openai::types::{ChatMessage, ChatRequest, ToolCall};
 use crate::orchestrator::{run_turn, TurnEvent};
 use crate::state::{AppState, ContinuationCache};
+use crate::turn_registry::ActiveTurn;
 
 pub async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
     if req.messages.is_empty() {
@@ -39,6 +43,64 @@ pub async fn chat_completions(
     ) {
         return e.into_response();
     }
+
+    // The downstream OpenAI response echoes back the model the client asked for
+    // (including any mode suffix); the base model is what we run upstream and is
+    // resolved inside `spawn_turn`.
+    let model_name = req
+        .model
+        .clone()
+        .unwrap_or_else(|| state.cfg.default_model.clone());
+    let stream = req.stream;
+
+    // Resumable streaming turns (FR-O8 reworked): a turn started with an
+    // `Idempotency-Key` keeps running across client disconnects and is buffered
+    // server-side, so backgrounding the app no longer loses a long generation —
+    // a reconnect with the same key replays it. Non-streaming requests and
+    // standard clients (no key) take the connection-bound legacy path below.
+    if let (Some(key), true) = (header_str(&headers, "idempotency-key"), stream) {
+        let last_event_id =
+            header_str(&headers, "last-event-id").and_then(|s| s.parse::<usize>().ok());
+        let (active, is_new) = state.turns.get_or_create(&key);
+        if is_new {
+            let rx = spawn_turn(&state, req, active.cancel.clone()).await;
+            spawn_pump(rx, active.clone(), state.continuations.clone());
+        }
+        // Replay from the client's cursor (or the start); the iOS app rebuilds
+        // from scratch and so omits `Last-Event-ID`.
+        let start = last_event_id.map(|n| n + 1).unwrap_or(0);
+        return attach_response(model_name, active, start);
+    }
+
+    // Legacy / standard-client path: the turn is bound to this connection and
+    // cancelled on disconnect via the SSE drop-guard (see `stream_response`).
+    let cancel = CancellationToken::new();
+    let rx = spawn_turn(&state, req, cancel.clone()).await;
+    if stream {
+        stream_response(model_name, rx, cancel, state.continuations.clone())
+    } else {
+        collect_response(model_name, rx, state.continuations.clone()).await
+    }
+}
+
+/// Read a non-empty, trimmed request header value as a `String`.
+fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Prepare the messages (incl. intra-turn continuation splicing) and spawn the
+/// turn task, returning the channel its `TurnEvent`s arrive on. The turn owns
+/// clones of everything it needs and runs detached on the provided `cancel`.
+async fn spawn_turn(
+    state: &AppState,
+    req: ChatRequest,
+    cancel: CancellationToken,
+) -> mpsc::Receiver<TurnEvent> {
+    use crate::orchestrator::tools::{ToolExecutor, ToolRegistry};
 
     // Resolve the per-turn tool selection and any app-hosted tool definitions
     // from the standard `tools`/`tool_choice` fields before we move the rest of
@@ -78,75 +140,149 @@ pub async fn chat_completions(
     // Deep Research is selected by the model id, not a request flag: split the
     // requested model into its base model and an optional research preset.
     let (base_model, preset) = state.cfg.presets().resolve_model(&requested_model);
-    // The downstream OpenAI response echoes back the model the client asked for
-    // (including any mode suffix); the base model is what we run upstream.
-    let model_name = requested_model;
     let model = base_model;
 
-    let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel::<TurnEvent>(64);
 
-    // Spawn the turn; it owns clones of everything it needs.
-    {
-        use crate::orchestrator::tools::{ToolExecutor, ToolRegistry};
-        let cfg = state.cfg.clone();
-        let backend = state.upstream.clone();
-        let tools = ToolRegistry::new(
-            state.cfg.clone(),
-            state.http.clone(),
-            state.code_exec.clone(),
+    let cfg = state.cfg.clone();
+    let backend = state.upstream.clone();
+    let tools = ToolRegistry::new(
+        state.cfg.clone(),
+        state.http.clone(),
+        state.code_exec.clone(),
+    );
+    let sem = state.upstream_sem.clone();
+    let images = state.images.clone();
+
+    // Per-turn structured logging (NFR-O7). Message content is never logged
+    // unless explicitly enabled.
+    let turn_id = uuid::Uuid::new_v4().simple().to_string();
+    // Count what's actually offered after the client's per-request selection,
+    // so the log reflects the real tool surface for this turn.
+    let tools_offered =
+        crate::orchestrator::turn::select_schemas(tools.schemas(), &enabled_tools).len();
+    let log_model = model.clone();
+    // Resolved research mode id (if any) for per-turn logging.
+    let mode = preset.map(|p| p.id);
+    if cfg.log_content {
+        tracing::debug!(turn_id, messages = ?messages, "turn content");
+    }
+
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        tracing::info!(turn_id, model = %log_model, stream, tools_offered, mode, "turn started");
+        run_turn(
+            cfg,
+            backend,
+            tools,
+            sem,
+            messages,
+            model,
+            options,
+            enabled_tools,
+            app_tools,
+            preset,
+            images,
+            tx,
+            cancel,
+        )
+        .await;
+        tracing::info!(
+            turn_id,
+            model = %log_model,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "turn finished"
         );
-        let sem = state.upstream_sem.clone();
-        let images = state.images.clone();
-        let cancel = cancel.clone();
+    });
 
-        // Per-turn structured logging (NFR-O7). Message content is never logged
-        // unless explicitly enabled.
-        let turn_id = uuid::Uuid::new_v4().simple().to_string();
-        // Count what's actually offered after the client's per-request selection,
-        // so the log reflects the real tool surface for this turn.
-        let tools_offered =
-            crate::orchestrator::turn::select_schemas(tools.schemas(), &enabled_tools).len();
-        let log_model = model.clone();
-        // Resolved research mode id (if any) for per-turn logging.
-        let mode = preset.map(|p| p.id);
-        if cfg.log_content {
-            tracing::debug!(turn_id, messages = ?messages, "turn content");
+    rx
+}
+
+/// Drain a turn's events into its `ActiveTurn` log so they survive client
+/// disconnects (the resumable path). Co-occurring server tool results carried on
+/// a `ToolCalls` event are stashed into the continuation cache here — once, on
+/// the producing side — then stripped so the buffered log stays small and a
+/// replay never re-stashes. When the turn's channel closes without an explicit
+/// terminal (e.g. a future cancellation), `finish()` releases any waiters.
+fn spawn_pump(
+    mut rx: mpsc::Receiver<TurnEvent>,
+    active: Arc<ActiveTurn>,
+    continuations: ContinuationCache,
+) {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let ev = match ev {
+                TurnEvent::ToolCalls { app, held } => {
+                    if let Some(held) = held {
+                        if let Some(key) = app.first().and_then(|c| c.id.clone()) {
+                            continuations.stash(key, held).await;
+                        }
+                    }
+                    TurnEvent::ToolCalls { app, held: None }
+                }
+                other => other,
+            };
+            active.push(ev);
         }
+        active.finish();
+    });
+}
 
-        tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            tracing::info!(turn_id, model = %log_model, stream, tools_offered, mode, "turn started");
-            run_turn(
-                cfg,
-                backend,
-                tools,
-                sem,
-                messages,
-                model,
-                options,
-                enabled_tools,
-                app_tools,
-                preset,
-                images,
-                tx,
-                cancel,
-            )
-            .await;
-            tracing::info!(
-                turn_id,
-                model = %log_model,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "turn finished"
-            );
-        });
-    }
+/// Build the SSE response by attaching to a buffered turn: replay the log from
+/// `start`, then tail live events until the turn ends. Each event is stamped
+/// with its log index as the SSE `id:`, so a reconnecting client can resume via
+/// `Last-Event-ID`. Crucially there is **no** drop-guard here — dropping this
+/// stream (the client disconnecting) detaches the responder but leaves the turn
+/// running, which is what lets a backgrounded generation finish.
+fn attach_response(model: String, active: Arc<ActiveTurn>, start: usize) -> Response {
+    let factory = ChunkFactory::new(model);
+    let mut len_rx = active.subscribe();
+    let body = async_stream::stream! {
+        yield factory.role_open();
+        let mut idx = start;
+        loop {
+            let (events, done) = active.snapshot_from(idx);
+            for ev in events {
+                let id = idx.to_string();
+                idx += 1;
+                match ev {
+                    TurnEvent::Status(s) => yield factory.status(&s).id(id),
+                    TurnEvent::Progress { status, progress } => {
+                        yield factory.progress(&status, progress).id(id)
+                    }
+                    TurnEvent::Reasoning(r) => yield factory.reasoning(&r).id(id),
+                    TurnEvent::Token(t) => yield factory.token(&t).id(id),
+                    TurnEvent::ToolCalls { app, .. } => yield factory.tool_calls(&app).id(id),
+                    TurnEvent::Error(e) => {
+                        yield factory.status(&format!("error: {e}")).id(id);
+                        yield factory.token(&format!("\n\n⚠️ {e}"));
+                        yield factory.finish("stop");
+                        yield done_event();
+                        return;
+                    }
+                    TurnEvent::Done { reason } => {
+                        yield factory.finish(&reason).id(id);
+                        yield done_event();
+                        return;
+                    }
+                }
+            }
+            if done {
+                // Terminal without an explicit Done/Error event (e.g. a turn
+                // cancelled mid-flight): just end the stream, matching the legacy
+                // channel-closed-without-Done behavior.
+                break;
+            }
+            // Wait for the next append; an error means the turn task is gone.
+            if len_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    };
 
-    if stream {
-        stream_response(model_name, rx, cancel, state.continuations.clone())
-    } else {
-        collect_response(model_name, rx, state.continuations.clone()).await
-    }
+    Sse::new(body.map(Ok::<Event, Infallible>))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 /// Reject a request carrying too many or too-large inline images before we spend

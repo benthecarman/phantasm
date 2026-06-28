@@ -64,6 +64,17 @@ pub struct Config {
     pub max_tool_iters: u8,
     pub ollama_concurrency: usize,
 
+    // Resumable turns (see `TurnRegistry`). A streaming turn started with an
+    // `Idempotency-Key` keeps running across client disconnects (e.g. the app
+    // backgrounding) and is buffered server-side so a reconnect replays it.
+    /// How long a finished turn's buffered output is retained after completion so
+    /// a late reconnect can still fetch it, before eviction.
+    pub turn_result_ttl_s: u64,
+    /// Cap on simultaneously buffered turns; the oldest is evicted past it. Each
+    /// entry can hold a full turn (incl. an inline base64 image), so this bounds
+    /// worst-case memory like `CONTINUATION_MAX`.
+    pub turn_registry_max: usize,
+
     // Request guards (DoS surface). The body limit is the coarse cap on the whole
     // request; the image caps are the finer ones — many small inline images, or a
     // single oversized one that still fits under the body limit.
@@ -267,6 +278,8 @@ impl Config {
             models,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
             ollama_concurrency: env_parse("OLLAMA_MAX_CONCURRENCY", 4usize).max(1),
+            turn_result_ttl_s: env_parse("TURN_RESULT_TTL_S", 24 * 60 * 60),
+            turn_registry_max: env_parse("TURN_REGISTRY_MAX", 128usize),
             max_request_body_bytes: env_parse("MAX_REQUEST_BODY_BYTES", 32 * 1024 * 1024),
             max_request_images: env_parse("MAX_REQUEST_IMAGES", 16usize),
             max_request_image_bytes: env_parse("MAX_REQUEST_IMAGE_BYTES", 16 * 1024 * 1024),
@@ -532,6 +545,8 @@ pub mod tests_support {
             models: vec![],
             max_tool_iters: 5,
             ollama_concurrency: 4,
+            turn_result_ttl_s: 24 * 60 * 60,
+            turn_registry_max: 128,
             max_request_body_bytes: 32 * 1024 * 1024,
             max_request_images: 16,
             max_request_image_bytes: 16 * 1024 * 1024,

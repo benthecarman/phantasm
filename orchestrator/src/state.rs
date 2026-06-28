@@ -40,6 +40,11 @@ pub struct AppState {
     /// on an app-hosted tool call when server calls co-occurred, so the
     /// follow-up request resumes without re-running (or losing) that server work.
     pub continuations: ContinuationCache,
+    /// Buffered resumable turns (see `crate::turn_registry`): a streaming turn
+    /// started with an `Idempotency-Key` keeps running across client disconnects
+    /// and is replayed on reconnect, so a long generation survives the app
+    /// backgrounding. Keyed by that header; TTL'd and bounded.
+    pub turns: crate::turn_registry::TurnRegistry,
     /// Server-hosted image blobs, present only when `IMAGE_STORE_DIR` is set.
     /// When absent, image tools fall back to inline base64 delivery.
     pub images: Option<crate::images::BlobStore>,

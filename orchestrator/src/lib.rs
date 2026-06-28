@@ -13,6 +13,7 @@ pub mod orchestrator;
 pub mod routes;
 pub mod state;
 pub mod tools;
+pub mod turn_registry;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -353,6 +354,10 @@ pub fn build_state(
     } else {
         None
     };
+    let turns = turn_registry::TurnRegistry::new(
+        Duration::from_secs(cfg.turn_result_ttl_s),
+        cfg.turn_registry_max,
+    );
     state::AppState {
         upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.ollama_concurrency)),
         cfg,
@@ -360,6 +365,7 @@ pub fn build_state(
         upstream,
         capabilities,
         continuations: state::ContinuationCache::new(),
+        turns,
         images,
         code_exec,
     }
