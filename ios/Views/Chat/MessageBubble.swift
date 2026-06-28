@@ -192,6 +192,7 @@ struct StreamingBubble: View {
     let text: String
     let reasoning: String
     let status: String?
+    let progress: Double?
     /// When the turn began — used only to seed the loader's verb (deterministic
     /// per turn). The preview shows no timestamp; that appears once the turn is
     /// complete and the bubble becomes a persisted `MessageBubble`. VM-owned so
@@ -202,7 +203,7 @@ struct StreamingBubble: View {
         HStack {
             VStack(alignment: .leading, spacing: 6) {
                 if let status, !status.isEmpty {
-                    StatusPill(text: status)
+                    StatusPill(text: status, isAnimated: true, progress: progress)
                 }
                 if !reasoning.isEmpty {
                     ThinkingDisclosure(text: reasoning)

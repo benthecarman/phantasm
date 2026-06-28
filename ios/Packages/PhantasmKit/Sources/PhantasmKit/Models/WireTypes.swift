@@ -268,8 +268,8 @@ extension WirePart: Codable {
     }
 }
 
-/// One streamed `chat.completion.chunk`. `xStatus` maps the additive `x_status`
-/// field; absence is normal (e.g. raw Ollama) and must not break decoding.
+/// One streamed `chat.completion.chunk`. `xStatus` / `xProgress` map additive
+/// `x_` fields; absence is normal (e.g. raw Ollama) and must not break decoding.
 public struct ChatChunk: Decodable, Sendable {
     public struct Choice: Decodable, Sendable {
         public struct Delta: Decodable, Sendable {
@@ -286,6 +286,7 @@ public struct ChatChunk: Decodable, Sendable {
     }
     public let choices: [Choice]
     public let xStatus: String?
+    public let xProgress: Double?
 }
 
 public extension ChatChunk.Choice.Delta {

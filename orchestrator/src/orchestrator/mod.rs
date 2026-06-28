@@ -13,6 +13,9 @@ pub use turn::run_turn;
 pub enum TurnEvent {
     /// Progress heartbeat, surfaced to the app via the additive `x_status` field.
     Status(String),
+    /// Determinate progress heartbeat. `progress` is normalized 0.0…1.0 and is
+    /// surfaced via the additive `x_progress` field alongside `x_status`.
+    Progress { status: String, progress: f64 },
     /// A token of model thinking/reasoning, hidden by default in the app.
     Reasoning(String),
     /// A token of the final assistant answer.

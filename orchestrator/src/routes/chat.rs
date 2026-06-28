@@ -214,6 +214,7 @@ fn stream_response(
         while let Some(ev) = rx.recv().await {
             match ev {
                 TurnEvent::Status(s) => yield factory.status(&s),
+                TurnEvent::Progress { status, progress } => yield factory.progress(&status, progress),
                 TurnEvent::Reasoning(r) => yield factory.reasoning(&r),
                 TurnEvent::Token(t) => yield factory.token(&t),
                 TurnEvent::ToolCalls { app, held } => {
@@ -278,7 +279,7 @@ async fn collect_response(
                 // Collected before responding, so we can use a real status.
                 return AppError::OllamaError(e).into_response();
             }
-            TurnEvent::Status(_) | TurnEvent::Reasoning(_) => {
+            TurnEvent::Status(_) | TurnEvent::Progress { .. } | TurnEvent::Reasoning(_) => {
                 // Non-streaming OpenAI completions expose only final content.
             }
         }

@@ -320,9 +320,11 @@ Consequences:
     is the backstop for deletes that never arrive.
   - The edit tool resolves a URL-delivered image back to bytes server-side, so
     editing a previously-generated image works in either form.
-- **Progress** rides an optional additive field on the SSE chunk,
-  `"x_status": "generating image… 42%"`. Standard clients ignore unknown fields;
-  the app reads `x_status`. Future custom fields should be `x_`-prefixed.
+- **Progress** rides optional additive fields on the SSE chunk, e.g.
+  `"x_status": "generating image… 42%"` plus `"x_progress": 0.42` for
+  determinate work such as ComfyUI image generation. Standard clients ignore
+  unknown fields; the app reads these `x_` fields. Future custom fields should
+  be `x_`-prefixed.
 - Conversation is stateless server-side: the app sends full history each turn.
 - Cancellation: the client aborts the SSE connection; the orchestrator detects
   the disconnect and halts generation and in-flight tool work.

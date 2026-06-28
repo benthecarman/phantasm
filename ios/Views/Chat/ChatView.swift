@@ -274,6 +274,7 @@ struct ChatView: View {
                             text: vm.streamingText,
                             reasoning: vm.streamingReasoning,
                             status: vm.statusText,
+                            progress: vm.statusProgress,
                             startedAt: vm.streamingStartedAt
                         )
                     }

@@ -199,7 +199,10 @@ async fn handle_ws_message(
             if pct != *last_pct {
                 *last_pct = pct;
                 let _ = tx
-                    .send(TurnEvent::Status(format!("generating image… {pct}%")))
+                    .send(TurnEvent::Progress {
+                        status: format!("generating image… {pct}%"),
+                        progress: pct as f64 / 100.0,
+                    })
                     .await;
             }
             Some(false)

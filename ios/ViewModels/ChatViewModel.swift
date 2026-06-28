@@ -24,6 +24,7 @@ final class ChatViewModel {
     /// SwiftUI for the recycled bubble.
     private(set) var streamingStartedAt = Date.now
     private(set) var statusText: String?
+    private(set) var statusProgress: Double?
     var errorMessage: String?
     /// A pending interactive app-tool prompt (e.g. `ask_user`'s multiple choice)
     /// awaiting the user. The composer + prompt views resolve it via
@@ -223,7 +224,11 @@ final class ChatViewModel {
     }
 
     var hasAssistantPreview: Bool {
-        isStreaming || !(statusText?.isEmpty ?? true) || !streamingText.isEmpty || !streamingReasoning.isEmpty
+        isStreaming
+            || !(statusText?.isEmpty ?? true)
+            || statusProgress != nil
+            || !streamingText.isEmpty
+            || !streamingReasoning.isEmpty
     }
 
     func shouldShowAssistantPreview(alongside messages: [ChatMessage]) -> Bool {
@@ -243,6 +248,8 @@ final class ChatViewModel {
         self.pendingAssistantPreviewMessageID = nil
         streamingText = ""
         streamingReasoning = ""
+        statusText = nil
+        statusProgress = nil
     }
 
     func send(_ rawText: String, attachments: [PendingAttachment] = []) {
@@ -302,6 +309,7 @@ final class ChatViewModel {
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
+        statusProgress = nil
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
@@ -441,6 +449,7 @@ final class ChatViewModel {
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
+        statusProgress = nil
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
@@ -517,12 +526,19 @@ final class ChatViewModel {
                 switch event {
                 case .token(let t):
                     statusText = nil
+                    statusProgress = nil
                     streamingText += t
                 case .reasoning(let r):
                     streamingReasoning += r
-                case .status(let s): statusText = s
+                case .status(let s):
+                    statusText = s
+                    statusProgress = nil
+                case .progress(let s, let progress):
+                    statusText = s
+                    statusProgress = progress
                 case .toolCalls(let calls):
                     statusText = nil
+                    statusProgress = nil
                     batchedCalls = calls
                 case .done: break
                 }
@@ -595,6 +611,7 @@ final class ChatViewModel {
         streamingText = pending.message.content
         streamingReasoning = pending.message.reasoning
         statusText = nil
+        statusProgress = nil
         pendingAssistantMessageID = pending.id
         pendingAssistantPreviewMessageID = nil
         errorMessage = nil
@@ -678,6 +695,7 @@ final class ChatViewModel {
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
+        statusProgress = nil
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
@@ -749,6 +767,7 @@ final class ChatViewModel {
                 switch AppToolRegistry.match(call) {
                 case .auto(let tool):
                     self?.statusText = tool.statusText
+                    self?.statusProgress = nil
                     result = await tool.resolve(call)
                 case .interactive(let tool):
                     if prompt == nil, let raised = tool.prompt(for: call) {
@@ -807,6 +826,7 @@ final class ChatViewModel {
     private func enterPromptWait(conversationId: UUID, store: ChatStore) {
         isStreaming = false
         statusText = nil
+        statusProgress = nil
         task = nil
         streamingText = ""
         streamingReasoning = ""
@@ -854,6 +874,7 @@ final class ChatViewModel {
         guard isStreaming else { return }
         isStreaming = false
         statusText = nil
+        statusProgress = nil
         task = nil
         if emptyPendingDisposition != .keepForRecovery {
             suspendedByScene = false

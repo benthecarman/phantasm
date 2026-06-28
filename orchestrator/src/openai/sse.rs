@@ -27,7 +27,12 @@ impl ChunkFactory {
         }
     }
 
-    fn base(&self, choices: Vec<ChunkChoice>, x_status: Option<String>) -> ChatChunk {
+    fn base(
+        &self,
+        choices: Vec<ChunkChoice>,
+        x_status: Option<String>,
+        x_progress: Option<f64>,
+    ) -> ChatChunk {
         ChatChunk {
             id: self.id.clone(),
             object: "chat.completion.chunk",
@@ -35,6 +40,7 @@ impl ChunkFactory {
             model: self.model.clone(),
             choices,
             x_status,
+            x_progress,
         }
     }
 
@@ -46,6 +52,7 @@ impl ChunkFactory {
                 delta: Delta::content(content),
                 finish_reason: None,
             }],
+            None,
             None,
         );
         to_event(&chunk)
@@ -60,6 +67,7 @@ impl ChunkFactory {
                 finish_reason: None,
             }],
             None,
+            None,
         );
         to_event(&chunk)
     }
@@ -72,6 +80,7 @@ impl ChunkFactory {
                 delta: Delta::role("assistant"),
                 finish_reason: None,
             }],
+            None,
             None,
         );
         to_event(&chunk)
@@ -86,6 +95,22 @@ impl ChunkFactory {
                 finish_reason: None,
             }],
             Some(status.to_string()),
+            None,
+        );
+        to_event(&chunk)
+    }
+
+    /// A determinate progress heartbeat with no content. The status text stays
+    /// human-readable; `x_progress` gives native clients the normalized value.
+    pub fn progress(&self, status: &str, progress: f64) -> Event {
+        let chunk = self.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: None,
+            }],
+            Some(status.to_string()),
+            Some(progress.clamp(0.0, 1.0)),
         );
         to_event(&chunk)
     }
@@ -114,6 +139,7 @@ impl ChunkFactory {
                 finish_reason: None,
             }],
             None,
+            None,
         );
         to_event(&chunk)
     }
@@ -126,6 +152,7 @@ impl ChunkFactory {
                 delta: Delta::default(),
                 finish_reason: Some(reason.to_string()),
             }],
+            None,
             None,
         );
         to_event(&chunk)
@@ -181,11 +208,16 @@ mod tests {
                 finish_reason: None,
             }],
             None,
+            None,
         );
         let v = chunk_json(&chunk);
         assert_eq!(v["object"], "chat.completion.chunk");
         assert_eq!(v["choices"][0]["delta"]["content"], "hi");
         assert!(v.get("x_status").is_none(), "x_status omitted when absent");
+        assert!(
+            v.get("x_progress").is_none(),
+            "x_progress omitted when absent"
+        );
         assert!(v["id"].as_str().unwrap().starts_with("chatcmpl-"));
     }
 
@@ -199,9 +231,29 @@ mod tests {
                 finish_reason: None,
             }],
             Some("searching the web…".into()),
+            None,
         );
         let v = chunk_json(&chunk);
         assert_eq!(v["x_status"], "searching the web…");
+        assert!(v.get("x_progress").is_none());
+        assert!(v["choices"][0]["delta"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_chunk_carries_status_and_normalized_progress() {
+        let f = ChunkFactory::new("llama3.1");
+        let chunk = f.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: None,
+            }],
+            Some("generating image… 42%".into()),
+            Some(0.42),
+        );
+        let v = chunk_json(&chunk);
+        assert_eq!(v["x_status"], "generating image… 42%");
+        assert_eq!(v["x_progress"], 0.42);
         assert!(v["choices"][0]["delta"].as_object().unwrap().is_empty());
     }
 
@@ -214,6 +266,7 @@ mod tests {
                 delta: Delta::reasoning("plan"),
                 finish_reason: None,
             }],
+            None,
             None,
         );
         let v = chunk_json(&chunk);
@@ -237,6 +290,7 @@ mod tests {
                 }]),
                 finish_reason: None,
             }],
+            None,
             None,
         );
         let v = chunk_json(&chunk);
@@ -279,6 +333,7 @@ mod tests {
                 delta: Delta::default(),
                 finish_reason: Some("stop".into()),
             }],
+            None,
             None,
         );
         let v = chunk_json(&chunk);
