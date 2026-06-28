@@ -15,6 +15,11 @@ import UIKit
 @Observable
 final class ChatViewModel {
     private(set) var isStreaming = false
+    /// Guards `recoverPendingTurnIfNeeded` against re-entrancy: it's set
+    /// synchronously before the async recovery starts (which only flips
+    /// `isStreaming` after an `await`), so concurrent foreground hooks can't each
+    /// launch a recovery stream for the same turn.
+    private var isRecovering = false
     private(set) var streamingText = ""
     private(set) var streamingReasoning = ""
     /// When the in-flight turn began. Seeds the loader's verb and the early
@@ -589,9 +594,18 @@ final class ChatViewModel {
     }
 
     func recoverPendingTurnIfNeeded() {
-        guard !isStreaming, isSceneActive, isViewVisible else { return }
+        // `isRecovering` is set synchronously here (on the main actor) so the
+        // several foreground hooks that all call this — `setSceneActive(true)` and
+        // `setViewVisible(true)` fire together when the app returns — can't each
+        // start a recovery. Without it, both pass the `!isStreaming` guard before
+        // `recoverPendingTurn` flips it (after its `await`), so two streams attach
+        // to the same turn and replay into one buffer: the duplicate image and
+        // mangled message.
+        guard !isStreaming, !isRecovering, isSceneActive, isViewVisible else { return }
+        isRecovering = true
         Task { [weak self] in
             await self?.recoverPendingTurn()
+            self?.isRecovering = false
         }
     }
 
