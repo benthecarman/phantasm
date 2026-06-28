@@ -139,7 +139,7 @@ The automated tests use mocks. To confirm against the real thing:
    Expect an `x_status:"searching the web…"` chunk, then a fast answer (~1–2s to
    first token).
 5. **Image turn** (with `TOOL_IMAGE_GEN=true` + workflow): ask for an image.
-   Expect `x_status:"generating image… N%"` progress, then a `data:` image URI
+   Expect `x_status:"generating image…"` plus `x_progress` updates, then a `data:` image URI
    embedded in the final markdown answer.
 6. **Cancellation.** Kill the curl mid-stream; the orchestrator logs the turn
    finishing and stops upstream work.

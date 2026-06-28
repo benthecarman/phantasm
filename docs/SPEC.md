@@ -321,7 +321,7 @@ Consequences:
   - The edit tool resolves a URL-delivered image back to bytes server-side, so
     editing a previously-generated image works in either form.
 - **Progress** rides optional additive fields on the SSE chunk, e.g.
-  `"x_status": "generating image… 42%"` plus `"x_progress": 0.42` for
+  `"x_status": "generating image…"` plus `"x_progress": 0.42` for
   determinate work such as ComfyUI image generation. Standard clients ignore
   unknown fields; the app reads these `x_` fields. Future custom fields should
   be `x_`-prefixed.

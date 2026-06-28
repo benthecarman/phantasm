@@ -248,11 +248,11 @@ mod tests {
                 delta: Delta::default(),
                 finish_reason: None,
             }],
-            Some("generating image… 42%".into()),
+            Some("generating image…".into()),
             Some(0.42),
         );
         let v = chunk_json(&chunk);
-        assert_eq!(v["x_status"], "generating image… 42%");
+        assert_eq!(v["x_status"], "generating image…");
         assert_eq!(v["x_progress"], 0.42);
         assert!(v["choices"][0]["delta"].as_object().unwrap().is_empty());
     }
