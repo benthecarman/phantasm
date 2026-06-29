@@ -10,6 +10,7 @@
 //! Fetching is bounded-concurrent with a hard per-URL timeout and drops
 //! stragglers. We never embed/chunk/RAG fresh results.
 
+use futures_util::StreamExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::time::Duration;
@@ -17,11 +18,17 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::net_guard;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome, TurnContext};
 use crate::orchestrator::TurnEvent;
 
 const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Raw-bytes ceiling per fetched result page. Generous (real pages extract far
+/// less text than this), but bounds memory so a single huge/streaming response
+/// can't be read in full — the old `resp.text()` path had no cap at all.
+const MAX_PAGE_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// How deep a search goes. `Quick` returns Brave's titles + snippets and is the
 /// default; `Thorough` additionally fetches and extracts the full result pages.
@@ -228,7 +235,7 @@ async fn do_search(
     // sub-agent reading several pages for one sub-question fits; ordinary
     // thorough searches keep the snippet-cheap overall cap.
     let (extracts, fetched, attempted) = if fetch {
-        fetch_pages(cfg, http, &results, ctx).await
+        fetch_pages(cfg, &results, ctx).await
     } else {
         (Vec::new(), 0, 0)
     };
@@ -319,11 +326,10 @@ fn truncate_at_char_boundary(out: &mut String, cap: usize) {
 /// can report the shortfall.
 async fn fetch_pages(
     cfg: &Config,
-    http: &reqwest::Client,
     results: &[BraveResult],
     ctx: &TurnContext,
 ) -> (Vec<Option<String>>, usize, usize) {
-    use futures_util::stream::{self, StreamExt};
+    use futures_util::stream;
 
     let timeout = Duration::from_millis(cfg.search_fetch_timeout_ms);
     // Per-PAGE cap, independent of result count (was `cap / results.len()`,
@@ -348,18 +354,15 @@ async fn fetch_pages(
     }
 
     let attempted = to_fetch.len();
-    let futures = to_fetch.into_iter().map(|(idx, url)| {
-        let http = http.clone();
-        async move {
-            let extract = match tokio::time::timeout(timeout, http.get(&url).send()).await {
-                Ok(Ok(resp)) => match tokio::time::timeout(timeout, resp.text()).await {
-                    Ok(Ok(html)) => Some(html_to_text(&html, per_extract_cap)),
-                    _ => None,
-                },
-                _ => None, // timed out or errored — drop this straggler
-            };
-            (idx, url, extract)
-        }
+    let futures = to_fetch.into_iter().map(|(idx, url)| async move {
+        // Result URLs are third-party (from Brave), so they go through the same
+        // SSRF guard as web_fetch: screen the resolved host, pin the connection,
+        // refuse redirects. The whole fetch is bounded by the per-page timeout.
+        let extract = tokio::time::timeout(timeout, fetch_page(&url, timeout, per_extract_cap))
+            .await
+            .ok()
+            .flatten();
+        (idx, url, extract)
     });
 
     let results_fetched: Vec<(usize, String, Option<String>)> = stream::iter(futures)
@@ -383,6 +386,31 @@ async fn fetch_pages(
     }
 
     (extracts, fetched, attempted)
+}
+
+/// Fetch one result page through the SSRF guard and extract its readable text,
+/// or `None` on any failure (refused host, transport error, non-success status).
+/// The raw body is capped at [`MAX_PAGE_BODY_BYTES`] so an oversized response is
+/// truncated rather than buffered whole.
+async fn fetch_page(url: &str, timeout: Duration, extract_cap: usize) -> Option<String> {
+    let target = net_guard::guard_url(url).await.ok()?;
+    let client = net_guard::pinned_client(&target, timeout).ok()?;
+    let resp = client.get(target.url.clone()).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        let room = MAX_PAGE_BODY_BYTES - bytes.len();
+        if chunk.len() >= room {
+            bytes.extend_from_slice(&chunk[..room]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(html_to_text(&String::from_utf8_lossy(&bytes), extract_cap))
 }
 
 /// HTML-to-text without a heavy dependency.
@@ -654,36 +682,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_fetch_hits_within_turn_cache() {
+    async fn cached_page_is_served_without_a_fresh_attempt() {
         use crate::config::tests_support::minimal;
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("<p>page body</p>"))
-            .mount(&server)
-            .await;
-
+        // A live mock server binds to loopback, which the SSRF guard refuses by
+        // design — so the network-fetch leg isn't exercised here. The unique
+        // logic to cover is the within-turn dedup: a URL already in the turn
+        // cache is served from it and never counted as a fresh attempt.
         let cfg = minimal();
-        let http = reqwest::Client::new();
         let ctx = TurnContext::default();
-        let url = server.uri();
-        let results = vec![r("T", "d", &url)];
+        let url = "https://example.test/page";
+        let results = vec![r("T", "d", url)];
+        ctx.cache
+            .lock()
+            .unwrap()
+            .pages
+            .insert(url.to_string(), Some("cached extract".into()));
 
-        // First fetch hits the network and populates the cache.
-        let (e1, fetched1, attempted1) = fetch_pages(&cfg, &http, &results, &ctx).await;
-        assert_eq!(attempted1, 1);
-        assert_eq!(fetched1, 1);
-        assert!(e1[0].as_deref().unwrap().contains("page body"));
+        let (extracts, fetched, attempted) = fetch_pages(&cfg, &results, &ctx).await;
+        assert_eq!(attempted, 0, "a cached URL is not re-attempted");
+        assert_eq!(fetched, 0);
+        assert_eq!(extracts[0].as_deref(), Some("cached extract"));
+    }
 
-        // Second fetch of the same URL is served from the cache: no new attempt.
-        let (e2, fetched2, attempted2) = fetch_pages(&cfg, &http, &results, &ctx).await;
-        assert_eq!(attempted2, 0, "cache hit must not re-attempt the fetch");
-        assert_eq!(fetched2, 0);
-        assert!(e2[0].as_deref().unwrap().contains("page body"));
-
-        // Exactly one request reached the server despite two fetch_pages calls.
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    #[tokio::test]
+    async fn fetch_page_refuses_internal_and_non_http_targets() {
+        // The SSRF guard rejects these before any connection, so each is a fast
+        // `None` — a Brave result pointing at loopback/metadata can't be read.
+        let t = Duration::from_millis(200);
+        assert!(fetch_page("http://127.0.0.1:1/x", t, 500).await.is_none());
+        assert!(fetch_page("http://169.254.169.254/latest", t, 500)
+            .await
+            .is_none());
+        assert!(fetch_page("file:///etc/passwd", t, 500).await.is_none());
     }
 }
