@@ -74,7 +74,9 @@ pub async fn run(
                 message: ChatMessage::tool_result(
                     call_id,
                     "image_generation",
-                    "Image generated successfully and shown to the user.",
+                    "Image generated and already displayed to the user inline. \
+                     It is shown automatically — do NOT output the image, a URL, \
+                     markdown, or any placeholder such as \"[image goes here]\".",
                 ),
                 append_to_answer: Some(markdown),
             }
