@@ -152,6 +152,9 @@ final class ChatViewModel {
     /// Per-chat opt-in for the app-hosted health tool. Off by default — it's
     /// privacy-sensitive and triggers a system permission prompt.
     var healthEnabled: Bool { conversation?.healthEnabled ?? false }
+    /// Per-chat opt-in for the app-hosted calendar tool. Off by default — it's
+    /// privacy-sensitive and triggers a system permission prompt.
+    var calendarEnabled: Bool { conversation?.calendarEnabled ?? false }
     /// The selected research mode for this chat (e.g. `"deep-research"`), or `nil`
     /// for an ordinary turn. It only reaches the wire as a model-id suffix at send
     /// time (redesign §7), gated on the backend advertising it.
@@ -167,6 +170,7 @@ final class ChatViewModel {
             imageGeneration: imageGenerationEnabled,
             location: locationEnabled,
             health: healthEnabled,
+            calendar: calendarEnabled,
             modeID: modeID
         )
     }
@@ -177,6 +181,7 @@ final class ChatViewModel {
             imageGeneration: on,
             location: locationEnabled,
             health: healthEnabled,
+            calendar: calendarEnabled,
             modeID: modeID
         )
     }
@@ -192,6 +197,7 @@ final class ChatViewModel {
             imageGeneration: imageGenerationEnabled,
             location: on,
             health: healthEnabled,
+            calendar: calendarEnabled,
             modeID: modeID
         )
     }
@@ -207,6 +213,23 @@ final class ChatViewModel {
             imageGeneration: imageGenerationEnabled,
             location: locationEnabled,
             health: on,
+            calendar: calendarEnabled,
+            modeID: modeID
+        )
+    }
+
+    func setCalendarEnabled(_ on: Bool) {
+        // Surface the Calendar permission sheet the moment the user enables the
+        // tool, not lazily on the model's first call. No-op once already decided.
+        if on { env?.requestCalendarAuthorization() }
+        // Remember the choice as the sticky default for future new chats.
+        env?.setDefaultCalendarEnabled(on)
+        setOptions(
+            webSearch: webSearchEnabled,
+            imageGeneration: imageGenerationEnabled,
+            location: locationEnabled,
+            health: healthEnabled,
+            calendar: on,
             modeID: modeID
         )
     }
@@ -217,6 +240,7 @@ final class ChatViewModel {
             imageGeneration: imageGenerationEnabled,
             location: locationEnabled,
             health: healthEnabled,
+            calendar: calendarEnabled,
             modeID: modeID
         )
     }
@@ -225,13 +249,15 @@ final class ChatViewModel {
     /// unsent draft the store write is a no-op and the selection rides along on
     /// the first send (the draft is inserted whole), mirroring `setModel`.
     private func setOptions(
-        webSearch: Bool, imageGeneration: Bool, location: Bool, health: Bool, modeID: String?
+        webSearch: Bool, imageGeneration: Bool, location: Bool, health: Bool,
+        calendar: Bool, modeID: String?
     ) {
         guard var conversation else { return }
         conversation.webSearchEnabled = webSearch
         conversation.imageGenerationEnabled = imageGeneration
         conversation.locationEnabled = location
         conversation.healthEnabled = health
+        conversation.calendarEnabled = calendar
         conversation.modeID = modeID
         self.conversation = conversation
         let id = conversation.id
@@ -242,6 +268,7 @@ final class ChatViewModel {
                 imageGenerationEnabled: imageGeneration,
                 locationEnabled: location,
                 healthEnabled: health,
+                calendarEnabled: calendar,
                 modeID: modeID
             )
         }
@@ -533,6 +560,7 @@ final class ChatViewModel {
                 switch spec.function.name {
                 case ToolName.location: return detail.conversation.locationEnabled
                 case ToolName.health: return detail.conversation.healthEnabled
+                case ToolName.calendar: return detail.conversation.calendarEnabled
                 default: return true
                 }
             }

@@ -31,6 +31,10 @@ final class AppEnvironment {
     /// into `AppToolRegistry` at launch) so the tool's HealthKit dependency stays
     /// in the app target.
     let healthProvider = HealthKitProvider()
+    /// Device-backed provider for the app-hosted calendar tool. Held here (and
+    /// wired into `AppToolRegistry` at launch) so the tool's EventKit dependency
+    /// stays in the app target.
+    let calendarProvider = CalendarProvider()
     let chatClient = ChatClient()
     let ollamaChatClient = OllamaNativeChatClient()
     let capabilitiesClient = CapabilitiesClient()
@@ -63,11 +67,11 @@ final class AppEnvironment {
         database = try! AppDatabase.makeShared()
         speechSynthesizer = SpeechSynthesizer(voicePrefs: voicePreferenceStore)
         dictationController = DictationController()
-        // Wire the app-hosted location/health tool providers into the registry so
-        // a forwarded `get_current_location` / `get_health_data` call resolves
-        // on-device.
+        // Wire the app-hosted device tool providers into the registry so forwarded
+        // location / health / calendar calls resolve on-device.
         AppToolRegistry.configureLocation(provider: locationProvider)
         AppToolRegistry.configureHealth(provider: healthProvider)
+        AppToolRegistry.configureCalendar(provider: calendarProvider)
         profiles = profileStore.load()
         thinkingPreferences = modelPreferenceStore.loadThinkingPreferences()
         // Keychain tokens outlive an app uninstall but the UserDefaults profile

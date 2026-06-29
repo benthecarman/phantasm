@@ -159,6 +159,7 @@ struct ChatView: View {
                     supportsImageGeneration: backendCapabilities?.hasToolSelector(ToolSelectorName.imageGeneration) ?? false,
                     supportsLocation: supportsAppTools,
                     supportsHealth: supportsAppTools,
+                    supportsCalendar: supportsAppTools,
                     modelSupportsTools: modelSupportsTools,
                     modelSupportsThinking: modelSupportsThinking,
                     webSearchEnabled: Binding(
@@ -176,6 +177,10 @@ struct ChatView: View {
                     healthEnabled: Binding(
                         get: { vm.healthEnabled },
                         set: { vm.setHealthEnabled($0) }
+                    ),
+                    calendarEnabled: Binding(
+                        get: { vm.calendarEnabled },
+                        set: { vm.setCalendarEnabled($0) }
                     ),
                     availableModes: vm.availableModes,
                     modeID: Binding(
@@ -510,6 +515,7 @@ struct ComposerView: View {
     /// orchestrator that forwards them. Combined with `modelSupportsTools`.
     let supportsLocation: Bool
     let supportsHealth: Bool
+    let supportsCalendar: Bool
     /// Whether the selected model supports tool/function calling.
     let modelSupportsTools: Bool
     /// Whether the selected model supports reasoning/thinking output.
@@ -518,6 +524,7 @@ struct ComposerView: View {
     let imageGenerationEnabled: Binding<Bool>
     let locationEnabled: Binding<Bool>
     let healthEnabled: Binding<Bool>
+    let calendarEnabled: Binding<Bool>
     /// Research modes the backend advertises (e.g. Deep Research). Empty ⇒ the
     /// composer hides the research UI (graceful, older/non-orchestrator backends).
     let availableModes: [Capabilities.Mode]
@@ -639,12 +646,14 @@ struct ComposerView: View {
                 supportsImageGeneration: supportsImageGeneration,
                 supportsLocation: supportsLocation,
                 supportsHealth: supportsHealth,
+                supportsCalendar: supportsCalendar,
                 modelSupportsTools: modelSupportsTools,
                 modelSupportsThinking: modelSupportsThinking,
                 webSearchEnabled: webSearchEnabled,
                 imageGenerationEnabled: imageGenerationEnabled,
                 locationEnabled: locationEnabled,
                 healthEnabled: healthEnabled,
+                calendarEnabled: calendarEnabled,
                 availableModes: availableModes,
                 modeID: modeID,
                 thinkingEnabled: thinkingEnabled

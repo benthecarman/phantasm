@@ -39,6 +39,10 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     /// forwards app tools). Off by default — it's privacy-sensitive and triggers a
     /// system permission prompt; the composer's tool selector flips it.
     public var healthEnabled: Bool
+    /// Whether this chat wants the app-hosted calendar tool offered. Off by
+    /// default — it's privacy-sensitive and triggers a system permission prompt;
+    /// the composer's tool selector flips it.
+    public var calendarEnabled: Bool
     /// The selected research/turn mode for this chat (e.g. `"deep-research"`), or
     /// `nil` for an ordinary turn. It's the *UI preference*; at send time it
     /// reaches the wire only as a suffix on the `model` id (`<base>:<modeID>`),
@@ -57,6 +61,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         imageGenerationEnabled: Bool = true,
         locationEnabled: Bool = false,
         healthEnabled: Bool = false,
+        calendarEnabled: Bool = false,
         modeID: String? = nil
     ) {
         self.id = id
@@ -70,6 +75,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         self.imageGenerationEnabled = imageGenerationEnabled
         self.locationEnabled = locationEnabled
         self.healthEnabled = healthEnabled
+        self.calendarEnabled = calendarEnabled
         self.modeID = modeID
     }
 

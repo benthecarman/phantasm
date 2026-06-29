@@ -20,6 +20,8 @@ protocol ChatViewModelEnvironment: AnyObject {
     func requestLocationAuthorizationWhenInUse()
     func setDefaultHealthEnabled(_ enabled: Bool)
     func requestHealthAuthorization()
+    func setDefaultCalendarEnabled(_ enabled: Bool)
+    func requestCalendarAuthorization()
     func warm(model: String)
     func speak(_ text: String, messageID: UUID)
 }
@@ -43,6 +45,14 @@ extension AppEnvironment: ChatViewModelEnvironment {
 
     func requestHealthAuthorization() {
         healthProvider.requestAuthorization()
+    }
+
+    func setDefaultCalendarEnabled(_ enabled: Bool) {
+        toolPreferenceStore.calendarEnabledDefault = enabled
+    }
+
+    func requestCalendarAuthorization() {
+        calendarProvider.requestAuthorization()
     }
 
     func speak(_ text: String, messageID: UUID) {

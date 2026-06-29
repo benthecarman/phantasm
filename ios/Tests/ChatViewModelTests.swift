@@ -307,8 +307,10 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
     var autoSpeakEnabled = false
     var defaultLocationEnabled = false
     var defaultHealthEnabled = false
+    var defaultCalendarEnabled = false
     var requestedLocationAuthorization = false
     var requestedHealthAuthorization = false
+    var requestedCalendarAuthorization = false
     var warmedModels: [String] = []
     var spokenTexts: [String] = []
 
@@ -352,6 +354,14 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
 
     func requestHealthAuthorization() {
         requestedHealthAuthorization = true
+    }
+
+    func setDefaultCalendarEnabled(_ enabled: Bool) {
+        defaultCalendarEnabled = enabled
+    }
+
+    func requestCalendarAuthorization() {
+        requestedCalendarAuthorization = true
     }
 
     func warm(model: String) {

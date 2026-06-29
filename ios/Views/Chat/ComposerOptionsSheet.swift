@@ -23,6 +23,7 @@ struct ComposerOptionsSheet: View {
     /// the Location / Health rows are usable.
     let supportsLocation: Bool
     let supportsHealth: Bool
+    let supportsCalendar: Bool
     let modelSupportsTools: Bool
     /// Whether the selected model can produce reasoning output. When false the
     /// Thinking row renders disabled + pinned off rather than hidden.
@@ -31,6 +32,7 @@ struct ComposerOptionsSheet: View {
     let imageGenerationEnabled: Binding<Bool>
     let locationEnabled: Binding<Bool>
     let healthEnabled: Binding<Bool>
+    let calendarEnabled: Binding<Bool>
     /// Research modes the backend advertises (e.g. Deep Research), already gated on
     /// their needed tools being usable. Empty ⇒ the Research section is hidden.
     let availableModes: [Capabilities.Mode]
@@ -110,6 +112,12 @@ struct ComposerOptionsSheet: View {
                         systemImage: "heart",
                         backendSupports: supportsHealth,
                         isOn: healthEnabled
+                    )
+                    toolRow(
+                        "Calendar",
+                        systemImage: "calendar",
+                        backendSupports: supportsCalendar,
+                        isOn: calendarEnabled
                     )
                 }
 

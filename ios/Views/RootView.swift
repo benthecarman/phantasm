@@ -173,10 +173,11 @@ struct RootView: View {
             title: "New Chat",
             modelID: nil,
             profileID: env.activeProfileID,
-            // Sticky: a new chat inherits the last location/health-tool choices, so
-            // enabling one keeps it on across chats.
+            // Sticky: a new chat inherits the last device-tool choices, so enabling
+            // one keeps it on across chats.
             locationEnabled: env.toolPreferenceStore.locationEnabledDefault,
-            healthEnabled: env.toolPreferenceStore.healthEnabledDefault
+            healthEnabled: env.toolPreferenceStore.healthEnabledDefault,
+            calendarEnabled: env.toolPreferenceStore.calendarEnabledDefault
         )
     }
 

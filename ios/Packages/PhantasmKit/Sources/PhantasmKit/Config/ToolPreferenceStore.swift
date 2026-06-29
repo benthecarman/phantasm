@@ -9,6 +9,7 @@ public final class ToolPreferenceStore: @unchecked Sendable {
     private let defaults: UserDefaults
     private let locationDefaultKey = "phantasm.tools.location.defaultEnabled"
     private let healthDefaultKey = "phantasm.tools.health.defaultEnabled"
+    private let calendarDefaultKey = "phantasm.tools.calendar.defaultEnabled"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -26,5 +27,12 @@ public final class ToolPreferenceStore: @unchecked Sendable {
     public var healthEnabledDefault: Bool {
         get { defaults.bool(forKey: healthDefaultKey) }
         set { defaults.set(newValue, forKey: healthDefaultKey) }
+    }
+
+    /// Whether a new chat should start with the calendar tool enabled. Off until
+    /// the user turns it on in any chat, then sticks on for subsequent new chats.
+    public var calendarEnabledDefault: Bool {
+        get { defaults.bool(forKey: calendarDefaultKey) }
+        set { defaults.set(newValue, forKey: calendarDefaultKey) }
     }
 }

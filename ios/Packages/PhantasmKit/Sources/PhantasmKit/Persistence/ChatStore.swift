@@ -89,6 +89,7 @@ public protocol ChatStore: Sendable {
         imageGenerationEnabled: Bool,
         locationEnabled: Bool,
         healthEnabled: Bool,
+        calendarEnabled: Bool,
         modeID: String?
     ) async throws
 

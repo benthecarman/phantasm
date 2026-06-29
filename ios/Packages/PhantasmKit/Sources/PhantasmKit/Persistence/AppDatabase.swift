@@ -158,6 +158,15 @@ public final class AppDatabase: Sendable {
                 t.add(column: "healthEnabled", .boolean).notNull().defaults(to: false)
             }
         }
+
+        // Per-chat opt-in for the app-hosted calendar tool. Off by default (same
+        // privacy reasoning as location/health); the composer's tool selector
+        // flips it.
+        migrator.registerMigration("v9_calendar_tool") { db in
+            try db.alter(table: "conversation") { t in
+                t.add(column: "calendarEnabled", .boolean).notNull().defaults(to: false)
+            }
+        }
         return migrator
     }
 }
@@ -252,6 +261,7 @@ extension AppDatabase: ChatStore {
         imageGenerationEnabled: Bool,
         locationEnabled: Bool,
         healthEnabled: Bool,
+        calendarEnabled: Bool,
         modeID: String?
     ) async throws {
         try await dbWriter.write { db in
@@ -260,6 +270,7 @@ extension AppDatabase: ChatStore {
             convo.imageGenerationEnabled = imageGenerationEnabled
             convo.locationEnabled = locationEnabled
             convo.healthEnabled = healthEnabled
+            convo.calendarEnabled = calendarEnabled
             convo.modeID = modeID
             try convo.update(db)
         }

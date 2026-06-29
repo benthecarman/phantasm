@@ -154,14 +154,15 @@ public enum AppToolRegistry {
         AskUserTool(), CurrentTimeTool(), RenderChartTool(),
     ]
 
-    /// The device-backed tools (location, health), wired in at app launch with
+    /// The device-backed tools (location, health, calendar), wired in at app launch with
     /// their providers. Guarded by a lock so the (non-isolated) accessors below
     /// stay usable from host tests, which simply never configure them — the tool
-    /// is then neither advertised nor routed. CoreLocation/HealthKit live in the
-    /// app target, so they can't be constructed here.
+    /// is then neither advertised nor routed. CoreLocation/HealthKit/EventKit live
+    /// in the app target, so they can't be constructed here.
     private static let lock = NSLock()
     private static var configuredLocationTool: LocationTool?
     private static var configuredHealthTool: HealthTool?
+    private static var configuredCalendarTool: CalendarTool?
 
     /// Wire the device-backed location tool into the registry. Call once at app
     /// launch (idempotent — replaces any prior provider).
@@ -179,6 +180,14 @@ public enum AppToolRegistry {
         configuredHealthTool = HealthTool(provider: provider)
     }
 
+    /// Wire the device-backed calendar tool into the registry. Call once at app
+    /// launch (idempotent — replaces any prior provider).
+    public static func configureCalendar(provider: any CalendarProviding) {
+        lock.lock()
+        defer { lock.unlock() }
+        configuredCalendarTool = CalendarTool(provider: provider)
+    }
+
     private static var locationTool: LocationTool? {
         lock.lock()
         defer { lock.unlock() }
@@ -191,12 +200,19 @@ public enum AppToolRegistry {
         return configuredHealthTool
     }
 
+    private static var calendarTool: CalendarTool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return configuredCalendarTool
+    }
+
     /// Every hosted tool currently available (device-backed tools only once
     /// their providers are configured at launch).
     public static var tools: [any AppTool] {
         baseTools
             + (locationTool.map { [$0] } ?? [])
             + (healthTool.map { [$0] } ?? [])
+            + (calendarTool.map { [$0] } ?? [])
     }
 
     /// Schemas to advertise this turn (the `tools` array).
