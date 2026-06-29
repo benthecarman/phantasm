@@ -392,15 +392,15 @@ impl Config {
             image_store_ttl_s: env_parse("IMAGE_STORE_TTL_S", 90 * 24 * 60 * 60),
             public_base_url: parse_opt_url("PUBLIC_BASE_URL")?,
             comfy_gen_workflow: env_path("COMFYUI_GEN_WORKFLOW"),
-            comfy_gen_prompt: env_node("COMFYUI_GEN_PROMPT"),
-            comfy_gen_negative: env_node("COMFYUI_GEN_NEGATIVE"),
-            comfy_gen_width: env_node("COMFYUI_GEN_WIDTH"),
-            comfy_gen_height: env_node("COMFYUI_GEN_HEIGHT"),
-            comfy_gen_seed: env_node("COMFYUI_GEN_SEED"),
+            comfy_gen_prompt: env_node("COMFYUI_GEN_PROMPT")?,
+            comfy_gen_negative: env_node("COMFYUI_GEN_NEGATIVE")?,
+            comfy_gen_width: env_node("COMFYUI_GEN_WIDTH")?,
+            comfy_gen_height: env_node("COMFYUI_GEN_HEIGHT")?,
+            comfy_gen_seed: env_node("COMFYUI_GEN_SEED")?,
             comfy_edit_workflow: env_path("COMFYUI_EDIT_WORKFLOW"),
-            comfy_edit_prompt: env_node("COMFYUI_EDIT_PROMPT"),
-            comfy_edit_image: env_node("COMFYUI_EDIT_IMAGE"),
-            comfy_edit_seed: env_node("COMFYUI_EDIT_SEED"),
+            comfy_edit_prompt: env_node("COMFYUI_EDIT_PROMPT")?,
+            comfy_edit_image: env_node("COMFYUI_EDIT_IMAGE")?,
+            comfy_edit_seed: env_node("COMFYUI_EDIT_SEED")?,
             log_format: if env_or("LOG_FORMAT", "text").eq_ignore_ascii_case("json") {
                 LogFormat::Json
             } else {
@@ -525,8 +525,13 @@ fn env_path(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn env_node(key: &str) -> Option<NodeInput> {
-    std::env::var(key).ok().and_then(|v| NodeInput::parse(&v))
+fn env_node(key: &str) -> Result<Option<NodeInput>> {
+    let Some(raw) = std::env::var(key).ok().filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    NodeInput::parse(&raw)
+        .map(Some)
+        .with_context(|| format!("{key} must be a node input reference like 25.noise_seed"))
 }
 
 fn csv(key: &str) -> Vec<String> {
@@ -665,7 +670,13 @@ pub mod tests_support {
 
 #[cfg(test)]
 mod tests {
-    use super::NodeInput;
+    use super::{env_node, NodeInput};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn node_input_parses_node_and_key() {
@@ -682,5 +693,39 @@ mod tests {
         assert!(NodeInput::parse("6").is_none());
         assert!(NodeInput::parse(".text").is_none());
         assert!(NodeInput::parse("6.").is_none());
+    }
+
+    #[test]
+    fn env_node_accepts_absent_blank_and_valid_values() {
+        let _guard = env_lock();
+        const KEY: &str = "PHANTASM_TEST_COMFY_NODE";
+
+        std::env::remove_var(KEY);
+        assert!(env_node(KEY).unwrap().is_none());
+
+        std::env::set_var(KEY, "  ");
+        assert!(env_node(KEY).unwrap().is_none());
+
+        std::env::set_var(KEY, "25.noise_seed");
+        let parsed = env_node(KEY).unwrap().unwrap();
+        assert_eq!(parsed.node, "25");
+        assert_eq!(parsed.key, "noise_seed");
+
+        std::env::remove_var(KEY);
+    }
+
+    #[test]
+    fn env_node_rejects_present_malformed_value() {
+        let _guard = env_lock();
+        const KEY: &str = "PHANTASM_TEST_COMFY_NODE";
+
+        std::env::set_var(KEY, "25");
+        let err = env_node(KEY).unwrap_err().to_string();
+        assert!(
+            err.contains(KEY) && err.contains("25.noise_seed"),
+            "unexpected error: {err}"
+        );
+
+        std::env::remove_var(KEY);
     }
 }
