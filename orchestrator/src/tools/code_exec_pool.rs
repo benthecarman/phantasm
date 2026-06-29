@@ -442,7 +442,40 @@ async fn read_capped<R: AsyncRead + Unpin>(mut r: R, cap: usize) -> (String, boo
             Err(_) => break,
         }
     }
+    // The byte-level cap can land mid-character; drop a trailing partial UTF-8
+    // sequence so the cut falls on a char boundary rather than becoming a `�`.
+    trim_trailing_partial_utf8(&mut kept);
     (String::from_utf8_lossy(&kept).into_owned(), truncated)
+}
+
+/// Drop an incomplete trailing UTF-8 sequence from `buf` — the continuation
+/// bytes plus their lead byte when the full sequence isn't present. A complete
+/// trailing char is kept; an empty buffer (or one ending in a complete char) is
+/// left unchanged. Mid-buffer invalid bytes are left for `from_utf8_lossy`.
+fn trim_trailing_partial_utf8(buf: &mut Vec<u8>) {
+    // Walk back over continuation bytes (0b10xx_xxxx) to the sequence's lead.
+    let mut lead = buf.len();
+    while lead > 0 && (buf[lead - 1] & 0xC0) == 0x80 {
+        lead -= 1;
+    }
+    if lead == 0 {
+        return;
+    }
+    let first = buf[lead - 1];
+    let expected = if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1 // stray/invalid lead byte — treat as a single byte, leave to lossy
+    };
+    if buf.len() - (lead - 1) < expected {
+        buf.truncate(lead - 1);
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +584,22 @@ mod tests {
             backend.spawned.load(Ordering::SeqCst) >= 2,
             "one cold container + one replacement"
         );
+    }
+
+    #[test]
+    fn trims_partial_trailing_utf8_only() {
+        // '€' is E2 82 AC; a cap keeping just its first two bytes drops it whole.
+        let mut buf = vec![b'a', 0xE2, 0x82];
+        trim_trailing_partial_utf8(&mut buf);
+        assert_eq!(buf, vec![b'a']);
+        // A complete trailing multibyte char is preserved untouched.
+        let mut whole = vec![0xE2, 0x82, 0xAC];
+        trim_trailing_partial_utf8(&mut whole);
+        assert_eq!(whole, vec![0xE2, 0x82, 0xAC]);
+        // Plain ASCII is left alone.
+        let mut ascii = b"hello".to_vec();
+        trim_trailing_partial_utf8(&mut ascii);
+        assert_eq!(ascii, b"hello");
     }
 
     #[tokio::test(start_paused = true)]
