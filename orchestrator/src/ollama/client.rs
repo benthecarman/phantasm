@@ -260,8 +260,88 @@ fn extract_thinking_control(options: &mut Map<String, Value>) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_thinking_control;
+    use super::{extract_thinking_control, ndjson_to_deltas};
+    use crate::error::AppError;
+    use crate::ollama::StreamDelta;
+    use bytes::Bytes;
+    use futures_util::{stream, StreamExt};
     use serde_json::{json, Map, Value};
+
+    async fn collect(chunks: Vec<reqwest::Result<Bytes>>) -> Vec<Result<StreamDelta, AppError>> {
+        ndjson_to_deltas(stream::iter(chunks)).collect().await
+    }
+
+    #[tokio::test]
+    async fn ndjson_reassembles_line_split_across_chunks() {
+        // One NDJSON object deliberately split mid-JSON, then a terminal line.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"{\"message\":{\"role\":\"assistant\",\"content\":\"He")),
+            Ok(Bytes::from_static(
+                b"llo\"},\"done\":false}\n{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+            )),
+        ];
+        let deltas: Vec<StreamDelta> = collect(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].content, "Hello");
+        assert!(!deltas[0].done);
+        assert!(deltas[1].done);
+        assert_eq!(deltas[1].done_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn ndjson_carries_thinking_as_reasoning() {
+        let chunks = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"hmm\"},\"done\":false}\n",
+        ))];
+        let deltas: Vec<StreamDelta> = collect(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].reasoning, "hmm");
+    }
+
+    #[tokio::test]
+    async fn ndjson_flushes_trailing_line_without_newline() {
+        // A final object arriving without its terminating newline is still emitted.
+        let chunks = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"tail\"},\"done\":true}",
+        ))];
+        let deltas: Vec<StreamDelta> = collect(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].content, "tail");
+        assert!(deltas[0].done);
+    }
+
+    #[tokio::test]
+    async fn ndjson_skips_blank_lines() {
+        let chunks = vec![Ok(Bytes::from_static(
+            b"\n{\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"done\":false}\n\n",
+        ))];
+        let deltas: Vec<StreamDelta> = collect(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].content, "x");
+    }
+
+    #[tokio::test]
+    async fn ndjson_surfaces_malformed_line_as_error() {
+        let chunks = vec![Ok(Bytes::from_static(b"{not json}\n"))];
+        let first = collect(chunks).await.into_iter().next().expect("one item");
+        assert!(matches!(first, Err(AppError::OllamaError(_))));
+    }
 
     #[test]
     fn reasoning_effort_none_maps_to_think_false() {
