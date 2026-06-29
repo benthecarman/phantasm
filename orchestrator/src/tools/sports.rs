@@ -28,7 +28,13 @@ pub struct SportsArgs {
 
 /// Leagues we expose, mapped to ESPN's `{sport}/{league}` path segments. Kept as
 /// an enum so the model is offered a closed set rather than guessing slugs.
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+///
+/// The JSON schema advertises the canonical `snake_case` names (via the
+/// `JsonSchema` derive and the serde rename), but deserialization is deliberately
+/// lenient: models tend to send "MLB", "baseball", "premier league", etc. We
+/// normalize and match a broad alias table rather than reject (see
+/// [`League::from_alias`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum League {
     Nfl,
@@ -80,6 +86,88 @@ impl League {
             League::ChampionsLeague => "Champions League",
             League::Mls => "MLS",
         }
+    }
+
+    /// Resolve whatever the model sent to a league, generously. The input is
+    /// normalized to lowercase alphanumerics (so "Premier League", "premier-league",
+    /// and "premierleague" all collapse to the same key) before matching a broad
+    /// alias table that covers common abbreviations, full names, and — for the
+    /// leagues where it is unambiguous — the bare sport name.
+    fn from_alias(raw: &str) -> Option<League> {
+        let key = normalize_key(raw);
+        let league = match key.as_str() {
+            // American football
+            "nfl" | "football" | "americanfootball" | "profootball" | "nationalfootballleague" => {
+                League::Nfl
+            }
+            "collegefootball" | "cfb" | "ncaaf" | "ncaafootball" | "ncaafb" | "collegefb" => {
+                League::CollegeFootball
+            }
+
+            // Basketball
+            "nba" | "basketball" | "probasketball" | "nationalbasketballassociation" => League::Nba,
+            "wnba" | "womensnba" | "womensbasketball" | "womensnationalbasketballassociation" => {
+                League::WNba
+            }
+            "menscollegebasketball"
+            | "ncaab"
+            | "ncaam"
+            | "ncaamb"
+            | "cbb"
+            | "collegebasketball"
+            | "marchmadness"
+            | "ncaamensbasketball" => League::MensCollegeBasketball,
+
+            // Baseball
+            "mlb" | "baseball" | "probaseball" | "majorleaguebaseball" => League::Mlb,
+
+            // Hockey
+            "nhl" | "hockey" | "icehockey" | "prohockey" | "nationalhockeyleague" => League::Nhl,
+
+            // Soccer / association football. Bare "soccer"/"football" is ambiguous
+            // across these leagues, so it is intentionally not mapped here.
+            "premierleague"
+            | "epl"
+            | "pl"
+            | "englishpremierleague"
+            | "eng1"
+            | "barclayspremierleague" => League::PremierLeague,
+            "laliga" | "esp1" | "spanishlaliga" | "laligasantander" | "primeradivision" => {
+                League::LaLiga
+            }
+            "championsleague" | "ucl" | "uefachampionsleague" | "uefachampions" | "uefacl" => {
+                League::ChampionsLeague
+            }
+            "mls" | "majorleaguesoccer" | "usa1" | "usmls" => League::Mls,
+
+            _ => return None,
+        };
+        Some(league)
+    }
+}
+
+/// Lowercase and strip everything that isn't an ASCII letter or digit, so
+/// punctuation, spacing, and case never matter when matching league aliases.
+fn normalize_key(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+impl<'de> Deserialize<'de> for League {
+    fn deserialize<D>(deserializer: D) -> Result<League, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        League::from_alias(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown league `{raw}`; try one of: nfl, college_football, nba, wnba, \
+                 mens_college_basketball, mlb, nhl, premier_league, la_liga, \
+                 champions_league, mls"
+            ))
+        })
     }
 }
 
@@ -330,6 +418,59 @@ mod tests {
     fn league_paths_are_stable() {
         assert_eq!(League::Nfl.path(), ("football", "nfl"));
         assert_eq!(League::PremierLeague.path(), ("soccer", "eng.1"));
+    }
+
+    #[test]
+    fn canonical_snake_case_names_parse() {
+        // Every label the schema advertises must round-trip back to its league.
+        for (name, league) in [
+            ("nfl", League::Nfl),
+            ("college_football", League::CollegeFootball),
+            ("nba", League::Nba),
+            ("wnba", League::WNba),
+            ("mens_college_basketball", League::MensCollegeBasketball),
+            ("mlb", League::Mlb),
+            ("nhl", League::Nhl),
+            ("premier_league", League::PremierLeague),
+            ("la_liga", League::LaLiga),
+            ("champions_league", League::ChampionsLeague),
+            ("mls", League::Mls),
+        ] {
+            assert_eq!(League::from_alias(name), Some(league), "for `{name}`");
+        }
+    }
+
+    #[test]
+    fn lenient_aliases_parse() {
+        // Casing, spacing, punctuation, abbreviations, and bare sport names.
+        assert_eq!(League::from_alias("MLB"), Some(League::Mlb));
+        assert_eq!(League::from_alias("baseball"), Some(League::Mlb));
+        assert_eq!(
+            League::from_alias("Premier League"),
+            Some(League::PremierLeague)
+        );
+        assert_eq!(League::from_alias("epl"), Some(League::PremierLeague));
+        assert_eq!(League::from_alias("EPL"), Some(League::PremierLeague));
+        assert_eq!(League::from_alias("ncaaf"), Some(League::CollegeFootball));
+        assert_eq!(
+            League::from_alias("March Madness"),
+            Some(League::MensCollegeBasketball)
+        );
+        assert_eq!(League::from_alias("ice hockey"), Some(League::Nhl));
+        assert_eq!(League::from_alias("Major League Soccer"), Some(League::Mls));
+    }
+
+    #[test]
+    fn unknown_league_is_rejected() {
+        assert_eq!(League::from_alias("quidditch"), None);
+        assert_eq!(League::from_alias(""), None);
+    }
+
+    #[test]
+    fn deserializes_alias_through_args() {
+        let args: SportsArgs =
+            serde_json::from_str(r#"{"league": "MLB"}"#).expect("MLB should parse");
+        assert_eq!(args.league, League::Mlb);
     }
 
     #[test]
