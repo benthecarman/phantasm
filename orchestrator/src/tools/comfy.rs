@@ -437,6 +437,16 @@ async fn handle_ws_message(
             let value = data?.get("value")?.as_i64()?;
             let max = data?.get("max")?.as_i64().filter(|m| *m > 0)?;
             let pct = (value * 100 / max).clamp(0, 100);
+            // Once we've advanced to the finishing phase (101), ignore a trailing
+            // full-progress frame: ComfyUI sometimes emits a final value==max after
+            // the post-sampling node has already started, which would otherwise
+            // bounce the pill from "finishing up…" back to a frozen "generating
+            // image…" 100% for the last second. A genuinely new pass (hires-fix
+            // second sampler) restarts at a low pct, so it still falls through and
+            // resumes the determinate bar.
+            if *last_pct == 101 && pct >= 100 {
+                return Some(false);
+            }
             if pct != *last_pct {
                 *last_pct = pct;
                 let _ = tx
@@ -789,6 +799,34 @@ mod tests {
             Some(false)
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn trailing_full_progress_after_finishing_is_ignored() {
+        let (tx, mut rx) = mpsc::channel(4);
+        // Already in the finishing phase.
+        let mut last = 101;
+
+        // A trailing value==max frame must not bounce the pill back to "generating".
+        let full = r#"{"type":"progress","data":{"value":20,"max":20}}"#;
+        assert_eq!(
+            handle_ws_message(full, "pid", &mut last, &tx).await,
+            Some(false)
+        );
+        assert_eq!(last, 101); // unchanged
+        assert!(rx.try_recv().is_err()); // no event emitted
+
+        // But a genuinely new low-progress pass (hires fix) resumes the bar.
+        let low = r#"{"type":"progress","data":{"value":2,"max":20}}"#;
+        assert_eq!(
+            handle_ws_message(low, "pid", &mut last, &tx).await,
+            Some(false)
+        );
+        assert_eq!(last, 10);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TurnEvent::Progress { progress, .. }) if (progress - 0.10).abs() < 1e-9
+        ));
     }
 
     #[tokio::test]
