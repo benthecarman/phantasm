@@ -4,8 +4,11 @@
 //! node ID) by injecting their inputs into configured nodes, then hand it to
 //! [`run_workflow`], which: opens the progress WebSocket *first* (so no early
 //! frames are missed), submits via `POST /prompt`, relays progress to the app as
-//! `x_status`, and fetches the finished image from `/history` + `/view`,
-//! returning it as a base64 `data:` URI ready to embed as markdown.
+//! `x_status`, and returns the finished image bytes. When the backend offers the
+//! `SaveImageWebsocket` node the image streams straight back over that same WS
+//! (no temp file, no extra round trips); otherwise it falls back to fetching from
+//! `/history` + `/view`. Either way the bytes are handed up for the caller to
+//! deliver (inline base64 `data:` URI, or persisted to the blob store).
 //!
 //! The edit tool additionally needs the user's image available to ComfyUI first;
 //! [`upload_temp_image`] handles that via `POST /upload/image` with
@@ -41,6 +44,36 @@ const STATUS_GENERATING: &str = "generating image…";
 const STATUS_FINISHING: &str = "finishing up…";
 const STATUS_RETRIEVING: &str = "retrieving image…";
 const STATUS_DOWNLOADING: &str = "downloading image…";
+
+/// Whether this ComfyUI exposes the `SaveImageWebsocket` node, probed once and
+/// cached for the process. When present, finished images stream straight back
+/// over the progress WS — no temp file written, no `/history` lookup + `/view`
+/// download afterwards. When absent (or the probe errors) we fall back to the
+/// `PreviewImage` + fetch path. A transient probe failure latches the fallback
+/// until restart, which is harmless: the fetch path is fully functional.
+static WS_DELIVERY: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+
+async fn ws_image_delivery(cfg: &Config, http: &reqwest::Client) -> bool {
+    *WS_DELIVERY
+        .get_or_init(|| async {
+            let Ok(url) = cfg.comfy_base.join("/object_info/SaveImageWebsocket") else {
+                return false;
+            };
+            // `/object_info/<node>` returns `{ "<node>": {…schema…} }` when the
+            // node exists, an empty object otherwise.
+            let supported = match http.get(url).send().await {
+                Ok(r) if r.status().is_success() => r
+                    .json::<Value>()
+                    .await
+                    .map(|v| v.get("SaveImageWebsocket").is_some())
+                    .unwrap_or(false),
+                _ => false,
+            };
+            tracing::debug!(supported, "probed ComfyUI SaveImageWebsocket support");
+            supported
+        })
+        .await
+}
 
 /// Tells ComfyUI to abandon a submitted prompt, freeing the GPU. Best-effort:
 /// `POST /interrupt` stops the prompt if it is currently executing, and
@@ -159,7 +192,14 @@ pub async fn run_workflow(
     mut workflow: Value,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<(Vec<u8>, String), String> {
-    force_temporary_outputs(&mut workflow);
+    // Prefer streaming the result back over the WS we already hold open; fall
+    // back to the temp-file + `/history` + `/view` path when the node is absent.
+    let ws_delivery = ws_image_delivery(cfg, http).await;
+    if ws_delivery {
+        force_ws_outputs(&mut workflow);
+    } else {
+        force_temporary_outputs(&mut workflow);
+    }
 
     let client_id = uuid::Uuid::new_v4().simple().to_string();
 
@@ -213,40 +253,86 @@ pub async fn run_workflow(
     // -2 = nothing seen yet, -1 = execution started (loading-model heartbeat sent),
     // 0..=100 = determinate sampling progress, 101 = post-sampling (finishing-up
     // heartbeat sent).
+    let cap = cfg.comfy_max_image_bytes;
     let deadline = tokio::time::sleep(Duration::from_secs(cfg.comfy_timeout_s));
     tokio::pin!(deadline);
     let mut last_pct: i64 = -2;
+    // Image streamed over the socket (WS-delivery mode). The last frame wins: the
+    // terminal `SaveImageWebsocket` node runs after any KSampler preview frames.
+    let mut ws_image: Option<(Vec<u8>, String)> = None;
+    // Execution-phase milestones (elapsed since submit), for the timing breakdown:
+    // first determinate progress = queue + model load done; finishing = sampling
+    // done, post-processing begun.
+    let mut first_progress_at: Option<Duration> = None;
+    let mut finishing_at: Option<Duration> = None;
     loop {
         tokio::select! {
             _ = &mut deadline => return Err("image generation timed out".into()),
             msg = ws.next() => match msg {
                 Some(Ok(Message::Text(txt))) => {
-                    if let Some(done) = handle_ws_message(&txt, &prompt_id, &mut last_pct, tx).await {
-                        if done { break; }
+                    let prev_pct = last_pct;
+                    let done = handle_ws_message(&txt, &prompt_id, &mut last_pct, tx).await;
+                    if first_progress_at.is_none() && prev_pct < 0 && (0..=100).contains(&last_pct) {
+                        first_progress_at = Some(submit_at.elapsed());
+                    }
+                    if finishing_at.is_none() && last_pct == 101 {
+                        finishing_at = Some(submit_at.elapsed());
+                    }
+                    if done == Some(true) {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Binary(b))) if ws_delivery => {
+                    if let Some(img) = parse_ws_image(&b, cap) {
+                        ws_image = Some(img);
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => {} // binary preview frames, pings — ignore
+                Some(Ok(_)) => {} // pings / previews (non-WS-delivery) — ignore
                 Some(Err(e)) => return Err(format!("websocket error: {e}")),
             }
         }
     }
     drop(ws);
 
-    // Generation finished (or the WS closed): the image is in ComfyUI's history,
-    // so disarm the guard. A timeout/WS-error bails earlier with it still armed,
-    // which is what frees the GPU on those paths.
+    // Generation finished (or the WS closed): the result is now in hand (streamed
+    // over the WS) or waiting in ComfyUI's history, so disarm the guard. A
+    // timeout/WS-error bails earlier with it still armed, freeing the GPU.
     interrupt.prompt_id = None;
-    let execute_ms = submit_at.elapsed().as_millis();
 
-    // Fetch the produced image: first locate it in ComfyUI's history…
-    let _ = tx.send(TurnEvent::Status(STATUS_RETRIEVING.into())).await;
-    let result = fetch_image(cfg, http, &prompt_id, tx).await;
+    // Break the opaque execute window into queue+load / sampling / finishing tail
+    // so we can tell whether the wall-clock is model residency vs raw sampling.
+    let execute_elapsed = submit_at.elapsed();
+    let sampling_ms = match (first_progress_at, finishing_at) {
+        (Some(start), Some(end)) => Some(end.saturating_sub(start).as_millis()),
+        _ => None,
+    };
+    let tail_ms = finishing_at.map(|f| execute_elapsed.saturating_sub(f).as_millis());
     tracing::debug!(
-        execute_ms = execute_ms as u64,
+        execute_ms = execute_elapsed.as_millis() as u64,
+        queue_load_ms = ?first_progress_at.map(|d| d.as_millis()),
+        sampling_ms = ?sampling_ms,
+        tail_ms = ?tail_ms,
+        ws_delivery,
         "comfy workflow finished (submit → execution-complete)"
     );
-    result
+
+    // WS-delivery: the bytes already arrived over the socket — no temp file, no
+    // `/history`, no `/view`. SaveImageWebsocket leaves nothing in history, so a
+    // missing frame is a hard error rather than a silent fall-through to fetch.
+    if ws_delivery {
+        return match ws_image {
+            Some((bytes, mime)) => {
+                tracing::debug!(bytes = bytes.len(), "image delivered over websocket");
+                Ok((bytes, mime))
+            }
+            None => Err("no image received over ComfyUI websocket".into()),
+        };
+    }
+
+    // Fallback path: locate the produced image in ComfyUI's history, then download.
+    let _ = tx.send(TurnEvent::Status(STATUS_RETRIEVING.into())).await;
+    fetch_image(cfg, http, &prompt_id, tx).await
 }
 
 /// Encode produced bytes as a `data:<mime>;base64,…` URI (inline delivery).
@@ -284,6 +370,56 @@ fn force_temporary_outputs(workflow: &mut Value) {
             }
         }
     }
+}
+
+/// Rewrite built-in output nodes to `SaveImageWebsocket`, which streams the
+/// finished image straight back over the progress WS instead of writing a temp
+/// file we then locate (`/history`) and download (`/view`). Both `SaveImage` and
+/// `PreviewImage` feed the same `images` input the WS node expects, so swapping
+/// the `class_type` (and dropping the now-irrelevant `filename_prefix`) is enough.
+/// Used in place of [`force_temporary_outputs`] when the backend advertises it.
+fn force_ws_outputs(workflow: &mut Value) {
+    let Some(nodes) = workflow.as_object_mut() else {
+        return;
+    };
+    for node in nodes.values_mut() {
+        let Some(obj) = node.as_object_mut() else {
+            continue;
+        };
+        let class = obj.get("class_type").and_then(Value::as_str);
+        if class == Some("SaveImage") || class == Some("PreviewImage") {
+            obj.insert(
+                "class_type".into(),
+                Value::String("SaveImageWebsocket".into()),
+            );
+            if let Some(inputs) = obj.get_mut("inputs").and_then(Value::as_object_mut) {
+                inputs.remove("filename_prefix");
+            }
+        }
+    }
+}
+
+/// Parse a ComfyUI binary WS frame carrying an image into `(bytes, mime)`. Layout:
+/// `[u32 BE event type][u32 BE image format][raw image bytes]`, where event 1 is
+/// `PREVIEW_IMAGE` and format 1 = JPEG, 2 = PNG. Frames that are truncated, of a
+/// different event type, empty, or whose payload exceeds `cap` yield `None`.
+fn parse_ws_image(frame: &[u8], cap: usize) -> Option<(Vec<u8>, String)> {
+    const PREVIEW_IMAGE: u32 = 1;
+    let event = u32::from_be_bytes(frame.get(0..4)?.try_into().ok()?);
+    if event != PREVIEW_IMAGE {
+        return None;
+    }
+    let format = u32::from_be_bytes(frame.get(4..8)?.try_into().ok()?);
+    let payload = frame.get(8..)?;
+    if payload.is_empty() || payload.len() > cap {
+        return None;
+    }
+    let mime = if format == 1 {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
+    Some((payload.to_vec(), mime.to_string()))
 }
 
 /// Returns `Some(true)` when generation for our prompt completed.
@@ -543,6 +679,55 @@ mod tests {
         assert_eq!(wf["9"]["inputs"]["images"], serde_json::json!(["8", 0]));
         assert!(wf["9"]["inputs"].get("filename_prefix").is_none());
         assert_eq!(wf["8"]["class_type"], "VAEDecode");
+    }
+
+    #[test]
+    fn force_ws_outputs_rewrites_save_and_preview() {
+        let mut wf = serde_json::json!({
+            "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": "phantasm", "images": ["8", 0] } },
+            "10": { "class_type": "PreviewImage", "inputs": { "images": ["8", 0] } },
+            "8": { "class_type": "VAEDecode", "inputs": { "samples": ["3", 0] } },
+        });
+
+        force_ws_outputs(&mut wf);
+
+        assert_eq!(wf["9"]["class_type"], "SaveImageWebsocket");
+        assert_eq!(wf["10"]["class_type"], "SaveImageWebsocket");
+        // The image wiring survives; the now-irrelevant prefix is dropped.
+        assert_eq!(wf["9"]["inputs"]["images"], serde_json::json!(["8", 0]));
+        assert!(wf["9"]["inputs"].get("filename_prefix").is_none());
+        // Non-output nodes are untouched.
+        assert_eq!(wf["8"]["class_type"], "VAEDecode");
+    }
+
+    #[test]
+    fn parse_ws_image_reads_header_and_payload() {
+        let cap = 1 << 20;
+        // event=1 (PREVIEW_IMAGE), format=2 (PNG), then the bytes.
+        let mut png = vec![0, 0, 0, 1, 0, 0, 0, 2];
+        png.extend_from_slice(b"\x89PNG-data");
+        let (bytes, mime) = parse_ws_image(&png, cap).unwrap();
+        assert_eq!(bytes, b"\x89PNG-data");
+        assert_eq!(mime, "image/png");
+
+        // format=1 → JPEG.
+        let jpeg = [vec![0, 0, 0, 1, 0, 0, 0, 1], b"jpegbytes".to_vec()].concat();
+        assert_eq!(parse_ws_image(&jpeg, cap).unwrap().1, "image/jpeg");
+    }
+
+    #[test]
+    fn parse_ws_image_rejects_bad_frames() {
+        let cap = 1 << 20;
+        // Too short for the 8-byte header.
+        assert!(parse_ws_image(&[0, 0, 0, 1], cap).is_none());
+        // Header present but no payload.
+        assert!(parse_ws_image(&[0, 0, 0, 1, 0, 0, 0, 2], cap).is_none());
+        // Wrong event type (not PREVIEW_IMAGE).
+        let other = [vec![0, 0, 0, 9, 0, 0, 0, 2], b"x".to_vec()].concat();
+        assert!(parse_ws_image(&other, cap).is_none());
+        // Payload exceeds the cap.
+        let big = [vec![0, 0, 0, 1, 0, 0, 0, 2], b"abcd".to_vec()].concat();
+        assert!(parse_ws_image(&big, 3).is_none());
     }
 
     #[tokio::test]
