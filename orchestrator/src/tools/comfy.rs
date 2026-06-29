@@ -23,6 +23,16 @@ use url::Url;
 use crate::config::{Config, NodeInput};
 use crate::orchestrator::TurnEvent;
 
+// The progress phases surfaced to the app as `x_status`, in order. `GENERATING`
+// and `DOWNLOADING` are each emitted twice — first as an indeterminate `Status`,
+// then as the label on the determinate `Progress` bar — so the label must match
+// across both for the pill to read as one continuous phase. Naming them keeps
+// those pairs in lockstep.
+const STATUS_QUEUED: &str = "queued…";
+const STATUS_GENERATING: &str = "generating image…";
+const STATUS_RETRIEVING: &str = "retrieving image…";
+const STATUS_DOWNLOADING: &str = "downloading image…";
+
 /// Tells ComfyUI to abandon a submitted prompt, freeing the GPU. Best-effort:
 /// `POST /interrupt` stops the prompt if it is currently executing, and
 /// `POST /queue {delete:[id]}` removes it if it is still queued. Errors are
@@ -181,10 +191,17 @@ pub async fn run_workflow(
         .to_string();
     interrupt.prompt_id = Some(prompt_id.clone());
 
-    // Consume progress until completion / timeout.
+    // Submitted but not yet dequeued: until ComfyUI starts the graph (model load
+    // can take seconds) there are no progress frames, so announce the wait rather
+    // than leaving the app frozen on the caller's "preparing…"/"uploading…" status.
+    let _ = tx.send(TurnEvent::Status(STATUS_QUEUED.into())).await;
+
+    // Consume progress until completion / timeout. `last_pct` is a 3-state marker:
+    // -2 = nothing seen yet, -1 = execution started (indeterminate heartbeat sent),
+    // 0..=100 = determinate sampling progress.
     let deadline = tokio::time::sleep(Duration::from_secs(cfg.comfy_timeout_s));
     tokio::pin!(deadline);
-    let mut last_pct: i64 = -1;
+    let mut last_pct: i64 = -2;
     loop {
         tokio::select! {
             _ = &mut deadline => return Err("image generation timed out".into()),
@@ -207,9 +224,9 @@ pub async fn run_workflow(
     // which is what frees the GPU on those paths.
     interrupt.prompt_id = None;
 
-    // Fetch the produced image.
-    let _ = tx.send(TurnEvent::Status("retrieving image…".into())).await;
-    fetch_image(cfg, http, &prompt_id).await
+    // Fetch the produced image: first locate it in ComfyUI's history…
+    let _ = tx.send(TurnEvent::Status(STATUS_RETRIEVING.into())).await;
+    fetch_image(cfg, http, &prompt_id, tx).await
 }
 
 /// Encode produced bytes as a `data:<mime>;base64,…` URI (inline delivery).
@@ -268,7 +285,7 @@ async fn handle_ws_message(
                 *last_pct = pct;
                 let _ = tx
                     .send(TurnEvent::Progress {
-                        status: "generating image…".into(),
+                        status: STATUS_GENERATING.into(),
                         progress: pct as f64 / 100.0,
                     })
                     .await;
@@ -278,7 +295,20 @@ async fn handle_ws_message(
         "executing" => {
             let node_is_null = data?.get("node").map(|n| n.is_null()).unwrap_or(false);
             let same_prompt = data?.get("prompt_id").and_then(|p| p.as_str()) == Some(prompt_id);
-            Some(node_is_null && same_prompt)
+            // `node: null` for our prompt signals completion (older ComfyUI).
+            if node_is_null {
+                return Some(same_prompt);
+            }
+            // First sign of execution, before any determinate progress (`last_pct`
+            // still at its -2 start): emit a one-time heartbeat so the pre-sampling
+            // stretch (model load, VAE encode of the edit input) shows movement
+            // instead of a frozen "queued…". Mark it sent by advancing to -1; once
+            // `progress` frames flow, the determinate bar takes over the same label.
+            if same_prompt && *last_pct == -2 {
+                *last_pct = -1;
+                let _ = tx.send(TurnEvent::Status(STATUS_GENERATING.into())).await;
+            }
+            Some(false)
         }
         // Newer ComfyUI signals completion with `execution_success` instead of an
         // `executing` frame carrying `node: null`. Honor both so generation
@@ -295,6 +325,7 @@ async fn fetch_image(
     cfg: &Config,
     http: &reqwest::Client,
     prompt_id: &str,
+    tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<(Vec<u8>, String), String> {
     let hist_url = cfg
         .comfy_base
@@ -331,21 +362,40 @@ async fn fetch_image(
         .unwrap_or("image/png")
         .to_string();
     let cap = cfg.comfy_max_image_bytes;
+    // Known body length, if usable for a determinate bar (absent on chunked/gzip).
+    let total = resp.content_length().map(|l| l as usize).filter(|l| *l > 0);
     // Fast reject on an advertised oversized body before streaming it.
-    if let Some(len) = resp.content_length() {
-        if len as usize > cap {
+    if let Some(len) = total {
+        if len > cap {
             return Err(format!("image too large ({len} bytes > {cap} cap)"));
         }
     }
+    // …then transfer the bytes: a distinct step from the history lookup. When the
+    // body length is known this is a determinate bar; otherwise it stays an
+    // indeterminate "downloading…" heartbeat (no number to report).
+    let _ = tx.send(TurnEvent::Status(STATUS_DOWNLOADING.into())).await;
     // Stream-accumulate so a missing/lying Content-Length can't blow past the cap.
     let mut bytes = Vec::new();
     let mut stream = resp.bytes_stream();
+    let mut last_pct: i64 = -1;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| e.to_string())?;
         if bytes.len() + chunk.len() > cap {
             return Err(format!("image exceeds {cap} byte cap"));
         }
         bytes.extend_from_slice(&chunk);
+        if let Some(total) = total {
+            let pct = (bytes.len() * 100 / total).min(100) as i64;
+            if pct != last_pct {
+                last_pct = pct;
+                let _ = tx
+                    .send(TurnEvent::Progress {
+                        status: STATUS_DOWNLOADING.into(),
+                        progress: pct as f64 / 100.0,
+                    })
+                    .await;
+            }
+        }
     }
     Ok((bytes, mime))
 }
@@ -469,6 +519,47 @@ mod tests {
         assert_eq!(
             handle_ws_message(other, "pid", &mut last, &tx).await,
             Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn executing_emits_one_presampling_heartbeat() {
+        let (tx, mut rx) = mpsc::channel(4);
+        // -2 is the start sentinel: nothing seen yet.
+        let mut last = -2;
+        let frame = r#"{"type":"executing","data":{"node":"3","prompt_id":"pid"}}"#;
+
+        // First non-null executing frame for our prompt → one heartbeat, not done.
+        assert_eq!(
+            handle_ws_message(frame, "pid", &mut last, &tx).await,
+            Some(false)
+        );
+        assert!(matches!(rx.try_recv(), Ok(TurnEvent::Status(s)) if s == STATUS_GENERATING));
+
+        // Subsequent executing frames stay quiet (heartbeat already advanced to -1).
+        assert_eq!(
+            handle_ws_message(frame, "pid", &mut last, &tx).await,
+            Some(false)
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Once determinate progress has been seen, no late heartbeat either.
+        let mut last = 50;
+        assert_eq!(
+            handle_ws_message(frame, "pid", &mut last, &tx).await,
+            Some(false)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn executing_null_node_marks_completion() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut last = -2;
+        let done = r#"{"type":"executing","data":{"node":null,"prompt_id":"pid"}}"#;
+        assert_eq!(
+            handle_ws_message(done, "pid", &mut last, &tx).await,
+            Some(true)
         );
     }
 

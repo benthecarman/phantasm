@@ -73,7 +73,7 @@ pub async fn run(
         Err(detail) => return error_outcome(call_id, detail),
     };
 
-    let _ = tx.send(TurnEvent::Status("preparing edit…".into())).await;
+    let _ = tx.send(TurnEvent::Status("loading image…".into())).await;
 
     let result = tokio::select! {
         r = edit(cfg, http, &args, &input_b64, tx) => r,
