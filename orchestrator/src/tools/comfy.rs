@@ -11,7 +11,7 @@
 //! [`upload_temp_image`] handles that via `POST /upload/image` with
 //! `type=temp`, then references it as an annotated `LoadImage` path.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use futures_util::StreamExt;
@@ -201,6 +201,10 @@ pub async fn run_workflow(
     // than leaving the app frozen on the caller's "preparing…"/"uploading…" status.
     let _ = tx.send(TurnEvent::Status(STATUS_QUEUED.into())).await;
 
+    // Timing breakdown for diagnosing where the post-submit wall-clock goes:
+    // queue+execute (here) vs history lookup vs byte download (in `fetch_image`).
+    let submit_at = Instant::now();
+
     // Consume progress until completion / timeout. `last_pct` is a 3-state marker:
     // -2 = nothing seen yet, -1 = execution started (indeterminate heartbeat sent),
     // 0..=100 = determinate sampling progress.
@@ -228,10 +232,16 @@ pub async fn run_workflow(
     // so disarm the guard. A timeout/WS-error bails earlier with it still armed,
     // which is what frees the GPU on those paths.
     interrupt.prompt_id = None;
+    let execute_ms = submit_at.elapsed().as_millis();
 
     // Fetch the produced image: first locate it in ComfyUI's history…
     let _ = tx.send(TurnEvent::Status(STATUS_RETRIEVING.into())).await;
-    fetch_image(cfg, http, &prompt_id, tx).await
+    let result = fetch_image(cfg, http, &prompt_id, tx).await;
+    tracing::debug!(
+        execute_ms = execute_ms as u64,
+        "comfy workflow finished (submit → execution-complete)"
+    );
+    result
 }
 
 /// Encode produced bytes as a `data:<mime>;base64,…` URI (inline delivery).
@@ -334,6 +344,7 @@ async fn fetch_image(
     prompt_id: &str,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<(Vec<u8>, String), String> {
+    let history_at = Instant::now();
     let hist_url = cfg
         .comfy_base
         .join(&format!("/history/{prompt_id}"))
@@ -349,7 +360,9 @@ async fn fetch_image(
 
     let image = find_first_image(&hist, prompt_id)
         .ok_or_else(|| "no image in ComfyUI output".to_string())?;
+    let history_ms = history_at.elapsed().as_millis();
 
+    let download_at = Instant::now();
     let view_url = cfg.comfy_base.join("/view").map_err(|e| e.to_string())?;
     let resp = http
         .get(view_url)
@@ -404,6 +417,12 @@ async fn fetch_image(
             }
         }
     }
+    tracing::debug!(
+        history_ms = history_ms as u64,
+        download_ms = download_at.elapsed().as_millis() as u64,
+        bytes = bytes.len(),
+        "retrieved comfy image (history lookup → byte download)"
+    );
     Ok((bytes, mime))
 }
 
