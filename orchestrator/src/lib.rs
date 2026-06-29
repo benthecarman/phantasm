@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod image_norm;
 pub mod images;
+pub mod net_guard;
 pub mod ollama;
 pub mod openai;
 pub mod orchestrator;

@@ -25,17 +25,16 @@
 //! starts so the client gets a clean HTTP status rather than a mangled stream.
 
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::StreamExt;
-use url::Url;
 
 use crate::config::Config;
 use crate::error::AppError;
 use crate::images::{recognized_image_type, sniff_content_type, BlobStore};
+use crate::net_guard;
 use crate::openai::types::{extract_store_ids, ChatMessage, ContentPart, MessageContent};
 
 const UNSUPPORTED: &str = "attached content is not a supported image (png/jpeg/gif/webp)";
@@ -277,29 +276,17 @@ fn encode(img: &image::DynamicImage) -> Result<Vec<u8>, AppError> {
 /// link-local address and pinning the connection to the validated IP (so DNS
 /// rebinding can't swap in an internal target). Redirects are not followed — a
 /// 3xx to an internal resource surfaces as a non-success status. Body is capped.
+/// The SSRF screening + connection pinning is the shared [`crate::net_guard`].
 async fn fetch_remote(url_str: &str, cfg: &Config) -> Result<Vec<u8>, AppError> {
-    let url = Url::parse(url_str).map_err(|_| AppError::BadRequest("invalid image URL".into()))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(AppError::BadRequest("unsupported image URL scheme".into()));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| AppError::BadRequest("image URL has no host".into()))?
-        .to_string();
-    let port = url
-        .port_or_known_default()
-        .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
-
-    let addr = resolve_allowed(&host, port).await?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_millis(cfg.image_fetch_timeout_ms))
-        .resolve(&host, addr)
-        .build()
-        .map_err(|e| AppError::Internal(format!("image http client build failed: {e}")))?;
+    let target = net_guard::guard_url(url_str)
+        .await
+        .map_err(AppError::BadRequest)?;
+    let client =
+        net_guard::pinned_client(&target, Duration::from_millis(cfg.image_fetch_timeout_ms))
+            .map_err(AppError::Internal)?;
 
     let resp = client
-        .get(url.clone())
+        .get(target.url.clone())
         .send()
         .await
         .map_err(|e| AppError::BadRequest(format!("failed to fetch image URL: {e}")))?;
@@ -330,56 +317,6 @@ async fn fetch_remote(url_str: &str, cfg: &Config) -> Result<Vec<u8>, AppError> 
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
-}
-
-/// Resolve `host:port` and return the first address that isn't disallowed.
-/// Errors if resolution fails or every address is private/loopback/etc.
-async fn resolve_allowed(host: &str, port: u16) -> Result<SocketAddr, AppError> {
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| AppError::BadRequest(format!("could not resolve image host: {e}")))?;
-    for addr in addrs {
-        if !ip_is_disallowed(addr.ip()) {
-            return Ok(addr);
-        }
-    }
-    Err(AppError::BadRequest(
-        "image host resolves only to disallowed (private/loopback/link-local) addresses".into(),
-    ))
-}
-
-/// Whether an IP must not be fetched from — the SSRF blocklist. Conservative:
-/// covers loopback, private, link-local, CGNAT-shared, multicast, unspecified,
-/// documentation/reserved ranges, and IPv4-mapped IPv6 (re-checked as v4).
-fn ip_is_disallowed(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4_disallowed(v4),
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return v4_disallowed(mapped);
-            }
-            let seg0 = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (seg0 & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
-        }
-    }
-}
-
-fn v4_disallowed(v4: Ipv4Addr) -> bool {
-    let [a, b, ..] = v4.octets();
-    v4.is_private()
-        || v4.is_loopback()
-        || v4.is_link_local()
-        || v4.is_broadcast()
-        || v4.is_documentation()
-        || v4.is_unspecified()
-        || v4.is_multicast()
-        || a == 0 // 0.0.0.0/8 "this network"
-        || (a == 100 && (64..128).contains(&b)) // CGNAT 100.64.0.0/10
-        || a >= 240 // 240.0.0.0/4 reserved
 }
 
 #[cfg(test)]
@@ -538,33 +475,5 @@ mod tests {
         assert_eq!(decoded.width().max(decoded.height()), 512);
         assert_eq!(decoded.width(), 512);
         assert_eq!(decoded.height(), 256);
-    }
-
-    #[test]
-    fn ssrf_blocklist_covers_internal_ranges() {
-        for bad in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.16.0.1",
-            "192.168.1.1",
-            "169.254.1.1",
-            "100.64.0.1",
-            "0.0.0.0",
-            "::1",
-            "fc00::1",
-            "fe80::1",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(
-                ip_is_disallowed(bad.parse().unwrap()),
-                "{bad} should be blocked"
-            );
-        }
-        for ok in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:2800:220:1::"] {
-            assert!(
-                !ip_is_disallowed(ok.parse().unwrap()),
-                "{ok} should be allowed"
-            );
-        }
     }
 }
