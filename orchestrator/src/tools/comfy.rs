@@ -23,12 +23,17 @@ use url::Url;
 use crate::config::{Config, NodeInput};
 use crate::orchestrator::TurnEvent;
 
-// The progress phases surfaced to the app as `x_status`, in order. `GENERATING`
-// and `DOWNLOADING` are each emitted twice — first as an indeterminate `Status`,
-// then as the label on the determinate `Progress` bar — so the label must match
-// across both for the pill to read as one continuous phase. Naming them keeps
-// those pairs in lockstep.
+// The progress phases surfaced to the app as `x_status`, in order. `DOWNLOADING`
+// is emitted twice — first as an indeterminate `Status`, then as the label on the
+// determinate `Progress` bar — so the label must match across both for the pill
+// to read as one continuous phase. Naming them keeps that pair in lockstep.
+//
+// `LOADING_MODEL` covers the pre-sampling stretch (checkpoint into VRAM, CLIP and
+// VAE encode) where ComfyUI emits no progress frames; it is deliberately distinct
+// from `GENERATING` so the indeterminate heartbeat and the determinate sampling
+// bar read as two phases rather than the same label stuttering.
 const STATUS_QUEUED: &str = "queued…";
+const STATUS_LOADING_MODEL: &str = "loading model…";
 const STATUS_GENERATING: &str = "generating image…";
 const STATUS_RETRIEVING: &str = "retrieving image…";
 const STATUS_DOWNLOADING: &str = "downloading image…";
@@ -301,12 +306,14 @@ async fn handle_ws_message(
             }
             // First sign of execution, before any determinate progress (`last_pct`
             // still at its -2 start): emit a one-time heartbeat so the pre-sampling
-            // stretch (model load, VAE encode of the edit input) shows movement
-            // instead of a frozen "queued…". Mark it sent by advancing to -1; once
-            // `progress` frames flow, the determinate bar takes over the same label.
+            // stretch (model load, CLIP/VAE encode) shows movement instead of a
+            // frozen "queued…". Mark it sent by advancing to -1; once `progress`
+            // frames flow, the determinate "generating image…" bar takes over.
             if same_prompt && *last_pct == -2 {
                 *last_pct = -1;
-                let _ = tx.send(TurnEvent::Status(STATUS_GENERATING.into())).await;
+                let _ = tx
+                    .send(TurnEvent::Status(STATUS_LOADING_MODEL.into()))
+                    .await;
             }
             Some(false)
         }
@@ -534,7 +541,7 @@ mod tests {
             handle_ws_message(frame, "pid", &mut last, &tx).await,
             Some(false)
         );
-        assert!(matches!(rx.try_recv(), Ok(TurnEvent::Status(s)) if s == STATUS_GENERATING));
+        assert!(matches!(rx.try_recv(), Ok(TurnEvent::Status(s)) if s == STATUS_LOADING_MODEL));
 
         // Subsequent executing frames stay quiet (heartbeat already advanced to -1).
         assert_eq!(
