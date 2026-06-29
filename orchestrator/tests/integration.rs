@@ -37,6 +37,27 @@ fn mock_ollama_recording(requests: RecordedRequests) -> Router {
     mock_ollama_with_recorder(Some(requests))
 }
 
+fn mock_ollama_app_tool_call() -> Router {
+    Router::new()
+        .route(
+            "/api/chat",
+            post(|body: axum::extract::Json<serde_json::Value>| async move {
+                let streaming = body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                if streaming {
+                    "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"unused\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+                } else {
+                    "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
+                       {\"function\":{\"name\":\"ask_user_input\",\"arguments\":{\"questions\":[{\"question\":\"Pick one\",\"options\":[\"A\",\"B\"],\"type\":\"single_select\"}]}}}\
+                     ]},\"done\":true,\"done_reason\":\"stop\"}\n"
+                }
+            }),
+        )
+        .route(
+            "/api/tags",
+            get(|| async { axum::Json(serde_json::json!({"models":[{"name":"m"}]})) }),
+        )
+}
+
 fn mock_ollama_with_recorder(requests: Option<RecordedRequests>) -> Router {
     Router::new()
         .route(
@@ -325,20 +346,49 @@ async fn spawn_orchestrator_with_calculator(ollama_base: &str) -> String {
 }
 
 /// Like `spawn_orchestrator`, but with the `code_exec` server tool enabled. The
-/// runtime binary is intentionally bogus so the warm pool's container launches
-/// fail fast — no real Docker/Podman is needed in CI. This exercises the wiring
-/// and the non-fatal failure path (NFR-O6): the tool folds its error into the
-/// `tool` message and the turn still completes.
+/// runtime is a tiny fake that passes deployment preflight (runtime/image/network)
+/// but fails container starts — no real Docker/Podman is needed in CI. This
+/// exercises the wiring and the non-fatal failure path (NFR-O6): the tool folds
+/// its error into the `tool` message and the turn still completes.
 async fn spawn_orchestrator_with_code_exec(ollama_base: &str) -> String {
     let mut cfg = test_config(ollama_base);
     cfg.code_exec_enabled = true;
-    cfg.code_exec_runtime = "/nonexistent/phantasm-codeexec-runtime".into();
+    cfg.code_exec_runtime = fake_code_exec_runtime();
+    cfg.code_exec_network = Some("phantasm-code-exec".into());
     cfg.code_exec_languages = vec!["python".into()];
     cfg.code_exec_pool_size = 1;
     let cfg = Arc::new(cfg);
     let capabilities = Arc::new(test_capabilities());
     let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
     spawn(routes::router(state)).await
+}
+
+fn fake_code_exec_runtime() -> String {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        file,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then exit 0; fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then exit 0; fi
+if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then exit 0; fi
+if [ "$1" = "rm" ]; then exit 0; fi
+echo "fake runtime refuses to start containers" >&2
+exit 1
+"#
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut perms = file.as_file().metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        file.as_file().set_permissions(perms).unwrap();
+    }
+    let (_file, path) = file.keep().unwrap();
+    path.to_string_lossy().into_owned()
 }
 
 /// A model `code_exec` call is executed server-side and never forwarded to the
@@ -402,6 +452,96 @@ async fn code_exec_runs_server_side_and_failure_is_non_fatal() {
     assert!(
         resolved,
         "a resolution request includes the folded code_exec tool result"
+    );
+}
+
+#[derive(Debug, PartialEq)]
+enum SseContractEvent {
+    Json(serde_json::Value),
+    Done,
+}
+
+fn fixture_events(name: &str) -> Vec<SseContractEvent> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../docs/contract-fixtures/orchestrator-sse")
+        .join(name);
+    parse_sse_contract(&std::fs::read_to_string(path).unwrap())
+}
+
+fn response_events(body: &str) -> Vec<SseContractEvent> {
+    parse_sse_contract(body)
+        .into_iter()
+        .map(|event| match event {
+            SseContractEvent::Json(mut value) => {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("id".into(), serde_json::json!("chatcmpl-fixture"));
+                    obj.insert("created".into(), serde_json::json!(1));
+                }
+                if let Some(calls) = value
+                    .pointer_mut("/choices/0/delta/tool_calls")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for call in calls {
+                        if let Some(obj) = call.as_object_mut() {
+                            obj.insert("id".into(), serde_json::json!("call_ask"));
+                        }
+                    }
+                }
+                SseContractEvent::Json(value)
+            }
+            SseContractEvent::Done => SseContractEvent::Done,
+        })
+        .collect()
+}
+
+fn parse_sse_contract(raw: &str) -> Vec<SseContractEvent> {
+    raw.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| {
+            if data == "[DONE]" {
+                SseContractEvent::Done
+            } else {
+                SseContractEvent::Json(serde_json::from_str(data).unwrap())
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn app_tool_call_stream_matches_contract_fixture() {
+    let ollama = spawn(mock_ollama_app_tool_call()).await;
+    let base = spawn_orchestrator(&ollama).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "ask me"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "ask_user_input",
+                    "description": "Ask the user",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "questions": { "type": "array" }
+                        },
+                        "required": ["questions"]
+                    }
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    assert_eq!(
+        response_events(&resp.text().await.unwrap()),
+        fixture_events("app-tool-call.sse")
     );
 }
 

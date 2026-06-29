@@ -192,10 +192,153 @@ fn now_secs() -> i64 {
 mod tests {
     use super::*;
 
+    #[derive(Debug, PartialEq)]
+    enum ContractEvent {
+        Json(serde_json::Value),
+        Done,
+    }
+
     /// `Event` doesn't expose its data, so we reserialize the chunk struct to
     /// assert shape. This validates the OpenAI envelope + additive x_status.
     fn chunk_json(c: &ChatChunk) -> serde_json::Value {
         serde_json::to_value(c).unwrap()
+    }
+
+    fn fixture_factory() -> ChunkFactory {
+        ChunkFactory {
+            id: "chatcmpl-fixture".into(),
+            model: "m".into(),
+            created: 1,
+        }
+    }
+
+    fn fixture_events(name: &str) -> Vec<ContractEvent> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/contract-fixtures/orchestrator-sse")
+            .join(name);
+        parse_contract(&std::fs::read_to_string(path).unwrap())
+    }
+
+    fn parse_contract(raw: &str) -> Vec<ContractEvent> {
+        raw.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| {
+                if data == "[DONE]" {
+                    ContractEvent::Done
+                } else {
+                    ContractEvent::Json(serde_json::from_str(data).unwrap())
+                }
+            })
+            .collect()
+    }
+
+    fn events(chunks: Vec<ChatChunk>) -> Vec<ContractEvent> {
+        let mut out: Vec<ContractEvent> = chunks
+            .into_iter()
+            .map(|chunk| ContractEvent::Json(chunk_json(&chunk)))
+            .collect();
+        out.push(ContractEvent::Done);
+        out
+    }
+
+    fn role_chunk(f: &ChunkFactory) -> ChatChunk {
+        f.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::role("assistant"),
+                finish_reason: None,
+            }],
+            None,
+            None,
+        )
+    }
+
+    fn finish_chunk(f: &ChunkFactory, reason: &str) -> ChatChunk {
+        f.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: Some(reason.into()),
+            }],
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn status_reasoning_image_fixture_matches_chunk_contract() {
+        let f = fixture_factory();
+        let actual = events(vec![
+            role_chunk(&f),
+            f.base(
+                vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta::default(),
+                    finish_reason: None,
+                }],
+                Some("searching the web...".into()),
+                None,
+            ),
+            f.base(
+                vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta::default(),
+                    finish_reason: None,
+                }],
+                Some("generating image...".into()),
+                Some(0.42),
+            ),
+            f.base(
+                vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta::reasoning("checking sources"),
+                    finish_reason: None,
+                }],
+                None,
+                None,
+            ),
+            f.base(
+                vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta::content(
+                        "Here is the image: ![generated](https://backend.example/v1/files/img_1/content?exp=1&sig=s)",
+                    ),
+                    finish_reason: None,
+                }],
+                None,
+                None,
+            ),
+            finish_chunk(&f, "stop"),
+        ]);
+        assert_eq!(actual, fixture_events("status-reasoning-image.sse"));
+    }
+
+    #[test]
+    fn stream_error_fixture_matches_chunk_contract() {
+        let f = fixture_factory();
+        let actual = events(vec![
+            role_chunk(&f),
+            f.base(
+                vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta::default(),
+                    finish_reason: None,
+                }],
+                Some("error: upstream boom".into()),
+                None,
+            ),
+            f.base(
+                vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta::content("\n\nWARNING: upstream boom"),
+                    finish_reason: None,
+                }],
+                None,
+                None,
+            ),
+            finish_chunk(&f, "stop"),
+        ]);
+        assert_eq!(actual, fixture_events("stream-error.sse"));
     }
 
     #[test]

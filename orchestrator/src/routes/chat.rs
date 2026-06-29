@@ -350,7 +350,7 @@ fn attach_response(
                     TurnEvent::ToolCalls { app, .. } => yield factory.tool_calls(&app).id(id),
                     TurnEvent::Error(e) => {
                         yield factory.status(&format!("error: {e}")).id(id);
-                        yield factory.token(&format!("\n\n⚠️ {e}"));
+                        yield factory.token(&format!("\n\nWARNING: {e}"));
                         yield factory.finish("stop");
                         yield done_event();
                         return;
@@ -462,7 +462,7 @@ fn stream_response(
                 }
                 TurnEvent::Error(e) => {
                     yield factory.status(&format!("error: {e}"));
-                    yield factory.token(&format!("\n\n⚠️ {e}"));
+                    yield factory.token(&format!("\n\nWARNING: {e}"));
                     yield factory.finish("stop");
                     yield done_event();
                     return;

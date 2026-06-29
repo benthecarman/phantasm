@@ -174,6 +174,10 @@ async fn tool_selectors(cfg: &Config, http: &reqwest::Client) -> Vec<ToolSelecto
 /// web access off never disables them.
 fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
     let mut selectors = Vec::new();
+    let code_exec_deployable = cfg.code_exec_usable()
+        && crate::tools::code_exec_pool::deployment_preflight(cfg)
+            .map_err(|e| tracing::warn!(error = %e, "code-exec unavailable for capabilities"))
+            .is_ok();
     if let Some(web) = make_selector(
         "web_search",
         "Web access",
@@ -189,7 +193,7 @@ fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
             // is always available (via utilities); listing it here too means that
             // when web access is on, its run gets internet — the server reads the
             // web-access signal from the other tools in this bucket, not the name.
-            (cfg.code_exec_usable(), "code_exec"),
+            (code_exec_deployable, "code_exec"),
         ],
     ) {
         selectors.push(web);
@@ -203,7 +207,7 @@ fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
             (cfg.ocr_usable(), "ocr"),
             // Always-on like the other utilities; with web access off it runs with
             // no network at all (so it carries no web risk).
-            (cfg.code_exec_usable(), "code_exec"),
+            (code_exec_deployable, "code_exec"),
         ],
     ) {
         selectors.push(utilities);
@@ -386,7 +390,7 @@ pub fn build_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{make_selector, tool_selector_id};
+    use super::{make_selector, offline_tool_selectors, tool_selector_id};
 
     #[test]
     fn tool_selector_id_groups_network_and_local_tools() {
@@ -434,6 +438,22 @@ mod tests {
         assert!(
             make_selector("utilities", "Utilities", &[(false, "calculator")]).is_none(),
             "a bucket with no usable tools is not advertised"
+        );
+    }
+
+    #[test]
+    fn code_exec_is_not_advertised_when_preflight_fails() {
+        let mut cfg = crate::config::tests_support::minimal();
+        cfg.code_exec_enabled = true;
+        cfg.code_exec_network = None;
+
+        let selectors = offline_tool_selectors(&cfg);
+        assert!(
+            selectors
+                .iter()
+                .flat_map(|selector| selector.tools.iter())
+                .all(|tool| tool != "code_exec"),
+            "code_exec must fail closed when deployment preflight fails"
         );
     }
 }

@@ -2,7 +2,9 @@ data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"mod
 
 data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{}}],"x_status":"searching the web..."}
 
-data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning":"checking sources"}}]}
+data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{}}],"x_status":"generating image...","x_progress":0.42}
+
+data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"checking sources"}}]}
 
 data: {"id":"chatcmpl-fixture","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Here is the image: ![generated](https://backend.example/v1/files/img_1/content?exp=1&sig=s)"}}]}
 

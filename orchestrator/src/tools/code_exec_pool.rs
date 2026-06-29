@@ -19,6 +19,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -139,9 +140,7 @@ impl CodeExecPool {
     /// a clearly-unusable config; warm-up failures are non-fatal (logged) — the pool
     /// still serves via cold fallback.
     pub fn new(cfg: Arc<Config>, network: NetworkMode) -> Result<Self, String> {
-        if cfg.code_exec_runtime.trim().is_empty() {
-            return Err("CODE_EXEC_RUNTIME is empty".into());
-        }
+        validate_sandbox_config(&cfg)?;
         let backend = Arc::new(PodmanBackend::new(cfg.code_exec_runtime.clone(), network));
         let pool = Self::with_backend(cfg, backend);
         pool.warm();
@@ -254,12 +253,149 @@ pub struct CodeExecPools {
 impl CodeExecPools {
     /// Build both lanes and start warming them. The offline lane uses
     /// `--network none`; the online lane uses the configured egress-filtered
-    /// network (or the runtime default when none is configured — dev/test only).
+    /// network. A missing or uninspectable online network fails closed so the
+    /// tool is not advertised.
     pub fn new(cfg: Arc<Config>) -> Result<Self, String> {
+        deployment_preflight(&cfg)?;
         let offline = CodeExecPool::new(cfg.clone(), NetworkMode::None)?;
         let online = CodeExecPool::new(cfg.clone(), NetworkMode::online(&cfg))?;
         Ok(CodeExecPools { offline, online })
     }
+}
+
+/// Verify that a code-exec deployment is constrained enough to advertise. This
+/// is intentionally fail-closed: if the runtime, image, network, or hardening
+/// config cannot be proven present, the tool is disabled rather than offered to
+/// the model.
+pub fn deployment_preflight(cfg: &Config) -> Result<(), String> {
+    validate_sandbox_config(cfg)?;
+    let network = cfg
+        .code_exec_network
+        .as_deref()
+        .ok_or_else(|| "CODE_EXEC_NETWORK is required when TOOL_CODE_EXEC=true".to_string())?;
+    run_probe(&cfg.code_exec_runtime, ["--version"], "container runtime")?;
+    run_probe(
+        &cfg.code_exec_runtime,
+        ["image", "inspect", cfg.code_exec_image.as_str()],
+        "code-exec image",
+    )?;
+    run_probe(
+        &cfg.code_exec_runtime,
+        ["network", "inspect", network],
+        "code-exec network",
+    )?;
+    Ok(())
+}
+
+fn validate_sandbox_config(cfg: &Config) -> Result<(), String> {
+    if cfg.code_exec_runtime.trim().is_empty() {
+        return Err("CODE_EXEC_RUNTIME is empty".into());
+    }
+    if cfg.code_exec_image.trim().is_empty() {
+        return Err("CODE_EXEC_IMAGE is empty".into());
+    }
+    if cfg.code_exec_memory.trim().is_empty() || cfg.code_exec_memory.trim() == "0" {
+        return Err("CODE_EXEC_MEMORY must set a non-zero memory cap".into());
+    }
+    let cpus: f64 = cfg
+        .code_exec_cpus
+        .trim()
+        .parse()
+        .map_err(|_| "CODE_EXEC_CPUS must be a positive number".to_string())?;
+    if !(cpus.is_finite() && cpus > 0.0) {
+        return Err("CODE_EXEC_CPUS must be a positive number".into());
+    }
+    if cfg.code_exec_pids_limit == 0 {
+        return Err("CODE_EXEC_PIDS_LIMIT must be greater than zero".into());
+    }
+    if user_is_root(&cfg.code_exec_run_user) {
+        return Err("CODE_EXEC_USER must not run code as root".into());
+    }
+
+    let args = run_container_args(cfg, "preflight", &NetworkMode::None);
+    for required in ["--read-only", "--cap-drop", "--security-opt", "--user"] {
+        if !args.iter().any(|arg| arg == required) {
+            return Err(format!("code-exec run args are missing {required}"));
+        }
+    }
+    if args.iter().any(|arg| arg == "--privileged") {
+        return Err("code-exec containers must not run privileged".into());
+    }
+    if !has_arg_pair(&args, "--cap-drop", "ALL") {
+        return Err("code-exec containers must drop all capabilities".into());
+    }
+    if !has_arg_pair(&args, "--security-opt", "no-new-privileges") {
+        return Err("code-exec containers must set no-new-privileges".into());
+    }
+    Ok(())
+}
+
+fn run_probe<'a>(
+    runtime: &str,
+    args: impl IntoIterator<Item = &'a str>,
+    what: &str,
+) -> Result<(), String> {
+    let out = StdCommand::new(runtime)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{what} probe failed to start `{runtime}`: {e}"))?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("{what} probe failed: {detail}"));
+    }
+    Ok(())
+}
+
+fn user_is_root(raw: &str) -> bool {
+    let mut parts = raw.trim().split(':');
+    let user = parts.next().unwrap_or_default();
+    let group = parts.next();
+    user.is_empty()
+        || user == "0"
+        || user.eq_ignore_ascii_case("root")
+        || group.is_some_and(|g| g == "0" || g.eq_ignore_ascii_case("root"))
+}
+
+fn has_arg_pair(args: &[String], key: &str, value: &str) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == key && pair[1] == value)
+}
+
+fn run_container_args(cfg: &Config, name: &str, network: &NetworkMode) -> Vec<String> {
+    let mut args = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        name.into(),
+        "--memory".into(),
+        cfg.code_exec_memory.clone(),
+        "--cpus".into(),
+        cfg.code_exec_cpus.clone(),
+        "--pids-limit".into(),
+        cfg.code_exec_pids_limit.to_string(),
+        "--read-only".into(),
+        "--tmpfs".into(),
+        "/tmp:rw,size=64m".into(),
+        "--user".into(),
+        cfg.code_exec_run_user.clone(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+    ];
+    match network {
+        NetworkMode::None => {
+            args.push("--network".into());
+            args.push("none".into());
+        }
+        NetworkMode::Named(net) => {
+            args.push("--network".into());
+            args.push(net.clone());
+        }
+        NetworkMode::RuntimeDefault => {}
+    }
+    args.push(cfg.code_exec_image.clone());
+    args
 }
 
 /// Park a freshly-started container as ready, unless the ready queue is already at
@@ -300,39 +436,7 @@ impl ContainerBackend for PodmanBackend {
         Box::pin(async move {
             let name = format!("phantasm-codeexec-{}", uuid::Uuid::new_v4().simple());
             let mut cmd = Command::new(&self.runtime);
-            cmd.arg("run")
-                .arg("-d")
-                .arg("--name")
-                .arg(&name)
-                .arg("--memory")
-                .arg(&cfg.code_exec_memory)
-                .arg("--cpus")
-                .arg(&cfg.code_exec_cpus)
-                .arg("--pids-limit")
-                .arg(cfg.code_exec_pids_limit.to_string())
-                .arg("--read-only")
-                .arg("--tmpfs")
-                .arg("/tmp:rw,size=64m")
-                .arg("--user")
-                .arg(&cfg.code_exec_run_user)
-                .arg("--cap-drop")
-                .arg("ALL")
-                .arg("--security-opt")
-                .arg("no-new-privileges");
-            // Network depends on this lane's mode. The offline lane gets no network
-            // at all; the online lane attaches to the egress-firewalled network
-            // (internet yes, internal/metadata no — a deployment concern) or, if
-            // none is configured, the runtime default (dev/test only).
-            match &self.network {
-                NetworkMode::None => {
-                    cmd.arg("--network").arg("none");
-                }
-                NetworkMode::Named(net) => {
-                    cmd.arg("--network").arg(net);
-                }
-                NetworkMode::RuntimeDefault => {}
-            }
-            cmd.arg(&cfg.code_exec_image);
+            cmd.args(run_container_args(cfg, &name, &self.network));
             // If the spawn future is dropped (cold-spawn timeout/cancel), kill the
             // `run` client rather than leaving it wedged against a stuck runtime.
             cmd.kill_on_drop(true);
@@ -547,7 +651,15 @@ mod tests {
         let mut c = crate::config::tests_support::minimal();
         c.code_exec_enabled = true;
         c.code_exec_pool_size = pool_size;
+        c.code_exec_network = Some("phantasm-code-exec".into());
         Arc::new(c)
+    }
+
+    fn raw_cfg() -> Config {
+        let mut c = crate::config::tests_support::minimal();
+        c.code_exec_enabled = true;
+        c.code_exec_network = Some("phantasm-code-exec".into());
+        c
     }
 
     /// Drain the background recycle/warm tasks so their effects are observable.
@@ -688,5 +800,32 @@ mod tests {
         let _ = h1.await.unwrap();
         settle().await;
         assert_eq!(pool.0.slots.available_permits(), 1);
+    }
+
+    #[test]
+    fn sandbox_config_rejects_root_user() {
+        let mut c = raw_cfg();
+        c.code_exec_run_user = "0:0".into();
+        let err = validate_sandbox_config(&c).unwrap_err();
+        assert!(err.contains("must not run code as root"));
+    }
+
+    #[test]
+    fn deployment_preflight_requires_explicit_online_network() {
+        let mut c = raw_cfg();
+        c.code_exec_network = None;
+        let err = deployment_preflight(&c).unwrap_err();
+        assert!(err.contains("CODE_EXEC_NETWORK is required"));
+    }
+
+    #[test]
+    fn run_args_include_hardening_without_privileged() {
+        let c = raw_cfg();
+        let args = run_container_args(&c, "name", &NetworkMode::None);
+        assert!(has_arg_pair(&args, "--network", "none"));
+        assert!(has_arg_pair(&args, "--cap-drop", "ALL"));
+        assert!(has_arg_pair(&args, "--security-opt", "no-new-privileges"));
+        assert!(args.iter().any(|arg| arg == "--read-only"));
+        assert!(!args.iter().any(|arg| arg == "--privileged"));
     }
 }
