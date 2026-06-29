@@ -59,8 +59,9 @@ pub struct Blob {
 
 impl BlobStore {
     /// Build a store rooted at `dir`, creating it if needed. `key` is the HMAC
-    /// signing key (the server auth token). Returns `None`-equivalent errors as
-    /// `Err` so startup can fail fast on an unwritable directory.
+    /// signing key (the server auth token). Returns `Err` so startup can fail
+    /// fast on an unwritable directory rather than silently degrading to inline
+    /// delivery on every image (see `deliver_image`'s write-failure fallback).
     pub fn new(
         dir: PathBuf,
         key: &str,
@@ -69,6 +70,16 @@ impl BlobStore {
         public_base: Option<&url::Url>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        // `create_dir_all` is a no-op that *succeeds* when the directory already
+        // exists, so it can't tell us the directory is actually writable — a
+        // read-only mount (e.g. systemd `ProtectSystem=strict` without a
+        // `ReadWritePaths`/`StateDirectory` for it) or a root-owned dir under a
+        // non-root service user both slip past it. Probe with a real write +
+        // remove so an unwritable store surfaces at boot, not as a silent
+        // per-image fallback that looks exactly like having no store at all.
+        let probe = dir.join(format!(".write-probe-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&probe, b"")?;
+        let _ = std::fs::remove_file(&probe);
         Ok(BlobStore {
             inner: Arc::new(Inner {
                 dir,
@@ -294,6 +305,33 @@ mod tests {
         assert!(s.delete(&id).await.unwrap(), "first delete removes");
         assert!(!s.delete(&id).await.unwrap(), "second delete is a no-op");
         assert!(s.get(&id).await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_fails_fast_on_unwritable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ro");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Root bypasses permission bits, so the probe would succeed and there'd
+        // be nothing to assert — detect that by trying a write ourselves and
+        // skip rather than claim a guarantee the environment can't uphold.
+        if std::fs::write(dir.join(".root-check"), b"").is_ok() {
+            let _ = std::fs::remove_file(dir.join(".root-check"));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        match BlobStore::new(dir.clone(), "k", 3600, 1 << 20, None) {
+            Ok(_) => panic!("a read-only store dir must fail at construction"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+
+        // Restore perms so the tempdir can clean itself up.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[tokio::test]
