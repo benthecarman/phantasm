@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod chat;
+pub mod health;
 pub mod images;
 pub mod models;
 pub mod warm;
@@ -38,7 +39,9 @@ pub fn router(state: AppState) -> Router {
 
     // Signature-gated, auth-exempt image fetch (Files-style content path), merged
     // alongside the bearer-gated DELETE on the resource.
-    let public = Router::new().route("/v1/files/{id}/content", get(images::get_image));
+    let public = Router::new()
+        .route("/healthz", get(health::healthz))
+        .route("/v1/files/{id}/content", get(images::get_image));
 
     authed
         .merge(public)

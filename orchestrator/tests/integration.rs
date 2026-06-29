@@ -978,6 +978,23 @@ async fn missing_token_is_rejected() {
 }
 
 #[tokio::test]
+async fn healthz_is_public_liveness_check() {
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator(&ollama).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/healthz"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["status"], "ok");
+    assert!(v["version"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[tokio::test]
 async fn auth_disabled_accepts_unauthenticated_requests() {
     let ollama = spawn(mock_ollama()).await;
     let mut cfg = test_config(&ollama);

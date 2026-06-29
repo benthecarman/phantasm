@@ -45,10 +45,12 @@ iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ O
 
 | Method | Path                    | Purpose                                  |
 |--------|-------------------------|------------------------------------------|
+| `GET`  | `/healthz`              | Auth-exempt process liveness check       |
 | `GET`  | `/v1/capabilities`      | Advertise models + which tools are live  |
 | `POST` | `/v1/chat/completions`  | OpenAI-compatible chat (SSE or JSON)      |
 
-All routes require `Authorization: Bearer <PHANTASM_AUTH_TOKEN>`.
+All `/v1/*` routes require `Authorization: Bearer <PHANTASM_AUTH_TOKEN>`
+except signed image fetches at `/v1/files/{id}/content`.
 
 ## Run
 
