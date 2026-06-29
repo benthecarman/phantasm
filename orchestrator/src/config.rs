@@ -146,6 +146,8 @@ pub struct Config {
     pub weather_enabled: bool,
     pub open_meteo_base: Url,
     pub open_meteo_geocoding_base: Url,
+    pub sports_enabled: bool,
+    pub espn_base: Url,
     pub maps_places_enabled: bool,
     pub nominatim_base: Url,
     pub overpass_base: Url,
@@ -336,6 +338,8 @@ impl Config {
                 "OPEN_METEO_GEOCODING_BASE_URL",
                 "https://geocoding-api.open-meteo.com",
             )?,
+            sports_enabled: env_bool("TOOL_SPORTS", false),
+            espn_base: parse_url("ESPN_API_BASE_URL", "https://site.api.espn.com")?,
             maps_places_enabled: env_bool("TOOL_MAPS_PLACES", false),
             nominatim_base: parse_url("NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org")?,
             overpass_base: parse_url("OVERPASS_BASE_URL", "https://overpass-api.de")?,
@@ -445,6 +449,10 @@ impl Config {
 
     pub fn weather_usable(&self) -> bool {
         self.weather_enabled
+    }
+
+    pub fn sports_usable(&self) -> bool {
+        self.sports_enabled
     }
 
     pub fn maps_places_usable(&self) -> bool {
@@ -601,6 +609,8 @@ pub mod tests_support {
             weather_enabled: false,
             open_meteo_base: "https://api.open-meteo.com".parse().unwrap(),
             open_meteo_geocoding_base: "https://geocoding-api.open-meteo.com".parse().unwrap(),
+            sports_enabled: false,
+            espn_base: "https://site.api.espn.com".parse().unwrap(),
             maps_places_enabled: false,
             nominatim_base: "https://nominatim.openstreetmap.org".parse().unwrap(),
             overpass_base: "https://overpass-api.de".parse().unwrap(),

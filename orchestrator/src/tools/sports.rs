@@ -1,0 +1,411 @@
+//! Sports scores and schedules backed by ESPN's public scoreboard API. No API
+//! key and no persistence.
+
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::Config;
+use crate::openai::types::{ChatMessage, ToolCall};
+use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
+use crate::orchestrator::TurnEvent;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SportsArgs {
+    /// Which league's games to look up.
+    pub league: League,
+    /// Day to fetch, as `YYYY-MM-DD`. Omit for the current scoreboard (today's
+    /// games, or the current week for weekly leagues like the NFL).
+    #[serde(default)]
+    pub date: Option<String>,
+    /// Optional case-insensitive team-name filter, e.g. "Lakers". Only games
+    /// involving a matching team are returned.
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// Leagues we expose, mapped to ESPN's `{sport}/{league}` path segments. Kept as
+/// an enum so the model is offered a closed set rather than guessing slugs.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum League {
+    Nfl,
+    CollegeFootball,
+    Nba,
+    WNba,
+    MensCollegeBasketball,
+    Mlb,
+    Nhl,
+    /// Association football — English Premier League.
+    PremierLeague,
+    /// Association football — Spanish La Liga.
+    LaLiga,
+    /// Association football — UEFA Champions League.
+    ChampionsLeague,
+    /// Association football — US Major League Soccer.
+    Mls,
+}
+
+impl League {
+    /// ESPN scoreboard path segments: `(sport, league)`.
+    fn path(self) -> (&'static str, &'static str) {
+        match self {
+            League::Nfl => ("football", "nfl"),
+            League::CollegeFootball => ("football", "college-football"),
+            League::Nba => ("basketball", "nba"),
+            League::WNba => ("basketball", "wnba"),
+            League::MensCollegeBasketball => ("basketball", "mens-college-basketball"),
+            League::Mlb => ("baseball", "mlb"),
+            League::Nhl => ("hockey", "nhl"),
+            League::PremierLeague => ("soccer", "eng.1"),
+            League::LaLiga => ("soccer", "esp.1"),
+            League::ChampionsLeague => ("soccer", "uefa.champions"),
+            League::Mls => ("soccer", "usa.1"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            League::Nfl => "NFL",
+            League::CollegeFootball => "College Football",
+            League::Nba => "NBA",
+            League::WNba => "WNBA",
+            League::MensCollegeBasketball => "Men's College Basketball",
+            League::Mlb => "MLB",
+            League::Nhl => "NHL",
+            League::PremierLeague => "Premier League",
+            League::LaLiga => "La Liga",
+            League::ChampionsLeague => "Champions League",
+            League::Mls => "MLS",
+        }
+    }
+}
+
+pub fn schema() -> Value {
+    let params = serde_json::to_value(schemars::schema_for!(SportsArgs))
+        .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+    tool_envelope(
+        "sports",
+        "Get scores, live status, and schedules for a sports league. Returns the \
+         current scoreboard by default, or a specific day's games when a date is given.",
+        params,
+    )
+}
+
+pub async fn run(
+    cfg: &Config,
+    http: &reqwest::Client,
+    call: &ToolCall,
+    call_id: &str,
+    tx: &mpsc::Sender<TurnEvent>,
+    cancel: &CancellationToken,
+) -> ToolOutcome {
+    let args: SportsArgs = match call.function.arguments.parse() {
+        Ok(a) => a,
+        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
+    };
+    let _ = tx.send(TurnEvent::Status("checking scores…".into())).await;
+
+    let result = tokio::select! {
+        r = scoreboard(cfg, http, &args) => r,
+        _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
+    };
+
+    match result {
+        Ok(text) => ToolOutcome {
+            message: ChatMessage::tool_result(call_id, "sports", text),
+            append_to_answer: None,
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "sports failed");
+            error_outcome(call_id, e)
+        }
+    }
+}
+
+async fn scoreboard(
+    cfg: &Config,
+    http: &reqwest::Client,
+    args: &SportsArgs,
+) -> Result<String, String> {
+    let (sport, league) = args.league.path();
+    let url = cfg
+        .espn_base
+        .join(&format!("/apis/site/v2/sports/{sport}/{league}/scoreboard"))
+        .map_err(|e| e.to_string())?;
+
+    let mut req = http
+        .get(url)
+        .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent);
+    if let Some(date) = args.date.as_deref() {
+        req = req.query(&[("dates", compact_date(date)?)]);
+    }
+
+    let resp: ScoreboardResponse = req
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(format_scoreboard(args, &resp))
+}
+
+/// ESPN's `dates` query wants `YYYYMMDD`; the model gives us `YYYY-MM-DD`.
+fn compact_date(date: &str) -> Result<String, String> {
+    let parts: Vec<&str> = date.split('-').collect();
+    if let [y, m, d] = parts[..] {
+        if y.len() == 4
+            && m.len() == 2
+            && d.len() == 2
+            && [y, m, d]
+                .iter()
+                .all(|p| p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Ok(format!("{y}{m}{d}"));
+        }
+    }
+    Err(format!("date must be YYYY-MM-DD, got `{date}`"))
+}
+
+fn format_scoreboard(args: &SportsArgs, resp: &ScoreboardResponse) -> String {
+    let filter = args
+        .team
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let games: Vec<&Event> = resp
+        .events
+        .iter()
+        .filter(|e| match filter {
+            Some(f) => e.involves_team(f),
+            None => true,
+        })
+        .collect();
+
+    if games.is_empty() {
+        return match filter {
+            Some(f) => format!("No {} games found matching `{f}`.", args.league.label()),
+            None => format!("No {} games scheduled.", args.league.label()),
+        };
+    }
+
+    let mut out = format!("{} scoreboard:", args.league.label());
+    for event in games {
+        out.push('\n');
+        out.push_str(&event.summary());
+    }
+    out
+}
+
+#[derive(Debug, Deserialize)]
+struct ScoreboardResponse {
+    #[serde(default)]
+    events: Vec<Event>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Event {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    competitions: Vec<Competition>,
+    #[serde(default)]
+    status: Option<Status>,
+}
+
+impl Event {
+    fn competitors(&self) -> &[Competitor] {
+        self.competitions
+            .first()
+            .map(|c| c.competitors.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn involves_team(&self, needle: &str) -> bool {
+        let needle = needle.to_lowercase();
+        self.competitors().iter().any(|c| {
+            c.team
+                .as_ref()
+                .map(|t| t.display_name.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        })
+    }
+
+    fn summary(&self) -> String {
+        let competitors = self.competitors();
+        // Home team is listed first by ESPN; render as "Away at Home" with scores.
+        let home = competitors
+            .iter()
+            .find(|c| c.home_away.as_deref() == Some("home"));
+        let away = competitors
+            .iter()
+            .find(|c| c.home_away.as_deref() == Some("away"));
+
+        let matchup = match (away, home) {
+            (Some(a), Some(h)) => format!(
+                "{} {} at {} {}",
+                a.name(),
+                a.score.as_deref().unwrap_or("-"),
+                h.name(),
+                h.score.as_deref().unwrap_or("-")
+            ),
+            _ => self
+                .name
+                .clone()
+                .unwrap_or_else(|| "unknown matchup".into()),
+        };
+
+        let state = self
+            .status
+            .as_ref()
+            .and_then(|s| s.type_.as_ref())
+            .and_then(|t| t.detail.clone())
+            .unwrap_or_else(|| "scheduled".into());
+
+        format!("- {matchup} ({state})")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Competition {
+    #[serde(default)]
+    competitors: Vec<Competitor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Competitor {
+    #[serde(rename = "homeAway", default)]
+    home_away: Option<String>,
+    #[serde(default)]
+    score: Option<String>,
+    #[serde(default)]
+    team: Option<Team>,
+}
+
+impl Competitor {
+    fn name(&self) -> &str {
+        self.team
+            .as_ref()
+            .map(|t| t.display_name.as_str())
+            .unwrap_or("unknown")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Team {
+    #[serde(rename = "displayName", default)]
+    display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Status {
+    #[serde(rename = "type", default)]
+    type_: Option<StatusType>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusType {
+    /// Human-readable status, e.g. "Final", "7:30 PM ET", "2nd Quarter".
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
+    ToolOutcome {
+        message: ChatMessage::tool_result(call_id, "sports", format!("sports failed: {detail}")),
+        append_to_answer: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn league_paths_are_stable() {
+        assert_eq!(League::Nfl.path(), ("football", "nfl"));
+        assert_eq!(League::PremierLeague.path(), ("soccer", "eng.1"));
+    }
+
+    #[test]
+    fn compacts_iso_date() {
+        assert_eq!(compact_date("2026-06-29").unwrap(), "20260629");
+        assert!(compact_date("June 29").is_err());
+        assert!(compact_date("2026-6-29").is_err());
+    }
+
+    fn event(away: &str, away_score: &str, home: &str, home_score: &str, detail: &str) -> Event {
+        Event {
+            name: Some(format!("{away} at {home}")),
+            competitions: vec![Competition {
+                competitors: vec![
+                    Competitor {
+                        home_away: Some("home".into()),
+                        score: Some(home_score.into()),
+                        team: Some(Team {
+                            display_name: home.into(),
+                        }),
+                    },
+                    Competitor {
+                        home_away: Some("away".into()),
+                        score: Some(away_score.into()),
+                        team: Some(Team {
+                            display_name: away.into(),
+                        }),
+                    },
+                ],
+            }],
+            status: Some(Status {
+                type_: Some(StatusType {
+                    detail: Some(detail.into()),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn formats_away_at_home_with_scores_and_status() {
+        let e = event("Lakers", "102", "Celtics", "99", "Final");
+        assert_eq!(e.summary(), "- Lakers 102 at Celtics 99 (Final)");
+    }
+
+    #[test]
+    fn team_filter_matches_case_insensitively() {
+        let e = event("Lakers", "102", "Celtics", "99", "Final");
+        assert!(e.involves_team("lakers"));
+        assert!(e.involves_team("CELT"));
+        assert!(!e.involves_team("Heat"));
+    }
+
+    #[test]
+    fn empty_scoreboard_reports_no_games() {
+        let args = SportsArgs {
+            league: League::Nba,
+            date: None,
+            team: None,
+        };
+        let resp = ScoreboardResponse { events: vec![] };
+        assert_eq!(format_scoreboard(&args, &resp), "No NBA games scheduled.");
+    }
+
+    #[test]
+    fn unmatched_filter_reports_no_match() {
+        let args = SportsArgs {
+            league: League::Nba,
+            date: None,
+            team: Some("Heat".into()),
+        };
+        let resp = ScoreboardResponse {
+            events: vec![event("Lakers", "102", "Celtics", "99", "Final")],
+        };
+        assert_eq!(
+            format_scoreboard(&args, &resp),
+            "No NBA games found matching `Heat`."
+        );
+    }
+}

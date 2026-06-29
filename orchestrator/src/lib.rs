@@ -181,6 +181,7 @@ fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
             (cfg.web_search_usable(), "web_search"),
             (cfg.web_fetch_usable(), "web_fetch"),
             (cfg.weather_usable(), "weather"),
+            (cfg.sports_usable(), "sports"),
             (cfg.maps_places_usable(), "maps_places"),
             (cfg.market_data_usable(), "market_data"),
             (cfg.github_usable(), "github"),
@@ -239,9 +240,8 @@ fn tool_usable(tool: &str, web_search: bool, image_generation: bool) -> bool {
 /// needs into the selector ids a mode requires.
 fn tool_selector_id(tool: &str) -> Option<&'static str> {
     match tool {
-        "web_search" | "web_fetch" | "weather" | "maps_places" | "market_data" | "github" => {
-            Some("web_search")
-        }
+        "web_search" | "web_fetch" | "weather" | "sports" | "maps_places" | "market_data"
+        | "github" => Some("web_search"),
         // `code_exec` lives in both utilities and web_search; report its always-on
         // home (utilities) for mode-requirement resolution.
         "calculator" | "unit_convert" | "ocr" | "code_exec" => Some("utilities"),

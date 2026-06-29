@@ -221,6 +221,8 @@ fn test_config(ollama_base: &str) -> Config {
         weather_enabled: false,
         open_meteo_base: "https://api.open-meteo.com".parse().unwrap(),
         open_meteo_geocoding_base: "https://geocoding-api.open-meteo.com".parse().unwrap(),
+        sports_enabled: false,
+        espn_base: "https://site.api.espn.com".parse().unwrap(),
         maps_places_enabled: false,
         nominatim_base: "https://nominatim.openstreetmap.org".parse().unwrap(),
         overpass_base: "https://overpass-api.de".parse().unwrap(),

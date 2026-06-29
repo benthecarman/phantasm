@@ -17,7 +17,7 @@ use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::TurnEvent;
 use crate::tools::{
     calculator, code_exec, code_exec_pool::CodeExecPools, github, image_edit, image_gen,
-    maps_places, market_data, ocr, unit_convert, weather, web_fetch, web_search,
+    maps_places, market_data, ocr, sports, unit_convert, weather, web_fetch, web_search,
 };
 
 /// Result of executing one tool call: the `tool`-role message to feed back to
@@ -128,6 +128,9 @@ impl ToolExecutor for ToolRegistry {
         if self.cfg.weather_usable() {
             out.push(weather::schema());
         }
+        if self.cfg.sports_usable() {
+            out.push(sports::schema());
+        }
         if self.cfg.maps_places_usable() {
             out.push(maps_places::schema());
         }
@@ -198,6 +201,9 @@ impl ToolExecutor for ToolRegistry {
             }
             "weather" if self.cfg.weather_usable() => {
                 weather::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
+            }
+            "sports" if self.cfg.sports_usable() => {
+                sports::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
             }
             "maps_places" if self.cfg.maps_places_usable() => {
                 maps_places::run(&self.cfg, &self.http, call, &call_id, &tx, &cancel).await
