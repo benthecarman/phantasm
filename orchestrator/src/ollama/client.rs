@@ -15,7 +15,6 @@ use crate::openai::types::ChatMessage;
 
 /// Explicit residency hint for the opt-in warm preload path.
 const WARM_KEEP_ALIVE: &str = "30m";
-const REASONING_EFFORT_NONE: &str = "none";
 
 #[derive(Clone)]
 pub struct OllamaClient {
@@ -45,6 +44,7 @@ impl OllamaClient {
     ) -> OllamaChatRequest {
         let mut options = options.clone();
         let think = extract_thinking_control(&mut options);
+        options.remove("tool_choice");
         OllamaChatRequest {
             model: model.to_string(),
             messages: messages.iter().map(OllamaMessage::from_openai).collect(),
@@ -72,11 +72,18 @@ impl OllamaClient {
             .get(url)
             .send()
             .await
-            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
+        }
+
         let tags: TagsResponse = resp
             .json()
             .await
-            .map_err(|e| AppError::OllamaError(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamError(e.to_string()))?;
         Ok(tags.models.into_iter().map(|m| m.name).collect())
     }
 
@@ -90,11 +97,11 @@ impl OllamaClient {
             .json(&serde_json::json!({ "model": model }))
             .send()
             .await
-            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
         let show: ShowResponse = resp
             .json()
             .await
-            .map_err(|e| AppError::OllamaError(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamError(e.to_string()))?;
         Ok(show.into())
     }
 
@@ -114,12 +121,12 @@ impl OllamaClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
         }
 
         Ok(())
@@ -144,20 +151,20 @@ impl ChatBackend for OllamaClient {
         );
         let resp = self.http.post(url).json(&body).send().await.map_err(|e| {
             tracing::warn!(model = %model, error = %e, "Ollama unreachable (chat_once)");
-            AppError::OllamaUnreachable(e.to_string())
+            AppError::UpstreamUnreachable(e.to_string())
         })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
             tracing::warn!(model = %model, %status, "Ollama returned error status (chat_once)");
-            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
         }
 
         let chunk: OllamaChatChunk = resp
             .json()
             .await
-            .map_err(|e| AppError::OllamaError(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamError(e.to_string()))?;
         Ok(chunk.message.unwrap_or_default().into_openai())
     }
 
@@ -176,14 +183,14 @@ impl ChatBackend for OllamaClient {
         );
         let resp = self.http.post(url).json(&body).send().await.map_err(|e| {
             tracing::warn!(model = %model, error = %e, "Ollama unreachable (chat_stream)");
-            AppError::OllamaUnreachable(e.to_string())
+            AppError::UpstreamUnreachable(e.to_string())
         })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
             tracing::warn!(model = %model, %status, "Ollama returned error status (chat_stream)");
-            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
         }
 
         let stream = ndjson_to_deltas(resp.bytes_stream());
@@ -200,7 +207,7 @@ where
     try_stream! {
         let mut buf = BytesMut::new();
         while let Some(next) = bytes.next().await {
-            let chunk = next.map_err(|e| AppError::OllamaError(e.to_string()))?;
+            let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
             buf.extend_from_slice(&chunk);
 
             // Emit one delta per complete `\n`-terminated JSON line.
@@ -211,7 +218,7 @@ where
                     continue;
                 }
                 let parsed: OllamaChatChunk = serde_json::from_slice(trimmed)
-                    .map_err(|e| AppError::OllamaError(format!("bad NDJSON line: {e}")))?;
+                    .map_err(|e| AppError::UpstreamError(format!("bad NDJSON line: {e}")))?;
                 yield delta_from(parsed);
             }
         }
@@ -236,26 +243,14 @@ fn delta_from(chunk: OllamaChatChunk) -> StreamDelta {
     )
 }
 
+/// Read the requested thinking control and strip the reasoning keys so they are
+/// not forwarded to `/api/chat` (which expects the native `think` flag instead).
 fn extract_thinking_control(options: &mut Map<String, Value>) -> Option<bool> {
-    if let Some(reasoning_effort) = options.get("reasoning_effort").and_then(Value::as_str) {
-        let think = !reasoning_effort.eq_ignore_ascii_case(REASONING_EFFORT_NONE);
-        options.remove("reasoning_effort");
-        return Some(think);
-    }
-
-    let reasoning_effort = options
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(Value::as_str);
-
-    if let Some(reasoning_effort) = reasoning_effort {
-        let think = !reasoning_effort.eq_ignore_ascii_case(REASONING_EFFORT_NONE);
-        options.remove("reasoning");
-        return Some(think);
-    }
-
-    None
+    let think = crate::openai::types::requested_thinking(options)?;
+    // Remove whichever key carried it (removing an absent key is a no-op).
+    options.remove("reasoning_effort");
+    options.remove("reasoning");
+    Some(think)
 }
 
 #[cfg(test)]
@@ -340,7 +335,7 @@ mod tests {
     async fn ndjson_surfaces_malformed_line_as_error() {
         let chunks = vec![Ok(Bytes::from_static(b"{not json}\n"))];
         let first = collect(chunks).await.into_iter().next().expect("one item");
-        assert!(matches!(first, Err(AppError::OllamaError(_))));
+        assert!(matches!(first, Err(AppError::UpstreamError(_))));
     }
 
     #[test]

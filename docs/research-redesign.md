@@ -73,7 +73,7 @@ are *not* token cost:
 - **Synthesis context** — grows with N findings, but findings are compressed, so
   this stays generous.
 - **Wall-clock** — on a single GPU, sub-agents largely **serialize at
-  `upstream_sem`** (`ollama_concurrency` + Ollama batching), so more sub-questions
+  `upstream_sem`** (`upstream_concurrency` + upstream batching), so more sub-questions
   ≈ proportionally more wait. That's a wait *the user chooses*, not a limit.
 
 So: a sensible **default** target, freely cranked up via preset values (not code):

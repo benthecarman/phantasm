@@ -171,6 +171,7 @@ async fn spawn_turn(
     // the request apart.
     let enabled_tools = req.tool_selection();
     let app_tools = req.app_tools();
+    let upstream_tool_choice = req.upstream_tool_choice();
 
     // Per XR-2 the app resends full history each turn, including multi-MB base64
     // image data-URIs from prior turns — so move the heavy fields out of `req`
@@ -179,9 +180,12 @@ async fn spawn_turn(
         model,
         stream,
         mut messages,
-        extra: options,
+        extra: mut options,
         ..
     } = req;
+    if let Some(tool_choice) = upstream_tool_choice {
+        options.insert("tool_choice".into(), tool_choice);
+    }
 
     // Intra-turn continuation (see `ContinuationCache`): if this request answers
     // a batch we paused because server calls co-occurred with the app call,
@@ -508,7 +512,7 @@ async fn collect_response(
             }
             TurnEvent::Error(e) => {
                 // Collected before responding, so we can use a real status.
-                return AppError::OllamaError(e).into_response();
+                return AppError::UpstreamError(e).into_response();
             }
             TurnEvent::Status(_) | TurnEvent::Progress { .. } | TurnEvent::Reasoning(_) => {
                 // Non-streaming OpenAI completions expose only final content.

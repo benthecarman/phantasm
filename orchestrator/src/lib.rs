@@ -28,7 +28,7 @@ use crate::openai::OpenAICompatibleClient;
 use crate::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo, ToolSelector};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const OLLAMA_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
@@ -37,13 +37,44 @@ pub struct UpstreamDetection {
     pub models: Vec<String>,
 }
 
-/// Detect which upstream chat API is exposed by `OLLAMA_BASE_URL`.
+/// Detect which upstream chat API is exposed by `UPSTREAM_BASE_URL`.
 ///
 /// Native Ollama is preferred because it has the tool-call behavior this
-/// orchestrator was built around. If `/api/tags` is unavailable, fall back to
-/// OpenAI-compatible `/v1/models`.
+/// orchestrator was built around. If `UPSTREAM_KIND` is unset/`auto` and
+/// `/api/tags` is unavailable, fall back to OpenAI-compatible `/v1/models`.
 pub async fn detect_upstream(cfg: &Config, http: &reqwest::Client) -> UpstreamDetection {
-    let probe_ollama = OllamaClient::new(http.clone(), cfg.ollama_base.clone());
+    if let Some(kind) = cfg.upstream_kind {
+        let models = match kind {
+            UpstreamKind::NativeOllama => {
+                let client = OllamaClient::new(http.clone(), cfg.upstream_base.clone());
+                tokio::time::timeout(PROBE_TIMEOUT, client.list_models())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            }
+            UpstreamKind::OpenAICompatible => tokio::time::timeout(
+                PROBE_TIMEOUT,
+                OpenAICompatibleClient::list_models(
+                    http,
+                    &cfg.upstream_base,
+                    cfg.upstream_api_key.as_deref(),
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok),
+        }
+        .unwrap_or_else(|| {
+            warn!(
+                upstream = ?kind,
+                "could not list configured upstream models; continuing with configured model list"
+            );
+            Vec::new()
+        });
+        return UpstreamDetection { kind, models };
+    }
+
+    let probe_ollama = OllamaClient::new(http.clone(), cfg.upstream_base.clone());
     if let Ok(Ok(models)) = tokio::time::timeout(PROBE_TIMEOUT, probe_ollama.list_models()).await {
         return UpstreamDetection {
             kind: UpstreamKind::NativeOllama,
@@ -55,7 +86,7 @@ pub async fn detect_upstream(cfg: &Config, http: &reqwest::Client) -> UpstreamDe
         PROBE_TIMEOUT,
         OpenAICompatibleClient::list_models(
             http,
-            &cfg.ollama_base,
+            &cfg.upstream_base,
             cfg.upstream_api_key.as_deref(),
         ),
     )
@@ -94,7 +125,7 @@ pub async fn probe_capabilities(
     // so clients can distinguish unknown from known-unsupported.
     let model_metadata = match upstream.kind {
         UpstreamKind::NativeOllama => {
-            let client = OllamaClient::new(http.clone(), cfg.ollama_base.clone());
+            let client = OllamaClient::new(http.clone(), cfg.upstream_base.clone());
             detect_model_metadata(&client, &models).await
         }
         UpstreamKind::OpenAICompatible => vec![(None, None); models.len()],
@@ -169,7 +200,7 @@ async fn tool_selectors(cfg: &Config, http: &reqwest::Client) -> Vec<ToolSelecto
 /// without a network probe.
 ///
 /// `web_search` groups the tools that reach out to third parties over the
-/// network; `utilities` groups the offline, on-box tools (calculator, unit
+/// network; `utilities` groups the offline, on-box tools (calculator, time, unit
 /// conversion, local OCR) — the app offers those unconditionally, so toggling
 /// web access off never disables them.
 fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
@@ -203,6 +234,7 @@ fn offline_tool_selectors(cfg: &Config) -> Vec<ToolSelector> {
         "Utilities",
         &[
             (cfg.calculator_usable(), "calculator"),
+            (cfg.time_usable(), "time"),
             (cfg.unit_convert_usable(), "unit_convert"),
             (cfg.ocr_usable(), "ocr"),
             // Always-on like the other utilities; with web access off it runs with
@@ -248,7 +280,7 @@ fn tool_selector_id(tool: &str) -> Option<&'static str> {
         | "github" => Some("web_search"),
         // `code_exec` lives in both utilities and web_search; report its always-on
         // home (utilities) for mode-requirement resolution.
-        "calculator" | "unit_convert" | "ocr" | "code_exec" => Some("utilities"),
+        "calculator" | "time" | "unit_convert" | "ocr" | "code_exec" => Some("utilities"),
         "image_generation" | "image_edit" => Some("image_generation"),
         _ => None,
     }
@@ -294,19 +326,20 @@ pub fn build_state(
         .connect_timeout(CONNECT_TIMEOUT)
         // Per-read only: streaming responses may run indefinitely as long as
         // bytes keep arriving, but a stalled backend will release its turn.
-        .read_timeout(OLLAMA_READ_TIMEOUT)
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
         .build()
         .expect("building HTTP client");
     let upstream = match upstream_kind {
         UpstreamKind::NativeOllama => UpstreamChatBackend::NativeOllama(OllamaClient::new(
             http.clone(),
-            cfg.ollama_base.clone(),
+            cfg.upstream_base.clone(),
         )),
         UpstreamKind::OpenAICompatible => {
             UpstreamChatBackend::OpenAICompatible(OpenAICompatibleClient::new(
                 http.clone(),
-                &cfg.ollama_base,
+                &cfg.upstream_base,
                 cfg.upstream_api_key.as_deref(),
+                cfg.upstream_thinking_hint,
             ))
         }
     };
@@ -376,7 +409,7 @@ pub fn build_state(
     };
     turns.spawn_watchdog(abandon_grace, tick);
     state::AppState {
-        upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.ollama_concurrency)),
+        upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.upstream_concurrency)),
         cfg,
         http,
         upstream,
@@ -411,7 +444,7 @@ mod tests {
         }
         // Offline tools live in their own always-on bucket. `code_exec` reports
         // utilities (its always-on home) even though it also appears in web_search.
-        for tool in ["calculator", "unit_convert", "ocr", "code_exec"] {
+        for tool in ["calculator", "time", "unit_convert", "ocr", "code_exec"] {
             assert_eq!(
                 tool_selector_id(tool),
                 Some("utilities"),

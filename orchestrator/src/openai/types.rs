@@ -7,6 +7,25 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Whether the client requested model "thinking" for this turn, read from the
+/// OpenAI-compatible reasoning controls in a request's pass-through options:
+/// `reasoning_effort` (string) or the nested `reasoning.effort` (string).
+/// `"none"` (case-insensitive) => thinking off; any other value => on; absent =>
+/// `None` (no preference). Shared by both upstream backends so the one wire
+/// contract for reasoning effort lives in a single place.
+pub(crate) fn requested_thinking(options: &serde_json::Map<String, Value>) -> Option<bool> {
+    const NONE: &str = "none";
+    if let Some(effort) = options.get("reasoning_effort").and_then(Value::as_str) {
+        return Some(!effort.eq_ignore_ascii_case(NONE));
+    }
+    options
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .map(|effort| !effort.eq_ignore_ascii_case(NONE))
+}
+
 /// Incoming `POST /v1/chat/completions` body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatRequest {
@@ -30,9 +49,9 @@ pub struct ChatRequest {
     /// tool and no app tools.
     #[serde(default)]
     pub tools: Option<Vec<ToolSpec>>,
-    /// Standard OpenAI `tool_choice`. Only `"none"` is acted on — it forces plain
-    /// chat (no tools offered) regardless of `tools`; other values fall through to
-    /// the normal auto behavior.
+    /// Standard OpenAI `tool_choice`. `"none"` forces plain chat. A specific
+    /// function choice narrows selection to that tool and is forwarded upstream
+    /// during tool resolution.
     #[serde(default)]
     pub tool_choice: Option<Value>,
     /// Any other OpenAI sampling parameters (temperature, top_p, …) passed through to Ollama.
@@ -80,6 +99,34 @@ impl ToolSpec {
 }
 
 impl ChatRequest {
+    fn forced_tool_choice_name(&self) -> Option<String> {
+        let choice = self.tool_choice.as_ref()?.as_object()?;
+        if choice.get("type").and_then(Value::as_str) != Some("function") {
+            return None;
+        }
+        choice
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// The `tool_choice` value that should be forwarded to an OpenAI-compatible
+    /// upstream. `none` is handled locally by offering no tools. Native Ollama
+    /// ignores this, since `/api/chat` has no matching forced-tool-choice field.
+    pub fn upstream_tool_choice(&self) -> Option<Value> {
+        match self.tool_choice.as_ref()? {
+            Value::String(s) if matches!(s.as_str(), "auto" | "required") => {
+                Some(Value::String(s.clone()))
+            }
+            Value::Object(_) if self.forced_tool_choice_name().is_some() => {
+                self.tool_choice.clone()
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve the per-turn tool selection from the standard `tools`/`tool_choice`
     /// fields into the orchestrator's narrowing list. `None` => offer every
     /// configured tool (field absent — older clients). `Some(list)` => offer only
@@ -91,6 +138,9 @@ impl ChatRequest {
     pub fn tool_selection(&self) -> Option<Vec<String>> {
         if self.tool_choice.as_ref().and_then(Value::as_str) == Some("none") {
             return Some(Vec::new());
+        }
+        if let Some(name) = self.forced_tool_choice_name() {
+            return Some(vec![name]);
         }
         self.tools
             .as_ref()
@@ -107,12 +157,16 @@ impl ChatRequest {
         if self.tool_choice.as_ref().and_then(Value::as_str) == Some("none") {
             return Vec::new();
         }
+        let forced = self.forced_tool_choice_name();
         let Some(list) = &self.tools else {
             return Vec::new();
         };
         list.iter()
             .filter_map(|spec| {
                 let f = spec.function.as_ref()?;
+                if forced.as_ref().is_some_and(|forced| forced != &f.name) {
+                    return None;
+                }
                 let parameters = f.parameters.clone()?;
                 let mut function = serde_json::Map::new();
                 function.insert("name".into(), Value::String(f.name.clone()));
@@ -367,6 +421,52 @@ mod tests {
             r#"{"messages":[],"tool_choice":"none","tools":[{"type":"function","function":{"name":"web_search"}}]}"#,
         );
         assert_eq!(r.tool_selection(), Some(vec![]));
+    }
+
+    #[test]
+    fn forced_tool_choice_selects_only_that_tool_and_forwards_upstream() {
+        let r = req(
+            r#"{"messages":[],"tool_choice":{"type":"function","function":{"name":"time"}},"tools":[
+                {"type":"function","function":{"name":"calculator"}},
+                {"type":"function","function":{"name":"time"}}
+            ]}"#,
+        );
+        assert_eq!(r.tool_selection(), Some(vec!["time".to_string()]));
+        assert_eq!(
+            r.upstream_tool_choice().unwrap()["function"]["name"],
+            "time"
+        );
+    }
+
+    #[test]
+    fn tool_choice_auto_and_required_forward_upstream() {
+        let auto = req(r#"{"messages":[],"tool_choice":"auto"}"#);
+        assert_eq!(
+            auto.upstream_tool_choice(),
+            Some(Value::String("auto".into()))
+        );
+
+        let required = req(r#"{"messages":[],"tool_choice":"required"}"#);
+        assert_eq!(
+            required.upstream_tool_choice(),
+            Some(Value::String("required".into()))
+        );
+
+        let none = req(r#"{"messages":[],"tool_choice":"none"}"#);
+        assert_eq!(none.upstream_tool_choice(), None);
+    }
+
+    #[test]
+    fn forced_tool_choice_filters_app_tools_too() {
+        let r = req(
+            r#"{"messages":[],"tool_choice":{"type":"function","function":{"name":"ask_user"}},"tools":[
+                {"type":"function","function":{"name":"ask_user","parameters":{"type":"object"}}},
+                {"type":"function","function":{"name":"other_app","parameters":{"type":"object"}}}
+            ]}"#,
+        );
+        let app = r.app_tools();
+        assert_eq!(app.len(), 1);
+        assert_eq!(app[0]["function"]["name"], "ask_user");
     }
 
     #[test]

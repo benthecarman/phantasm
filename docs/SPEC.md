@@ -89,7 +89,7 @@ image generation on top of plain inference.
     {
       "id": "utilities",
       "label": "Utilities",
-      "tools": ["calculator", "unit_convert", "ocr"]
+      "tools": ["calculator", "time", "unit_convert", "ocr"]
     },
     {
       "id": "image_generation",
@@ -150,9 +150,9 @@ when all three concrete tools are listed.
 Buckets are grouped by what a user reasons about, not by implementation:
 `web_search` holds the tools that reach **out to the internet** (search, fetch,
 weather, maps, market data, GitHub) and is gated by the per-chat web-access
-toggle; `utilities` holds **offline, on-box** tools (calculator, unit
-conversion, local OCR) that the app offers **unconditionally** — disabling web
-access never disables them, and the app needs no separate toggle for them.
+toggle; `utilities` holds **offline, on-box** tools (calculator, current time,
+unit conversion, local OCR) that the app offers **unconditionally** — disabling
+web access never disables them, and the app needs no separate toggle for them.
 `image_generation` covers image gen + edit, gated by the image toggle. Research
 modes are advertised only when the actual Brave-backed `web_search` schema is
 usable.
@@ -295,11 +295,13 @@ shorthand (`{"type":"web_search"}`); the server fills in the real schema and
 intersects with what it has configured (a client can never enable a tool the
 deployment lacks). Semantics: `tools` **absent** → the server offers every
 configured tool (older clients keep working); **present** → only the named
-tools; an **empty array** or `tool_choice: "none"` → no tools (plain chat).
-Tools remain server-side and invisible otherwise; this only lets the client
-scope which of the advertised (`/v1/capabilities`) tools apply to a given
-conversation. Because selection rides standard fields, any OpenAI client can do
-it and a bare backend ignores it harmlessly.
+tools; a specific `tool_choice` function object → only that tool and, for
+OpenAI-compatible upstreams, a forwarded forced tool choice during tool
+resolution; an **empty array** or `tool_choice: "none"` → no tools (plain
+chat). Tools remain server-side and invisible otherwise; this only lets the
+client scope which of the advertised (`/v1/capabilities`) tools apply to a
+given conversation. Because selection rides standard fields, any OpenAI client
+can do it and a bare backend ignores it harmlessly.
 
 **Deep Research mode (model id, not a flag).** Deep Research is a **mode**
 selected via the standard `model` field, never a request flag — there is no
@@ -388,11 +390,11 @@ conversion, weather, places/geocoding, market data, GitHub reads, and OCR
 (FR-O9). Local docs/filesystem tools and side-effecting tools are out of scope.
 
 **Non-functional:** co-location over localhost/LAN (NFR-O1), async concurrency
-with a configurable Ollama concurrency limit (NFR-O2), low plain-chat latency
+with a configurable upstream generation limit (NFR-O2), low plain-chat latency
 (<50ms added; NFR-O3), env-var config (NFR-O4), Docker + compose (NFR-O5), tool
 failures non-fatal (NFR-O6), structured per-turn logs with no content by default
 (NFR-O7), and fast search (~1–2s to first token: snippet-first, no RAG, bounded
-concurrent fetch, small injected context, warm model; NFR-O8).
+concurrent fetch, small injected context, warm model where supported; NFR-O8).
 
 ## 4. iOS app requirements
 
@@ -449,8 +451,11 @@ MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel
   the `Idempotency-Key`/`Last-Event-ID` headers, SSE `id:`, and a
   `POST /v1/chat/cancel` endpoint — leaving request/response bodies standard.
 - Upstream native Ollama via **`/api/chat`** when available (Ollama
-  OpenAI-compat drops streamed tool_calls), with OpenAI-compatible `/v1`
-  fallback for non-Ollama model hosts.
+  OpenAI-compat drops streamed tool_calls), with explicit or auto-detected
+  OpenAI-compatible `/v1` support for non-Ollama model hosts such as vLLM and
+  llama.cpp. `UPSTREAM_KIND` may force `native_ollama` or
+  `openai_compatible`/`vllm`/`llama_cpp`; unset/`auto` probes native Ollama
+  first, then `/v1/models`.
 - Image return format: inline base64 data-URI markdown by default; absolute
   server-hosted image URLs when the deployment configures a store + public base
   (server-side choice, no client opt-in; see §2.2b).

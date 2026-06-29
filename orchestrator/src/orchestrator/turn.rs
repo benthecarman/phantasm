@@ -104,6 +104,9 @@ pub async fn run_turn<B, T>(
     B: ChatBackend,
     T: ToolExecutor,
 {
+    let mut options = options;
+    let mut forced_tool_choice = options.remove("tool_choice");
+
     // Bound concurrent Ollama work; surface a wait if we have to queue (NFR-O2).
     let _permit = match sem.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -137,7 +140,7 @@ pub async fn run_turn<B, T>(
     // out across concurrent sub-agents. Holding a single whole-run permit here
     // would under-count those calls and let `research_fanout_concurrency`
     // sub-agent calls run per permit, over-subscribing the GPU past
-    // OLLAMA_MAX_CONCURRENCY (NFR-O2). So we drop the outer permit and hand the
+    // UPSTREAM_MAX_CONCURRENCY (NFR-O2). So we drop the outer permit and hand the
     // semaphore to the engine, which re-acquires it per upstream call — keeping
     // total concurrent Ollama work across plain + research turns <= the global
     // bound. (Dropping first also avoids a self-deadlock: the engine's first
@@ -214,8 +217,12 @@ pub async fn run_turn<B, T>(
             return;
         }
 
+        let mut tool_options = options.clone();
+        if let Some(choice) = forced_tool_choice.take() {
+            tool_options.insert("tool_choice".into(), choice);
+        }
         let resp = tokio::select! {
-            r = backend.chat_once(&model, vision.as_deref().unwrap_or(&messages), &schemas, &options) => r,
+            r = backend.chat_once(&model, vision.as_deref().unwrap_or(&messages), &schemas, &tool_options) => r,
             _ = cancel.cancelled() => return,
         };
 

@@ -14,9 +14,7 @@ use url::Url;
 
 use crate::error::AppError;
 use crate::ollama::{ChatBackend, DeltaStream, StreamDelta};
-use crate::openai::types::{ChatMessage, MessageContent};
-
-const REASONING_EFFORT_NONE: &str = "none";
+use crate::openai::types::{requested_thinking, ChatMessage, MessageContent};
 
 #[derive(Clone)]
 pub struct OpenAICompatibleClient {
@@ -25,10 +23,19 @@ pub struct OpenAICompatibleClient {
     api_base: String,
     /// Bearer token sent on every request, when the deployment requires one.
     api_key: Option<SecretString>,
+    /// Whether to send the Qwen-style `chat_template_kwargs.enable_thinking` hint.
+    /// On for template-driven hosts (vLLM/llama.cpp); a deployment pointing at a
+    /// strict `/v1` server that rejects unknown body fields turns it off.
+    thinking_hint: bool,
 }
 
 impl OpenAICompatibleClient {
-    pub fn new(http: reqwest::Client, base: &Url, api_key: Option<&str>) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        base: &Url,
+        api_key: Option<&str>,
+        thinking_hint: bool,
+    ) -> Self {
         let api_key = api_key
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -37,6 +44,7 @@ impl OpenAICompatibleClient {
             http,
             api_base: openai_api_base(base),
             api_key,
+            thinking_hint,
         }
     }
 
@@ -66,16 +74,16 @@ impl OpenAICompatibleClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
         }
         let models: ModelsResponse = resp
             .json()
             .await
-            .map_err(|e| AppError::OllamaError(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamError(e.to_string()))?;
         Ok(models.data.into_iter().map(|m| m.id).collect())
     }
 
@@ -85,14 +93,19 @@ impl OpenAICompatibleClient {
         tools: &[Value],
         options: &Map<String, Value>,
         stream: bool,
+        thinking_hint: bool,
     ) -> Value {
         let mut body = options.clone();
-        remove_noop_reasoning_suppression(&mut body);
+        if thinking_hint {
+            apply_chat_template_thinking_hint(&mut body);
+        }
         body.insert("model".into(), Value::String(model.to_string()));
-        body.insert("messages".into(), json!(messages));
+        body.insert("messages".into(), messages_value(messages));
         body.insert("stream".into(), Value::Bool(stream));
         if !tools.is_empty() {
             body.insert("tools".into(), Value::Array(tools.to_vec()));
+        } else {
+            body.remove("tool_choice");
         }
         Value::Object(body)
     }
@@ -102,24 +115,43 @@ impl OpenAICompatibleClient {
     }
 }
 
-fn remove_noop_reasoning_suppression(options: &mut Map<String, Value>) {
-    if options
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .is_some_and(|effort| effort.eq_ignore_ascii_case(REASONING_EFFORT_NONE))
-    {
-        options.remove("reasoning_effort");
-    }
+/// Serialize the history into the request `messages` array. We serialize each
+/// message from a borrow rather than cloning the whole slice first — histories
+/// carry multi-MB inline base64 images and the two-phase tool loop re-issues the
+/// upstream call several times per turn, so a per-call clone is pure waste (the
+/// Ollama path avoids it the same way). Only tool-role messages are copied, to
+/// drop their `name`: OpenAI-compatible tool results are matched by
+/// `tool_call_id`, and `name` (kept internally for Ollama's native `tool_name`)
+/// may be rejected by strict /v1 servers. Those messages are small.
+fn messages_value(messages: &[ChatMessage]) -> Value {
+    let items = messages
+        .iter()
+        .map(|message| {
+            if message.role == "tool" && message.name.is_some() {
+                let mut message = message.clone();
+                message.name = None;
+                json!(message)
+            } else {
+                json!(message)
+            }
+        })
+        .collect();
+    Value::Array(items)
+}
 
-    let nested_none = options
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(Value::as_str)
-        .is_some_and(|effort| effort.eq_ignore_ascii_case(REASONING_EFFORT_NONE));
-    if nested_none {
-        options.remove("reasoning");
-    }
+fn apply_chat_template_thinking_hint(options: &mut Map<String, Value>) {
+    let Some(enable_thinking) = requested_thinking(options) else {
+        return;
+    };
+
+    let mut kwargs = options
+        .remove("chat_template_kwargs")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    kwargs
+        .entry("enable_thinking")
+        .or_insert(Value::Bool(enable_thinking));
+    options.insert("chat_template_kwargs".into(), Value::Object(kwargs));
 }
 
 impl ChatBackend for OpenAICompatibleClient {
@@ -130,22 +162,23 @@ impl ChatBackend for OpenAICompatibleClient {
         tools: &[Value],
         options: &Map<String, Value>,
     ) -> Result<ChatMessage, AppError> {
-        let request = Self::build_request(model, messages, tools, options, false);
+        let request =
+            Self::build_request(model, messages, tools, options, false, self.thinking_hint);
         let resp = self
             .authed_post(&self.chat_url())
             .json(&request)
             .send()
             .await
-            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
         }
         let response: Value = resp
             .json()
             .await
-            .map_err(|e| AppError::OllamaError(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamError(e.to_string()))?;
 
         response
             .get("choices")
@@ -154,7 +187,7 @@ impl ChatBackend for OpenAICompatibleClient {
             .and_then(|choice| choice.get("message"))
             .map(chat_message_from_openai)
             .transpose()?
-            .ok_or_else(|| AppError::OllamaError("missing chat completion message".into()))
+            .ok_or_else(|| AppError::UpstreamError("missing chat completion message".into()))
     }
 
     async fn chat_stream(
@@ -163,17 +196,17 @@ impl ChatBackend for OpenAICompatibleClient {
         messages: &[ChatMessage],
         options: &Map<String, Value>,
     ) -> Result<DeltaStream, AppError> {
-        let request = Self::build_request(model, messages, &[], options, true);
+        let request = Self::build_request(model, messages, &[], options, true, self.thinking_hint);
         let resp = self
             .authed_post(&self.chat_url())
             .json(&request)
             .send()
             .await
-            .map_err(|e| AppError::OllamaUnreachable(e.to_string()))?;
+            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::OllamaError(format!("{status}: {detail}")));
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
         }
         Ok(Box::pin(sse_bytes_to_deltas(resp.bytes_stream())))
     }
@@ -189,8 +222,9 @@ where
 {
     try_stream! {
         let mut buf = BytesMut::new();
+        let mut think_tags = ThinkTagNormalizer::default();
         'read: while let Some(next) = bytes.next().await {
-            let chunk = next.map_err(|e| AppError::OllamaError(e.to_string()))?;
+            let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
             buf.extend_from_slice(&chunk);
 
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -202,8 +236,21 @@ where
                     break 'read;
                 }
                 let value: Value = serde_json::from_slice(payload)
-                    .map_err(|e| AppError::OllamaError(format!("bad SSE data line: {e}")))?;
-                yield delta_from_openai_chunk(&value);
+                    .map_err(|e| AppError::UpstreamError(format!("bad SSE data line: {e}")))?;
+                yield think_tags.normalize(delta_from_openai_chunk(&value));
+            }
+        }
+
+        // Flush a final `data:` line that arrived without its terminating newline
+        // (a server that closes the connection right after the last chunk, with no
+        // `[DONE]` sentinel). The inner loop only splits on `\n`, so without this
+        // the last delta — which carries `finish_reason` — would be lost. Lenient
+        // like the NDJSON path: a truncated tail is dropped, not surfaced as error.
+        if let Some(payload) = sse_data_payload(buf.as_ref()) {
+            if payload != b"[DONE]" {
+                if let Ok(value) = serde_json::from_slice::<Value>(payload) {
+                    yield think_tags.normalize(delta_from_openai_chunk(&value));
+                }
             }
         }
     }
@@ -230,9 +277,13 @@ fn delta_from_openai_chunk(chunk: &Value) -> StreamDelta {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let reasoning = delta.and_then(reasoning_from_delta).unwrap_or_default();
+    // Treat only a non-empty `finish_reason` as terminal: some compat servers
+    // send `"finish_reason":""` (rather than null) on intermediate chunks, and an
+    // empty string must not end the stream early.
     let done_reason = choice
         .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
         .map(ToString::to_string);
     StreamDelta::new(content, reasoning, done_reason.is_some(), done_reason)
 }
@@ -243,6 +294,88 @@ fn reasoning_from_delta(delta: &Value) -> Option<&str> {
         .or_else(|| delta.get("reasoning_content"))
         .or_else(|| delta.get("thinking"))
         .and_then(Value::as_str)
+}
+
+#[derive(Default)]
+struct ThinkTagNormalizer {
+    pending: String,
+    in_reasoning: bool,
+}
+
+impl ThinkTagNormalizer {
+    fn normalize(&mut self, mut delta: StreamDelta) -> StreamDelta {
+        // Scan content for inline <think> tags. Skip the scan only when the
+        // upstream is already separating reasoning natively AND we are not
+        // mid-tag: once a tag is open we must keep scanning to find its close,
+        // even if a later chunk also carries a native reasoning field — otherwise
+        // the </think> leaks into visible content and `in_reasoning` stays stuck.
+        if !delta.content.is_empty() && (self.in_reasoning || delta.reasoning.is_empty()) {
+            let (content, reasoning) = self.process_content(&delta.content);
+            delta.content = content;
+            if delta.reasoning.is_empty() {
+                delta.reasoning = reasoning;
+            } else {
+                delta.reasoning.push_str(&reasoning);
+            }
+        }
+        if delta.done {
+            let flushed = self.flush();
+            if self.in_reasoning {
+                delta.reasoning.push_str(&flushed);
+            } else {
+                delta.content.push_str(&flushed);
+            }
+            self.in_reasoning = false;
+        }
+        delta
+    }
+
+    fn process_content(&mut self, content: &str) -> (String, String) {
+        self.pending.push_str(content);
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+
+        loop {
+            if self.in_reasoning {
+                if let Some(pos) = self.pending.find("</think>") {
+                    reasoning.push_str(&self.pending[..pos]);
+                    self.pending.drain(..pos + "</think>".len());
+                    self.in_reasoning = false;
+                } else {
+                    let split = stable_prefix_len(&self.pending, "</think>");
+                    reasoning.push_str(&self.pending[..split]);
+                    self.pending.drain(..split);
+                    break;
+                }
+            } else if let Some(pos) = self.pending.find("<think>") {
+                visible.push_str(&self.pending[..pos]);
+                self.pending.drain(..pos + "<think>".len());
+                self.in_reasoning = true;
+            } else {
+                let split = stable_prefix_len(&self.pending, "<think>");
+                visible.push_str(&self.pending[..split]);
+                self.pending.drain(..split);
+                break;
+            }
+        }
+
+        (visible, reasoning)
+    }
+
+    fn flush(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn stable_prefix_len(s: &str, tag: &str) -> usize {
+    let max_suffix = s.len().min(tag.len().saturating_sub(1));
+    for len in (1..=max_suffix).rev() {
+        let start = s.len() - len;
+        if s.is_char_boundary(start) && tag.starts_with(&s[start..]) {
+            return start;
+        }
+    }
+    s.len()
 }
 
 fn chat_message_from_openai(value: &Value) -> Result<ChatMessage, AppError> {
@@ -261,7 +394,7 @@ fn chat_message_from_openai(value: &Value) -> Result<ChatMessage, AppError> {
         .cloned()
         .map(serde_json::from_value)
         .transpose()
-        .map_err(|e| AppError::OllamaError(format!("bad tool_calls: {e}")))?;
+        .map_err(|e| AppError::UpstreamError(format!("bad tool_calls: {e}")))?;
 
     Ok(ChatMessage {
         role,
@@ -363,7 +496,7 @@ mod tests {
             vec![Ok(Bytes::from_static(b"data: {not json}\n\n"))];
         let mut got = Box::pin(sse_bytes_to_deltas(stream::iter(chunks)));
         let first = got.next().await.expect("one item");
-        assert!(matches!(first, Err(AppError::OllamaError(_))));
+        assert!(matches!(first, Err(AppError::UpstreamError(_))));
     }
 
     #[test]
@@ -400,14 +533,86 @@ mod tests {
     }
 
     #[test]
-    fn build_request_drops_noop_reasoning_suppression() {
+    fn think_tag_normalizer_moves_tagged_content_to_reasoning() {
+        let mut normalizer = ThinkTagNormalizer::default();
+
+        let first = normalizer.normalize(StreamDelta::content("<think>plan", false, None));
+        let second = normalizer.normalize(StreamDelta::content("</think>answer", false, None));
+
+        assert_eq!(first.content, "");
+        assert_eq!(first.reasoning, "plan");
+        assert_eq!(second.content, "answer");
+        assert_eq!(second.reasoning, "");
+    }
+
+    #[test]
+    fn think_tag_normalizer_handles_split_tags() {
+        let mut normalizer = ThinkTagNormalizer::default();
+
+        let first = normalizer.normalize(StreamDelta::content("<thi", false, None));
+        let second = normalizer.normalize(StreamDelta::content("nk>plan</th", false, None));
+        let third = normalizer.normalize(StreamDelta::content("ink>done", false, None));
+
+        assert_eq!(first.content, "");
+        assert_eq!(first.reasoning, "");
+        assert_eq!(second.content, "");
+        assert_eq!(second.reasoning, "plan");
+        assert_eq!(third.content, "done");
+        assert_eq!(third.reasoning, "");
+    }
+
+    #[test]
+    fn think_tag_normalizer_handles_mixed_tagged_content() {
+        let mut normalizer = ThinkTagNormalizer::default();
+
+        let delta = normalizer.normalize(StreamDelta::content(
+            "before <think>plan</think> after",
+            false,
+            None,
+        ));
+
+        assert_eq!(delta.content, "before  after");
+        assert_eq!(delta.reasoning, "plan");
+    }
+
+    #[test]
+    fn think_tag_normalizer_leaves_ordinary_content_untouched() {
+        let mut normalizer = ThinkTagNormalizer::default();
+
+        let delta = normalizer.normalize(StreamDelta::content("plain answer", false, None));
+
+        assert_eq!(delta.content, "plain answer");
+        assert_eq!(delta.reasoning, "");
+    }
+
+    #[test]
+    fn think_tag_normalizer_flushes_unclosed_tag_as_reasoning_on_done() {
+        let mut normalizer = ThinkTagNormalizer::default();
+
+        let first = normalizer.normalize(StreamDelta::content("<think>plan", false, None));
+        let done = normalizer.normalize(StreamDelta::content(
+            " still planning",
+            true,
+            Some("stop".into()),
+        ));
+
+        assert_eq!(first.content, "");
+        assert_eq!(first.reasoning, "plan");
+        assert_eq!(done.content, "");
+        assert_eq!(done.reasoning, " still planning");
+        assert!(done.done);
+    }
+
+    #[test]
+    fn build_request_preserves_disabled_reasoning_effort() {
         let mut options = Map::new();
         options.insert("reasoning_effort".into(), Value::String("none".into()));
         options.insert("temperature".into(), json!(0.2));
 
-        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true);
+        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true, true);
 
-        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(body["temperature"], json!(0.2));
     }
 
@@ -416,8 +621,132 @@ mod tests {
         let mut options = Map::new();
         options.insert("reasoning_effort".into(), Value::String("medium".into()));
 
-        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true);
+        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true, true);
 
         assert_eq!(body["reasoning_effort"], "medium");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn build_request_maps_nested_disabled_reasoning_effort() {
+        let mut options = Map::new();
+        options.insert("reasoning".into(), json!({ "effort": "none" }));
+
+        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true, true);
+
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn build_request_preserves_existing_chat_template_kwargs() {
+        let mut options = Map::new();
+        options.insert("reasoning_effort".into(), Value::String("none".into()));
+        options.insert(
+            "chat_template_kwargs".into(),
+            json!({ "foo": "bar", "enable_thinking": true }),
+        );
+
+        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true, true);
+
+        assert_eq!(body["chat_template_kwargs"]["foo"], "bar");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn build_request_forwards_tool_choice_only_when_tools_are_offered() {
+        let mut options = Map::new();
+        options.insert(
+            "tool_choice".into(),
+            json!({"type":"function","function":{"name":"time"}}),
+        );
+        let tools = vec![json!({"type":"function","function":{"name":"time"}})];
+        let with_tools =
+            OpenAICompatibleClient::build_request("m", &[], &tools, &options, false, true);
+        assert_eq!(with_tools["tool_choice"]["function"]["name"], "time");
+
+        let without_tools =
+            OpenAICompatibleClient::build_request("m", &[], &[], &options, true, true);
+        assert!(without_tools.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn build_request_omits_tool_name_from_tool_results() {
+        let messages = vec![ChatMessage::tool_result("call_1", "calculator", "2")];
+        let body =
+            OpenAICompatibleClient::build_request("m", &messages, &[], &Map::new(), false, true);
+        let message = &body["messages"][0];
+
+        assert_eq!(message["role"], "tool");
+        assert_eq!(message["tool_call_id"], "call_1");
+        assert!(message.get("name").is_none());
+    }
+
+    #[test]
+    fn build_request_omits_thinking_hint_when_disabled() {
+        let mut options = Map::new();
+        options.insert("reasoning_effort".into(), Value::String("none".into()));
+
+        let body = OpenAICompatibleClient::build_request("m", &[], &[], &options, true, false);
+
+        // reasoning_effort still rides through, but the Qwen-style template hint is
+        // not injected — for strict /v1 servers that reject unknown body fields.
+        assert_eq!(body["reasoning_effort"], "none");
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn empty_finish_reason_is_not_terminal() {
+        // Some compat servers send "finish_reason":"" on intermediate chunks.
+        let chunk = json!({
+            "choices": [{ "delta": { "content": "hi" }, "finish_reason": "" }]
+        });
+        let delta = delta_from_openai_chunk(&chunk);
+        assert_eq!(delta.content, "hi");
+        assert!(
+            !delta.done,
+            "an empty finish_reason must not end the stream"
+        );
+        assert_eq!(delta.done_reason, None);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_flushes_final_line_without_newline() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        // A server that closes after the final chunk with no trailing newline and
+        // no [DONE] sentinel; the terminal delta must still be emitted.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"bye\"},\"finish_reason\":\"stop\"}]}",
+        ))];
+        let deltas: Vec<StreamDelta> = sse_bytes_to_deltas(stream::iter(chunks))
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].content, "bye");
+        assert!(deltas[0].done);
+        assert_eq!(deltas[0].done_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn think_tag_normalizer_recovers_when_native_reasoning_accompanies_close_tag() {
+        let mut normalizer = ThinkTagNormalizer::default();
+
+        // Tag opened in a pure-content chunk, then the close arrives on a chunk
+        // that also carries a native reasoning field. The close must still be
+        // consumed so it does not leak and the state machine recovers.
+        let first = normalizer.normalize(StreamDelta::content("<think>plan", false, None));
+        let second =
+            normalizer.normalize(StreamDelta::new("</think>answer", "native", false, None));
+        let third = normalizer.normalize(StreamDelta::content(" more", false, None));
+
+        assert_eq!(first.reasoning, "plan");
+        assert_eq!(second.content, "answer");
+        assert_eq!(second.reasoning, "native");
+        assert_eq!(third.content, " more", "must not be stuck in reasoning");
+        assert_eq!(third.reasoning, "");
     }
 }

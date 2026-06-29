@@ -27,10 +27,10 @@ pub enum AppError {
     PayloadTooLarge(String),
 
     #[error("upstream model host is unreachable: {0}")]
-    OllamaUnreachable(String),
+    UpstreamUnreachable(String),
 
     #[error("upstream model host returned an error: {0}")]
-    OllamaError(String),
+    UpstreamError(String),
 
     #[error("internal error: {0}")]
     Internal(String),
@@ -44,8 +44,8 @@ impl AppError {
             AppError::PayloadTooLarge(_) => {
                 (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error")
             }
-            AppError::OllamaUnreachable(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
-            AppError::OllamaError(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
+            AppError::UpstreamUnreachable(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
+            AppError::UpstreamError(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
     }

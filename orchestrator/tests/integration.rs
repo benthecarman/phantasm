@@ -189,6 +189,18 @@ fn mock_openai_compatible() -> Router {
         )
 }
 
+fn mock_openai_compatible_with_json_tags_error() -> Router {
+    mock_openai_compatible().route(
+        "/api/tags",
+        get(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error":"not found"})),
+            )
+        }),
+    )
+}
+
 /// Like [`mock_openai_compatible`] but `/v1/chat/completions` fails with a 500
 /// and a detail body, so we can assert the orchestrator surfaces the upstream
 /// error rather than masking it.
@@ -204,17 +216,104 @@ fn mock_openai_compatible_erroring() -> Router {
         )
 }
 
-fn test_config(ollama_base: &str) -> Config {
+/// A mock OpenAI-compatible backend for vLLM/llama.cpp-style server tool use.
+/// The first non-streaming call returns a standard OpenAI `tool_calls` message.
+/// After the orchestrator appends a `tool` role result, the final streaming pass
+/// emits "Hello world".
+fn mock_openai_compatible_tool_call(requests: RecordedRequests) -> Router {
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    let streaming =
+                        body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let resumed = body.0["messages"]
+                        .as_array()
+                        .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
+                    requests.lock().await.push(body.0.clone());
+                    if streaming {
+                        if body.0.get("tools").is_some() {
+                            return (StatusCode::BAD_REQUEST, "final stream must not include tools")
+                                .into_response();
+                        }
+                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
+                                    data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
+                                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                                    data: [DONE]\n\n";
+                        ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
+                    } else if resumed {
+                        let tool_messages = body.0["messages"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|m| m["role"] == "tool");
+                        for message in tool_messages {
+                            if message.get("name").is_some() {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    "OpenAI-compatible tool messages must omit name",
+                                )
+                                    .into_response();
+                            }
+                            if message.get("tool_call_id").is_none() {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    "OpenAI-compatible tool messages require tool_call_id",
+                                )
+                                    .into_response();
+                            }
+                        }
+                        axum::Json(serde_json::json!({
+                            "choices": [{
+                                "message": { "role": "assistant", "content": "resolved" },
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                        .into_response()
+                    } else {
+                        axum::Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_calc",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "calculator",
+                                            "arguments": "{\"expression\":\"1+1\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { axum::Json(serde_json::json!({"data":[{"id":"m"}]})) }),
+        )
+}
+
+fn test_config(upstream_base: &str) -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: Some(TOKEN.into()),
         cors_allowed_origins: vec![],
-        ollama_base: ollama_base.parse().unwrap(),
+        upstream_kind: None,
+        upstream_base: upstream_base.parse().unwrap(),
         upstream_api_key: None,
+        upstream_thinking_hint: true,
         default_model: "m".into(),
         models: vec!["m".into()],
         max_tool_iters: 5,
-        ollama_concurrency: 4,
+        upstream_concurrency: 4,
         turn_result_ttl_s: 24 * 60 * 60,
         turn_registry_max: 128,
         turn_abandon_grace_s: 300,
@@ -238,6 +337,7 @@ fn test_config(ollama_base: &str) -> Config {
         web_fetch_enabled: false,
         web_fetch_context_chars: 8000,
         calculator_enabled: false,
+        time_enabled: false,
         unit_convert_enabled: false,
         weather_enabled: false,
         open_meteo_base: "https://api.open-meteo.com".parse().unwrap(),
@@ -323,12 +423,12 @@ fn test_capabilities() -> CapabilitySnapshot {
     }
 }
 
-async fn spawn_orchestrator(ollama_base: &str) -> String {
-    spawn_orchestrator_with_kind(ollama_base, UpstreamKind::NativeOllama).await
+async fn spawn_orchestrator(upstream_base: &str) -> String {
+    spawn_orchestrator_with_kind(upstream_base, UpstreamKind::NativeOllama).await
 }
 
-async fn spawn_orchestrator_with_kind(ollama_base: &str, upstream_kind: UpstreamKind) -> String {
-    let cfg = Arc::new(test_config(ollama_base));
+async fn spawn_orchestrator_with_kind(upstream_base: &str, upstream_kind: UpstreamKind) -> String {
+    let cfg = Arc::new(test_config(upstream_base));
     let capabilities = Arc::new(test_capabilities());
     let state = phantasm_orchestrator::build_state(cfg, capabilities, upstream_kind);
     spawn(routes::router(state)).await
@@ -336,12 +436,19 @@ async fn spawn_orchestrator_with_kind(ollama_base: &str, upstream_kind: Upstream
 
 /// Like `spawn_orchestrator`, but with the `calculator` server tool enabled so
 /// the mixed app+server tool-call flow has a real server tool to execute.
-async fn spawn_orchestrator_with_calculator(ollama_base: &str) -> String {
-    let mut cfg = test_config(ollama_base);
+async fn spawn_orchestrator_with_calculator(upstream_base: &str) -> String {
+    spawn_orchestrator_with_calculator_kind(upstream_base, UpstreamKind::NativeOllama).await
+}
+
+async fn spawn_orchestrator_with_calculator_kind(
+    upstream_base: &str,
+    upstream_kind: UpstreamKind,
+) -> String {
+    let mut cfg = test_config(upstream_base);
     cfg.calculator_enabled = true;
     let cfg = Arc::new(cfg);
     let capabilities = Arc::new(test_capabilities());
-    let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
+    let state = phantasm_orchestrator::build_state(cfg, capabilities, upstream_kind);
     spawn(routes::router(state)).await
 }
 
@@ -350,8 +457,8 @@ async fn spawn_orchestrator_with_calculator(ollama_base: &str) -> String {
 /// but fails container starts — no real Docker/Podman is needed in CI. This
 /// exercises the wiring and the non-fatal failure path (NFR-O6): the tool folds
 /// its error into the `tool` message and the turn still completes.
-async fn spawn_orchestrator_with_code_exec(ollama_base: &str) -> String {
-    let mut cfg = test_config(ollama_base);
+async fn spawn_orchestrator_with_code_exec(upstream_base: &str) -> String {
+    let mut cfg = test_config(upstream_base);
     cfg.code_exec_enabled = true;
     cfg.code_exec_runtime = fake_code_exec_runtime();
     cfg.code_exec_network = Some("phantasm-code-exec".into());
@@ -691,6 +798,38 @@ async fn detects_openai_compatible_upstream_when_tags_absent() {
 }
 
 #[tokio::test]
+async fn detects_openai_compatible_upstream_when_tags_returns_json_error() {
+    let openai = spawn(mock_openai_compatible_with_json_tags_error()).await;
+    let cfg = test_config(&openai);
+    let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
+
+    assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(detection.models, ["m".to_string()]);
+}
+
+#[tokio::test]
+async fn explicit_openai_compatible_upstream_skips_native_ollama_probe() {
+    let openai = spawn(mock_openai_compatible()).await;
+    let mut cfg = test_config(&openai);
+    cfg.upstream_kind = Some(UpstreamKind::OpenAICompatible);
+    let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
+
+    assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(detection.models, ["m".to_string()]);
+}
+
+#[tokio::test]
+async fn explicit_native_ollama_upstream_does_not_fallback_to_openai_compatible() {
+    let openai = spawn(mock_openai_compatible()).await;
+    let mut cfg = test_config(&openai);
+    cfg.upstream_kind = Some(UpstreamKind::NativeOllama);
+    let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
+
+    assert_eq!(detection.kind, UpstreamKind::NativeOllama);
+    assert!(detection.models.is_empty());
+}
+
+#[tokio::test]
 async fn plain_chat_streams_tokens() {
     let ollama = spawn(mock_ollama()).await;
     let base = spawn_orchestrator(&ollama).await;
@@ -1005,6 +1144,96 @@ async fn openai_compatible_upstream_streams_tokens() {
 }
 
 #[tokio::test]
+async fn openai_compatible_upstream_runs_server_tool_loop() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let openai = spawn(mock_openai_compatible_tool_call(requests.clone())).await;
+    let base =
+        spawn_orchestrator_with_calculator_kind(&openai, UpstreamKind::OpenAICompatible).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "tool_choice": "required",
+            "messages": [{"role": "user", "content": "what is 1+1?"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    let mut content = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+    }
+    assert_eq!(content, "Hello world");
+
+    let requests = requests.lock().await;
+    let resolution = requests
+        .iter()
+        .find(|r| r["tools"].as_array().is_some_and(|tools| !tools.is_empty()))
+        .expect(
+            "expected the non-streaming OpenAI-compatible tool-resolution call to include tools",
+        );
+    assert_eq!(
+        resolution["tool_choice"], "required",
+        "expected downstream tool_choice to be forwarded during tool resolution"
+    );
+    assert!(
+        requests.iter().any(|r| {
+            r["messages"]
+                .as_array()
+                .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"))
+        }),
+        "expected the resumed OpenAI-compatible call to include the calculator tool result"
+    );
+    let resumed = requests
+        .iter()
+        .find(|r| {
+            r["messages"]
+                .as_array()
+                .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"))
+        })
+        .expect("resumed request");
+    let tool_message = resumed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("tool result message");
+    assert_eq!(tool_message["tool_call_id"], "call_calc");
+    assert!(tool_message.get("name").is_none());
+    assert!(
+        requests
+            .iter()
+            .filter(|r| r["stream"].as_bool() == Some(true))
+            .all(|r| r.get("tools").is_none() && r.get("tool_choice").is_none()),
+        "expected final OpenAI-compatible stream requests to omit tools and tool_choice"
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|r| r["messages"]
+                .as_array()
+                .is_some_and(|ms| { ms.iter().any(|m| m["role"] == "tool") }))
+            .all(|r| r.get("tool_choice").is_none()),
+        "expected resumed post-tool OpenAI-compatible calls to omit tool_choice"
+    );
+}
+
+#[tokio::test]
 async fn openai_compatible_upstream_error_surfaces_as_bad_gateway() {
     let openai = spawn(mock_openai_compatible_erroring()).await;
     let base = spawn_orchestrator_with_kind(&openai, UpstreamKind::OpenAICompatible).await;
@@ -1021,7 +1250,7 @@ async fn openai_compatible_upstream_error_surfaces_as_bad_gateway() {
         .await
         .unwrap();
 
-    // OllamaError maps to 502, and the upstream status + detail ride through.
+    // UpstreamError maps to 502, and the upstream status + detail ride through.
     assert_eq!(resp.status().as_u16(), 502);
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["error"]["type"], "upstream_error");
@@ -1190,8 +1419,8 @@ async fn capabilities_requires_auth_and_reports_models() {
 }
 
 /// Spawn the orchestrator with a CORS allow-list configured.
-async fn spawn_orchestrator_with_cors(ollama_base: &str, origins: Vec<String>) -> String {
-    let mut cfg = test_config(ollama_base);
+async fn spawn_orchestrator_with_cors(upstream_base: &str, origins: Vec<String>) -> String {
+    let mut cfg = test_config(upstream_base);
     cfg.cors_allowed_origins = origins;
     let cfg = Arc::new(cfg);
     let capabilities = Arc::new(test_capabilities());
@@ -1262,8 +1491,8 @@ async fn cors_allows_configured_origin() {
 /// Spawn the orchestrator with a server-hosted image store rooted at `dir`. The
 /// store's signing key is the server auth token, so a `BlobStore` the test
 /// builds against the same dir + token mints URLs the server will accept.
-async fn spawn_orchestrator_with_images(ollama_base: &str, dir: std::path::PathBuf) -> String {
-    let mut cfg = test_config(ollama_base);
+async fn spawn_orchestrator_with_images(upstream_base: &str, dir: std::path::PathBuf) -> String {
+    let mut cfg = test_config(upstream_base);
     cfg.image_store_dir = Some(dir);
     let cfg = Arc::new(cfg);
     let capabilities = Arc::new(test_capabilities());

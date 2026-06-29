@@ -10,6 +10,7 @@ pub mod maps_places;
 pub mod market_data;
 pub mod ocr;
 pub mod sports;
+pub mod time;
 pub mod unit_convert;
 pub mod weather;
 pub mod web_fetch;

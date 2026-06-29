@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use url::Url;
 
+use crate::ollama::UpstreamKind;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Json,
@@ -55,14 +57,19 @@ pub struct Config {
     /// it's an exact-match list of origins (e.g. `https://chat.example`).
     pub cors_allowed_origins: Vec<String>,
 
-    // Ollama (upstream model host)
-    pub ollama_base: Url,
+    // Upstream model host
+    pub upstream_kind: Option<UpstreamKind>,
+    pub upstream_base: Url,
     pub upstream_api_key: Option<String>,
+    /// Send the Qwen-style `chat_template_kwargs.enable_thinking` hint to an
+    /// OpenAI-compatible upstream (vLLM/llama.cpp templates honor it). Disable
+    /// for a strict `/v1` server that rejects unknown body fields. Default on.
+    pub upstream_thinking_hint: bool,
     pub default_model: String,
-    /// Models advertised in /v1/capabilities. Empty => probe `/api/tags` at startup.
+    /// Models advertised in /v1/capabilities. Empty => probe the upstream at startup.
     pub models: Vec<String>,
     pub max_tool_iters: u8,
-    pub ollama_concurrency: usize,
+    pub upstream_concurrency: usize,
 
     // Resumable turns (see `TurnRegistry`). A streaming turn started with an
     // `Idempotency-Key` keeps running across client disconnects (e.g. the app
@@ -142,6 +149,7 @@ pub struct Config {
     pub web_fetch_enabled: bool,
     pub web_fetch_context_chars: usize,
     pub calculator_enabled: bool,
+    pub time_enabled: bool,
     pub unit_convert_enabled: bool,
     pub weather_enabled: bool,
     pub open_meteo_base: Url,
@@ -268,12 +276,19 @@ impl Config {
             );
         }
 
-        let ollama_base = parse_url("OLLAMA_BASE_URL", "http://localhost:11434")?;
+        let upstream_kind = parse_upstream_kind()?;
+        let upstream_base = parse_url_alias(
+            "UPSTREAM_BASE_URL",
+            "OLLAMA_BASE_URL",
+            "http://localhost:11434",
+        )?;
         let upstream_api_key = std::env::var("UPSTREAM_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty());
-        let default_model = env_or("OLLAMA_DEFAULT_MODEL", "llama3.1");
-        let models = csv("OLLAMA_MODELS");
+        let upstream_thinking_hint = env_bool("UPSTREAM_THINKING_HINT", true);
+        let default_model =
+            env_or_alias("UPSTREAM_DEFAULT_MODEL", "OLLAMA_DEFAULT_MODEL", "llama3.1");
+        let models = csv_alias("UPSTREAM_MODELS", "OLLAMA_MODELS");
 
         let web_search_enabled = env_bool("TOOL_WEB_SEARCH", false);
         let brave_base = parse_url("BRAVE_BASE_URL", "https://api.search.brave.com")?;
@@ -289,12 +304,19 @@ impl Config {
             bind_addr,
             auth_token,
             cors_allowed_origins: csv("PHANTASM_CORS_ALLOWED_ORIGINS"),
-            ollama_base,
+            upstream_kind,
+            upstream_base,
             upstream_api_key,
+            upstream_thinking_hint,
             default_model,
             models,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
-            ollama_concurrency: env_parse("OLLAMA_MAX_CONCURRENCY", 4usize).max(1),
+            upstream_concurrency: env_parse_alias(
+                "UPSTREAM_MAX_CONCURRENCY",
+                "OLLAMA_MAX_CONCURRENCY",
+                4usize,
+            )
+            .max(1),
             turn_result_ttl_s: env_parse("TURN_RESULT_TTL_S", 24 * 60 * 60),
             turn_registry_max: env_parse("TURN_REGISTRY_MAX", 128usize),
             turn_abandon_grace_s: env_parse("TURN_ABANDON_GRACE_S", 300u64),
@@ -331,6 +353,7 @@ impl Config {
             web_fetch_enabled: env_bool("TOOL_WEB_FETCH", false),
             web_fetch_context_chars: env_parse("WEB_FETCH_CONTEXT_CHARS", 8000usize).max(500),
             calculator_enabled: env_bool("TOOL_CALCULATOR", false),
+            time_enabled: env_bool("TOOL_TIME", false),
             unit_convert_enabled: env_bool("TOOL_UNIT_CONVERT", false),
             weather_enabled: env_bool("TOOL_WEATHER", false),
             open_meteo_base: parse_url("OPEN_METEO_BASE_URL", "https://api.open-meteo.com")?,
@@ -443,6 +466,10 @@ impl Config {
         self.calculator_enabled
     }
 
+    pub fn time_usable(&self) -> bool {
+        self.time_enabled
+    }
+
     pub fn unit_convert_usable(&self) -> bool {
         self.unit_convert_enabled
     }
@@ -501,6 +528,14 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+fn env_or_alias(primary: &str, legacy: &str, default: &str) -> String {
+    std::env::var(primary)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var(legacy).ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
         Ok(v) => matches!(
@@ -514,6 +549,15 @@ fn env_bool(key: &str, default: bool) -> bool {
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key)
         .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_parse_alias<T: std::str::FromStr>(primary: &str, legacy: &str, default: T) -> T {
+    std::env::var(primary)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var(legacy).ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
@@ -546,9 +590,50 @@ fn csv(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn csv_alias(primary: &str, legacy: &str) -> Vec<String> {
+    let raw = std::env::var(primary)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var(legacy).ok().filter(|s| !s.trim().is_empty()));
+    raw.map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 fn parse_url(key: &str, default: &str) -> Result<Url> {
     let raw = env_or(key, default);
     Url::parse(&raw).with_context(|| format!("{key} must be a valid URL (got {raw:?})"))
+}
+
+fn parse_url_alias(primary: &str, legacy: &str, default: &str) -> Result<Url> {
+    let raw = env_or_alias(primary, legacy, default);
+    Url::parse(&raw)
+        .with_context(|| format!("{primary} or {legacy} must be a valid URL (got {raw:?})"))
+}
+
+fn parse_upstream_kind() -> Result<Option<UpstreamKind>> {
+    let Some(raw) = std::env::var("UPSTREAM_KIND")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "auto" => Ok(None),
+        "ollama" | "native_ollama" | "native" => Ok(Some(UpstreamKind::NativeOllama)),
+        "openai" | "openai_compatible" | "vllm" | "llama_cpp" | "llamacpp" => {
+            Ok(Some(UpstreamKind::OpenAICompatible))
+        }
+        _ => anyhow::bail!(
+            "UPSTREAM_KIND must be auto, ollama, native_ollama, openai_compatible, vllm, or llama_cpp"
+        ),
+    }
 }
 
 /// Parse an optional URL env var: absent/blank => `None`; present-but-invalid is
@@ -574,12 +659,14 @@ pub mod tests_support {
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             auth_token: Some("test-token".into()),
             cors_allowed_origins: vec![],
-            ollama_base: "http://localhost:11434".parse().unwrap(),
+            upstream_kind: None,
+            upstream_base: "http://localhost:11434".parse().unwrap(),
             upstream_api_key: None,
+            upstream_thinking_hint: true,
             default_model: "m".into(),
             models: vec![],
             max_tool_iters: 5,
-            ollama_concurrency: 4,
+            upstream_concurrency: 4,
             turn_result_ttl_s: 24 * 60 * 60,
             turn_registry_max: 128,
             turn_abandon_grace_s: 300,
@@ -610,6 +697,7 @@ pub mod tests_support {
             web_fetch_enabled: false,
             web_fetch_context_chars: 8000,
             calculator_enabled: false,
+            time_enabled: false,
             unit_convert_enabled: false,
             weather_enabled: false,
             open_meteo_base: "https://api.open-meteo.com".parse().unwrap(),
@@ -670,7 +758,11 @@ pub mod tests_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_node, NodeInput};
+    use super::{
+        csv_alias, env_node, env_or_alias, env_parse_alias, parse_upstream_kind, parse_url_alias,
+        NodeInput,
+    };
+    use crate::ollama::UpstreamKind;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -725,6 +817,103 @@ mod tests {
             err.contains(KEY) && err.contains("25.noise_seed"),
             "unexpected error: {err}"
         );
+
+        std::env::remove_var(KEY);
+    }
+
+    #[test]
+    fn upstream_env_aliases_prefer_new_names() {
+        let _guard = env_lock();
+        const BASE: &str = "UPSTREAM_BASE_URL";
+        const LEGACY_BASE: &str = "OLLAMA_BASE_URL";
+        const MODEL: &str = "UPSTREAM_DEFAULT_MODEL";
+        const LEGACY_MODEL: &str = "OLLAMA_DEFAULT_MODEL";
+        const MODELS: &str = "UPSTREAM_MODELS";
+        const LEGACY_MODELS: &str = "OLLAMA_MODELS";
+        const CONCURRENCY: &str = "UPSTREAM_MAX_CONCURRENCY";
+        const LEGACY_CONCURRENCY: &str = "OLLAMA_MAX_CONCURRENCY";
+
+        for key in [
+            BASE,
+            LEGACY_BASE,
+            MODEL,
+            LEGACY_MODEL,
+            MODELS,
+            LEGACY_MODELS,
+            CONCURRENCY,
+            LEGACY_CONCURRENCY,
+        ] {
+            std::env::remove_var(key);
+        }
+
+        std::env::set_var(LEGACY_BASE, "http://legacy:11434");
+        std::env::set_var(BASE, "http://new:8000");
+        assert_eq!(
+            parse_url_alias(BASE, LEGACY_BASE, "http://default")
+                .unwrap()
+                .as_str(),
+            "http://new:8000/"
+        );
+
+        std::env::set_var(LEGACY_MODEL, "legacy-model");
+        std::env::set_var(MODEL, "new-model");
+        assert_eq!(env_or_alias(MODEL, LEGACY_MODEL, "default"), "new-model");
+
+        std::env::set_var(LEGACY_MODELS, "legacy-a,legacy-b");
+        std::env::set_var(MODELS, "new-a, new-b");
+        assert_eq!(csv_alias(MODELS, LEGACY_MODELS), ["new-a", "new-b"]);
+
+        std::env::set_var(LEGACY_CONCURRENCY, "2");
+        std::env::set_var(CONCURRENCY, "7");
+        assert_eq!(env_parse_alias(CONCURRENCY, LEGACY_CONCURRENCY, 4usize), 7);
+        std::env::set_var(CONCURRENCY, "  ");
+        assert_eq!(env_parse_alias(CONCURRENCY, LEGACY_CONCURRENCY, 4usize), 2);
+
+        for key in [
+            BASE,
+            LEGACY_BASE,
+            MODEL,
+            LEGACY_MODEL,
+            MODELS,
+            LEGACY_MODELS,
+            CONCURRENCY,
+            LEGACY_CONCURRENCY,
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn upstream_kind_parses_aliases() {
+        let _guard = env_lock();
+        const KEY: &str = "UPSTREAM_KIND";
+
+        std::env::remove_var(KEY);
+        assert_eq!(parse_upstream_kind().unwrap(), None);
+
+        std::env::set_var(KEY, "auto");
+        assert_eq!(parse_upstream_kind().unwrap(), None);
+
+        std::env::set_var(KEY, "native-ollama");
+        assert_eq!(
+            parse_upstream_kind().unwrap(),
+            Some(UpstreamKind::NativeOllama)
+        );
+
+        std::env::set_var(KEY, "vllm");
+        assert_eq!(
+            parse_upstream_kind().unwrap(),
+            Some(UpstreamKind::OpenAICompatible)
+        );
+
+        std::env::set_var(KEY, "llama_cpp");
+        assert_eq!(
+            parse_upstream_kind().unwrap(),
+            Some(UpstreamKind::OpenAICompatible)
+        );
+
+        std::env::set_var(KEY, "bad");
+        assert!(parse_upstream_kind().is_err());
 
         std::env::remove_var(KEY);
     }

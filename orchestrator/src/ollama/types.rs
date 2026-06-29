@@ -271,4 +271,14 @@ mod tests {
         assert_eq!(native.content.as_deref(), Some("hello"));
         assert!(native.images.is_none());
     }
+
+    #[test]
+    fn from_openai_keeps_tool_name_for_native_tool_results() {
+        let msg = ChatMessage::tool_result("call_1", "calculator", "2");
+        let native = OllamaMessage::from_openai(&msg);
+
+        assert_eq!(native.role, "tool");
+        assert_eq!(native.content.as_deref(), Some("2"));
+        assert_eq!(native.tool_name.as_deref(), Some("calculator"));
+    }
 }
