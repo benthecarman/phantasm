@@ -193,12 +193,23 @@ impl CodeExecPool {
             .await
             .map_err(|_| "code-exec pool is shut down".to_string())?;
 
+        let timeout = Duration::from_secs(inner.cfg.code_exec_timeout_s.max(1));
+
+        // Borrow a warm container, or cold-spawn one when the pool is still
+        // warming/drained. The cold spawn is bounded by the wall-clock timeout and
+        // cancel too: a wedged runtime must not hang the call indefinitely while
+        // holding a slot permit (it previously awaited the spawn outside any bound).
         let container = match inner.take_ready() {
             Some(c) => c,
-            None => inner.backend.spawn_container(&inner.cfg).await?,
+            None => tokio::select! {
+                c = inner.backend.spawn_container(&inner.cfg) => c?,
+                _ = tokio::time::sleep(timeout) => {
+                    return Ok(ExecOutput::timed_out(inner.cfg.code_exec_timeout_s))
+                }
+                _ = cancel.cancelled() => return Err("cancelled".to_string()),
+            },
         };
 
-        let timeout = Duration::from_secs(inner.cfg.code_exec_timeout_s.max(1));
         let result = tokio::select! {
             r = inner.backend.exec(&container, language, code, &inner.cfg) => r,
             _ = tokio::time::sleep(timeout) => Ok(ExecOutput::timed_out(inner.cfg.code_exec_timeout_s)),
@@ -322,6 +333,9 @@ impl ContainerBackend for PodmanBackend {
                 NetworkMode::RuntimeDefault => {}
             }
             cmd.arg(&cfg.code_exec_image);
+            // If the spawn future is dropped (cold-spawn timeout/cancel), kill the
+            // `run` client rather than leaving it wedged against a stuck runtime.
+            cmd.kill_on_drop(true);
 
             let out = cmd
                 .output()
@@ -445,6 +459,9 @@ mod tests {
         execed: AtomicUsize,
         fail_spawn: bool,
         hold: Option<Arc<tokio::sync::Notify>>,
+        /// When set, `spawn_container` blocks on it — models a wedged runtime so a
+        /// cold spawn's timeout/cancel handling can be tested.
+        spawn_hold: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl ContainerBackend for MockBackend {
@@ -453,6 +470,9 @@ mod tests {
             _cfg: &'a Config,
         ) -> PoolFuture<'a, Result<Container, String>> {
             Box::pin(async move {
+                if let Some(gate) = &self.spawn_hold {
+                    gate.notified().await;
+                }
                 if self.fail_spawn {
                     return Err("spawn failed".into());
                 }
@@ -531,6 +551,24 @@ mod tests {
             backend.spawned.load(Ordering::SeqCst) >= 2,
             "one cold container + one replacement"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_spawn_timeout_does_not_hang() {
+        // Empty pool (not warmed) + a runtime whose spawn never returns: execute
+        // must hit the wall-clock timeout and free its slot, not block forever.
+        let backend = Arc::new(MockBackend {
+            spawn_hold: Some(Arc::new(tokio::sync::Notify::new())),
+            ..Default::default()
+        });
+        let pool = CodeExecPool::with_backend(cfg(1), backend.clone());
+        let out = pool
+            .execute("python", "x", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.timed_out, "a wedged cold spawn must time out");
+        // Slot was released, so a subsequent borrow can still proceed.
+        assert_eq!(pool.0.slots.available_permits(), 1);
     }
 
     #[tokio::test]
