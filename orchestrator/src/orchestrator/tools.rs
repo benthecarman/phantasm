@@ -55,7 +55,7 @@ pub struct TurnCache {
 #[derive(Clone, Default)]
 pub struct TurnContext {
     /// Editable images for this turn, most recent last, as raw base64 (data-URI
-    /// prefixes stripped). Server-hosted `/v1/images/<id>` references in history
+    /// prefixes stripped). Server-hosted `/v1/files/<id>/content` references in history
     /// are resolved to bytes here, so consuming tools (`image_edit`, `ocr`) see
     /// plain base64 regardless of how the image was delivered.
     pub input_images: Vec<String>,

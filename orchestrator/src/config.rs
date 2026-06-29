@@ -208,7 +208,7 @@ pub struct Config {
 
     // Server-hosted image blobs. When `image_store_dir` is set, generated/edited
     // images are persisted there and delivered to the app as signed URL
-    // references (`/v1/images/<id>`) instead of inline base64 — keeping re-sent
+    // references (`/v1/files/<id>/content`) instead of inline base64 — keeping re-sent
     // history small. Unset => disabled, and images stay inline (back-compat).
     pub image_store_dir: Option<PathBuf>,
     /// How long a generated image is reachable (default 90 days): both the
@@ -219,7 +219,7 @@ pub struct Config {
     /// is the primary access guard; the signature + expiry are defense-in-depth.
     pub image_store_ttl_s: u64,
     /// Public origin the app reaches this server at, used to mint absolute image
-    /// URLs. Unset => emit site-relative `/v1/images/<id>` and let the app
+    /// URLs. Unset => emit site-relative `/v1/files/<id>/content` and let the app
     /// resolve against the base URL it already dials.
     pub public_base_url: Option<Url>,
 

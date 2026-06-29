@@ -3,7 +3,7 @@
 //!
 //! Two modes, chosen per turn from [`TurnContext`]:
 //!   * **Reference** — when a blob store is configured *and* the client opted in:
-//!     persist the bytes and embed a signed `/v1/images/<id>` URL. Keeps re-sent
+//!     persist the bytes and embed a signed `/v1/files/<id>/content` URL. Keeps re-sent
 //!     history small (FR-O5 URL delivery).
 //!   * **Inline** — otherwise (or if the store write fails): a base64 `data:` URI,
 //!     the back-compatible form every OpenAI client renders.

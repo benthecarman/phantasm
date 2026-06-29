@@ -338,7 +338,7 @@ pub async fn run_turn<B, T>(
                         // (e.g. image_edit right after image_generation) can act
                         // on it. The image rides only the streamed answer, never
                         // the message history latest_input_images() scans — and in
-                        // URL-delivery mode it's a `/v1/images/<id>` ref, not bytes
+                        // URL-delivery mode it's a `/v1/files/<id>/content` ref, not bytes
                         // — so resolve it into the turn context directly.
                         ctx.input_images.extend(
                             resolve_images(
@@ -432,7 +432,7 @@ fn push_vision(vision: &mut Option<Vec<ChatMessage>>, msg: &ChatMessage) {
 
 /// Resolve a single message's editable images to base64, most recent last: both
 /// inline `data:` payloads (user attachments, inline-delivered generations) and
-/// server-hosted `/v1/images/<id>` references, the latter read from `store`.
+/// server-hosted `/v1/files/<id>/content` references, the latter read from `store`.
 /// References resolve to nothing when no store is available (older history,
 /// store disabled) — they're then simply not editable.
 async fn resolve_images(
