@@ -1,7 +1,10 @@
 //! Fetch and extract a specific HTTP(S) page. Stateless and bounded; no local
-//! filesystem access and no non-HTTP schemes.
+//! filesystem access and no non-HTTP schemes. The target URL is model-chosen, so
+//! every fetch goes through the shared SSRF guard ([`crate::net_guard`]): the host
+//! is resolved and screened, the connection is pinned to the validated IP, and
+//! redirects are refused (a 3xx to an internal resource can't re-resolve past the
+//! guard).
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -10,9 +13,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use url::Url;
 
 use crate::config::Config;
+use crate::net_guard;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome, TurnContext};
 use crate::orchestrator::TurnEvent;
@@ -39,7 +42,6 @@ pub fn schema() -> Value {
 
 pub async fn run(
     cfg: &Config,
-    http: &reqwest::Client,
     call: &ToolCall,
     call_id: &str,
     ctx: &TurnContext,
@@ -53,7 +55,7 @@ pub async fn run(
     let _ = tx.send(TurnEvent::Status("fetching page…".into())).await;
 
     let result = tokio::select! {
-        r = fetch(cfg, http, &args, ctx) => r,
+        r = fetch(cfg, &args, ctx) => r,
         _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
     };
 
@@ -69,14 +71,11 @@ pub async fn run(
     }
 }
 
-async fn fetch(
-    cfg: &Config,
-    http: &reqwest::Client,
-    args: &WebFetchArgs,
-    ctx: &TurnContext,
-) -> Result<String, String> {
-    let url = validate_url(&args.url)?;
-    let cache_key = url.as_str().to_string();
+async fn fetch(cfg: &Config, args: &WebFetchArgs, ctx: &TurnContext) -> Result<String, String> {
+    // SSRF guard: resolve + screen the host and pin the connection to the
+    // validated IP, with redirects disabled (see module docs).
+    let target = net_guard::guard_url(&args.url).await?;
+    let cache_key = target.url.as_str().to_string();
     if let Some(hit) = ctx
         .cache
         .lock()
@@ -91,10 +90,11 @@ async fn fetch(
         .unwrap_or(cfg.web_fetch_context_chars)
         .clamp(500, cfg.web_fetch_context_chars);
     let body_cap = cap.saturating_mul(4).saturating_add(8192);
-    let resp = http
-        .get(url.clone())
+    let timeout = Duration::from_millis(cfg.search_fetch_timeout_ms.max(1000));
+    let client = net_guard::pinned_client(&target, timeout)?;
+    let resp = client
+        .get(target.url.clone())
         .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
-        .timeout(Duration::from_millis(cfg.search_fetch_timeout_ms.max(1000)))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -151,46 +151,6 @@ fn cache_page(ctx: &TurnContext, url: &str, text: Option<String>) {
     }
 }
 
-fn validate_url(raw: &str) -> Result<Url, String> {
-    let url = Url::parse(raw).map_err(|e| format!("invalid URL: {e}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("only http and https URLs are allowed".into());
-    }
-    let Some(host) = url.host_str() else {
-        return Err("URL has no host".into());
-    };
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
-        return Err("localhost URLs are not allowed".into());
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip(ip) {
-            return Err(
-                "private, loopback, link-local, and unspecified IPs are not allowed".into(),
-            );
-        }
-    }
-    Ok(url)
-}
-
-fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-        }
-    }
-}
-
 fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
     ToolOutcome {
         message: ChatMessage::tool_result(
@@ -204,13 +164,20 @@ fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::net_guard::guard_url;
 
-    #[test]
-    fn rejects_non_http_and_localhost() {
-        assert!(validate_url("file:///etc/passwd").is_err());
-        assert!(validate_url("http://localhost:8080").is_err());
-        assert!(validate_url("http://127.0.0.1:8080").is_err());
-        assert!(validate_url("https://example.com/page").is_ok());
+    // URL validation lives in the shared net_guard (resolution + IP screening +
+    // connection pinning), exercised here at the boundary web_fetch relies on:
+    // non-HTTP schemes, localhost, and internal IP literals are all refused, so
+    // a model-chosen URL can't reach loopback/link-local/metadata targets.
+    #[tokio::test]
+    async fn rejects_non_http_localhost_and_internal_literals() {
+        assert!(guard_url("file:///etc/passwd").await.is_err());
+        assert!(guard_url("http://localhost:8080").await.is_err());
+        assert!(guard_url("http://127.0.0.1:8080").await.is_err());
+        assert!(guard_url("http://169.254.169.254/latest/meta-data")
+            .await
+            .is_err());
+        assert!(guard_url("http://[::1]:8080").await.is_err());
     }
 }

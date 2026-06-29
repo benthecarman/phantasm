@@ -188,7 +188,7 @@ impl ToolExecutor for ToolRegistry {
                 web_search::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
             }
             "web_fetch" if self.cfg.web_fetch_usable() => {
-                web_fetch::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
+                web_fetch::run(&self.cfg, call, &call_id, ctx, &tx, &cancel).await
             }
             "calculator" if self.cfg.calculator_usable() => {
                 calculator::run(call, &call_id, &tx, &cancel).await
