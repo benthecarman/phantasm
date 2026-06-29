@@ -90,6 +90,7 @@ final class ChatViewModel {
         if sceneIsActive && isViewVisible {
             recoverPendingTurnIfNeeded()
         }
+        healUncachedServerImages()
     }
 
     func setViewVisible(_ visible: Bool) {
@@ -962,7 +963,7 @@ final class ChatViewModel {
                             isComplete: true,
                             createdAt: .now
                         )
-                        self?.cacheServerImages(messageID: pendingID, content: committed)
+                        await self?.cacheServerImages(messageID: pendingID, content: committed)
                         try await store.updateConversation(
                             id: conversation.id, title: nil, modelID: nil, updatedAt: .now
                         )
@@ -990,7 +991,7 @@ final class ChatViewModel {
                 Task { [weak self] in
                     do {
                         try await store.insertMessage(assistant, attachments: [])
-                        self?.cacheServerImages(messageID: assistant.id, content: committed)
+                        await self?.cacheServerImages(messageID: assistant.id, content: committed)
                         try await store.updateConversation(
                             id: conversation.id, title: nil, modelID: nil, updatedAt: .now
                         )
@@ -1034,22 +1035,58 @@ final class ChatViewModel {
     /// Fetch and locally cache any server-hosted images the just-committed
     /// assistant message references, so they render offline and survive the
     /// signed URL's expiry (the message keeps the compact reference for re-sent
-    /// history). Fire-and-forget and best-effort — off the commit path.
-    private func cacheServerImages(messageID: UUID, content: String) {
-        let refs = ServerImageRef.references(in: content)
+    /// history). `await`ed on the commit path so it runs under the same
+    /// background-task assertion — otherwise a turn that completes as the app
+    /// suspends (e.g. an interrupted image edit, recovered on reopen) would lose
+    /// the caching to suspension, leaving the image to spin forever after restart.
+    private func cacheServerImages(messageID: UUID, content: String) async {
+        await cacheServerImages(messageID: messageID, refs: ServerImageRef.references(in: content))
+    }
+
+    /// Fetch + persist `refs` as local `remoteImage` attachments on `messageID`.
+    /// Best-effort: unreachable refs are skipped. The caller owns the enclosing
+    /// `Task` / background assertion.
+    private func cacheServerImages(
+        messageID: UUID, refs: [(id: String, url: String)]
+    ) async {
         guard !refs.isEmpty, let store else { return }
-        Task {
-            var attachments: [Attachment] = []
-            for ref in refs {
-                guard let url = URL(string: ref.url), let img = await imageFetcher.fetch(url) else {
-                    continue
-                }
-                attachments.append(
-                    Attachment(
-                        messageId: messageID, kind: .remoteImage, name: ref.id,
-                        data: img.data, mimeType: img.mime))
+        var attachments: [Attachment] = []
+        for ref in refs {
+            guard let url = URL(string: ref.url), let img = await imageFetcher.fetch(url) else {
+                continue
             }
-            try? await store.addAttachments(messageID: messageID, attachments: attachments)
+            attachments.append(
+                Attachment(
+                    messageId: messageID, kind: .remoteImage, name: ref.id,
+                    data: img.data, mimeType: img.mime))
+        }
+        try? await store.addAttachments(messageID: messageID, attachments: attachments)
+    }
+
+    /// Cache any server-hosted images referenced in this conversation that aren't
+    /// stored locally yet. Self-heals messages whose commit-time caching was lost
+    /// — chiefly an image edit interrupted by backgrounding and recovered on a
+    /// later open, where the live caching raced app suspension. Idempotent and
+    /// best-effort; runs whenever the conversation is opened.
+    private func healUncachedServerImages() {
+        guard let store, let conversation else { return }
+        let conversationID = conversation.id
+        Task { [weak self] in
+            guard let detail = try? await store.conversationDetail(id: conversationID) else {
+                return
+            }
+            for cm in detail.messages where cm.message.role == "assistant" {
+                let refs = ServerImageRef.references(in: cm.message.content)
+                guard !refs.isEmpty else { continue }
+                let cached = Set(
+                    cm.attachments
+                        .filter { $0.kind == AttachmentKind.remoteImage.rawValue }
+                        .map(\.name)
+                )
+                let missing = refs.filter { !cached.contains($0.id) }
+                guard !missing.isEmpty else { continue }
+                await self?.cacheServerImages(messageID: cm.message.id, refs: missing)
+            }
         }
     }
 

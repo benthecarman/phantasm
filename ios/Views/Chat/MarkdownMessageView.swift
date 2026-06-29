@@ -228,6 +228,7 @@ private struct RemoteImage: View {
     let url: URL
     let onTap: (UIImage) -> Void
     @State private var image: UIImage?
+    @State private var loadFailed = false
 
     var body: some View {
         Group {
@@ -237,11 +238,27 @@ private struct RemoteImage: View {
                     .contentShape(Rectangle())
                     .onTapGesture { onTap(image) }
                     .contextMenu { ImageActions(image: image) }
+            } else if loadFailed {
+                // A ref that can't resolve (its blob is gone, or the URL is
+                // unreachable) collapses to nothing rather than leaving a stuck
+                // spinner above the surrounding content. The spinner is reserved
+                // for an in-flight load that's actually expected to arrive.
+                EmptyView()
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity)
-                    .task(id: url) { image = await RemoteImageCache.shared.image(for: url) }
             }
+        }
+        .task(id: url) { await load() }
+    }
+
+    @MainActor
+    private func load() async {
+        loadFailed = false
+        if let loaded = await RemoteImageCache.shared.image(for: url) {
+            image = loaded
+        } else {
+            loadFailed = true
         }
     }
 }
@@ -255,7 +272,10 @@ private final class RemoteImageCache: @unchecked Sendable {
 
     func image(for url: URL) async -> UIImage? {
         if let hit = cache.object(forKey: url as NSURL) { return hit }
-        guard let (data, _) = try? await URLSession.shared.data(from: url),
+        // Bound the wait: a stalled fetch should resolve to a failure (and
+        // collapse the placeholder) rather than spin indefinitely.
+        let request = URLRequest(url: url, timeoutInterval: 20)
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
               let image = UIImage(data: data) else { return nil }
         cache.setObject(image, forKey: url as NSURL)
         return image
