@@ -9,12 +9,69 @@ public enum HealthMetric: String, Sendable, CaseIterable, Equatable {
     case walkingRunningDistance = "walking_running_distance"
     case activeEnergy = "active_energy"
     case exerciseMinutes = "exercise_minutes"
+    // Nutrition — summed over the range.
+    case dietaryEnergy = "dietary_energy"
+    case dietaryProtein = "dietary_protein"
+    case dietaryCarbohydrates = "dietary_carbohydrates"
+    case dietaryFatTotal = "dietary_fat_total"
+    case dietaryFatSaturated = "dietary_fat_saturated"
+    case dietaryFatMonounsaturated = "dietary_fat_monounsaturated"
+    case dietaryFatPolyunsaturated = "dietary_fat_polyunsaturated"
+    case dietaryFiber = "dietary_fiber"
+    case dietarySugar = "dietary_sugar"
+    case dietaryWater = "dietary_water"
+    case dietaryCaffeine = "dietary_caffeine"
+    case dietarySodium = "dietary_sodium"
+    case dietaryCholesterol = "dietary_cholesterol"
+    case dietaryCalcium = "dietary_calcium"
+    case dietaryIron = "dietary_iron"
+    case dietaryPotassium = "dietary_potassium"
+    case dietaryMagnesium = "dietary_magnesium"
+    case dietaryZinc = "dietary_zinc"
+    case dietaryVitaminA = "dietary_vitamin_a"
+    case dietaryVitaminB6 = "dietary_vitamin_b6"
+    case dietaryVitaminB12 = "dietary_vitamin_b12"
+    case dietaryVitaminC = "dietary_vitamin_c"
+    case dietaryVitaminD = "dietary_vitamin_d"
+    case dietaryVitaminE = "dietary_vitamin_e"
+    case dietaryVitaminK = "dietary_vitamin_k"
+    case dietaryThiamin = "dietary_thiamin"
+    case dietaryRiboflavin = "dietary_riboflavin"
+    case dietaryNiacin = "dietary_niacin"
+    case dietaryFolate = "dietary_folate"
+    case dietaryBiotin = "dietary_biotin"
+    case dietaryPantothenicAcid = "dietary_pantothenic_acid"
+    case dietaryPhosphorus = "dietary_phosphorus"
+    case dietaryIodine = "dietary_iodine"
+    case dietarySelenium = "dietary_selenium"
+    case dietaryCopper = "dietary_copper"
+    case dietaryManganese = "dietary_manganese"
+    case dietaryChromium = "dietary_chromium"
+    case dietaryMolybdenum = "dietary_molybdenum"
+    case dietaryChloride = "dietary_chloride"
     // Vitals — averaged, with min/max.
     case heartRate = "heart_rate"
     case restingHeartRate = "resting_heart_rate"
     case heartRateVariability = "heart_rate_variability"
     case respiratoryRate = "respiratory_rate"
     case bloodOxygen = "blood_oxygen"
+    // Cycle tracking and reproductive health.
+    case basalBodyTemperature = "basal_body_temperature"
+    case menstrualFlow = "menstrual_flow"
+    case intermenstrualBleeding = "intermenstrual_bleeding"
+    case cervicalMucusQuality = "cervical_mucus_quality"
+    case ovulationTestResult = "ovulation_test_result"
+    case pregnancyTestResult = "pregnancy_test_result"
+    case progesteroneTestResult = "progesterone_test_result"
+    case contraceptive
+    case lactation
+    case pregnancy
+    case bleedingDuringPregnancy = "bleeding_during_pregnancy"
+    case bleedingAfterPregnancy = "bleeding_after_pregnancy"
+    case infrequentMenstrualCycles = "infrequent_menstrual_cycles"
+    case irregularMenstrualCycles = "irregular_menstrual_cycles"
+    case persistentIntermenstrualBleeding = "persistent_intermenstrual_bleeding"
+    case prolongedMenstrualPeriods = "prolonged_menstrual_periods"
     // Body — most recent value.
     case weight
     case height
@@ -23,11 +80,12 @@ public enum HealthMetric: String, Sendable, CaseIterable, Equatable {
     // Special shapes.
     case sleep
     case workouts
+    case sexualActivity = "sexual_activity"
 
     /// How this metric aggregates over a range — drives both the provider's
     /// query (sum vs. average vs. most-recent) and the formatter's line shape.
     public enum Kind: Sendable, Equatable {
-        /// Totalled across the range (steps, energy, distance, exercise minutes).
+        /// Totalled across the range (steps, energy, nutrition, distance, exercise minutes).
         case cumulative
         /// Averaged across samples, reported with min/max (heart rate, SpO₂, …).
         case discrete
@@ -37,13 +95,27 @@ public enum HealthMetric: String, Sendable, CaseIterable, Equatable {
         case sleep
         /// A list of recent workouts.
         case workouts
+        /// Category samples counted as events.
+        case events
     }
 
     public var kind: Kind {
         switch self {
-        case .steps, .walkingRunningDistance, .activeEnergy, .exerciseMinutes:
+        case .steps, .walkingRunningDistance, .activeEnergy, .exerciseMinutes,
+             .dietaryEnergy, .dietaryProtein, .dietaryCarbohydrates,
+             .dietaryFatTotal, .dietaryFatSaturated, .dietaryFatMonounsaturated,
+             .dietaryFatPolyunsaturated, .dietaryFiber, .dietarySugar,
+             .dietaryWater, .dietaryCaffeine, .dietarySodium, .dietaryCholesterol,
+             .dietaryCalcium, .dietaryIron, .dietaryPotassium, .dietaryMagnesium,
+             .dietaryZinc, .dietaryVitaminA, .dietaryVitaminB6, .dietaryVitaminB12,
+             .dietaryVitaminC, .dietaryVitaminD, .dietaryVitaminE, .dietaryVitaminK,
+             .dietaryThiamin, .dietaryRiboflavin, .dietaryNiacin, .dietaryFolate,
+             .dietaryBiotin, .dietaryPantothenicAcid, .dietaryPhosphorus,
+             .dietaryIodine, .dietarySelenium, .dietaryCopper, .dietaryManganese,
+             .dietaryChromium, .dietaryMolybdenum, .dietaryChloride:
             return .cumulative
-        case .heartRate, .restingHeartRate, .heartRateVariability, .respiratoryRate, .bloodOxygen:
+        case .heartRate, .restingHeartRate, .heartRateVariability, .respiratoryRate, .bloodOxygen,
+             .basalBodyTemperature:
             return .discrete
         case .weight, .height, .bodyMassIndex, .bodyFat:
             return .latest
@@ -51,8 +123,22 @@ public enum HealthMetric: String, Sendable, CaseIterable, Equatable {
             return .sleep
         case .workouts:
             return .workouts
+        case .menstrualFlow, .intermenstrualBleeding, .cervicalMucusQuality,
+             .ovulationTestResult, .pregnancyTestResult, .progesteroneTestResult,
+             .contraceptive, .lactation, .pregnancy, .bleedingDuringPregnancy,
+             .bleedingAfterPregnancy, .infrequentMenstrualCycles, .irregularMenstrualCycles,
+             .persistentIntermenstrualBleeding, .prolongedMenstrualPeriods,
+             .sexualActivity:
+            return .events
         }
     }
+}
+
+/// How much detail the model wants back from HealthKit. Summary is the stable,
+/// low-token default; daily adds per-day buckets for trend questions.
+public enum HealthGranularity: String, Sendable, CaseIterable, Equatable {
+    case summary
+    case daily
 }
 
 /// Why a health read couldn't run at all (as opposed to an individual metric
@@ -82,20 +168,25 @@ public struct HealthQuery: Sendable, Equatable {
     public var metrics: [HealthMetric]
     public var start: Date
     public var end: Date
+    public var granularity: HealthGranularity
 
-    public init(metrics: [HealthMetric], start: Date, end: Date) {
+    public init(
+        metrics: [HealthMetric], start: Date, end: Date,
+        granularity: HealthGranularity = .summary
+    ) {
         self.metrics = metrics
         self.start = start
         self.end = end
+        self.granularity = granularity
     }
 }
 
-/// An aggregated numeric reading for a quantity metric. Which fields are
-/// populated depends on the metric's `kind` (sum for cumulative, average/min/max
-/// for discrete, latest for body metrics). `unit` is a short, model-readable
-/// label like "bpm", "kg", or "kcal".
-public struct HealthSummary: Sendable, Equatable {
-    public var unit: String
+/// One daily bucket for a quantity metric. Which fields are populated mirrors
+/// `HealthSummary`: sum for cumulative, average/min/max for discrete, latest for
+/// body metrics.
+public struct HealthQuantityBucket: Sendable, Equatable {
+    public var start: Date
+    public var end: Date
     public var sum: Double?
     public var average: Double?
     public var minimum: Double?
@@ -104,7 +195,8 @@ public struct HealthSummary: Sendable, Equatable {
     public var latestDate: Date?
 
     public init(
-        unit: String,
+        start: Date,
+        end: Date,
         sum: Double? = nil,
         average: Double? = nil,
         minimum: Double? = nil,
@@ -112,7 +204,8 @@ public struct HealthSummary: Sendable, Equatable {
         latest: Double? = nil,
         latestDate: Date? = nil
     ) {
-        self.unit = unit
+        self.start = start
+        self.end = end
         self.sum = sum
         self.average = average
         self.minimum = minimum
@@ -122,9 +215,46 @@ public struct HealthSummary: Sendable, Equatable {
     }
 }
 
-/// Sleep durations summed over the range, in seconds. Any field may be nil when
-/// the source didn't record that stage.
-public struct HealthSleepSummary: Sendable, Equatable {
+/// An aggregated numeric reading for a quantity metric. Which fields are
+/// populated depends on the metric's `kind` (sum for cumulative, average/min/max
+/// for discrete, latest for body metrics). `daily` is populated when requested
+/// via `HealthGranularity.daily`. `unit` is a short, model-readable label like
+/// "bpm", "kg", or "kcal".
+public struct HealthSummary: Sendable, Equatable {
+    public var unit: String
+    public var sum: Double?
+    public var average: Double?
+    public var minimum: Double?
+    public var maximum: Double?
+    public var latest: Double?
+    public var latestDate: Date?
+    public var daily: [HealthQuantityBucket]
+
+    public init(
+        unit: String,
+        sum: Double? = nil,
+        average: Double? = nil,
+        minimum: Double? = nil,
+        maximum: Double? = nil,
+        latest: Double? = nil,
+        latestDate: Date? = nil,
+        daily: [HealthQuantityBucket] = []
+    ) {
+        self.unit = unit
+        self.sum = sum
+        self.average = average
+        self.minimum = minimum
+        self.maximum = maximum
+        self.latest = latest
+        self.latestDate = latestDate
+        self.daily = daily
+    }
+}
+
+/// One daily sleep bucket, credited to the wake-up day. Evening samples roll
+/// forward to the next local day so a night isn't split at midnight.
+public struct HealthSleepBucket: Sendable, Equatable {
+    public var day: Date
     public var asleep: TimeInterval?
     public var inBed: TimeInterval?
     public var deep: TimeInterval?
@@ -133,6 +263,7 @@ public struct HealthSleepSummary: Sendable, Equatable {
     public var awake: TimeInterval?
 
     public init(
+        day: Date,
         asleep: TimeInterval? = nil,
         inBed: TimeInterval? = nil,
         deep: TimeInterval? = nil,
@@ -140,12 +271,111 @@ public struct HealthSleepSummary: Sendable, Equatable {
         core: TimeInterval? = nil,
         awake: TimeInterval? = nil
     ) {
+        self.day = day
         self.asleep = asleep
         self.inBed = inBed
         self.deep = deep
         self.rem = rem
         self.core = core
         self.awake = awake
+    }
+}
+
+/// Sleep durations summed over the range, in seconds. Any field may be nil when
+/// the source didn't record that stage. `daily` is populated when requested via
+/// `HealthGranularity.daily`.
+public struct HealthSleepSummary: Sendable, Equatable {
+    public var asleep: TimeInterval?
+    public var inBed: TimeInterval?
+    public var deep: TimeInterval?
+    public var rem: TimeInterval?
+    public var core: TimeInterval?
+    public var awake: TimeInterval?
+    public var daily: [HealthSleepBucket]
+
+    public init(
+        asleep: TimeInterval? = nil,
+        inBed: TimeInterval? = nil,
+        deep: TimeInterval? = nil,
+        rem: TimeInterval? = nil,
+        core: TimeInterval? = nil,
+        awake: TimeInterval? = nil,
+        daily: [HealthSleepBucket] = []
+    ) {
+        self.asleep = asleep
+        self.inBed = inBed
+        self.deep = deep
+        self.rem = rem
+        self.core = core
+        self.awake = awake
+        self.daily = daily
+    }
+}
+
+/// One named count inside an event reading, such as menstrual-flow intensity or
+/// a pregnancy/ovulation test result.
+public struct HealthEventBreakdown: Sendable, Equatable {
+    public var label: String
+    public var count: Int
+
+    public init(label: String, count: Int) {
+        self.label = label
+        self.count = count
+    }
+}
+
+/// One daily event-count bucket.
+public struct HealthEventBucket: Sendable, Equatable {
+    public var day: Date
+    public var count: Int
+    public var breakdown: [HealthEventBreakdown]
+    public var protectedCount: Int?
+    public var unprotectedCount: Int?
+    public var protectionUnknownCount: Int?
+
+    public init(
+        day: Date,
+        count: Int,
+        breakdown: [HealthEventBreakdown] = [],
+        protectedCount: Int? = nil,
+        unprotectedCount: Int? = nil,
+        protectionUnknownCount: Int? = nil
+    ) {
+        self.day = day
+        self.count = count
+        self.breakdown = breakdown
+        self.protectedCount = protectedCount
+        self.unprotectedCount = unprotectedCount
+        self.protectionUnknownCount = protectionUnknownCount
+    }
+}
+
+/// Counted category samples, used for event-like HealthKit data such as sexual
+/// activity and cycle tracking. `breakdown` is populated when HealthKit's
+/// category values are meaningful; protection counts are only populated for
+/// sexual activity when HealthKit recorded that metadata.
+public struct HealthEventSummary: Sendable, Equatable {
+    public var count: Int
+    public var breakdown: [HealthEventBreakdown]
+    public var protectedCount: Int?
+    public var unprotectedCount: Int?
+    public var protectionUnknownCount: Int?
+    public var daily: [HealthEventBucket]
+
+    public init(
+        count: Int,
+        breakdown: [HealthEventBreakdown] = [],
+        protectedCount: Int? = nil,
+        unprotectedCount: Int? = nil,
+        protectionUnknownCount: Int? = nil,
+        daily: [HealthEventBucket] = []
+    ) {
+        self.count = count
+        self.breakdown = breakdown
+        self.protectedCount = protectedCount
+        self.unprotectedCount = unprotectedCount
+        self.protectionUnknownCount = protectionUnknownCount
+        self.daily = daily
     }
 }
 
@@ -179,6 +409,7 @@ public struct HealthWorkout: Sendable, Equatable {
 public enum HealthReading: Sendable, Equatable {
     case quantity(HealthSummary)
     case sleep(HealthSleepSummary)
+    case events(HealthEventSummary)
     case workouts([HealthWorkout])
     case noData
     case unavailable(String)
@@ -220,20 +451,32 @@ public struct HealthTool: AutoResolvedTool {
 
     public var spec: ToolSpec {
         let metricValues = HealthMetric.allCases.map { JSONValue.string($0.rawValue) }
+        let granularityValues = HealthGranularity.allCases.map { JSONValue.string($0.rawValue) }
         return ToolSpec(
             name: ToolName.health,
             description: "Read the user's on-device Apple Health data (read-only). Use it "
                 + "whenever a request depends on the user's health or fitness — steps, "
-                + "workouts, heart rate, sleep, weight, etc. Returns aggregated summaries "
-                + "over a time range: totals for activity (steps, distance, energy, "
-                + "exercise minutes), averages with min/max for vitals (heart rate, resting "
-                + "heart rate, HRV, respiratory rate, blood oxygen), the latest value for "
-                + "body metrics (weight, height, BMI, body fat), sleep stage durations, and "
-                + "recent workouts. Times use the device's local days. The device may prompt "
-                + "for permission the first time; a metric that returns \"no data\" may mean "
-                + "the user has nothing recorded OR hasn't granted access to it — if you need "
-                + "it, ask them to enable it for Phantasm in Settings > Health. Default range "
-                + "is today when none is given.",
+                + "workouts, heart rate, sleep, weight, nutrition, hydration, etc. Returns "
+                + "aggregated summaries over a time range: totals for activity (steps, "
+                + "distance, active energy burned, exercise minutes) and nutrition intake "
+                + "(dietary energy consumed, protein, carbs, fats, fiber, sugar, water, "
+                + "caffeine, sodium, cholesterol, vitamins, and minerals), averages with "
+                + "min/max for vitals (heart rate, resting "
+                + "heart rate, HRV, respiratory rate, blood oxygen), basal body temperature "
+                + "averages/min/max, the latest value for body metrics (weight, height, BMI, "
+                + "body fat), sleep stage durations, cycle tracking/reproductive-health "
+                + "event counts with value breakdowns (flow intensity, mucus quality, test "
+                + "results, pregnancy/lactation/contraceptive records), and recent workouts. "
+                + "`sexual_activity` returns the count of sexual activity events recorded in "
+                + "HealthKit, with protection-used counts when recorded. "
+                + "Use `dietary_energy` for calories eaten/drunk; use `active_energy` for "
+                + "calories burned. Pass `granularity: \"daily\"` when you need trend or "
+                + "day-by-day evidence instead of only a range summary. Times use the "
+                + "device's local days. The device may prompt for permission the first time; "
+                + "a metric that returns \"no data\" may mean the user has nothing recorded "
+                + "OR hasn't granted access to it — if you need it, ask them to enable it "
+                + "for Phantasm in Settings > Health. Default range is today when none is "
+                + "given.",
             parameters: .object([
                 "type": .string("object"),
                 "properties": .object([
@@ -258,6 +501,14 @@ public struct HealthTool: AutoResolvedTool {
                         "description": .string(
                             "Convenience time range. Omit to use today, or override with "
                                 + "start_date/end_date."),
+                    ]),
+                    "granularity": .object([
+                        "type": .string("string"),
+                        "enum": .array(granularityValues),
+                        "description": .string(
+                            "How much detail to return. Use `summary` for compact totals "
+                                + "(default). Use `daily` for per-day buckets when comparing "
+                                + "trends, consistency, or changes over time."),
                     ]),
                     "start_date": .object([
                         "type": .string("string"),
@@ -296,6 +547,7 @@ public struct HealthTool: AutoResolvedTool {
     private struct Args: Decodable {
         let metrics: [String]?
         let period: String?
+        let granularity: String?
         let start_date: String?
         let end_date: String?
     }
@@ -313,11 +565,14 @@ public struct HealthTool: AutoResolvedTool {
         let metrics = (args.metrics ?? []).compactMap(HealthMetric.init(rawValue:))
         guard !metrics.isEmpty else { return nil }
 
+        let granularity = args.granularity
+            .flatMap(HealthGranularity.init(rawValue:)) ?? .summary
         let range = dateRange(
             period: args.period, startDate: args.start_date, endDate: args.end_date,
             now: now, calendar: calendar
         )
-        return HealthQuery(metrics: metrics, start: range.start, end: range.end)
+        return HealthQuery(
+            metrics: metrics, start: range.start, end: range.end, granularity: granularity)
     }
 
     /// Resolve the half-open `[start, end)` range. Explicit start/end win over
@@ -397,7 +652,9 @@ public struct HealthTool: AutoResolvedTool {
         case .quantity(let summary):
             return quantityLine(result.metric, summary, query: query, calendar: calendar)
         case .sleep(let sleep):
-            return sleepLine(sleep)
+            return sleepLine(sleep, calendar: calendar)
+        case .events(let events):
+            return eventLine(events, query: query, calendar: calendar)
         case .workouts(let workouts):
             return workoutsLine(workouts, calendar: calendar)
         case .noData:
@@ -411,47 +668,172 @@ public struct HealthTool: AutoResolvedTool {
         _ metric: HealthMetric, _ summary: HealthSummary, query: HealthQuery, calendar: Calendar
     ) -> String {
         let unit = summary.unit
+        let text: String
         switch metric.kind {
         case .cumulative:
             guard let sum = summary.sum else { return "no data in range" }
-            var text = "\(number(sum)) \(unit) total"
+            var total = "\(number(sum)) \(unit) total"
             let days = dayCount(query, calendar: calendar)
             if days > 1 {
-                text += " (avg \(number(sum / Double(days)))/day)"
+                total += " (avg \(number(sum / Double(days)))/day)"
             }
-            return text
+            text = total
         case .discrete:
             guard let average = summary.average else { return "no data in range" }
-            var text = "avg \(number(average)) \(unit)"
+            var averageText = "avg \(number(average)) \(unit)"
             if let lo = summary.minimum, let hi = summary.maximum {
-                text += " (min \(number(lo)), max \(number(hi)))"
+                averageText += " (min \(number(lo)), max \(number(hi)))"
             }
-            return text
+            text = averageText
         case .latest:
             guard let latest = summary.latest else { return "no data in range" }
-            var text = "\(number(latest)) \(unit)"
+            var latestText = "\(number(latest)) \(unit)"
             if let date = summary.latestDate {
-                text += " (as of \(shortDate(date, calendar: calendar)))"
+                latestText += " (as of \(shortDate(date, calendar: calendar)))"
             }
-            return text
-        case .sleep, .workouts:
+            text = latestText
+        case .sleep, .workouts, .events:
             return "no data in range"
         }
+        guard query.granularity == .daily, !summary.daily.isEmpty else { return text }
+        return text + "\n  daily: " + quantityDailyLine(
+            metric, summary.daily, unit: unit, calendar: calendar)
     }
 
-    private static func sleepLine(_ sleep: HealthSleepSummary) -> String {
-        guard sleep.asleep != nil || sleep.inBed != nil else { return "no data in range" }
+    private static func sleepLine(_ sleep: HealthSleepSummary, calendar: Calendar) -> String {
+        guard hasSleepValues(
+            asleep: sleep.asleep, inBed: sleep.inBed, deep: sleep.deep, rem: sleep.rem,
+            core: sleep.core, awake: sleep.awake
+        ) else { return "no data in range" }
+        var text = sleepText(
+            asleep: sleep.asleep, inBed: sleep.inBed, deep: sleep.deep, rem: sleep.rem,
+            core: sleep.core, awake: sleep.awake)
+        if !sleep.daily.isEmpty {
+            text += "\n  daily: " + sleepDailyLine(sleep.daily, calendar: calendar)
+        }
+        return text
+    }
+
+    private static func quantityDailyLine(
+        _ metric: HealthMetric, _ buckets: [HealthQuantityBucket], unit: String, calendar: Calendar
+    ) -> String {
+        buckets.map { bucket in
+            let day = shortDate(bucket.start, calendar: calendar)
+            switch metric.kind {
+            case .cumulative:
+                return "\(day) \(number(bucket.sum ?? 0)) \(unit)"
+            case .discrete:
+                var text = "\(day) avg \(number(bucket.average ?? 0)) \(unit)"
+                if let lo = bucket.minimum, let hi = bucket.maximum {
+                    text += " (min \(number(lo)), max \(number(hi)))"
+                }
+                return text
+            case .latest:
+                var text = "\(day) \(number(bucket.latest ?? 0)) \(unit)"
+                if let latestDate = bucket.latestDate,
+                   !calendar.isDate(latestDate, inSameDayAs: bucket.start) {
+                    text += " (as of \(shortDate(latestDate, calendar: calendar)))"
+                }
+                return text
+            case .sleep, .workouts, .events:
+                return "\(day) no data"
+            }
+        }.joined(separator: "; ")
+    }
+
+    private static func sleepDailyLine(_ buckets: [HealthSleepBucket], calendar: Calendar) -> String {
+        buckets.map { bucket in
+            let text = sleepText(
+                asleep: bucket.asleep, inBed: bucket.inBed, deep: bucket.deep, rem: bucket.rem,
+                core: bucket.core, awake: bucket.awake)
+            return "\(shortDay(bucket.day, calendar: calendar)): \(text)"
+        }.joined(separator: "; ")
+    }
+
+    private static func sleepText(
+        asleep: TimeInterval?, inBed: TimeInterval?, deep: TimeInterval?,
+        rem: TimeInterval?, core: TimeInterval?, awake: TimeInterval?
+    ) -> String {
         var parts: [String] = []
-        if let asleep = sleep.asleep { parts.append("\(duration(asleep)) asleep") }
-        if let inBed = sleep.inBed { parts.append("\(duration(inBed)) in bed") }
+        if let asleep { parts.append("\(duration(asleep)) asleep") }
+        if let inBed { parts.append("\(duration(inBed)) in bed") }
         var stages: [String] = []
-        if let deep = sleep.deep { stages.append("deep \(duration(deep))") }
-        if let rem = sleep.rem { stages.append("REM \(duration(rem))") }
-        if let core = sleep.core { stages.append("core \(duration(core))") }
-        if let awake = sleep.awake { stages.append("awake \(duration(awake))") }
+        if let deep { stages.append("deep \(duration(deep))") }
+        if let rem { stages.append("REM \(duration(rem))") }
+        if let core { stages.append("core \(duration(core))") }
+        if let awake { stages.append("awake \(duration(awake))") }
+        if parts.isEmpty { return stages.joined(separator: ", ") }
         var text = parts.joined(separator: ", ")
         if !stages.isEmpty { text += " [\(stages.joined(separator: ", "))]" }
         return text
+    }
+
+    private static func hasSleepValues(
+        asleep: TimeInterval?, inBed: TimeInterval?, deep: TimeInterval?,
+        rem: TimeInterval?, core: TimeInterval?, awake: TimeInterval?
+    ) -> Bool {
+        asleep != nil || inBed != nil || deep != nil || rem != nil || core != nil || awake != nil
+    }
+
+    private static func eventLine(
+        _ summary: HealthEventSummary, query: HealthQuery, calendar: Calendar
+    ) -> String {
+        guard summary.count > 0 else { return "no data in range" }
+        var text = "\(eventCount(summary.count)) total"
+        let details = eventDetails(
+            breakdown: summary.breakdown,
+            protectedCount: summary.protectedCount,
+            unprotectedCount: summary.unprotectedCount,
+            unknownCount: summary.protectionUnknownCount)
+        if !details.isEmpty {
+            text += " (\(details.joined(separator: ", ")))"
+        }
+        guard query.granularity == .daily, !summary.daily.isEmpty else { return text }
+        text += "\n  daily: " + summary.daily.map { bucket in
+            var day = "\(shortDate(bucket.day, calendar: calendar)) \(eventCount(bucket.count))"
+            let details = eventDetails(
+                breakdown: bucket.breakdown,
+                protectedCount: bucket.protectedCount,
+                unprotectedCount: bucket.unprotectedCount,
+                unknownCount: bucket.protectionUnknownCount)
+            if !details.isEmpty {
+                day += " (\(details.joined(separator: ", ")))"
+            }
+            return day
+        }.joined(separator: "; ")
+        return text
+    }
+
+    private static func eventCount(_ count: Int) -> String {
+        "\(count) \(count == 1 ? "event" : "events")"
+    }
+
+    private static func eventDetails(
+        breakdown: [HealthEventBreakdown],
+        protectedCount: Int?,
+        unprotectedCount: Int?,
+        unknownCount: Int?
+    ) -> [String] {
+        breakdownText(breakdown) + protectionText(
+            protectedCount: protectedCount,
+            unprotectedCount: unprotectedCount,
+            unknownCount: unknownCount)
+    }
+
+    private static func breakdownText(_ breakdown: [HealthEventBreakdown]) -> [String] {
+        breakdown.filter { $0.count > 0 }.map { "\($0.label) \($0.count)" }
+    }
+
+    private static func protectionText(
+        protectedCount: Int?, unprotectedCount: Int?, unknownCount: Int?
+    ) -> [String] {
+        var parts: [String] = []
+        if let protectedCount { parts.append("\(protectedCount) protected") }
+        if let unprotectedCount { parts.append("\(unprotectedCount) unprotected") }
+        if let unknownCount, unknownCount > 0 {
+            parts.append("\(unknownCount) protection unknown")
+        }
+        return parts
     }
 
     private static func workoutsLine(_ workouts: [HealthWorkout], calendar: Calendar) -> String {
@@ -490,6 +872,15 @@ public struct HealthTool: AutoResolvedTool {
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
         formatter.dateFormat = "MMM d, yyyy"
+        return formatter.string(from: date)
+    }
+
+    private static func shortDay(_ date: Date, calendar: Calendar) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "MMM d"
         return formatter.string(from: date)
     }
 

@@ -34,6 +34,40 @@ final class HealthToolTests: XCTestCase {
         XCTAssertEqual(parsed?.metrics, [.steps, .heartRate])
     }
 
+    func testParseKeepsNutritionMetrics() {
+        let parsed = HealthTool.parseQuery(
+            #"{"metrics":["dietary_energy","dietary_protein","dietary_water","dietary_sodium"]}"#,
+            now: day(2026, 6, 29),
+            calendar: utc
+        )
+        XCTAssertEqual(
+            parsed?.metrics,
+            [.dietaryEnergy, .dietaryProtein, .dietaryWater, .dietarySodium])
+    }
+
+    func testParseKeepsSexualActivityMetric() {
+        let parsed = HealthTool.parseQuery(
+            #"{"metrics":["sexual_activity"]}"#,
+            now: day(2026, 6, 29),
+            calendar: utc
+        )
+        XCTAssertEqual(parsed?.metrics, [.sexualActivity])
+    }
+
+    func testParseKeepsCycleTrackingMetrics() {
+        let parsed = HealthTool.parseQuery(
+            #"{"metrics":["menstrual_flow","ovulation_test_result","cervical_mucus_quality","basal_body_temperature","pregnancy_test_result"]}"#,
+            now: day(2026, 6, 29),
+            calendar: utc
+        )
+        XCTAssertEqual(
+            parsed?.metrics,
+            [
+                .menstrualFlow, .ovulationTestResult, .cervicalMucusQuality,
+                .basalBodyTemperature, .pregnancyTestResult,
+            ])
+    }
+
     func testParseReturnsNilWhenNoValidMetrics() {
         XCTAssertNil(HealthTool.parseQuery(#"{"metrics":[]}"#, now: day(2026, 6, 29), calendar: utc))
         XCTAssertNil(HealthTool.parseQuery(#"{"metrics":["nope"]}"#, now: day(2026, 6, 29), calendar: utc))
@@ -62,6 +96,19 @@ final class HealthToolTests: XCTestCase {
         XCTAssertEqual(range.end, day(2026, 6, 8)) // exclusive end = day after the 7th
     }
 
+    func testParseGranularityDefaultsToSummaryAndAcceptsDaily() {
+        let summary = HealthTool.parseQuery(
+            #"{"metrics":["steps"]}"#, now: day(2026, 6, 29), calendar: utc
+        )
+        XCTAssertEqual(summary?.granularity, .summary)
+
+        let daily = HealthTool.parseQuery(
+            #"{"metrics":["steps"],"granularity":"daily"}"#,
+            now: day(2026, 6, 29), calendar: utc
+        )
+        XCTAssertEqual(daily?.granularity, .daily)
+    }
+
     // MARK: - Formatting
 
     func testCumulativeFormatsTotalAndDailyAverageOverMultiDayRange() {
@@ -72,6 +119,52 @@ final class HealthToolTests: XCTestCase {
             results: [result], calendar: utc)
         XCTAssertTrue(block.contains("steps: 8,432 steps total"))
         XCTAssertTrue(block.contains("avg")) // 7-day range → daily average shown
+    }
+
+    func testCumulativeFormatsDailyBucketsWhenRequested() {
+        let result = HealthMetricResult(
+            metric: .steps,
+            reading: .quantity(HealthSummary(
+                unit: "steps",
+                sum: 3000,
+                daily: [
+                    HealthQuantityBucket(
+                        start: day(2026, 6, 28), end: day(2026, 6, 29), sum: 1000),
+                    HealthQuantityBucket(
+                        start: day(2026, 6, 29), end: day(2026, 6, 30), sum: 2000),
+                ])))
+        let block = HealthTool.format(
+            query: HealthQuery(
+                metrics: [.steps], start: day(2026, 6, 28), end: day(2026, 6, 30),
+                granularity: .daily),
+            results: [result],
+            calendar: utc)
+        XCTAssertTrue(block.contains("steps: 3,000 steps total"))
+        XCTAssertTrue(block.contains("daily: Jun 28, 2026 1,000 steps; Jun 29, 2026 2,000 steps"))
+    }
+
+    func testNutritionMetricsFormatAsCumulativeTotals() {
+        let block = HealthTool.format(
+            query: query(
+                [.dietaryEnergy, .dietaryProtein, .dietaryWater],
+                day(2026, 6, 29),
+                day(2026, 6, 30)),
+            results: [
+                HealthMetricResult(
+                    metric: .dietaryEnergy,
+                    reading: .quantity(HealthSummary(unit: "kcal", sum: 2180))),
+                HealthMetricResult(
+                    metric: .dietaryProtein,
+                    reading: .quantity(HealthSummary(unit: "g", sum: 132.5))),
+                HealthMetricResult(
+                    metric: .dietaryWater,
+                    reading: .quantity(HealthSummary(unit: "mL", sum: 2400))),
+            ],
+            calendar: utc)
+
+        XCTAssertTrue(block.contains("dietary_energy: 2,180 kcal total"))
+        XCTAssertTrue(block.contains("dietary_protein: 132.5 g total"))
+        XCTAssertTrue(block.contains("dietary_water: 2,400 mL total"))
     }
 
     func testCumulativeOmitsDailyAverageForSingleDay() {
@@ -117,6 +210,151 @@ final class HealthToolTests: XCTestCase {
         XCTAssertTrue(block.contains("sleep: 7h 12m asleep, 8h 2m in bed"))
         XCTAssertTrue(block.contains("deep 1h"))
         XCTAssertTrue(block.contains("REM 1h 30m"))
+    }
+
+    func testSleepFormatsDailyBucketsWhenRequested() {
+        let result = HealthMetricResult(
+            metric: .sleep,
+            reading: .sleep(HealthSleepSummary(
+                asleep: 50400,
+                inBed: 54000,
+                daily: [
+                    HealthSleepBucket(day: day(2026, 6, 28), asleep: 21600, inBed: 23400),
+                    HealthSleepBucket(
+                        day: day(2026, 6, 29), asleep: 28800, inBed: 30600, deep: 4200),
+                ])))
+        let block = HealthTool.format(
+            query: HealthQuery(
+                metrics: [.sleep], start: day(2026, 6, 28), end: day(2026, 6, 30),
+                granularity: .daily),
+            results: [result],
+            calendar: utc)
+        XCTAssertTrue(block.contains("sleep: 14h asleep, 15h in bed"))
+        XCTAssertTrue(block.contains("daily: Jun 28: 6h asleep, 6h 30m in bed; Jun 29: 8h asleep, 8h 30m in bed [deep 1h 10m]"))
+    }
+
+    func testSexualActivityFormatsEventCountAndProtectionCounts() {
+        let result = HealthMetricResult(
+            metric: .sexualActivity,
+            reading: .events(HealthEventSummary(
+                count: 3,
+                protectedCount: 2,
+                unprotectedCount: 0,
+                protectionUnknownCount: 1)))
+        let block = HealthTool.format(
+            query: query([.sexualActivity], day(2026, 6, 22), day(2026, 6, 30)),
+            results: [result],
+            calendar: utc)
+
+        XCTAssertTrue(block.contains(
+            "sexual_activity: 3 events total (2 protected, 0 unprotected, 1 protection unknown)"))
+    }
+
+    func testSexualActivityFormatsDailyBucketsWhenRequested() {
+        let result = HealthMetricResult(
+            metric: .sexualActivity,
+            reading: .events(HealthEventSummary(
+                count: 3,
+                protectedCount: 1,
+                unprotectedCount: 1,
+                protectionUnknownCount: 1,
+                daily: [
+                    HealthEventBucket(
+                        day: day(2026, 6, 28),
+                        count: 1,
+                        protectedCount: 1,
+                        unprotectedCount: 0,
+                        protectionUnknownCount: 0),
+                    HealthEventBucket(
+                        day: day(2026, 6, 29),
+                        count: 2,
+                        protectedCount: 0,
+                        unprotectedCount: 1,
+                        protectionUnknownCount: 1),
+                ])))
+        let block = HealthTool.format(
+            query: HealthQuery(
+                metrics: [.sexualActivity],
+                start: day(2026, 6, 28),
+                end: day(2026, 6, 30),
+                granularity: .daily),
+            results: [result],
+            calendar: utc)
+
+        XCTAssertTrue(block.contains("sexual_activity: 3 events total"))
+        XCTAssertTrue(block.contains(
+            "daily: Jun 28, 2026 1 event (1 protected, 0 unprotected); Jun 29, 2026 2 events (0 protected, 1 unprotected, 1 protection unknown)"))
+    }
+
+    func testCycleTrackingFormatsEventBreakdown() {
+        let result = HealthMetricResult(
+            metric: .menstrualFlow,
+            reading: .events(HealthEventSummary(
+                count: 4,
+                breakdown: [
+                    HealthEventBreakdown(label: "light", count: 1),
+                    HealthEventBreakdown(label: "heavy", count: 2),
+                    HealthEventBreakdown(label: "cycle_start", count: 1),
+                ])))
+        let block = HealthTool.format(
+            query: query([.menstrualFlow], day(2026, 6, 22), day(2026, 6, 30)),
+            results: [result],
+            calendar: utc)
+
+        XCTAssertTrue(block.contains(
+            "menstrual_flow: 4 events total (light 1, heavy 2, cycle_start 1)"))
+    }
+
+    func testCycleTrackingFormatsDailyBreakdownsWhenRequested() {
+        let result = HealthMetricResult(
+            metric: .pregnancyTestResult,
+            reading: .events(HealthEventSummary(
+                count: 3,
+                breakdown: [
+                    HealthEventBreakdown(label: "negative", count: 1),
+                    HealthEventBreakdown(label: "positive", count: 1),
+                    HealthEventBreakdown(label: "indeterminate", count: 1),
+                ],
+                daily: [
+                    HealthEventBucket(
+                        day: day(2026, 6, 28),
+                        count: 1,
+                        breakdown: [HealthEventBreakdown(label: "negative", count: 1)]),
+                    HealthEventBucket(
+                        day: day(2026, 6, 29),
+                        count: 2,
+                        breakdown: [
+                            HealthEventBreakdown(label: "positive", count: 1),
+                            HealthEventBreakdown(label: "indeterminate", count: 1),
+                        ]),
+                ])))
+        let block = HealthTool.format(
+            query: HealthQuery(
+                metrics: [.pregnancyTestResult],
+                start: day(2026, 6, 28),
+                end: day(2026, 6, 30),
+                granularity: .daily),
+            results: [result],
+            calendar: utc)
+
+        XCTAssertTrue(block.contains(
+            "pregnancy_test_result: 3 events total (negative 1, positive 1, indeterminate 1)"))
+        XCTAssertTrue(block.contains(
+            "daily: Jun 28, 2026 1 event (negative 1); Jun 29, 2026 2 events (positive 1, indeterminate 1)"))
+    }
+
+    func testBasalBodyTemperatureFormatsAsDiscreteMetric() {
+        let result = HealthMetricResult(
+            metric: .basalBodyTemperature,
+            reading: .quantity(HealthSummary(
+                unit: "degC", average: 36.6, minimum: 36.3, maximum: 36.9)))
+        let block = HealthTool.format(
+            query: query([.basalBodyTemperature], day(2026, 6, 29), day(2026, 6, 30)),
+            results: [result],
+            calendar: utc)
+
+        XCTAssertTrue(block.contains(
+            "basal_body_temperature: avg 36.6 degC (min 36.3, max 36.9)"))
     }
 
     func testWorkoutsFormatsCountActivityAndMetrics() {
