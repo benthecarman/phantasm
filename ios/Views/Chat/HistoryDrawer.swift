@@ -1,6 +1,7 @@
 import GRDBQuery
 import PhantasmKit
 import SwiftUI
+import UIKit
 
 /// The slide-over history pane (Claude-style): a "new chat" affordance at the
 /// top, a full-text search field, the reverse-chronological conversation list,
@@ -81,37 +82,50 @@ struct HistoryDrawer: View {
                 }
             }
             ForEach(results) { result in
-                Button {
-                    onSelect(result.conversation)
-                } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(result.conversation.title).lineLimit(1)
-                        if let snippet = result.snippet, !snippet.isEmpty {
-                            Text(snippet)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        } else {
-                            Text(result.conversation.updatedAt, format: .relative(presentation: .named))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .listRowBackground(
-                    result.conversation.id == selection?.id ? Color.accentColor.opacity(0.12) : Color.clear
-                )
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button(role: .destructive) {
-                        Haptics.notify(.warning)
-                        deleteConversation(result.conversation)
-                    } label: {
-                        Label("Delete", systemImage: "trash")
+                let isSelected = result.conversation.id == selection?.id
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(result.conversation.title).lineLimit(1)
+                    if let snippet = result.snippet, !snippet.isEmpty {
+                        Text(snippet)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else {
+                        Text(result.conversation.updatedAt, format: .relative(presentation: .named))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // The row used to lean on List's default insets for padding; we
+                // zero those out below (so the red fill reaches the edges) and
+                // reinstate the spacing here on the content itself.
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
+                // Opaque row surface (selection tint composited over the drawer's
+                // own color) so the swipe's red fill stays hidden until the row is
+                // dragged aside. Must sit *under* the swipe modifier.
+                .background {
+                    ZStack {
+                        Color(.secondarySystemBackground)
+                        if isSelected { Color.accentColor.opacity(0.12) }
+                    }
+                }
+                .swipeToDelete {
+                    Haptics.notify(.warning)
+                    deleteConversation(result.conversation)
+                }
+                // A tap selects the chat. Unlike a Button, a tap gesture fails once
+                // the finger moves past its slop, so a swipe-to-delete no longer
+                // also fires selection (which was opening the chat + closing the
+                // drawer mid-delete).
+                .onTapGesture { onSelect(result.conversation) }
+                // Zero insets + hidden separator let the red fill span the entire
+                // row edge-to-edge instead of the system's inset pill.
+                .listRowInsets(EdgeInsets())
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
             }
         }
         .listStyle(.plain)
@@ -173,5 +187,123 @@ struct HistoryDrawer: View {
                 try? await store.deleteConversation(id: id)
             }
         }
+    }
+}
+
+// MARK: - Swipe to delete
+
+private extension View {
+    /// Full-bleed swipe-to-delete: dragging the row leftward reveals a red fill
+    /// that spans the *entire* row (no system inset "pill", no "Delete" label —
+    /// just a trash glyph). Releasing past the commit threshold runs `action`; a
+    /// shorter drag springs back.
+    func swipeToDelete(action: @escaping () -> Void) -> some View {
+        modifier(SwipeToDelete(action: action))
+    }
+}
+
+private struct SwipeToDelete: ViewModifier {
+    let action: () -> Void
+
+    @State private var offset: CGFloat = 0
+    /// Whether the drag has crossed `commitThreshold` — drives the "armed" cue
+    /// (icon scale) and gates the one-shot haptic so it fires only on crossing.
+    @State private var armed = false
+    /// Measured row width, so a committed swipe slides the content fully off and
+    /// the red fills the rest of the row.
+    @State private var rowWidth: CGFloat = 0
+    /// Horizontal-vs-vertical intent, decided once at the start of a drag (nil =
+    /// undecided). Deciding up front — instead of re-checking width-vs-height
+    /// every frame — keeps the row tracking the finger through the final pixels of
+    /// a slide-back, where the cumulative horizontal delta shrinks below any
+    /// incidental vertical drift and a per-frame guard would freeze it.
+    @State private var horizontalDrag: Bool?
+    /// Reused, pre-prepared generator — firing it is cheap, unlike building a
+    /// fresh `UIImpactFeedbackGenerator` + `prepare()` on the main thread mid-drag
+    /// (that synchronous spin-up was the stall felt when crossing the threshold).
+    @State private var armHaptic = UIImpactFeedbackGenerator(style: .rigid)
+
+    /// Leftward drag distance past which releasing commits the delete.
+    private let commitThreshold: CGFloat = 100
+
+    /// Icon scale derived purely from `offset` (1 → 1.25 across a short band just
+    /// past the threshold). Keeping it a function of the drag — rather than a
+    /// spring keyed on a bool — means nothing animates mid-drag, so the row tracks
+    /// the finger 1:1 with no stall when sliding back.
+    private var iconScale: CGFloat {
+        1 + min(0.25, max(0, -offset - commitThreshold) / 40 * 0.25)
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .offset(x: offset)
+            // Sits behind the opaque row content, filling the whole row. Only the
+            // strip uncovered as the row slides left actually shows red.
+            .background {
+                Color.red
+                    .overlay(alignment: .trailing) {
+                        Image(systemName: "trash")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .scaleEffect(iconScale)
+                            .padding(.trailing, 24)
+                            .opacity(Double(min(1, -offset / commitThreshold)))
+                    }
+            }
+            .background {
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear { rowWidth = geo.size.width }
+                        .onChange(of: geo.size.width) { _, newValue in rowWidth = newValue }
+                }
+            }
+            .clipped()
+            .simultaneousGesture(
+                // simultaneous (not exclusive) so the List keeps scrolling
+                // vertically and the row's tap still selects the chat.
+                DragGesture(minimumDistance: 12)
+                    .onChanged { value in
+                        // Decide direction once, on the first movement, then commit
+                        // to it for the rest of the drag (so the final pixels of a
+                        // slide-back still track the finger).
+                        if horizontalDrag == nil {
+                            horizontalDrag = abs(value.translation.width) > abs(value.translation.height)
+                            if horizontalDrag == true { armHaptic.prepare() }
+                        }
+                        guard horizontalDrag == true else { return }
+                        // Track the finger but clamp closed at 0 — this lets you
+                        // drag back the whole way to fully shut it.
+                        offset = min(0, value.translation.width)
+                        let nowArmed = -offset >= commitThreshold
+                        if nowArmed != armed {
+                            // Tick only when *arming* (crossing far enough), not
+                            // when backing off — a haptic on the slide-back is what
+                            // stalled it near the threshold.
+                            if nowArmed {
+                                armHaptic.impactOccurred()
+                                armHaptic.prepare()
+                            }
+                            armed = nowArmed
+                        }
+                    }
+                    .onEnded { _ in
+                        horizontalDrag = nil
+                        if offset < -commitThreshold {
+                            // Slide the content fully off so the red fills the rest
+                            // of the row, then delete after a short beat — long
+                            // enough to register the fill, short enough not to hang.
+                            let target = rowWidth > 0 ? -rowWidth : -2000
+                            withAnimation(.easeOut(duration: 0.18)) { offset = target }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                                action()
+                            }
+                        } else {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                offset = 0
+                            }
+                            armed = false
+                        }
+                    }
+            )
     }
 }
