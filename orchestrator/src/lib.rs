@@ -17,24 +17,34 @@ pub mod state;
 pub mod tools;
 pub mod turn_registry;
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::warn;
 
 use crate::config::Config;
-use crate::ollama::{OllamaClient, UpstreamChatBackend, UpstreamKind};
-use crate::openai::OpenAICompatibleClient;
+use crate::ollama::{UpstreamChatBackend, UpstreamKind};
 use crate::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo, ToolSelector};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpstreamDetection {
     pub kind: UpstreamKind,
     pub models: Vec<String>,
+    pub backend: UpstreamChatBackend,
+}
+
+impl fmt::Debug for UpstreamDetection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpstreamDetection")
+            .field("kind", &self.kind)
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 /// Detect which upstream chat API is exposed by `UPSTREAM_BASE_URL`.
@@ -44,90 +54,82 @@ pub struct UpstreamDetection {
 /// `/api/tags` is unavailable, fall back to OpenAI-compatible `/v1/models`.
 pub async fn detect_upstream(cfg: &Config, http: &reqwest::Client) -> UpstreamDetection {
     if let Some(kind) = cfg.upstream_kind {
-        let models = match kind {
-            UpstreamKind::NativeOllama => {
-                let client = OllamaClient::new(http.clone(), cfg.upstream_base.clone());
-                tokio::time::timeout(PROBE_TIMEOUT, client.list_models())
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-            }
-            UpstreamKind::OpenAICompatible => tokio::time::timeout(
-                PROBE_TIMEOUT,
-                OpenAICompatibleClient::list_models(
-                    http,
-                    &cfg.upstream_base,
-                    cfg.upstream_api_key.as_deref(),
-                ),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok),
-        }
-        .unwrap_or_else(|| {
+        let backend = UpstreamChatBackend::from_config(kind, http.clone(), cfg);
+        let models = probe_backend_models(&backend).await.unwrap_or_else(|| {
             warn!(
                 upstream = ?kind,
                 "could not list configured upstream models; continuing with configured model list"
             );
             Vec::new()
         });
-        return UpstreamDetection { kind, models };
-    }
-
-    let probe_ollama = OllamaClient::new(http.clone(), cfg.upstream_base.clone());
-    if let Ok(Ok(models)) = tokio::time::timeout(PROBE_TIMEOUT, probe_ollama.list_models()).await {
         return UpstreamDetection {
-            kind: UpstreamKind::NativeOllama,
+            kind,
             models,
+            backend,
         };
     }
 
-    if let Ok(Ok(models)) = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        OpenAICompatibleClient::list_models(
-            http,
-            &cfg.upstream_base,
-            cfg.upstream_api_key.as_deref(),
-        ),
-    )
-    .await
-    {
+    let native = UpstreamChatBackend::from_config(UpstreamKind::NativeOllama, http.clone(), cfg);
+    if let Some(models) = probe_backend_models(&native).await {
+        return UpstreamDetection {
+            kind: UpstreamKind::NativeOllama,
+            models,
+            backend: native,
+        };
+    }
+
+    let openai =
+        UpstreamChatBackend::from_config(UpstreamKind::OpenAICompatible, http.clone(), cfg);
+    if let Some(models) = probe_backend_models(&openai).await {
         return UpstreamDetection {
             kind: UpstreamKind::OpenAICompatible,
             models,
+            backend: openai,
         };
     }
 
     warn!("could not detect upstream type; defaulting to native Ollama mode");
+    let backend = UpstreamChatBackend::from_config(UpstreamKind::NativeOllama, http.clone(), cfg);
     UpstreamDetection {
         kind: UpstreamKind::NativeOllama,
         models: Vec::new(),
+        backend,
     }
+}
+
+async fn probe_backend_models(backend: &UpstreamChatBackend) -> Option<Vec<String>> {
+    tokio::time::timeout(PROBE_TIMEOUT, backend.list_models())
+        .await
+        .ok()
+        .and_then(Result::ok)
 }
 
 /// Compute the capabilities manifest from config + bounded startup probes (FR-O1).
 pub async fn probe_capabilities(
     cfg: &Config,
     http: &reqwest::Client,
-    upstream: &UpstreamDetection,
+    upstream: &UpstreamChatBackend,
+    probed_models: Option<&[String]>,
 ) -> CapabilitySnapshot {
     let models = if !cfg.models.is_empty() {
         cfg.models.clone()
-    } else if !upstream.models.is_empty() {
-        upstream.models.clone()
+    } else if let Some(models) = probed_models.filter(|models| !models.is_empty()) {
+        models.to_vec()
+    } else if let Some(models) = probe_backend_models(upstream)
+        .await
+        .filter(|models| !models.is_empty())
+    {
+        models
     } else {
-        warn!("could not list upstream models at startup; advertising none");
+        warn!("could not list upstream models; advertising none");
         Vec::new()
     };
 
     // Per-model vision + tool support is only knowable for native Ollama (via
     // `/api/show`). For an OpenAI-compatible upstream we omit model capabilities
     // so clients can distinguish unknown from known-unsupported.
-    let model_metadata = match upstream.kind {
-        UpstreamKind::NativeOllama => {
-            let client = OllamaClient::new(http.clone(), cfg.upstream_base.clone());
-            detect_model_metadata(&client, &models).await
-        }
+    let model_metadata = match upstream.kind() {
+        UpstreamKind::NativeOllama => detect_model_metadata(upstream, &models).await,
         UpstreamKind::OpenAICompatible => vec![(None, None); models.len()],
     };
     let models: Vec<ModelInfo> = models
@@ -290,12 +292,12 @@ fn tool_selector_id(tool: &str) -> Option<&'static str> {
 /// timeout). Capability field names mirror the upstream names (e.g.
 /// `"completion"`, `"vision"`, `"tools"`, `"thinking"`).
 async fn detect_model_metadata(
-    client: &OllamaClient,
+    upstream: &UpstreamChatBackend,
     models: &[String],
 ) -> Vec<(Option<ModelCapabilities>, Option<u64>)> {
     let checks = models.iter().map(|model| async move {
-        match tokio::time::timeout(PROBE_TIMEOUT, client.model_metadata(model)).await {
-            Ok(Ok(metadata)) => (
+        match tokio::time::timeout(PROBE_TIMEOUT, upstream.model_metadata(model)).await {
+            Ok(Some(Ok(metadata))) => (
                 Some(ModelCapabilities::from_names(&metadata.capabilities)),
                 metadata.context_length,
             ),
@@ -315,34 +317,39 @@ pub async fn probe_reachable(http: &reqwest::Client, base: &str, path: &str) -> 
     )
 }
 
-/// Build `AppState` from a loaded config (shared by `main` and tests).
+/// HTTP client used for upstream calls. Per-read timeout lets streaming responses
+/// run indefinitely as long as bytes keep arriving, while stalled backends release
+/// their turn.
+pub fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
+        .build()
+}
+
+/// Build `AppState` from a loaded config and explicit upstream kind. Kept for
+/// tests that force one provider; production should reuse the backend returned by
+/// [`detect_upstream`] via [`build_state_with_upstream`].
 pub fn build_state(
     cfg: Arc<Config>,
     capabilities: Arc<CapabilitySnapshot>,
     upstream_kind: UpstreamKind,
 ) -> state::AppState {
+    let http = build_http_client().expect("building HTTP client");
+    let upstream = UpstreamChatBackend::from_config(upstream_kind, http.clone(), &cfg);
+    build_state_with_upstream(cfg, capabilities, http, upstream)
+}
+
+/// Build `AppState` using an already-selected upstream backend. This keeps
+/// startup detection, chat, warm, and capability refreshes pinned to one provider
+/// kind unless the process is restarted with different config.
+pub fn build_state_with_upstream(
+    cfg: Arc<Config>,
+    capabilities: Arc<CapabilitySnapshot>,
+    http: reqwest::Client,
+    upstream: UpstreamChatBackend,
+) -> state::AppState {
     let capabilities = state::CapabilitiesCache::new(capabilities);
-    let http = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        // Per-read only: streaming responses may run indefinitely as long as
-        // bytes keep arriving, but a stalled backend will release its turn.
-        .read_timeout(UPSTREAM_READ_TIMEOUT)
-        .build()
-        .expect("building HTTP client");
-    let upstream = match upstream_kind {
-        UpstreamKind::NativeOllama => UpstreamChatBackend::NativeOllama(OllamaClient::new(
-            http.clone(),
-            cfg.upstream_base.clone(),
-        )),
-        UpstreamKind::OpenAICompatible => {
-            UpstreamChatBackend::OpenAICompatible(OpenAICompatibleClient::new(
-                http.clone(),
-                &cfg.upstream_base,
-                cfg.upstream_api_key.as_deref(),
-                cfg.upstream_thinking_hint,
-            ))
-        }
-    };
     // Stand up the server-hosted image store when configured. A configured-but-
     // unwritable directory degrades to inline delivery (logged) rather than
     // taking down startup. The signed-URL HMAC key is the auth token when one is

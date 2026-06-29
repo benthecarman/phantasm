@@ -68,7 +68,9 @@ impl RealHarness {
             .ok()
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
 
-        let capabilities = Arc::new(probe_capabilities(&cfg, &probe_http, &upstream).await);
+        let capabilities = Arc::new(
+            probe_capabilities(&cfg, &probe_http, &upstream.backend, Some(&upstream.models)).await,
+        );
         let cfg = Arc::new(cfg);
         let state = build_state(cfg, capabilities, upstream.kind);
         let base = spawn(routes::router(state)).await;

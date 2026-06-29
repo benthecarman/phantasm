@@ -6,7 +6,9 @@ pub use client::OllamaClient;
 use futures_util::Stream;
 use serde_json::{Map, Value};
 
+use crate::config::Config;
 use crate::error::AppError;
+use crate::ollama::types::ModelMetadata;
 use crate::openai::types::ChatMessage;
 use crate::openai::OpenAICompatibleClient;
 
@@ -78,10 +80,50 @@ pub enum UpstreamChatBackend {
 }
 
 impl UpstreamChatBackend {
+    pub fn from_config(kind: UpstreamKind, http: reqwest::Client, cfg: &Config) -> Self {
+        match kind {
+            UpstreamKind::NativeOllama => UpstreamChatBackend::NativeOllama(OllamaClient::new(
+                http,
+                cfg.upstream_base.clone(),
+            )),
+            UpstreamKind::OpenAICompatible => {
+                UpstreamChatBackend::OpenAICompatible(OpenAICompatibleClient::new(
+                    http,
+                    &cfg.upstream_base,
+                    cfg.upstream_api_key.as_deref(),
+                    cfg.upstream_thinking_hint,
+                ))
+            }
+        }
+    }
+
     pub fn kind(&self) -> UpstreamKind {
         match self {
             UpstreamChatBackend::NativeOllama(_) => UpstreamKind::NativeOllama,
             UpstreamChatBackend::OpenAICompatible(_) => UpstreamKind::OpenAICompatible,
+        }
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<String>, AppError> {
+        match self {
+            UpstreamChatBackend::NativeOllama(client) => client.list_models().await,
+            UpstreamChatBackend::OpenAICompatible(client) => client.list_models().await,
+        }
+    }
+
+    pub async fn model_metadata(&self, model: &str) -> Option<Result<ModelMetadata, AppError>> {
+        match self {
+            UpstreamChatBackend::NativeOllama(client) => Some(client.model_metadata(model).await),
+            UpstreamChatBackend::OpenAICompatible(_) => None,
+        }
+    }
+
+    pub async fn warm_model(&self, model: &str) -> Result<bool, AppError> {
+        match self {
+            UpstreamChatBackend::NativeOllama(client) => {
+                client.warm_model(model).await.map(|()| true)
+            }
+            UpstreamChatBackend::OpenAICompatible(_) => Ok(false),
         }
     }
 }

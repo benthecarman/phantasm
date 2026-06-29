@@ -9,9 +9,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
 use phantasm_orchestrator::config::{Config, LogFormat};
-use phantasm_orchestrator::ollama::UpstreamKind;
-use phantasm_orchestrator::routes;
+use phantasm_orchestrator::ollama::{UpstreamChatBackend, UpstreamKind};
 use phantasm_orchestrator::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo};
+use phantasm_orchestrator::{probe_capabilities, routes};
 use tokio::sync::Mutex;
 
 const TOKEN: &str = "test-token";
@@ -35,6 +35,23 @@ fn mock_ollama() -> Router {
 
 fn mock_ollama_recording(requests: RecordedRequests) -> Router {
     mock_ollama_with_recorder(Some(requests))
+}
+
+fn mock_ollama_show_error() -> Router {
+    Router::new()
+        .route(
+            "/api/tags",
+            get(|| async { axum::Json(serde_json::json!({"models":[{"name":"m"}]})) }),
+        )
+        .route(
+            "/api/show",
+            post(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({"error":"missing model"})),
+                )
+            }),
+        )
 }
 
 fn mock_ollama_app_tool_call() -> Router {
@@ -794,6 +811,7 @@ async fn detects_openai_compatible_upstream_when_tags_absent() {
     let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
 
     assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(detection.backend.kind(), detection.kind);
     assert_eq!(detection.models, ["m".to_string()]);
 }
 
@@ -804,6 +822,7 @@ async fn detects_openai_compatible_upstream_when_tags_returns_json_error() {
     let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
 
     assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(detection.backend.kind(), detection.kind);
     assert_eq!(detection.models, ["m".to_string()]);
 }
 
@@ -815,6 +834,7 @@ async fn explicit_openai_compatible_upstream_skips_native_ollama_probe() {
     let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
 
     assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(detection.backend.kind(), detection.kind);
     assert_eq!(detection.models, ["m".to_string()]);
 }
 
@@ -826,7 +846,44 @@ async fn explicit_native_ollama_upstream_does_not_fallback_to_openai_compatible(
     let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
 
     assert_eq!(detection.kind, UpstreamKind::NativeOllama);
+    assert_eq!(detection.backend.kind(), detection.kind);
     assert!(detection.models.is_empty());
+}
+
+#[tokio::test]
+async fn native_capabilities_omit_metadata_when_show_errors() {
+    let ollama = spawn(mock_ollama_show_error()).await;
+    let mut cfg = test_config(&ollama);
+    cfg.models = vec![];
+    let http = reqwest::Client::new();
+    let detection = phantasm_orchestrator::detect_upstream(&cfg, &http).await;
+
+    let capabilities =
+        probe_capabilities(&cfg, &http, &detection.backend, Some(&detection.models)).await;
+
+    assert_eq!(capabilities.models.len(), 1);
+    assert_eq!(capabilities.models[0].id, "m");
+    assert!(
+        capabilities.models[0].capabilities.is_none(),
+        "failed /api/show metadata should be unknown, not known-unsupported"
+    );
+    assert_eq!(capabilities.models[0].context_length, None);
+}
+
+#[tokio::test]
+async fn capability_refresh_uses_fixed_backend_kind() {
+    let openai = spawn(mock_openai_compatible()).await;
+    let mut cfg = test_config(&openai);
+    cfg.models = vec![];
+    let http = reqwest::Client::new();
+    let native = UpstreamChatBackend::from_config(UpstreamKind::NativeOllama, http.clone(), &cfg);
+
+    let capabilities = probe_capabilities(&cfg, &http, &native, None).await;
+
+    assert!(
+        capabilities.models.is_empty(),
+        "fixed native refresh must not redetect /v1/models from the same base URL"
+    );
 }
 
 #[tokio::test]

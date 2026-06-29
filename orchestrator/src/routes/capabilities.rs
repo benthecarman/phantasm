@@ -9,15 +9,14 @@
 use axum::extract::State;
 use axum::Json;
 
+use crate::probe_capabilities;
 use crate::state::{AppState, CapabilitySnapshot, CAPABILITIES_TTL};
-use crate::{detect_upstream, probe_capabilities};
 
 pub async fn capabilities(State(state): State<AppState>) -> Json<CapabilitySnapshot> {
     let snapshot = state
         .capabilities
         .get_or_refresh(CAPABILITIES_TTL, || async {
-            let upstream = detect_upstream(&state.cfg, &state.http).await;
-            probe_capabilities(&state.cfg, &state.http, &upstream).await
+            probe_capabilities(&state.cfg, &state.http, &state.upstream, None).await
         })
         .await;
     Json((*snapshot).clone())

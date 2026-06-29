@@ -12,7 +12,6 @@ use axum::extract::State;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::ollama::UpstreamChatBackend;
 use crate::state::AppState;
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,17 +35,10 @@ pub async fn warm(
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| state.cfg.default_model.clone());
 
-    let UpstreamChatBackend::NativeOllama(client) = &state.upstream else {
-        return Json(WarmResponse {
-            warmed: false,
-            model,
-        });
-    };
-
     // Bound concurrent upstream load against in-flight generations (NFR-O2).
     let _permit = state.upstream_sem.acquire().await;
-    let warmed = match client.warm_model(&model).await {
-        Ok(()) => true,
+    let warmed = match state.upstream.warm_model(&model).await {
+        Ok(warmed) => warmed,
         Err(e) => {
             tracing::warn!(model = %model, error = %e, "warm preload failed");
             false

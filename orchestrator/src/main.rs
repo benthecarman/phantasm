@@ -1,12 +1,13 @@
 //! Phantasm orchestrator entrypoint.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use phantasm_orchestrator::config::{Config, LogFormat};
 use phantasm_orchestrator::state::AppState;
-use phantasm_orchestrator::{build_state, detect_upstream, probe_capabilities, routes};
+use phantasm_orchestrator::{
+    build_http_client, build_state_with_upstream, detect_upstream, probe_capabilities, routes,
+};
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -17,14 +18,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Arc::new(cfg);
 
-    // A throwaway client just for the startup probes; AppState builds its own.
-    let probe_http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(2))
-        .build()
-        .context("building HTTP client")?;
-    let upstream = detect_upstream(&cfg, &probe_http).await;
-    let capabilities = Arc::new(probe_capabilities(&cfg, &probe_http, &upstream).await);
+    let http = build_http_client().context("building HTTP client")?;
+    let upstream = detect_upstream(&cfg, &http).await;
+    let capabilities =
+        Arc::new(probe_capabilities(&cfg, &http, &upstream.backend, Some(&upstream.models)).await);
     let vision_models = capabilities
         .models
         .iter()
@@ -67,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
         "capabilities resolved"
     );
 
-    let state: AppState = build_state(cfg.clone(), capabilities, upstream.kind);
+    let state: AppState =
+        build_state_with_upstream(cfg.clone(), capabilities, http, upstream.backend);
     let app = routes::router(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)

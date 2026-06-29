@@ -57,34 +57,17 @@ impl OpenAICompatibleClient {
         }
     }
 
-    pub async fn list_models(
-        http: &reqwest::Client,
-        base: &Url,
-        api_key: Option<&str>,
-    ) -> Result<Vec<String>, AppError> {
-        let url = Url::parse(&format!(
-            "{}/models",
-            openai_api_base(base).trim_end_matches('/')
-        ))
-        .map_err(|e| AppError::Internal(format!("bad OpenAI upstream URL: {e}")))?;
-        let mut req = http.get(url);
-        if let Some(api_key) = api_key.filter(|s| !s.trim().is_empty()) {
-            req = req.bearer_auth(api_key);
+    /// A GET builder carrying the bearer token when one is configured.
+    fn authed_get(&self, url: &str) -> reqwest::RequestBuilder {
+        let req = self.http.get(url);
+        match &self.api_key {
+            Some(key) => req.bearer_auth(key.expose_secret()),
+            None => req,
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
-        }
-        let models: ModelsResponse = resp
-            .json()
-            .await
-            .map_err(|e| AppError::UpstreamError(e.to_string()))?;
-        Ok(models.data.into_iter().map(|m| m.id).collect())
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<String>, AppError> {
+        list_models_response(self.authed_get(&self.models_url())).await
     }
 
     fn build_request(
@@ -113,6 +96,27 @@ impl OpenAICompatibleClient {
     fn chat_url(&self) -> String {
         format!("{}/chat/completions", self.api_base)
     }
+
+    fn models_url(&self) -> String {
+        format!("{}/models", self.api_base)
+    }
+}
+
+async fn list_models_response(req: reqwest::RequestBuilder) -> Result<Vec<String>, AppError> {
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(AppError::UpstreamError(format!("{status}: {detail}")));
+    }
+    let models: ModelsResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::UpstreamError(e.to_string()))?;
+    Ok(models.data.into_iter().map(|m| m.id).collect())
 }
 
 /// Serialize the history into the request `messages` array. We serialize each

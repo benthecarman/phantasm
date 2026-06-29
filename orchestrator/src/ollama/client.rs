@@ -98,6 +98,13 @@ impl OllamaClient {
             .send()
             .await
             .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
+        }
+
         let show: ShowResponse = resp
             .json()
             .await
@@ -255,12 +262,15 @@ fn extract_thinking_control(options: &mut Map<String, Value>) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_thinking_control, ndjson_to_deltas};
+    use super::{extract_thinking_control, ndjson_to_deltas, OllamaClient};
     use crate::error::AppError;
     use crate::ollama::StreamDelta;
     use bytes::Bytes;
     use futures_util::{stream, StreamExt};
     use serde_json::{json, Map, Value};
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn collect(chunks: Vec<reqwest::Result<Bytes>>) -> Vec<Result<StreamDelta, AppError>> {
         ndjson_to_deltas(stream::iter(chunks)).collect().await
@@ -336,6 +346,38 @@ mod tests {
         let chunks = vec![Ok(Bytes::from_static(b"{not json}\n"))];
         let first = collect(chunks).await.into_iter().next().expect("one item");
         assert!(matches!(first, Err(AppError::UpstreamError(_))));
+    }
+
+    #[tokio::test]
+    async fn model_metadata_surfaces_non_success_show_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": "missing model"
+            })))
+            .mount(&server)
+            .await;
+        let client = OllamaClient::new(
+            reqwest::Client::new(),
+            Url::parse(&server.uri()).expect("mock server URL"),
+        );
+
+        let err = client
+            .model_metadata("missing")
+            .await
+            .expect_err("non-2xx /api/show should fail");
+
+        match err {
+            AppError::UpstreamError(message) => {
+                assert!(message.contains("404"), "status should be preserved");
+                assert!(
+                    message.contains("missing model"),
+                    "response body should be preserved"
+                );
+            }
+            other => panic!("expected UpstreamError, got {other:?}"),
+        }
     }
 
     #[test]
