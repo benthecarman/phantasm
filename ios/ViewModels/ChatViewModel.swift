@@ -522,11 +522,13 @@ final class ChatViewModel {
         // App-hosted tools (e.g. ask_user) ride as full schemas the orchestrator
         // forwards back to us — only against an orchestrator with a tool-capable
         // model (a raw-Ollama backend has nothing to forward through).
-        // App-hosted tools ride only against an orchestrator with a tool-capable
-        // model. Location and health are gated further by this chat's
-        // per-conversation opt-in (both off by default); the always-on app tools
-        // (ask_user, current_time) ride unconditionally.
-        let appTools = (env.backendMode.capabilities != nil && env.supportsTools(model))
+        // App-hosted tools resolve entirely on-device, so they ride against any
+        // backend that speaks OpenAI function-calling — orchestrator, native
+        // Ollama, or a plain OpenAI endpoint — with a tool-capable model.
+        // Location and health are gated further by this chat's per-conversation
+        // opt-in (both off by default); the always-on app tools (ask_user,
+        // current_time) ride unconditionally.
+        let appTools = env.supportsTools(model)
             ? AppTools.all.filter { spec in
                 switch spec.function.name {
                 case ToolName.location: return detail.conversation.locationEnabled

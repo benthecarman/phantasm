@@ -102,11 +102,12 @@ struct ChatView: View {
         env.backendMode.capabilities
     }
 
-    /// Whether app-hosted tools (e.g. location) can ride this turn: only against
-    /// an orchestrator backend, which forwards the calls back to us. The model
-    /// must also be tool-capable (`modelSupportsTools`), checked in the composer.
+    /// Whether app-hosted tools (e.g. location) can ride this turn. They resolve
+    /// on-device via standard OpenAI tool-calling, so any backend can carry them
+    /// — orchestrator, native Ollama, or a plain OpenAI endpoint. The model must
+    /// also be tool-capable (`modelSupportsTools`), checked in the composer.
     private var supportsAppTools: Bool {
-        env.backendMode.capabilities != nil
+        true
     }
 
     var body: some View {

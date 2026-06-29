@@ -31,9 +31,16 @@ public struct OllamaNativeChatClient: ChatClienting {
                     let stream = try client.chatStream(
                         model: model,
                         messages: request.messages.map(\.ollamaMessage),
+                        tools: ollamaTools(from: request.tools),
                         think: request.ollamaThink
                     )
 
+                    // App-hosted tool calls accumulate across chunks; Ollama
+                    // returns them whole (not fragmented), so each call maps
+                    // straight to a `WireToolCall`. The native API gives calls no
+                    // id, but the downstream resolver keys every call by `id`
+                    // (skipping any without one), so we synthesize a stable one.
+                    var toolCalls: [WireToolCall] = []
                     for try await chunk in stream {
                         try Task.checkCancellation()
                         if let thinking = chunk.message.thinking,
@@ -43,7 +50,21 @@ public struct OllamaNativeChatClient: ChatClienting {
                         if !chunk.message.content.isEmpty {
                             continuation.yield(.token(chunk.message.content))
                         }
+                        for call in chunk.message.toolCalls ?? [] {
+                            let index = toolCalls.count
+                            toolCalls.append(WireToolCall(
+                                index: index,
+                                id: "call_\(index)",
+                                function: .init(
+                                    name: call.function.name,
+                                    arguments: encodeArguments(call.function.arguments)
+                                )
+                            ))
+                        }
                         if chunk.done {
+                            if !toolCalls.isEmpty {
+                                continuation.yield(.toolCalls(toolCalls))
+                            }
                             continuation.yield(.done)
                             continuation.finish()
                             return
@@ -58,6 +79,32 @@ public struct OllamaNativeChatClient: ChatClienting {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Maps the request's app-hosted tool specs to Ollama tools. Only full
+    /// schemas (app tools carry `parameters`) are forwarded — name-only server
+    /// selectors have no schema to send, and a raw Ollama backend has no server
+    /// tools anyway. Each spec is re-encoded through the same wire encoder used
+    /// for OpenAI backends, so the model sees an identical schema.
+    private func ollamaTools(from specs: [ToolSpec]?) -> [any ToolProtocol]? {
+        guard let specs else { return nil }
+        let encoder = Wire.encoder()
+        let tools: [any ToolProtocol] = specs.compactMap { spec in
+            guard spec.function.parameters != nil,
+                  let data = try? encoder.encode(spec),
+                  let value = try? JSONDecoder().decode(Value.self, from: data)
+            else { return nil }
+            return RawTool(schema: value)
+        }
+        return tools.isEmpty ? nil : tools
+    }
+
+    /// Serializes Ollama's structured tool-call arguments back into the
+    /// JSON-encoded string that `WireToolCall` (and the OpenAI shape) expects.
+    private func encodeArguments(_ args: [String: Value]) -> String {
+        guard let data = try? JSONEncoder().encode(args),
+              let json = String(data: data, encoding: .utf8) else { return "{}" }
+        return json
     }
 
     private func session(for token: String) -> URLSession {
@@ -81,6 +128,12 @@ public struct OllamaNativeChatClient: ChatClienting {
     }
 }
 
+/// Minimal `ToolProtocol` conformer that carries a pre-built tool schema value
+/// straight through to Ollama (the app already holds full OpenAI-style schemas).
+private struct RawTool: ToolProtocol {
+    let schema: any (Codable & Sendable)
+}
+
 private extension WireMessage {
     var ollamaMessage: Ollama.Chat.Message {
         let text = content.plainText
@@ -90,12 +143,33 @@ private extension WireMessage {
         case "system":
             return .system(text, images: attachedImages)
         case "assistant":
+            if let toolCalls, !toolCalls.isEmpty {
+                return .assistant(
+                    text, images: attachedImages,
+                    toolCalls: toolCalls.compactMap(\.ollamaToolCall)
+                )
+            }
             return .assistant(text, images: attachedImages)
         case "tool":
             return .tool(text)
         default:
             return .user(text, images: attachedImages)
         }
+    }
+}
+
+private extension WireToolCall {
+    /// Converts a persisted OpenAI-shape tool call back into Ollama's structured
+    /// form so the assistant's tool_call turn is echoed when continuing a turn.
+    var ollamaToolCall: Ollama.Chat.Message.ToolCall? {
+        guard let name = function?.name else { return nil }
+        var arguments: [String: Value] = [:]
+        if let raw = function?.arguments,
+           let data = raw.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String: Value].self, from: data) {
+            arguments = decoded
+        }
+        return .init(function: .init(name: name, arguments: arguments))
     }
 }
 
