@@ -88,6 +88,7 @@ public protocol ChatStore: Sendable {
         webSearchEnabled: Bool,
         imageGenerationEnabled: Bool,
         locationEnabled: Bool,
+        healthEnabled: Bool,
         modeID: String?
     ) async throws
 

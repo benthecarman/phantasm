@@ -35,6 +35,10 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     /// backend forwards app tools). Off by default — it's privacy-sensitive and
     /// triggers a system permission prompt; the composer's tool selector flips it.
     public var locationEnabled: Bool
+    /// Whether this chat wants the app-hosted health tool offered (when the backend
+    /// forwards app tools). Off by default — it's privacy-sensitive and triggers a
+    /// system permission prompt; the composer's tool selector flips it.
+    public var healthEnabled: Bool
     /// The selected research/turn mode for this chat (e.g. `"deep-research"`), or
     /// `nil` for an ordinary turn. It's the *UI preference*; at send time it
     /// reaches the wire only as a suffix on the `model` id (`<base>:<modeID>`),
@@ -52,6 +56,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         webSearchEnabled: Bool = true,
         imageGenerationEnabled: Bool = true,
         locationEnabled: Bool = false,
+        healthEnabled: Bool = false,
         modeID: String? = nil
     ) {
         self.id = id
@@ -64,6 +69,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         self.webSearchEnabled = webSearchEnabled
         self.imageGenerationEnabled = imageGenerationEnabled
         self.locationEnabled = locationEnabled
+        self.healthEnabled = healthEnabled
         self.modeID = modeID
     }
 

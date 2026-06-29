@@ -48,11 +48,16 @@ targets:
         NSMicrophoneUsageDescription: "Phantasm uses the microphone so you can dictate messages. Audio is transcribed on-device and never leaves your phone."
         NSSpeechRecognitionUsageDescription: "Phantasm uses speech recognition to transcribe your dictation. On supported devices this runs entirely on-device."
         NSLocationWhenInUseUsageDescription: "Phantasm shares your current location with the AI model only when you turn on the Location tool for a chat and the model asks for it."
+        NSHealthShareUsageDescription: "Phantasm shares your Apple Health data with the AI model only when you turn on the Health tool for a chat and the model asks for it. Access is read-only."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+    entitlements:
+      path: App/Phantasm.entitlements
+      properties:
+        com.apple.developer.healthkit: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.phantasm.app

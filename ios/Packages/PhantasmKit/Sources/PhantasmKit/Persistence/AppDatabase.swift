@@ -150,6 +150,14 @@ public final class AppDatabase: Sendable {
                 t.add(column: "locationEnabled", .boolean).notNull().defaults(to: false)
             }
         }
+
+        // Per-chat opt-in for the app-hosted health tool. Off by default (same
+        // privacy reasoning as location); the composer's tool selector flips it.
+        migrator.registerMigration("v8_health_tool") { db in
+            try db.alter(table: "conversation") { t in
+                t.add(column: "healthEnabled", .boolean).notNull().defaults(to: false)
+            }
+        }
         return migrator
     }
 }
@@ -243,6 +251,7 @@ extension AppDatabase: ChatStore {
         webSearchEnabled: Bool,
         imageGenerationEnabled: Bool,
         locationEnabled: Bool,
+        healthEnabled: Bool,
         modeID: String?
     ) async throws {
         try await dbWriter.write { db in
@@ -250,6 +259,7 @@ extension AppDatabase: ChatStore {
             convo.webSearchEnabled = webSearchEnabled
             convo.imageGenerationEnabled = imageGenerationEnabled
             convo.locationEnabled = locationEnabled
+            convo.healthEnabled = healthEnabled
             convo.modeID = modeID
             try convo.update(db)
         }

@@ -18,6 +18,8 @@ protocol ChatViewModelEnvironment: AnyObject {
     func disabledReasoningEffortForCurrentBackend() -> String?
     func setDefaultLocationEnabled(_ enabled: Bool)
     func requestLocationAuthorizationWhenInUse()
+    func setDefaultHealthEnabled(_ enabled: Bool)
+    func requestHealthAuthorization()
     func warm(model: String)
     func speak(_ text: String, messageID: UUID)
 }
@@ -33,6 +35,14 @@ extension AppEnvironment: ChatViewModelEnvironment {
 
     func requestLocationAuthorizationWhenInUse() {
         locationProvider.requestAuthorizationWhenInUse()
+    }
+
+    func setDefaultHealthEnabled(_ enabled: Bool) {
+        toolPreferenceStore.healthEnabledDefault = enabled
+    }
+
+    func requestHealthAuthorization() {
+        healthProvider.requestAuthorization()
     }
 
     func speak(_ text: String, messageID: UUID) {

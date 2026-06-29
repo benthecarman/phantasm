@@ -20,8 +20,9 @@ struct ComposerOptionsSheet: View {
     let supportsImageGeneration: Bool
     /// Whether the backend forwards app-hosted tools (i.e. it's an orchestrator).
     /// Like the server-tool flags, combined with `modelSupportsTools` to decide if
-    /// the Location row is usable.
+    /// the Location / Health rows are usable.
     let supportsLocation: Bool
+    let supportsHealth: Bool
     let modelSupportsTools: Bool
     /// Whether the selected model can produce reasoning output. When false the
     /// Thinking row renders disabled + pinned off rather than hidden.
@@ -29,6 +30,7 @@ struct ComposerOptionsSheet: View {
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
     let locationEnabled: Binding<Bool>
+    let healthEnabled: Binding<Bool>
     /// Research modes the backend advertises (e.g. Deep Research), already gated on
     /// their needed tools being usable. Empty ⇒ the Research section is hidden.
     let availableModes: [Capabilities.Mode]
@@ -102,6 +104,12 @@ struct ComposerOptionsSheet: View {
                         systemImage: "location",
                         backendSupports: supportsLocation,
                         isOn: locationEnabled
+                    )
+                    toolRow(
+                        "Health",
+                        systemImage: "heart",
+                        backendSupports: supportsHealth,
+                        isOn: healthEnabled
                     )
                 }
 

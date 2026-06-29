@@ -153,6 +153,7 @@ struct ChatView: View {
                     supportsWebSearch: backendCapabilities?.hasToolSelector(ToolSelectorName.webSearch) ?? false,
                     supportsImageGeneration: backendCapabilities?.hasToolSelector(ToolSelectorName.imageGeneration) ?? false,
                     supportsLocation: supportsAppTools,
+                    supportsHealth: supportsAppTools,
                     modelSupportsTools: modelSupportsTools,
                     modelSupportsThinking: modelSupportsThinking,
                     webSearchEnabled: Binding(
@@ -166,6 +167,10 @@ struct ChatView: View {
                     locationEnabled: Binding(
                         get: { vm.locationEnabled },
                         set: { vm.setLocationEnabled($0) }
+                    ),
+                    healthEnabled: Binding(
+                        get: { vm.healthEnabled },
+                        set: { vm.setHealthEnabled($0) }
                     ),
                     availableModes: vm.availableModes,
                     modeID: Binding(
@@ -499,6 +504,7 @@ struct ComposerView: View {
     /// Whether app-hosted tools (e.g. location) can ride — i.e. the backend is an
     /// orchestrator that forwards them. Combined with `modelSupportsTools`.
     let supportsLocation: Bool
+    let supportsHealth: Bool
     /// Whether the selected model supports tool/function calling.
     let modelSupportsTools: Bool
     /// Whether the selected model supports reasoning/thinking output.
@@ -506,6 +512,7 @@ struct ComposerView: View {
     let webSearchEnabled: Binding<Bool>
     let imageGenerationEnabled: Binding<Bool>
     let locationEnabled: Binding<Bool>
+    let healthEnabled: Binding<Bool>
     /// Research modes the backend advertises (e.g. Deep Research). Empty ⇒ the
     /// composer hides the research UI (graceful, older/non-orchestrator backends).
     let availableModes: [Capabilities.Mode]
@@ -626,11 +633,13 @@ struct ComposerView: View {
                 supportsWebSearch: supportsWebSearch,
                 supportsImageGeneration: supportsImageGeneration,
                 supportsLocation: supportsLocation,
+                supportsHealth: supportsHealth,
                 modelSupportsTools: modelSupportsTools,
                 modelSupportsThinking: modelSupportsThinking,
                 webSearchEnabled: webSearchEnabled,
                 imageGenerationEnabled: imageGenerationEnabled,
                 locationEnabled: locationEnabled,
+                healthEnabled: healthEnabled,
                 availableModes: availableModes,
                 modeID: modeID,
                 thinkingEnabled: thinkingEnabled

@@ -149,6 +149,9 @@ final class ChatViewModel {
     /// Per-chat opt-in for the app-hosted location tool. Off by default — it's
     /// privacy-sensitive and triggers a system permission prompt.
     var locationEnabled: Bool { conversation?.locationEnabled ?? false }
+    /// Per-chat opt-in for the app-hosted health tool. Off by default — it's
+    /// privacy-sensitive and triggers a system permission prompt.
+    var healthEnabled: Bool { conversation?.healthEnabled ?? false }
     /// The selected research mode for this chat (e.g. `"deep-research"`), or `nil`
     /// for an ordinary turn. It only reaches the wire as a model-id suffix at send
     /// time (redesign §7), gated on the backend advertising it.
@@ -163,6 +166,7 @@ final class ChatViewModel {
             webSearch: on,
             imageGeneration: imageGenerationEnabled,
             location: locationEnabled,
+            health: healthEnabled,
             modeID: modeID
         )
     }
@@ -172,6 +176,7 @@ final class ChatViewModel {
             webSearch: webSearchEnabled,
             imageGeneration: on,
             location: locationEnabled,
+            health: healthEnabled,
             modeID: modeID
         )
     }
@@ -186,6 +191,22 @@ final class ChatViewModel {
             webSearch: webSearchEnabled,
             imageGeneration: imageGenerationEnabled,
             location: on,
+            health: healthEnabled,
+            modeID: modeID
+        )
+    }
+
+    func setHealthEnabled(_ on: Bool) {
+        // Surface the HealthKit permission sheet the moment the user enables the
+        // tool, not lazily on the model's first call. No-op once already decided.
+        if on { env?.requestHealthAuthorization() }
+        // Remember the choice as the sticky default for future new chats.
+        env?.setDefaultHealthEnabled(on)
+        setOptions(
+            webSearch: webSearchEnabled,
+            imageGeneration: imageGenerationEnabled,
+            location: locationEnabled,
+            health: on,
             modeID: modeID
         )
     }
@@ -195,6 +216,7 @@ final class ChatViewModel {
             webSearch: webSearchEnabled,
             imageGeneration: imageGenerationEnabled,
             location: locationEnabled,
+            health: healthEnabled,
             modeID: modeID
         )
     }
@@ -203,12 +225,13 @@ final class ChatViewModel {
     /// unsent draft the store write is a no-op and the selection rides along on
     /// the first send (the draft is inserted whole), mirroring `setModel`.
     private func setOptions(
-        webSearch: Bool, imageGeneration: Bool, location: Bool, modeID: String?
+        webSearch: Bool, imageGeneration: Bool, location: Bool, health: Bool, modeID: String?
     ) {
         guard var conversation else { return }
         conversation.webSearchEnabled = webSearch
         conversation.imageGenerationEnabled = imageGeneration
         conversation.locationEnabled = location
+        conversation.healthEnabled = health
         conversation.modeID = modeID
         self.conversation = conversation
         let id = conversation.id
@@ -218,6 +241,7 @@ final class ChatViewModel {
                 webSearchEnabled: webSearch,
                 imageGenerationEnabled: imageGeneration,
                 locationEnabled: location,
+                healthEnabled: health,
                 modeID: modeID
             )
         }
@@ -499,12 +523,16 @@ final class ChatViewModel {
         // forwards back to us — only against an orchestrator with a tool-capable
         // model (a raw-Ollama backend has nothing to forward through).
         // App-hosted tools ride only against an orchestrator with a tool-capable
-        // model. Location is gated further by this chat's per-conversation opt-in
-        // (off by default); the always-on app tools (ask_user, current_time) ride
-        // unconditionally.
+        // model. Location and health are gated further by this chat's
+        // per-conversation opt-in (both off by default); the always-on app tools
+        // (ask_user, current_time) ride unconditionally.
         let appTools = (env.backendMode.capabilities != nil && env.supportsTools(model))
-            ? AppTools.all.filter {
-                $0.function.name != ToolName.location || detail.conversation.locationEnabled
+            ? AppTools.all.filter { spec in
+                switch spec.function.name {
+                case ToolName.location: return detail.conversation.locationEnabled
+                case ToolName.health: return detail.conversation.healthEnabled
+                default: return true
+                }
             }
             : []
         let request = ChatRequest(

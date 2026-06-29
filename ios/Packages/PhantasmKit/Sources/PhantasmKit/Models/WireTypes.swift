@@ -474,6 +474,10 @@ public enum ToolName {
     /// from the device (CoreLocation + reverse geocoding) and continues the turn
     /// automatically. Off by default and toggled per chat. See `LocationTool`.
     public static let location = "get_current_location"
+    /// App-hosted: the model reads the user's on-device Apple Health data. The app
+    /// answers from HealthKit and continues the turn automatically (read-only).
+    /// Off by default and toggled per chat. See `HealthTool`.
+    public static let health = "get_health_data"
 }
 
 /// App-facing capability bucket ids from `capabilities.tool_selectors`.

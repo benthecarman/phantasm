@@ -152,13 +152,14 @@ public enum AppToolRegistry {
     /// auto-resolved calls.
     private static let baseTools: [any AppTool] = [AskUserTool(), CurrentTimeTool()]
 
-    /// The location tool, wired in at app launch with a device-backed provider.
-    /// Guarded by a lock so the (non-isolated) accessors below stay usable from
-    /// host tests, which simply never configure it — `get_current_location` is
-    /// then neither advertised nor routed. CoreLocation lives in the app target,
-    /// so it can't be constructed here.
+    /// The device-backed tools (location, health), wired in at app launch with
+    /// their providers. Guarded by a lock so the (non-isolated) accessors below
+    /// stay usable from host tests, which simply never configure them — the tool
+    /// is then neither advertised nor routed. CoreLocation/HealthKit live in the
+    /// app target, so they can't be constructed here.
     private static let lock = NSLock()
     private static var configuredLocationTool: LocationTool?
+    private static var configuredHealthTool: HealthTool?
 
     /// Wire the device-backed location tool into the registry. Call once at app
     /// launch (idempotent — replaces any prior provider).
@@ -168,15 +169,32 @@ public enum AppToolRegistry {
         configuredLocationTool = LocationTool(provider: provider)
     }
 
+    /// Wire the device-backed health tool into the registry. Call once at app
+    /// launch (idempotent — replaces any prior provider).
+    public static func configureHealth(provider: any HealthProviding) {
+        lock.lock()
+        defer { lock.unlock() }
+        configuredHealthTool = HealthTool(provider: provider)
+    }
+
     private static var locationTool: LocationTool? {
         lock.lock()
         defer { lock.unlock() }
         return configuredLocationTool
     }
 
-    /// Every hosted tool currently available (location only once configured).
+    private static var healthTool: HealthTool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return configuredHealthTool
+    }
+
+    /// Every hosted tool currently available (device-backed tools only once
+    /// their providers are configured at launch).
     public static var tools: [any AppTool] {
-        baseTools + (locationTool.map { [$0] } ?? [])
+        baseTools
+            + (locationTool.map { [$0] } ?? [])
+            + (healthTool.map { [$0] } ?? [])
     }
 
     /// Schemas to advertise this turn (the `tools` array).

@@ -22,6 +22,8 @@
 	<string>1</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Phantasm uses the camera so you can take a photo to attach to a message.</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>Phantasm shares your Apple Health data with the AI model only when you turn on the Health tool for a chat and the model asks for it. Access is read-only.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Phantasm shares your current location with the AI model only when you turn on the Location tool for a chat and the model asks for it.</string>
 	<key>NSMicrophoneUsageDescription</key>
