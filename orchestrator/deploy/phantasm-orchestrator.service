@@ -1,16 +1,73 @@
 # Phantasm orchestrator — systemd unit (bare-metal / non-Docker deploy).
 #
-# Install:
-#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin phantasm
-#   sudo install -m 0755 target/release/phantasm-orchestrator /usr/local/bin/
-#   sudo install -d -m 0755 /etc/phantasm /opt/phantasm/workflows
-#   sudo cp orchestrator/.env.example /etc/phantasm/orchestrator.env  # then edit
-#   sudo chown root:phantasm /etc/phantasm/orchestrator.env && sudo chmod 0640 /etc/phantasm/orchestrator.env
-#   sudo cp orchestrator/workflows/*.json /opt/phantasm/workflows/    # if using image gen
-#   sudo cp orchestrator/deploy/phantasm-orchestrator.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now phantasm-orchestrator
+# This unit supports the code-exec tool running on ROOTLESS podman
+# (CODE_EXEC_RUNTIME=podman). Launching rootless containers is fundamentally
+# incompatible with a heavy process sandbox, so most of it is lifted here and the
+# real isolation is delegated to the per-container sandbox the orchestrator
+# applies (--read-only, --cap-drop ALL, --security-opt no-new-privileges,
+# --network none on the offline lane, and pid/cpu/mem caps). See the inline NOTEs
+# for exactly which directives had to go and why. If you are NOT using code-exec,
+# you can re-enable the full process sandbox the NOTEs describe.
+#
+# This unit runs podman ROOTLESS as a normal login user. Before installing,
+# replace the placeholders below — they are intentionally invalid, so the unit
+# will refuse to start until you do:
+#   - YOURUSER  (User= / Group=)               -> a real login user with subuid/subgid ranges
+#   - YOURUID   (XDG_RUNTIME_DIR= / ReadWritePaths=) -> that user's uid (`id -u YOURUSER`)
+#
+# ---- Install --------------------------------------------------------------
+# 0. Pick the user that will own the rootless containers (must have a real login
+#    + subuid/subgid ranges; a desktop user already does — check /etc/subuid):
+#      grep "^<user>:" /etc/subuid /etc/subgid
+#
+# 1. Binary + config:
+#      sudo install -m 0755 target/release/phantasm-orchestrator /usr/local/bin/
+#      sudo install -d -m 0755 /etc/phantasm /opt/phantasm/workflows
+#      sudo cp orchestrator/.env.example /etc/phantasm/orchestrator.env   # then edit
+#      sudo chown root:<user> /etc/phantasm/orchestrator.env && sudo chmod 0640 /etc/phantasm/orchestrator.env
+#      sudo cp orchestrator/workflows/*.json /opt/phantasm/workflows/     # if using image gen
+#
+# 2. Build the code-exec image and load it into the SERVICE user's store. The
+#    store follows $HOME, and this unit sets HOME=/var/lib/phantasm, so the image
+#    MUST live in that store — NOT the user's normal ~/.local store. Beware: if
+#    your shell exports XDG_DATA_HOME, it overrides $HOME for storage, so build
+#    with a clean env to be sure it lands in the right place:
+#      sudo install -d -o <user> -g <user> /var/lib/phantasm
+#      # build wherever convenient, then move it into the service store:
+#      podman build -t phantasm/code-exec:latest orchestrator/docker/code-exec
+#      podman save localhost/phantasm/code-exec:latest \
+#        | sudo -u <user> env -i HOME=/var/lib/phantasm PATH=/usr/bin:/bin podman load
+#    Reference it by its FULLY-QUALIFIED name in the env file, or podman will try
+#    to pull from a registry called "localhost":
+#      CODE_EXEC_IMAGE=localhost/phantasm/code-exec:latest
+#
+# 3. If the online lane is enabled (CODE_EXEC_NETWORK set), create that network in
+#    the same store:
+#      sudo -u <user> env -i HOME=/var/lib/phantasm PATH=/usr/bin:/bin \
+#        podman network create "$CODE_EXEC_NETWORK"
+#
+# 4. REQUIRED: enable lingering so logind keeps /run/user/<uid> (the podman
+#    runroot + user D-Bus the systemd cgroup manager needs) alive without an
+#    interactive session:
+#      sudo loginctl enable-linger <user>
+#
+# 5. Install + start:
+#      sudo cp orchestrator/deploy/phantasm-orchestrator.service /etc/systemd/system/
+#      sudo systemctl daemon-reload && sudo systemctl enable --now phantasm-orchestrator
 #
 # Logs: journalctl -u phantasm-orchestrator -f
+# A clean start logs "code execution tools enabled" with NO "code-exec warm-up:
+# container failed" warnings.
+#
+# Troubleshooting (each was a real failure mode while bringing this up):
+#   "cannot resolve /home/<user>"            -> ProtectHome was masking podman's store; relocate HOME (done here)
+#   short-name ... did not resolve           -> use the fully-qualified localhost/... image name
+#   image pull-error ... dial tcp :443       -> image not in the SERVICE store (XDG_DATA_HOME leak); reload per step 2
+#   database run root ... mismatch           -> stale libpod db from an earlier runroot; `podman system migrate`, or remove storage/db.sql
+#   lstat /run/user/<uid>: permission denied -> ProtectHome=yes masks /run/user; keep it off (see NOTE below)
+#   sethostname: operation not permitted     -> ProtectHostname=yes locks UTS; keep it off (see NOTE below)
+#   cgroup mkdir ... permission denied       -> no user session for cgroups; enable-linger (step 4)
+# ---------------------------------------------------------------------------
 
 [Unit]
 Description=Phantasm orchestrator (self-hosted OpenAI-compatible AI proxy)
@@ -25,44 +82,64 @@ After=ollama.service
 Type=notify
 NotifyAccess=main
 
-# Dedicated unprivileged service account (see install steps above).
-User=phantasm
-Group=phantasm
+# The login user that owns the rootless containers (replace YOURUSER).
+User=YOURUSER
+Group=YOURUSER
 
-# All config is env-driven (NFR-O4). Keep secrets out of the unit file: this
-# file is `KEY=value` lines — .env.example is already in that format.
 EnvironmentFile=/etc/phantasm/orchestrator.env
 ExecStart=/usr/local/bin/phantasm-orchestrator
 
-Restart=on-failure
+WorkingDirectory=/var/lib/phantasm
+StateDirectory=phantasm
+
+# code-exec shells out to ROOTLESS podman. Keep its image/container store out of
+# /home by relocating $HOME to the StateDirectory. podman's graphroot follows
+# $HOME, so the image store lives under /var/lib/phantasm/.local/share/containers
+# and never touches /home.
+Environment=HOME=/var/lib/phantasm
+# Rootless podman needs a real user runtime dir + user D-Bus + user-level cgroup
+# delegation to apply --memory/--cpus and set up rootless networking. logind
+# provides all three at /run/user/<uid> once the account is lingering
+# (`sudo loginctl enable-linger <user>`). Container cgroups are then created under
+# the user manager's delegated slice via the default systemd cgroup manager, so
+# no Delegate= / RuntimeDirectory= is needed here. MUST match the User's uid.
+Environment=XDG_RUNTIME_DIR=/run/user/YOURUID
+
+Restart=always
 RestartSec=2
 # Allow in-flight streaming turns to drain on SIGTERM before SIGKILL. Pairs with
 # the orchestrator's graceful-shutdown handler.
 TimeoutStopSec=30
 
 # ---- Sandboxing / hardening ----
-# The orchestrator never writes to disk (it only reads its workflow JSON), so it
-# can run against a read-only filesystem.
-NoNewPrivileges=true
+# Filesystem protections are retained. /var/lib/phantasm (StateDirectory) holds
+# podman's image store.
 ProtectSystem=strict
-ProtectHome=true
+# NOTE: ProtectHome=yes would also mask /run/user as inaccessible, which breaks
+# rootless podman (it needs /run/user/<uid> for its runroot + the user D-Bus that
+# the systemd cgroup manager talks to). A BindPaths= hole does NOT survive the
+# ProtectHome mask. So instead protect the actual home dirs explicitly and leave
+# /run/user alone. The service's own HOME is /var/lib/phantasm, never /home/<user>.
+ProtectHome=no
+InaccessiblePaths=/home
+# ProtectSystem=strict keeps /run read-only; podman needs to write its runroot.
+# Must match XDG_RUNTIME_DIR above.
+ReadWritePaths=/run/user/YOURUID
 PrivateTmp=true
-PrivateDevices=true
-ProtectClock=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectHostname=true
 ProtectProc=invisible
-RestrictNamespaces=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
+# NOTE: ProtectHostname=yes locks the UTS namespace, which makes the container's
+# own `sethostname` during init fail with EPERM. Leave it off.
+
+# Process-level hardening is DISABLED here on purpose: it is incompatible with
+# launching rootless podman. newuidmap/newgidmap are setuid-root, so podman
+# requires NoNewPrivileges=no; and SystemCallFilter=, RestrictNamespaces=,
+# MemoryDenyWriteExecute=, RestrictSUIDSGID=, PrivateDevices=, ProtectKernel*=,
+# ProtectClock=, RestrictRealtime=, LockPersonality=, RestrictAddressFamilies=
+# all silently re-imply NoNewPrivileges=yes, so they must stay off too. Untrusted
+# code is sandboxed at the CONTAINER level (--read-only, --cap-drop ALL,
+# --security-opt no-new-privileges, --network none, pid/cpu/mem caps).
+NoNewPrivileges=false
+
 # Bound resource use a little; tune for your host.
 LimitNOFILE=65536
 
