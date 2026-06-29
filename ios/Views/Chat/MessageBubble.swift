@@ -55,6 +55,16 @@ struct MessageBubble: View {
                     if !message.message.reasoning.isEmpty {
                         ThinkingDisclosure(text: message.message.reasoning)
                     }
+                    // A `render_chart` row draws its chart(s) here; an invalid spec
+                    // shows a plain-text note instead of rendering something broken.
+                    ForEach(Array(message.chartRenders.enumerated()), id: \.offset) { _, render in
+                        switch render {
+                        case let .success(spec):
+                            ChartView(spec: spec)
+                        case let .failure(error):
+                            chartFallback(error)
+                        }
+                    }
                     if !content.isEmpty {
                         MarkdownMessageView(text: content, cachedImages: cachedImages) { index, image in
                             onTapImage(message.message.id, index, image)
@@ -65,6 +75,19 @@ struct MessageBubble: View {
             }
             if !isUser { Spacer(minLength: 40) }
         }
+    }
+
+    /// Shown in place of a chart when the model's `render_chart` data can't be
+    /// drawn (empty/oversized/non-finite). Clear and non-crashing; the model also
+    /// receives the reason via the tool result and usually answers in prose next.
+    private func chartFallback(_ error: ChartSpec.ValidationError) -> some View {
+        Label(error.message, systemImage: "chart.bar.xaxis")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     private var copyButton: some View {

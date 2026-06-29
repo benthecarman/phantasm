@@ -150,7 +150,9 @@ public enum AppToolRegistry {
     /// The always-available, dependency-free hosted tools. `ask_user` is first so a
     /// forwarded interactive prompt is preferred when a batch mixes it with
     /// auto-resolved calls.
-    private static let baseTools: [any AppTool] = [AskUserTool(), CurrentTimeTool()]
+    private static let baseTools: [any AppTool] = [
+        AskUserTool(), CurrentTimeTool(), RenderChartTool(),
+    ]
 
     /// The device-backed tools (location, health), wired in at app launch with
     /// their providers. Guarded by a lock so the (non-isolated) accessors below

@@ -274,6 +274,29 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
     }
 }
 
+public extension ChatMessage {
+    /// The chart(s) this assistant row asked to render, decoded from its forwarded
+    /// `render_chart` tool calls — each either a drawable `ChartSpec` or a
+    /// validation error the view shows as a plain-text fallback. Empty unless the
+    /// row carries at least one `render_chart` call. Pure/host-testable so the view
+    /// stays dumb (just renders or shows the fallback).
+    var chartRenders: [Result<ChartSpec, ChartSpec.ValidationError>] {
+        renderChartCalls.map { ChartSpec.decode(fromArguments: $0.function?.arguments) }
+    }
+
+    /// Whether this row carries a `render_chart` call — keeps the otherwise-empty
+    /// tool-call row visible in the transcript so the chart can be drawn.
+    var hasChartRender: Bool { !renderChartCalls.isEmpty }
+
+    private var renderChartCalls: [WireToolCall] {
+        guard message.role == "assistant", let json = message.toolCalls,
+              let data = json.data(using: .utf8),
+              let calls = try? Wire.decoder().decode([WireToolCall].self, from: data)
+        else { return [] }
+        return calls.filter { $0.function?.name == ToolName.renderChart }
+    }
+}
+
 public extension Array where Element == ChatMessage {
     /// Full history mapped to the wire format (stateless server, XR-2). Only
     /// completed messages are sent. Assistant messages that forwarded app-tool

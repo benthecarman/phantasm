@@ -58,7 +58,11 @@ struct ChatView: View {
             // `tool_calls`) and any auto-resolved tool's result (raw data meant for
             // the model, not the transcript). An interactive answer — e.g. an
             // `ask_user` pick — still shows.
-            if m.role == "assistant", m.toolCalls != nil, m.content.isEmpty { return false }
+            // …except a `render_chart` call: its row carries the chart to draw, so
+            // keep it visible even though its prose body is empty.
+            if m.role == "assistant", m.toolCalls != nil, m.content.isEmpty {
+                return item.hasChartRender
+            }
             if m.role == "tool", AppToolRegistry.isAutoResolved(name: m.name) { return false }
             return true
         }
