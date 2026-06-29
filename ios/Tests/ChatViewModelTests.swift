@@ -104,7 +104,7 @@ final class ChatViewModelTests: XCTestCase {
         }
     }
 
-    func testRecoverPendingAssistantRowContinuesStreamingInPlace() async throws {
+    func testRecoverPendingAssistantRowReplaysStreamingInPlace() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
         let env = FakeChatEnvironment(client: client)
@@ -123,7 +123,7 @@ final class ChatViewModelTests: XCTestCase {
             isComplete: false
         )
         try await store.insertMessage(pending, attachments: [])
-        client.enqueue(events: [.token(" answer"), .done])
+        client.enqueue(events: [.reasoning("thinking"), .token("partial answer"), .done])
 
         let vm = makeViewModel(env: env, store: store, conversation: conversation)
         vm.setViewVisible(true)
@@ -306,7 +306,9 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
     var ollamaStreamingClient: any ChatClienting { ollamaClient }
     var autoSpeakEnabled = false
     var defaultLocationEnabled = false
+    var defaultHealthEnabled = false
     var requestedLocationAuthorization = false
+    var requestedHealthAuthorization = false
     var warmedModels: [String] = []
     var spokenTexts: [String] = []
 
@@ -342,6 +344,14 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
 
     func requestLocationAuthorizationWhenInUse() {
         requestedLocationAuthorization = true
+    }
+
+    func setDefaultHealthEnabled(_ enabled: Bool) {
+        defaultHealthEnabled = enabled
+    }
+
+    func requestHealthAuthorization() {
+        requestedHealthAuthorization = true
     }
 
     func warm(model: String) {
@@ -389,7 +399,7 @@ private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
         lock.unlock()
     }
 
-    func stream(_ request: ChatRequest, base: URL, token: String)
+    func stream(_ request: ChatRequest, base: URL, token: String, turnID: String?)
         -> AsyncThrowingStream<ChatStreamEvent, Error>
     {
         let script = nextScript(recording: request)

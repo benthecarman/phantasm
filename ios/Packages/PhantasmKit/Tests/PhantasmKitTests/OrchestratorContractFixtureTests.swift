@@ -24,9 +24,14 @@ final class OrchestratorContractFixtureTests: XCTestCase {
         XCTAssertEqual(calls.count, 1)
         XCTAssertEqual(calls[0].id, "call_ask")
         XCTAssertEqual(calls[0].function?.name, ToolName.askUser)
+        let arguments = try XCTUnwrap(calls[0].function?.arguments)
         XCTAssertEqual(
-            calls[0].function?.arguments,
-            #"{"questions":[{"question":"Pick one","options":["A","B"],"type":"single_select"}]}"#
+            try Wire.decoder().decode(AskUserArguments.self, from: Data(arguments.utf8)),
+            AskUserArguments(
+                questions: [
+                    .init(question: "Pick one", options: ["A", "B"], type: "single_select")
+                ]
+            )
         )
         XCTAssertEqual(events.last, .done)
     }
@@ -58,6 +63,16 @@ final class OrchestratorContractFixtureTests: XCTestCase {
         let text = try String(contentsOf: url, encoding: .utf8)
         return text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
     }
+}
+
+private struct AskUserArguments: Decodable, Equatable {
+    struct Question: Decodable, Equatable {
+        let question: String
+        let options: [String]
+        let type: String
+    }
+
+    let questions: [Question]
 }
 
 private extension [ChatStreamEvent] {
