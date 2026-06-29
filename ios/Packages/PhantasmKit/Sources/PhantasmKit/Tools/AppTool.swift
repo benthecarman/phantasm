@@ -49,11 +49,15 @@ public protocol InteractiveTool: AppTool {
 public enum AppToolPrompt: Sendable, Equatable, Identifiable {
     /// The `ask_user_input` multiple-choice form (single/multi/rank questions).
     case multipleChoice(MultipleChoice)
+    /// A `create_calendar_event` confirmation. Calendar writes are never
+    /// auto-approved; the user must explicitly confirm or cancel.
+    case calendarEvent(CalendarEventConfirmation)
 
     /// The forwarded call this prompt answers — its result rides this id.
     public var toolCallId: String {
         switch self {
         case .multipleChoice(let choice): return choice.toolCallId
+        case .calendarEvent(let confirmation): return confirmation.toolCallId
         }
     }
 
@@ -61,10 +65,18 @@ public enum AppToolPrompt: Sendable, Equatable, Identifiable {
     public var toolName: String {
         switch self {
         case .multipleChoice: return ToolName.askUser
+        case .calendarEvent: return ToolName.createCalendarEvent
         }
     }
 
     public var id: String { toolCallId }
+
+    public var acceptsFreeTextAnswer: Bool {
+        switch self {
+        case .multipleChoice: return true
+        case .calendarEvent: return false
+        }
+    }
 }
 
 /// `ask_user_input`: an interactive multiple-choice prompt. A single tool that
@@ -163,6 +175,7 @@ public enum AppToolRegistry {
     private static var configuredLocationTool: LocationTool?
     private static var configuredHealthTool: HealthTool?
     private static var configuredCalendarTool: CalendarTool?
+    private static var configuredCalendarCreateEventTool: CalendarCreateEventTool?
 
     /// Wire the device-backed location tool into the registry. Call once at app
     /// launch (idempotent — replaces any prior provider).
@@ -186,6 +199,7 @@ public enum AppToolRegistry {
         lock.lock()
         defer { lock.unlock() }
         configuredCalendarTool = CalendarTool(provider: provider)
+        configuredCalendarCreateEventTool = CalendarCreateEventTool(provider: provider)
     }
 
     private static var locationTool: LocationTool? {
@@ -206,13 +220,21 @@ public enum AppToolRegistry {
         return configuredCalendarTool
     }
 
+    private static var calendarCreateEventTool: CalendarCreateEventTool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return configuredCalendarCreateEventTool
+    }
+
     /// Every hosted tool currently available (device-backed tools only once
     /// their providers are configured at launch).
     public static var tools: [any AppTool] {
-        baseTools
-            + (locationTool.map { [$0] } ?? [])
-            + (healthTool.map { [$0] } ?? [])
-            + (calendarTool.map { [$0] } ?? [])
+        var out = baseTools
+        if let locationTool { out.append(locationTool) }
+        if let healthTool { out.append(healthTool) }
+        if let calendarTool { out.append(calendarTool) }
+        if let calendarCreateEventTool { out.append(calendarCreateEventTool) }
+        return out
     }
 
     /// Schemas to advertise this turn (the `tools` array).
@@ -242,6 +264,13 @@ public enum AppToolRegistry {
     public static func isAutoResolved(name: String?) -> Bool {
         guard let name, let tool = tool(named: name) else { return false }
         return tool is any AutoResolvedTool
+    }
+
+    public static func createCalendarEvent(_ confirmation: CalendarEventConfirmation) async -> String {
+        guard let tool = calendarCreateEventTool else {
+            return "create_calendar_event failed: calendar event creation is not configured."
+        }
+        return await tool.create(confirmation)
     }
 
     /// The first interactive prompt among `calls` that has no result yet (used to

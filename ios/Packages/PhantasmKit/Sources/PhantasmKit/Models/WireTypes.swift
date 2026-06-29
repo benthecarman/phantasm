@@ -479,9 +479,13 @@ public enum ToolName {
     /// Off by default and toggled per chat. See `HealthTool`.
     public static let health = "get_health_data"
     /// App-hosted: the model reads the user's on-device Calendar events. The app
-    /// answers from EventKit and continues the turn automatically (read-only).
-    /// Off by default and toggled per chat. See `CalendarTool`.
+    /// answers from EventKit and continues the turn automatically. Off by default
+    /// and toggled per chat. See `CalendarTool`.
     public static let calendar = "get_calendar_events"
+    /// App-hosted: the model asks to create an on-device Calendar event. The app
+    /// shows a confirmation prompt, then writes through EventKit only if the user
+    /// approves. Off by default and toggled per chat. See `CalendarCreateEventTool`.
+    public static let createCalendarEvent = "create_calendar_event"
     /// App-hosted: the model emits structured chart data the app renders natively
     /// with Swift Charts. Resolves on-device (the result just acknowledges the
     /// render); the chart is drawn from the call's arguments. See `RenderChartTool`.

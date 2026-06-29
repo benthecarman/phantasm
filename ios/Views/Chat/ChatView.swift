@@ -135,6 +135,11 @@ struct ChatView: View {
                     case .multipleChoice(let choice):
                         ChoicePromptView(choice: choice) { vm.answerPendingPrompt($0) }
                             .id(choice.toolCallId)
+                    case .calendarEvent(let confirmation):
+                        CalendarEventPromptView(confirmation: confirmation) {
+                            vm.answerPendingCalendarEvent(confirm: $0)
+                        }
+                        .id(confirmation.toolCallId)
                     }
                 }
                 if let usage = contextUsage, usage.isNearLimit || usage.isOverLimit {
@@ -144,7 +149,7 @@ struct ChatView: View {
                     input: $input,
                     attachments: $attachments,
                     isStreaming: vm.isStreaming,
-                    canSend: vm.canSend,
+                    canSend: vm.canSend && (vm.pendingPrompt?.acceptsFreeTextAnswer ?? true),
                     focus: $composerFocused,
                     dictation: env.dictationController,
                     availableModels: env.availableModels,

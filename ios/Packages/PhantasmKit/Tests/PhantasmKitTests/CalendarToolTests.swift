@@ -26,6 +26,13 @@ final class CalendarToolTests: XCTestCase {
         )
     }
 
+    private func createCall(arguments: String? = "{}") -> WireToolCall {
+        WireToolCall(
+            id: "create_cal",
+            function: WireToolCall.Function(name: ToolName.createCalendarEvent, arguments: arguments)
+        )
+    }
+
     func testParseQueryDefaultsToUpcomingWeek() {
         let now = day(2026, 6, 29, hour: 12)
 
@@ -118,18 +125,78 @@ final class CalendarToolTests: XCTestCase {
         AppToolRegistry.configureCalendar(provider: StubCalendarProvider(result: .success([])))
 
         XCTAssertTrue(AppToolRegistry.specs.map(\.function.name).contains(ToolName.calendar))
+        XCTAssertTrue(AppToolRegistry.specs.map(\.function.name).contains(ToolName.createCalendarEvent))
         XCTAssertTrue(AppToolRegistry.isAutoResolved(name: ToolName.calendar))
+        XCTAssertFalse(AppToolRegistry.isAutoResolved(name: ToolName.createCalendarEvent))
         if case .auto = AppToolRegistry.match(call()) {
         } else {
             XCTFail("calendar tool should be auto-resolved")
         }
+        if case .interactive = AppToolRegistry.match(createCall()) {
+        } else {
+            XCTFail("calendar create tool should be interactive")
+        }
+    }
+
+    func testParseCreateEventConfirmationDefaultsTimedEnd() {
+        let confirmation = CalendarCreateEventTool.parseConfirmation(
+            createCall(arguments: #"{"title":"Lunch","start_date":"2026-06-29T12:30:00"}"#),
+            calendar: utc
+        )
+
+        XCTAssertEqual(confirmation?.toolCallId, "create_cal")
+        XCTAssertEqual(confirmation?.draft.title, "Lunch")
+        XCTAssertEqual(confirmation?.draft.start, day(2026, 6, 29, hour: 12).addingTimeInterval(30 * 60))
+        XCTAssertEqual(confirmation?.draft.end, day(2026, 6, 29, hour: 13).addingTimeInterval(30 * 60))
+        XCTAssertFalse(confirmation?.draft.isAllDay ?? true)
+    }
+
+    func testParseCreateEventConfirmationNormalizesAllDayEvent() {
+        let confirmation = CalendarCreateEventTool.parseConfirmation(
+            createCall(arguments: #"{"title":"Holiday","start_date":"2026-06-29","end_date":"2026-06-29","is_all_day":true,"calendar":"Home"}"#),
+            calendar: utc
+        )
+
+        XCTAssertEqual(confirmation?.draft.start, day(2026, 6, 29))
+        XCTAssertEqual(confirmation?.draft.end, day(2026, 6, 30))
+        XCTAssertEqual(confirmation?.draft.calendarTitle, "Home")
+        XCTAssertTrue(confirmation?.draft.isAllDay ?? false)
+    }
+
+    func testCreateEventToolConfirmsThroughProvider() async throws {
+        let event = CalendarEvent(
+            title: "Lunch",
+            start: day(2026, 6, 29, hour: 12),
+            end: day(2026, 6, 29, hour: 13),
+            calendarTitle: "Work"
+        )
+        let tool = CalendarCreateEventTool(
+            provider: StubCalendarProvider(
+                result: .success([]),
+                createResult: .success(event)
+            )
+        )
+        let confirmation = try XCTUnwrap(CalendarCreateEventTool.parseConfirmation(
+            createCall(arguments: #"{"title":"Lunch","start_date":"2026-06-29T12:00:00"}"#),
+            calendar: utc
+        ))
+
+        let result = await tool.create(confirmation)
+
+        XCTAssertTrue(result.hasPrefix("create_calendar_event succeeded:"))
+        XCTAssertTrue(result.contains("Lunch"))
     }
 }
 
 private struct StubCalendarProvider: CalendarProviding {
     let result: Result<[CalendarEvent], CalendarLookupError>
+    var createResult: Result<CalendarEvent, CalendarLookupError> = .failure(.unavailable("not configured"))
 
     func events(matching query: CalendarEventQuery) async -> Result<[CalendarEvent], CalendarLookupError> {
         result
+    }
+
+    func createEvent(_ draft: CalendarEventDraft) async -> Result<CalendarEvent, CalendarLookupError> {
+        createResult
     }
 }

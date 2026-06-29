@@ -31,6 +31,50 @@ public struct CalendarEvent: Sendable, Equatable {
     }
 }
 
+/// A calendar event the model wants to create. It is shown to the user for
+/// confirmation before the app writes anything to EventKit.
+public struct CalendarEventDraft: Sendable, Equatable {
+    public var title: String
+    public var start: Date
+    public var end: Date
+    public var isAllDay: Bool
+    public var calendarTitle: String?
+    public var location: String?
+    public var notes: String?
+
+    public init(
+        title: String,
+        start: Date,
+        end: Date,
+        isAllDay: Bool = false,
+        calendarTitle: String? = nil,
+        location: String? = nil,
+        notes: String? = nil
+    ) {
+        self.title = title
+        self.start = start
+        self.end = end
+        self.isAllDay = isAllDay
+        self.calendarTitle = calendarTitle
+        self.location = location
+        self.notes = notes
+    }
+}
+
+/// A pending calendar write confirmation. The app persists the model's forwarded
+/// tool call, shows this prompt, and only creates the event if the user confirms.
+public struct CalendarEventConfirmation: Sendable, Equatable, Identifiable {
+    public let toolCallId: String
+    public let draft: CalendarEventDraft
+
+    public var id: String { toolCallId }
+
+    public init(toolCallId: String, draft: CalendarEventDraft) {
+        self.toolCallId = toolCallId
+        self.draft = draft
+    }
+}
+
 /// What to read from Calendar: a half-open `[start, end)` range plus optional
 /// filtering and detail flags. Built by the tool, consumed by the EventKit
 /// provider in the app target.
@@ -83,6 +127,13 @@ public enum CalendarLookupError: Error, Sendable, Equatable {
 /// lives there, keeping this package host-testable).
 public protocol CalendarProviding: Sendable {
     func events(matching query: CalendarEventQuery) async -> Result<[CalendarEvent], CalendarLookupError>
+    func createEvent(_ draft: CalendarEventDraft) async -> Result<CalendarEvent, CalendarLookupError>
+}
+
+public extension CalendarProviding {
+    func createEvent(_ draft: CalendarEventDraft) async -> Result<CalendarEvent, CalendarLookupError> {
+        .failure(.unavailable("calendar event creation is not configured."))
+    }
 }
 
 /// The app-hosted `get_calendar_events` tool. It is read-only: creating or
@@ -106,7 +157,7 @@ public struct CalendarTool: AutoResolvedTool {
         let today = Self.schemaDate(Date(), calendar: .current)
         return ToolSpec(
             name: ToolName.calendar,
-            description: "Read the user's on-device Calendar events (read-only). Use it "
+            description: "Read the user's on-device Calendar events. Use it "
                 + "whenever a request depends on their schedule, availability, meetings, "
                 + "appointments, or upcoming plans. The user's device timezone is "
                 + "\"\(deviceZone)\" and today's date is \(today). Pass an explicit "
@@ -225,7 +276,7 @@ public struct CalendarTool: AutoResolvedTool {
 
     /// Accepts local days (`YYYY-MM-DD`) and ISO 8601 date-times. Date-times with
     /// no offset are interpreted in `calendar.timeZone`.
-    private static func parseDate(_ value: String?, calendar: Calendar) -> Date? {
+    static func parseDate(_ value: String?, calendar: Calendar) -> Date? {
         guard let value = trimmed(value) else { return nil }
         if let day = parseDay(value, calendar: calendar) { return day }
         if let instant = internetDateFormatter.date(from: value) { return instant }
@@ -249,7 +300,7 @@ public struct CalendarTool: AutoResolvedTool {
         return calendar.date(from: components).map(calendar.startOfDay(for:))
     }
 
-    private static func isRangeAllowed(start: Date, end: Date, calendar: Calendar) -> Bool {
+    static func isRangeAllowed(start: Date, end: Date, calendar: Calendar) -> Bool {
         let days = calendar.dateComponents([.day], from: start, to: end).day ?? (maxRangeDays + 1)
         return days <= maxRangeDays
     }
@@ -293,7 +344,7 @@ public struct CalendarTool: AutoResolvedTool {
         return lines.joined(separator: "\n")
     }
 
-    private static func eventLine(_ event: CalendarEvent, calendar: Calendar) -> String {
+    static func eventLine(_ event: CalendarEvent, calendar: Calendar) -> String {
         var parts = [
             timeLabel(event, calendar: calendar),
             event.calendarTitle,
@@ -330,7 +381,7 @@ public struct CalendarTool: AutoResolvedTool {
             + "\(shortDateTime(query.end, calendar: calendar))"
     }
 
-    private static func schemaDate(_ date: Date, calendar: Calendar) -> String {
+    static func schemaDate(_ date: Date, calendar: Calendar) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = calendar
@@ -369,6 +420,169 @@ public struct CalendarTool: AutoResolvedTool {
     private static func eventSort(_ lhs: CalendarEvent, _ rhs: CalendarEvent) -> Bool {
         if lhs.start != rhs.start { return lhs.start < rhs.start }
         return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+    }
+
+    private static func trimmed(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        return value
+    }
+}
+
+/// The app-hosted `create_calendar_event` tool. It is interactive: the app shows
+/// a confirmation prompt and only saves after the user taps Add.
+public struct CalendarCreateEventTool: InteractiveTool {
+    public static let defaultDurationSeconds: TimeInterval = 60 * 60
+
+    private let provider: any CalendarProviding
+
+    public init(provider: any CalendarProviding) {
+        self.provider = provider
+    }
+
+    public let name = ToolName.createCalendarEvent
+
+    public var spec: ToolSpec {
+        let deviceZone = TimeZone.current.identifier
+        let today = CalendarTool.schemaDate(Date(), calendar: .current)
+        return ToolSpec(
+            name: ToolName.createCalendarEvent,
+            description: "Create a Calendar event on the user's device, after the "
+                + "app shows a confirmation prompt. Use only when the user clearly "
+                + "asks to add, schedule, save, or put an event on their calendar. "
+                + "Do not use for edits or deletes. The user's device timezone is "
+                + "\"\(deviceZone)\" and today's date is \(today). Include all known "
+                + "details; if important details are missing, ask the user before "
+                + "calling. If the user cancels, the tool result says it was not added.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "title": .object([
+                        "type": .string("string"),
+                        "description": .string("Event title shown in Calendar."),
+                    ]),
+                    "start_date": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Required start. Use YYYY-MM-DD for an all-day local day "
+                                + "or ISO 8601 date-time for a timed event."),
+                    ]),
+                    "end_date": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Optional exclusive end. Defaults to one hour after the "
+                                + "start for timed events or the next day for all-day "
+                                + "events. The duration is capped at 31 days."),
+                    ]),
+                    "is_all_day": .object([
+                        "type": .string("boolean"),
+                        "description": .string("Whether this is an all-day event."),
+                    ]),
+                    "calendar": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Optional target calendar name. If omitted, the device "
+                                + "default calendar is used."),
+                    ]),
+                    "location": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional event location."),
+                    ]),
+                    "notes": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional notes to store on the event."),
+                    ]),
+                ]),
+                "required": .array([.string("title"), .string("start_date")]),
+            ])
+        )
+    }
+
+    public func prompt(for call: WireToolCall) -> AppToolPrompt? {
+        Self.parseConfirmation(call).map(AppToolPrompt.calendarEvent)
+    }
+
+    public func create(_ confirmation: CalendarEventConfirmation) async -> String {
+        switch await provider.createEvent(confirmation.draft) {
+        case .success(let event):
+            return Self.formatCreated(event: event)
+        case .failure(let error):
+            return "create_calendar_event failed: \(error.modelMessage)"
+        }
+    }
+
+    public static func cancelledResult() -> String {
+        "create_calendar_event cancelled: the user declined to add the event."
+    }
+
+    public static func parseConfirmation(
+        _ call: WireToolCall, calendar: Calendar = .current
+    ) -> CalendarEventConfirmation? {
+        guard call.function?.name == ToolName.createCalendarEvent,
+              let id = call.id, !id.isEmpty,
+              let args = parseArgs(call.function?.arguments)
+        else { return nil }
+
+        guard let title = trimmed(args.title),
+              let start = CalendarTool.parseDate(args.startDate, calendar: calendar)
+        else { return nil }
+
+        let isAllDay = args.isAllDay ?? false
+        let fallbackEnd: Date
+        if isAllDay {
+            fallbackEnd = calendar.date(byAdding: .day, value: 1, to: start) ?? start
+        } else {
+            fallbackEnd = start.addingTimeInterval(defaultDurationSeconds)
+        }
+        var end = CalendarTool.parseDate(args.endDate, calendar: calendar) ?? fallbackEnd
+        var normalizedStart = start
+        if isAllDay {
+            normalizedStart = calendar.startOfDay(for: start)
+            end = calendar.startOfDay(for: end)
+            if end <= normalizedStart {
+                end = calendar.date(byAdding: .day, value: 1, to: normalizedStart) ?? normalizedStart
+            }
+        }
+        guard end > normalizedStart,
+              CalendarTool.isRangeAllowed(start: normalizedStart, end: end, calendar: calendar)
+        else { return nil }
+
+        return CalendarEventConfirmation(
+            toolCallId: id,
+            draft: CalendarEventDraft(
+                title: title,
+                start: normalizedStart,
+                end: end,
+                isAllDay: isAllDay,
+                calendarTitle: trimmed(args.calendar),
+                location: trimmed(args.location),
+                notes: trimmed(args.notes)
+            )
+        )
+    }
+
+    public static func formatCreated(
+        event: CalendarEvent, calendar: Calendar = .current
+    ) -> String {
+        "create_calendar_event succeeded: added "
+            + CalendarTool.eventLine(event, calendar: calendar)
+    }
+
+    private struct Args: Decodable {
+        let title: String?
+        let startDate: String?
+        let endDate: String?
+        let isAllDay: Bool?
+        let calendar: String?
+        let location: String?
+        let notes: String?
+    }
+
+    private static func parseArgs(_ raw: String?) -> Args? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty, let data = raw.data(using: .utf8)
+        else { return nil }
+        return try? Wire.decoder().decode(Args.self, from: data)
     }
 
     private static func trimmed(_ value: String?) -> String? {

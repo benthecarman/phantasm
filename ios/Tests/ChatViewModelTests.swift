@@ -228,6 +228,104 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isStreaming)
     }
 
+    func testCalendarCreatePromptCancelsAndContinues() async throws {
+        AppToolRegistry.configureCalendar(provider: TestCalendarProvider())
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        env.backendMode = .full(Self.fullCapabilities())
+        var conversation = Conversation()
+        conversation.calendarEnabled = true
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        let calls = [
+            WireToolCall(
+                index: 0,
+                id: "create_cal",
+                function: .init(
+                    name: ToolName.createCalendarEvent,
+                    arguments: #"{"title":"Lunch","start_date":"2026-06-29T12:00:00"}"#
+                )
+            ),
+        ]
+        client.enqueue(events: [.toolCalls(calls), .done])
+        client.enqueue(events: [.token("I won't add it."), .done])
+
+        vm.send("add lunch")
+
+        try await waitUntil {
+            if case .calendarEvent = vm.pendingPrompt {
+                return !vm.isStreaming
+            }
+            return false
+        }
+
+        vm.answerPendingCalendarEvent(confirm: false)
+
+        try await waitUntil {
+            guard let detail = try await store.conversationDetail(id: conversation.id) else {
+                return false
+            }
+            return detail.messages.map(\.message.role) == ["user", "assistant", "tool", "assistant"]
+                && detail.messages[2].message.name == ToolName.createCalendarEvent
+                && detail.messages[2].message.content.contains("cancelled")
+                && detail.messages.last?.message.content == "I won't add it."
+        }
+        XCTAssertNil(vm.pendingPrompt)
+    }
+
+    func testCalendarCreatePromptConfirmsAndContinues() async throws {
+        let created = CalendarEvent(
+            title: "Lunch",
+            start: Self.date(2026, 6, 29, hour: 12),
+            end: Self.date(2026, 6, 29, hour: 13),
+            calendarTitle: "Work"
+        )
+        AppToolRegistry.configureCalendar(provider: TestCalendarProvider(createResult: .success(created)))
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        env.backendMode = .full(Self.fullCapabilities())
+        var conversation = Conversation()
+        conversation.calendarEnabled = true
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        let calls = [
+            WireToolCall(
+                index: 0,
+                id: "create_cal",
+                function: .init(
+                    name: ToolName.createCalendarEvent,
+                    arguments: #"{"title":"Lunch","start_date":"2026-06-29T12:00:00"}"#
+                )
+            ),
+        ]
+        client.enqueue(events: [.toolCalls(calls), .done])
+        client.enqueue(events: [.token("Added."), .done])
+
+        vm.send("add lunch")
+
+        try await waitUntil {
+            if case .calendarEvent = vm.pendingPrompt {
+                return !vm.isStreaming
+            }
+            return false
+        }
+
+        vm.answerPendingCalendarEvent(confirm: true)
+
+        try await waitUntil {
+            guard let detail = try await store.conversationDetail(id: conversation.id) else {
+                return false
+            }
+            return detail.messages.map(\.message.role) == ["user", "assistant", "tool", "assistant"]
+                && detail.messages[2].message.name == ToolName.createCalendarEvent
+                && detail.messages[2].message.content.hasPrefix("create_calendar_event succeeded:")
+                && detail.messages.last?.message.content == "Added."
+        }
+        XCTAssertNil(vm.pendingPrompt)
+    }
+
     private func makeViewModel(
         env: FakeChatEnvironment,
         store: AppDatabase,
@@ -288,6 +386,32 @@ final class ChatViewModelTests: XCTestCase {
                 )
             ]
         )
+    }
+
+    private static func date(_ year: Int, _ month: Int, _ day: Int, hour: Int = 0) -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        var components = DateComponents()
+        components.calendar = calendar
+        components.timeZone = calendar.timeZone
+        components.year = year
+        components.month = month
+        components.day = day
+        components.hour = hour
+        return components.date!
+    }
+}
+
+private struct TestCalendarProvider: CalendarProviding {
+    var eventsResult: Result<[CalendarEvent], CalendarLookupError> = .success([])
+    var createResult: Result<CalendarEvent, CalendarLookupError> = .failure(.unavailable("not configured"))
+
+    func events(matching query: CalendarEventQuery) async -> Result<[CalendarEvent], CalendarLookupError> {
+        eventsResult
+    }
+
+    func createEvent(_ draft: CalendarEventDraft) async -> Result<CalendarEvent, CalendarLookupError> {
+        createResult
     }
 }
 

@@ -2,13 +2,9 @@ import EventKit
 import Foundation
 import PhantasmKit
 
-/// EventKit-backed `CalendarProviding` for the app-hosted `get_calendar_events`
-/// tool. Lives in the app target (EventKit is kept out of `PhantasmKit` so the
-/// package stays host-testable); `CalendarTool` holds this behind the protocol
-/// and does the pure parsing + formatting.
-///
-/// Read-only: it requests full calendar-event access only so it can read events;
-/// it never creates, edits, or deletes calendar data.
+/// EventKit-backed `CalendarProviding` for the app-hosted Calendar tools. Lives
+/// in the app target (EventKit is kept out of `PhantasmKit` so the package stays
+/// host-testable); the pure tool types hold this behind the protocol.
 @MainActor
 final class CalendarProvider: CalendarProviding {
     private let store = EKEventStore()
@@ -53,6 +49,41 @@ final class CalendarProvider: CalendarProviding {
         return .success(Array(events))
     }
 
+    func createEvent(_ draft: CalendarEventDraft) async -> Result<CalendarEvent, CalendarLookupError> {
+        switch await ensureWriteAccess() {
+        case .success:
+            break
+        case .failure(let error):
+            return .failure(error)
+        }
+
+        let calendar: EKCalendar
+        switch calendarForNewEvent(named: draft.calendarTitle) {
+        case .success(let selected):
+            calendar = selected
+        case .failure(let error):
+            return .failure(error)
+        }
+
+        let event = EKEvent(eventStore: store)
+        event.calendar = calendar
+        event.title = draft.title
+        event.startDate = draft.start
+        event.endDate = draft.end
+        event.isAllDay = draft.isAllDay
+        event.location = draft.location
+        event.notes = draft.notes
+
+        do {
+            try store.save(event, span: .thisEvent, commit: true)
+            return .success(Self.calendarEvent(from: event, includeNotes: true))
+        } catch {
+            return .failure(.unavailable(
+                "couldn't create the Calendar event: \(error.localizedDescription)"
+            ))
+        }
+    }
+
     private func ensureFullAccess() async -> Result<Void, CalendarLookupError> {
         switch EKEventStore.authorizationStatus(for: .event) {
         case .fullAccess:
@@ -60,6 +91,23 @@ final class CalendarProvider: CalendarProviding {
         case .notDetermined:
             return await requestFullAccess()
         case .denied, .writeOnly:
+            return .failure(.permissionDenied)
+        case .restricted:
+            return .failure(.restricted)
+        case .authorized:
+            return .success(())
+        @unknown default:
+            return .failure(.unavailable("calendar access is unavailable on this device."))
+        }
+    }
+
+    private func ensureWriteAccess() async -> Result<Void, CalendarLookupError> {
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .fullAccess, .writeOnly:
+            return .success(())
+        case .notDetermined:
+            return await requestFullAccess()
+        case .denied:
             return .failure(.permissionDenied)
         case .restricted:
             return .failure(.restricted)
@@ -103,6 +151,35 @@ final class CalendarProvider: CalendarProviding {
             ))
         }
         return .success(matched)
+    }
+
+    private func calendarForNewEvent(named name: String?) -> Result<EKCalendar, CalendarLookupError> {
+        let writable = store.calendars(for: .event)
+            .filter(\.allowsContentModifications)
+            .sorted {
+                $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+            }
+        if let name = Self.trimmed(name) {
+            if let matched = writable.first(where: { calendar in
+                calendar.title.localizedCaseInsensitiveContains(name)
+                    || name.localizedCaseInsensitiveContains(calendar.title)
+            }) {
+                return .success(matched)
+            }
+            let available = writable.map(\.title).joined(separator: ", ")
+            return .failure(.unavailable(
+                "no writable calendars matched \(name). Writable calendars: \(available)"
+            ))
+        }
+
+        if let defaultCalendar = store.defaultCalendarForNewEvents,
+           defaultCalendar.allowsContentModifications {
+            return .success(defaultCalendar)
+        }
+        if let firstWritable = writable.first {
+            return .success(firstWritable)
+        }
+        return .failure(.unavailable("no writable Calendar is available on this device."))
     }
 
     private func eventMatchesText(_ event: EKEvent, query: CalendarEventQuery) -> Bool {

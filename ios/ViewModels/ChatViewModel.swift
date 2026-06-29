@@ -31,11 +31,11 @@ final class ChatViewModel {
     private(set) var statusText: String?
     private(set) var statusProgress: Double?
     var errorMessage: String?
-    /// A pending interactive app-tool prompt (e.g. `ask_user`'s multiple choice)
-    /// awaiting the user. The composer + prompt views resolve it via
-    /// `answerPendingPrompt`. Nil when there's nothing to answer. Auto-resolved
-    /// tools (e.g. `current_time`) never set this — they continue the turn on
-    /// their own (`resolveToolBatch`).
+    /// A pending interactive app-tool prompt (e.g. `ask_user`'s multiple choice
+    /// or a Calendar write confirmation) awaiting the user. Prompt views resolve
+    /// it via the answer helpers below. Nil when there's nothing to answer.
+    /// Auto-resolved tools (e.g. `current_time`) never set this — they continue
+    /// the turn on their own (`resolveToolBatch`).
     private(set) var pendingPrompt: AppToolPrompt?
 
     private var env: (any ChatViewModelEnvironment)?
@@ -310,14 +310,17 @@ final class ChatViewModel {
     }
 
     func send(_ rawText: String, attachments: [PendingAttachment] = []) {
-        // A typed message while an interactive prompt is pending IS the answer (it
-        // must be returned as the tool result before the turn can continue).
-        if pendingPrompt != nil {
-            let answer = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !answer.isEmpty {
-                answerPendingPrompt(answer)
-                return
+        // A typed message while an `ask_user` prompt is pending IS the answer.
+        // Prompts that require explicit buttons (Calendar writes) block ordinary
+        // sends until the user confirms or cancels in the prompt UI.
+        if let pendingPrompt {
+            if pendingPrompt.acceptsFreeTextAnswer {
+                let answer = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !answer.isEmpty {
+                    answerPendingPrompt(answer)
+                }
             }
+            return
         }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!text.isEmpty || !attachments.isEmpty), canSend,
@@ -560,7 +563,8 @@ final class ChatViewModel {
                 switch spec.function.name {
                 case ToolName.location: return detail.conversation.locationEnabled
                 case ToolName.health: return detail.conversation.healthEnabled
-                case ToolName.calendar: return detail.conversation.calendarEnabled
+                case ToolName.calendar, ToolName.createCalendarEvent:
+                    return detail.conversation.calendarEnabled
                 default: return true
                 }
             }
@@ -761,13 +765,35 @@ final class ChatViewModel {
         }
     }
 
-    /// Answer a pending interactive prompt: persist the answer as a `tool`-role
-    /// result for the forwarded call, then stream the model's continuation. The
-    /// answer is the tapped option(s) or free-typed text — either way it must be
-    /// returned as the tool result before the turn can resume.
+    /// Answer a pending `ask_user` prompt: persist the answer as a `tool`-role
+    /// result for the forwarded call, then stream the model's continuation.
     func answerPendingPrompt(_ answer: String) {
         let text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let prompt = pendingPrompt, !isStreaming,
+        guard !text.isEmpty, pendingPrompt?.acceptsFreeTextAnswer == true else { return }
+        completePendingPrompt { text }
+    }
+
+    /// Answer a pending Calendar event confirmation. Confirming performs the
+    /// EventKit write first and returns the save result to the model; canceling
+    /// returns a non-fatal cancellation result.
+    func answerPendingCalendarEvent(confirm: Bool) {
+        guard case .calendarEvent(let confirmation) = pendingPrompt else { return }
+        if confirm {
+            completePendingPrompt(status: "adding calendar event…") {
+                await AppToolRegistry.createCalendarEvent(confirmation)
+            }
+        } else {
+            completePendingPrompt {
+                CalendarCreateEventTool.cancelledResult()
+            }
+        }
+    }
+
+    private func completePendingPrompt(
+        status: String? = nil,
+        result: @escaping @Sendable () async -> String
+    ) {
+        guard let prompt = pendingPrompt, !isStreaming,
               let env, let store, let conversation,
               let base = env.activeProfile?.baseURL else { return }
         guard let model = env.backendMode.resolvedChatModel(
@@ -775,21 +801,15 @@ final class ChatViewModel {
             defaultModel: env.preferredModel
         ) else { return }
 
+        let toolCallId = prompt.toolCallId
+        let toolName = prompt.toolName
         pendingPrompt = nil
-        let toolMessage = Message(
-            conversationId: conversation.id,
-            role: "tool",
-            content: text,
-            isComplete: true,
-            toolCallId: prompt.toolCallId,
-            name: prompt.toolName
-        )
 
         isStreaming = true
         streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
-        statusText = nil
+        statusText = status
         statusProgress = nil
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
@@ -798,6 +818,19 @@ final class ChatViewModel {
         let token = env.activeToken ?? ""
 
         task = Task { [weak self] in
+            let text = await result()
+            if Task.isCancelled {
+                self?.finishAfterStreamFailure(CancellationError())
+                return
+            }
+            let toolMessage = Message(
+                conversationId: conversation.id,
+                role: "tool",
+                content: text,
+                isComplete: true,
+                toolCallId: toolCallId,
+                name: toolName
+            )
             do {
                 try await store.insertMessage(toolMessage, attachments: [])
             } catch {

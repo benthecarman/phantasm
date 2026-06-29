@@ -49,8 +49,9 @@ targets:
         NSSpeechRecognitionUsageDescription: "Phantasm uses speech recognition to transcribe your dictation. On supported devices this runs entirely on-device."
         NSLocationWhenInUseUsageDescription: "Phantasm shares your current location with the AI model only when you turn on the Location tool for a chat and the model asks for it."
         NSHealthShareUsageDescription: "Phantasm shares your Apple Health data with the AI model only when you turn on the Health tool for a chat and the model asks for it. Access is read-only."
-        NSCalendarsFullAccessUsageDescription: "Phantasm shares your calendar events with the AI model only when you turn on the Calendar tool for a chat and the model asks for it. Access is read-only."
-        NSCalendarsUsageDescription: "Phantasm shares your calendar events with the AI model only when you turn on the Calendar tool for a chat and the model asks for it. Access is read-only."
+        NSCalendarsFullAccessUsageDescription: "Phantasm shares calendar events with the AI model only when you turn on the Calendar tool for a chat. Event creation also requires your confirmation before anything is added."
+        NSCalendarsWriteOnlyAccessUsageDescription: "Phantasm can add calendar events only when you turn on the Calendar tool for a chat and confirm the event details."
+        NSCalendarsUsageDescription: "Phantasm shares calendar events with the AI model only when you turn on the Calendar tool for a chat. Event creation also requires your confirmation before anything is added."
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
