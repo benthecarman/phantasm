@@ -31,17 +31,29 @@ use crate::turn_registry::ActiveTurn;
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ChatRequest>,
+    Json(mut req): Json<ChatRequest>,
 ) -> Response {
     if req.messages.is_empty() {
         return AppError::BadRequest("`messages` must not be empty".into()).into_response();
     }
 
+    // Coarse guard first (count + estimated size, no decode), then the normalizing
+    // pass that resolves/validates/downscales each attached image into a canonical
+    // inline data URI before the turn forwards it to Ollama.
     if let Err(e) = validate_image_limits(
         &req.messages,
         state.cfg.max_request_images,
         state.cfg.max_request_image_bytes,
     ) {
+        return e.into_response();
+    }
+    if let Err(e) = crate::image_norm::normalize_request_images(
+        &mut req.messages,
+        &state.cfg,
+        state.images.as_ref(),
+    )
+    .await
+    {
         return e.into_response();
     }
 

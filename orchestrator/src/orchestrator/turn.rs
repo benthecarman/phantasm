@@ -168,12 +168,22 @@ pub async fn run_turn<B, T>(
         }
     }
 
+    // Vision projection (FR/#2): the images the model *sees* are downscaled to a
+    // bounded resolution — models cap resolution internally, so anything larger
+    // just wastes upload + memory. This is a throwaway copy; the full-fidelity
+    // `messages` are what feed the tools (OCR/edit work on originals) and the
+    // resumable `held` continuation. `None` => nothing over the trigger, so the
+    // upstream view is just `messages` (no clone on the plain/text fast path).
+    // `mut` so mid-turn tool messages (assistant + tool results, which carry no
+    // images) can be mirrored into the projection as the loop appends them.
+    let mut vision = crate::image_norm::downscale_messages_for_vision(&messages, &cfg).await;
+
     // Plain fast path: no tools to offer => one streaming call.
     if schemas.is_empty() {
         stream_final(
             &backend,
             &model,
-            &messages,
+            vision.as_deref().unwrap_or(&messages),
             &options,
             Vec::new(),
             &tx,
@@ -205,7 +215,7 @@ pub async fn run_turn<B, T>(
         }
 
         let resp = tokio::select! {
-            r = backend.chat_once(&model, &messages, &schemas, &options) => r,
+            r = backend.chat_once(&model, vision.as_deref().unwrap_or(&messages), &schemas, &options) => r,
             _ = cancel.cancelled() => return,
         };
 
@@ -224,7 +234,16 @@ pub async fn run_turn<B, T>(
             None => {
                 // Model produced a final answer — re-issue as a stream for live tokens.
                 tracing::debug!(iter, "model produced final answer; streaming");
-                stream_final(&backend, &model, &messages, &options, appends, &tx, &cancel).await;
+                stream_final(
+                    &backend,
+                    &model,
+                    vision.as_deref().unwrap_or(&messages),
+                    &options,
+                    appends,
+                    &tx,
+                    &cancel,
+                )
+                .await;
                 return;
             }
             Some(calls) => {
@@ -302,11 +321,16 @@ pub async fn run_turn<B, T>(
                     return;
                 }
 
+                // Mirror into the vision projection (when active) so the next
+                // upstream call sees the same continuation. These messages carry
+                // no images, so the clone is cheap and needs no downscaling.
+                push_vision(&mut vision, &resp);
                 messages.push(resp); // assistant message carrying the tool_calls
                 let Some(outcomes) = execute_calls(&tools, &calls, &ctx, &tx, &cancel).await else {
                     return;
                 };
                 for outcome in outcomes {
+                    push_vision(&mut vision, &outcome.message);
                     messages.push(outcome.message);
                     if let Some(extra) = outcome.append_to_answer {
                         // A generated/edited image becomes the most recent image
@@ -336,7 +360,16 @@ pub async fn run_turn<B, T>(
         "tool-resolution hit the iteration cap; forcing final answer"
     );
     let _ = tx.send(TurnEvent::Status("finishing up…".into())).await;
-    stream_final(&backend, &model, &messages, &options, appends, &tx, &cancel).await;
+    stream_final(
+        &backend,
+        &model,
+        vision.as_deref().unwrap_or(&messages),
+        &options,
+        appends,
+        &tx,
+        &cancel,
+    )
+    .await;
 }
 
 /// Execute a batch of tool calls concurrently, returning outcomes in call
@@ -386,6 +419,15 @@ fn held_result_message(outcome: ToolOutcome) -> ChatMessage {
         message.content = Some(MessageContent::Text(combined));
     }
     message
+}
+
+/// Append `msg` to the vision projection when one is active. A no-op otherwise —
+/// the projection only exists when some image needed downscaling, in which case
+/// the upstream view must track the same continuation `messages` accumulates.
+fn push_vision(vision: &mut Option<Vec<ChatMessage>>, msg: &ChatMessage) {
+    if let Some(v) = vision.as_mut() {
+        v.push(msg.clone());
+    }
 }
 
 /// Resolve a single message's editable images to base64, most recent last: both

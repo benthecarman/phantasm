@@ -30,6 +30,11 @@ anyhow = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
 bytes = "1"
 base64 = "0.22"
+# Decode/resize/re-encode for request-image normalization (downscaling oversized
+# vision inputs before they reach Ollama). Decode-only codecs we accept on input;
+# we re-encode to png/jpeg. `default-features = false` keeps the codec surface to
+# what we actually sniff for.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 sha2 = "0.10"
 hmac = "0.12"
 uuid = { version = "1", features = ["v4"] }

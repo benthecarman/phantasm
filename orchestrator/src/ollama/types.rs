@@ -135,8 +135,8 @@ impl OllamaMessage {
     /// content parts are split: text is concatenated into `content`, image
     /// payloads move to the native `images` field.
     pub fn from_openai(m: &ChatMessage) -> Self {
-        let (content, images) = match m.content.clone() {
-            Some(c) => c.into_text_and_images(),
+        let (content, images) = match &m.content {
+            Some(c) => c.to_text_and_images(),
             None => (None, Vec::new()),
         };
         OllamaMessage {

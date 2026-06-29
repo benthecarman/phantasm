@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod image_norm;
 pub mod images;
 pub mod ollama;
 pub mod openai;

@@ -216,20 +216,27 @@ fn is_valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// The image type identified from magic bytes, or `None` if the bytes aren't a
+/// format we recognize. The strict check used when an unknown blob must be
+/// rejected (e.g. validating an upload) rather than assumed.
+pub(crate) fn recognized_image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 /// Identify the image type from magic bytes; defaults to PNG (ComfyUI's usual
 /// output) when unrecognized. Returned as a `&'static str` content-type.
-fn sniff_content_type(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
-        "image/png"
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        "image/jpeg"
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        "image/gif"
-    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        "image/webp"
-    } else {
-        "image/png"
-    }
+pub(crate) fn sniff_content_type(bytes: &[u8]) -> &'static str {
+    recognized_image_type(bytes).unwrap_or("image/png")
 }
 
 fn prune_dir(dir: &Path, ttl_s: u64) -> usize {

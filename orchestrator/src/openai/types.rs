@@ -202,16 +202,24 @@ pub struct ImageUrl {
 impl MessageContent {
     /// Split into (concatenated text, base64 image payloads). Data-URI prefixes
     /// (`data:<mime>;base64,`) are stripped so the payload is ready for Ollama's
-    /// native per-message `images` field.
+    /// native per-message `images` field. Owned variant of [`Self::to_text_and_images`].
     pub fn into_text_and_images(self) -> (Option<String>, Vec<String>) {
+        self.to_text_and_images()
+    }
+
+    /// Borrowing form of [`Self::into_text_and_images`] for the hot Ollama
+    /// conversion path: the two-phase turn loop re-issues the upstream call
+    /// several times per turn, and cloning the whole (possibly multi-MB) content
+    /// just to split it is pure waste. Same result, no `self` clone.
+    pub fn to_text_and_images(&self) -> (Option<String>, Vec<String>) {
         match self {
-            MessageContent::Text(s) => (Some(s), Vec::new()),
+            MessageContent::Text(s) => (Some(s.clone()), Vec::new()),
             MessageContent::Parts(parts) => {
                 let mut texts = Vec::new();
                 let mut images = Vec::new();
                 for part in parts {
                     match part {
-                        ContentPart::Text { text } => texts.push(text),
+                        ContentPart::Text { text } => texts.push(text.clone()),
                         ContentPart::ImageUrl { image_url } => {
                             images.push(strip_data_uri(&image_url.url));
                         }
@@ -267,7 +275,7 @@ impl MessageContent {
 
 /// Pull every `<id>` out of `/v1/files/<id>/content` occurrences in `s` (id =
 /// our base64url charset, terminated by `/`, `?`, `)`, quote, whitespace, …).
-fn extract_store_ids(s: &str) -> Vec<String> {
+pub(crate) fn extract_store_ids(s: &str) -> Vec<String> {
     const MARKER: &str = "/v1/files/";
     let mut out = Vec::new();
     let mut rest = s;

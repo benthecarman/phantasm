@@ -90,6 +90,16 @@ pub struct Config {
     pub max_request_images: usize,
     /// Max decoded bytes accepted for a single inline image.
     pub max_request_image_bytes: usize,
+    /// Longest edge (px) a vision input is allowed before it's downscaled on the
+    /// way to Ollama. Models cap resolution internally, so larger wastes upload,
+    /// memory, and re-sent-history bytes for no quality gain.
+    pub image_max_dimension: u32,
+    /// Only images whose source bytes exceed this are decoded+downscaled; smaller
+    /// ones pass through after a cheap magic-byte sniff (bounds per-turn CPU when
+    /// history images are re-sent every turn).
+    pub image_downscale_trigger_bytes: usize,
+    /// Timeout for fetching a remote (`http(s)`) input image, per attempt.
+    pub image_fetch_timeout_ms: u64,
 
     // Research mode presets. Mode ids/labels/tools are server-side data
     // (orchestrator::presets); these knobs override the per-tier numeric/boolean
@@ -289,6 +299,12 @@ impl Config {
             max_request_body_bytes: env_parse("MAX_REQUEST_BODY_BYTES", 32 * 1024 * 1024),
             max_request_images: env_parse("MAX_REQUEST_IMAGES", 16usize),
             max_request_image_bytes: env_parse("MAX_REQUEST_IMAGE_BYTES", 16 * 1024 * 1024),
+            image_max_dimension: env_parse("IMAGE_MAX_DIMENSION", 1536u32).max(1),
+            image_downscale_trigger_bytes: env_parse(
+                "IMAGE_DOWNSCALE_TRIGGER_BYTES",
+                1024 * 1024usize,
+            ),
+            image_fetch_timeout_ms: env_parse("IMAGE_FETCH_TIMEOUT_MS", 10_000u64),
             research_deep_fanout: env_parse("RESEARCH_DEEP_FANOUT", 4usize),
             research_deep_searches_per_subq: env_parse("RESEARCH_DEEP_SEARCHES_PER_SUBQ", 3usize),
             research_deep_verify: env_bool("RESEARCH_DEEP_VERIFY", true),
@@ -557,6 +573,9 @@ pub mod tests_support {
             max_request_body_bytes: 32 * 1024 * 1024,
             max_request_images: 16,
             max_request_image_bytes: 16 * 1024 * 1024,
+            image_max_dimension: 1536,
+            image_downscale_trigger_bytes: 1024 * 1024,
+            image_fetch_timeout_ms: 10_000,
             research_deep_fanout: 4,
             research_deep_searches_per_subq: 3,
             research_deep_verify: true,
