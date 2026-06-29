@@ -31,10 +31,14 @@ use crate::orchestrator::TurnEvent;
 // `LOADING_MODEL` covers the pre-sampling stretch (checkpoint into VRAM, CLIP and
 // VAE encode) where ComfyUI emits no progress frames; it is deliberately distinct
 // from `GENERATING` so the indeterminate heartbeat and the determinate sampling
-// bar read as two phases rather than the same label stuttering.
+// bar read as two phases rather than the same label stuttering. `FINISHING` is the
+// mirror on the back end: VAE decode + save run after sampling hits 100% but emit
+// no progress, so the bar would otherwise sit frozen at 100% — this labels the
+// tail as active instead.
 const STATUS_QUEUED: &str = "queued…";
 const STATUS_LOADING_MODEL: &str = "loading model…";
 const STATUS_GENERATING: &str = "generating image…";
+const STATUS_FINISHING: &str = "finishing up…";
 const STATUS_RETRIEVING: &str = "retrieving image…";
 const STATUS_DOWNLOADING: &str = "downloading image…";
 
@@ -205,9 +209,10 @@ pub async fn run_workflow(
     // queue+execute (here) vs history lookup vs byte download (in `fetch_image`).
     let submit_at = Instant::now();
 
-    // Consume progress until completion / timeout. `last_pct` is a 3-state marker:
-    // -2 = nothing seen yet, -1 = execution started (indeterminate heartbeat sent),
-    // 0..=100 = determinate sampling progress.
+    // Consume progress until completion / timeout. `last_pct` is a phase marker:
+    // -2 = nothing seen yet, -1 = execution started (loading-model heartbeat sent),
+    // 0..=100 = determinate sampling progress, 101 = post-sampling (finishing-up
+    // heartbeat sent).
     let deadline = tokio::time::sleep(Duration::from_secs(cfg.comfy_timeout_s));
     tokio::pin!(deadline);
     let mut last_pct: i64 = -2;
@@ -314,16 +319,25 @@ async fn handle_ws_message(
             if node_is_null {
                 return Some(same_prompt);
             }
-            // First sign of execution, before any determinate progress (`last_pct`
-            // still at its -2 start): emit a one-time heartbeat so the pre-sampling
-            // stretch (model load, CLIP/VAE encode) shows movement instead of a
-            // frozen "queued…". Mark it sent by advancing to -1; once `progress`
-            // frames flow, the determinate "generating image…" bar takes over.
             if same_prompt && *last_pct == -2 {
+                // First sign of execution, before any determinate progress (-2
+                // start): emit a one-time heartbeat so the pre-sampling stretch
+                // (model load, CLIP/VAE encode) shows movement instead of a frozen
+                // "queued…". Advancing to -1 marks it sent; once `progress` frames
+                // flow, the determinate "generating image…" bar takes over.
                 *last_pct = -1;
                 let _ = tx
                     .send(TurnEvent::Status(STATUS_LOADING_MODEL.into()))
                     .await;
+            } else if same_prompt && (0..=100).contains(&*last_pct) {
+                // A node is still running after sampling reported progress — VAE
+                // decode / save — which emit no progress frames, so the bar would
+                // otherwise sit frozen at 100%. Switch to an indeterminate
+                // "finishing up…" so the tail reads as active. 101 marks it sent; a
+                // later sampler (e.g. hires fix) resuming `progress` frames cleanly
+                // overrides it back to the determinate bar.
+                *last_pct = 101;
+                let _ = tx.send(TurnEvent::Status(STATUS_FINISHING.into())).await;
             }
             Some(false)
         }
@@ -568,9 +582,23 @@ mod tests {
             Some(false)
         );
         assert!(rx.try_recv().is_err());
+    }
 
-        // Once determinate progress has been seen, no late heartbeat either.
-        let mut last = 50;
+    #[tokio::test]
+    async fn executing_after_sampling_emits_finishing_once() {
+        let (tx, mut rx) = mpsc::channel(4);
+        // Sampling already reported determinate progress (bar near 100%).
+        let mut last = 100;
+        let frame = r#"{"type":"executing","data":{"node":"9","prompt_id":"pid"}}"#;
+
+        // A node still running after sampling (VAE decode/save) → "finishing up…".
+        assert_eq!(
+            handle_ws_message(frame, "pid", &mut last, &tx).await,
+            Some(false)
+        );
+        assert!(matches!(rx.try_recv(), Ok(TurnEvent::Status(s)) if s == STATUS_FINISHING));
+
+        // Further post-sampling nodes stay quiet (advanced to 101).
         assert_eq!(
             handle_ws_message(frame, "pid", &mut last, &tx).await,
             Some(false)
