@@ -275,6 +275,11 @@ fn format_snippets(
     fetched: usize,
     attempted: usize,
 ) -> String {
+    // Reserve room for the trailing straggler note up front, so appending it
+    // can't push the result past `cap` (it's part of the budget, not extra).
+    let note = straggler_note(fetched, attempted);
+    let body_cap = cap.saturating_sub(note.as_deref().map_or(0, str::len));
+
     let mut out = format!("Web search results for \"{query}\":\n\n");
     for (i, r) in results.iter().enumerate() {
         let mut entry = format!("{}. {} — {} ({})\n", i + 1, r.title, r.description, r.url);
@@ -283,13 +288,13 @@ fn format_snippets(
             entry.push_str(extract);
             entry.push('\n');
         }
-        if out.len() + entry.len() > cap {
+        if out.len() + entry.len() > body_cap {
             break;
         }
         out.push_str(&entry);
     }
-    truncate_at_char_boundary(&mut out, cap);
-    if let Some(note) = straggler_note(fetched, attempted) {
+    truncate_at_char_boundary(&mut out, body_cap);
+    if let Some(note) = note {
         out.push_str(&note);
     }
     out
@@ -566,8 +571,21 @@ mod tests {
     fn context_cap_is_respected() {
         let results = vec![r("T", "long description here", "https://x")];
         let out = format_snippets("q", &results, &[], 20, 0, 0);
-        // The straggler note (if any) is appended after the cap; the body is capped.
         assert!(out.len() <= 20);
+    }
+
+    #[test]
+    fn cap_includes_the_straggler_note() {
+        // With a note present, the note is part of the budget — the whole output
+        // (body + note) must still fit under the cap, not overflow it.
+        let results = vec![r(
+            "T",
+            "a much longer description than the cap allows",
+            "https://x",
+        )];
+        let out = format_snippets("q", &results, &[], 80, 1, 4);
+        assert!(out.len() <= 80, "output {} exceeds cap 80", out.len());
+        assert!(out.contains("(fetched 1 of 4 sources; 3 timed out)"));
     }
 
     #[test]
