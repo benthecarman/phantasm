@@ -28,6 +28,10 @@ struct ChatView: View {
     @FocusState private var composerFocused: Bool
     /// Picked once per chat (the view is rebuilt per conversation via `.id`).
     @State private var greeting = GreetingPrompts.random()
+    /// Whether the transcript is parked at (or very near) the bottom. Auto-scroll
+    /// only follows the streaming tail while this is true; once the user scrolls
+    /// up to read history it goes false and we stop yanking them back down.
+    @State private var isPinnedToBottom = true
     @Namespace private var logoNamespace
 
     init(
@@ -309,15 +313,35 @@ struct ChatView: View {
             // still fire; the drag gives the iOS-standard swipe-down dismissal.
             .scrollDismissesKeyboard(.interactively)
             .simultaneousGesture(TapGesture().onEnded { composerFocused = false })
-            // During streaming, tokens arrive many-per-second; an animated scroll
-            // per token stacks overlapping animations and janks. Follow the tail
-            // without animation while streaming, and animate the discrete jumps
-            // (new committed message, first appear).
-            .onChange(of: vm.streamingText) { _, _ in scrollToBottom(proxy, animated: false) }
-            .onChange(of: vm.streamingReasoning) { _, _ in scrollToBottom(proxy, animated: false) }
+            // Decide whether to keep following the streaming tail. The trap here
+            // is that a token arriving grows the content *before* the follow
+            // scroll catches up, which briefly looks identical to the user
+            // scrolling up. We tell them apart by the scroll offset's direction:
+            //   • Re-pin whenever the bottom is in view (distance ~0). Uses
+            //     `visibleRect` so it's correct regardless of insets/keyboard.
+            //   • Unpin only when the offset actually *decreased* (a real upward
+            //     scroll) AND we're now away from the bottom. Content growth never
+            //     decreases the offset, so it can't stop the follow.
+            .onScrollGeometryChange(for: ScrollSnapshot.self) { geometry in
+                ScrollSnapshot(
+                    offsetY: geometry.contentOffset.y,
+                    distanceFromBottom: geometry.contentSize.height - geometry.visibleRect.maxY
+                )
+            } action: { old, new in
+                if new.distanceFromBottom < pinThreshold {
+                    isPinnedToBottom = true
+                } else if new.offsetY < old.offsetY - scrollUpDeadzone {
+                    isPinnedToBottom = false
+                }
+            }
+            // Tokens arrive many-per-second; follow the tail without animation
+            // (`followTail`) so overlapping animations don't jank. Discrete jumps
+            // (new committed message, first appear) animate via `scrollToBottom`.
+            .onChange(of: vm.streamingText) { _, _ in followTail(proxy) }
+            .onChange(of: vm.streamingReasoning) { _, _ in followTail(proxy) }
             .onChange(of: messages) { _, _ in
                 vm.reconcileAssistantPreview(with: messages)
-                scrollToBottom(proxy)
+                if isPinnedToBottom { scrollToBottom(proxy) }
             }
             .onAppear {
                 vm.reconcileAssistantPreview(with: messages)
@@ -370,6 +394,18 @@ struct ChatView: View {
     }
 
     private let bottomID = "bottom-anchor"
+    /// How close to the bottom (points) counts as "at the bottom" — within this,
+    /// we re-pin and resume following the streaming tail.
+    private let pinThreshold: CGFloat = 40
+    /// Upward offset travel (points) a move must exceed to read as a deliberate
+    /// scroll-up rather than scroll jitter.
+    private let scrollUpDeadzone: CGFloat = 4
+
+    /// Follow the streaming tail without animation, but only while pinned — so
+    /// scrolling up to read history isn't fought by per-token scrolls.
+    private func followTail(_ proxy: ScrollViewProxy) {
+        if isPinnedToBottom { scrollToBottom(proxy, animated: false) }
+    }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
         if animated {
@@ -390,6 +426,10 @@ struct ChatView: View {
         input = ""
         attachments = []
         composerFocused = false
+        // Sending is an explicit "take me to the latest" intent: re-pin so the
+        // committed message and the streamed reply are followed even if the user
+        // had scrolled up while reading.
+        isPinnedToBottom = true
         if animateLogo {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                 vm.send(text, attachments: pending)
@@ -414,6 +454,15 @@ struct ChatView: View {
         editingMessageID = nil
         vm.resend(afterEditing: id, newText: text)
     }
+}
+
+/// A snapshot of the transcript's scroll state used to decide tail-following.
+/// `distanceFromBottom` is derived from `visibleRect` so it's 0 at the bottom
+/// regardless of content insets; `offsetY` lets us tell a real upward scroll
+/// (offset decreases) apart from content growing during streaming (offset holds).
+private struct ScrollSnapshot: Equatable {
+    var offsetY: CGFloat
+    var distanceFromBottom: CGFloat
 }
 
 /// The message composer with a send / stop control (FR-A3, FR-A9).
