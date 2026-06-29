@@ -1,9 +1,10 @@
 //! Image editing tool backed by ComfyUI (FR-O5).
 //!
-//! Unlike generation, editing needs an input image: it takes the user's most
-//! recent attached image (surfaced via [`crate::orchestrator::tools::TurnContext`]),
-//! uploads it into ComfyUI's input folder, injects it plus the instruction into
-//! the configured edit workflow, runs it, and embeds the result as markdown.
+//! Unlike generation, editing needs an input image: by default the most recent
+//! image in the conversation (surfaced via [`crate::orchestrator::tools::TurnContext`]),
+//! or a specific one when the model passes an `image_ref`. It uploads that image
+//! into ComfyUI's input folder, injects it plus the instruction into the
+//! configured edit workflow, runs it, and embeds the result as markdown.
 //! The output size is determined by the workflow (e.g. Klein mirrors the input).
 
 use base64::Engine;
@@ -28,6 +29,11 @@ pub struct ImageEditArgs {
     /// Seed for reproducibility (optional; randomized when omitted).
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Optional reference to a specific image already in the conversation: its
+    /// `/v1/files/<id>` link (or just the bare `<id>`). Omit to edit the most
+    /// recent image, which is the usual case.
+    #[serde(default)]
+    pub image_ref: Option<String>,
 }
 
 pub fn schema() -> Value {
@@ -39,8 +45,9 @@ pub fn schema() -> Value {
          'make it look like winter'). Operates on the most recent image in the \
          conversation — whether the user attached it or it was generated \
          earlier — so use this (not image_generation) when the user asks to \
-         change or modify a picture already in the chat. The edited image is \
-         shown to the user.",
+         change or modify a picture already in the chat. To target a specific \
+         earlier image instead of the most recent, pass its /v1/files/<id> \
+         reference as image_ref. The edited image is shown to the user.",
         params,
     )
 }
@@ -59,18 +66,17 @@ pub async fn run(
         Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
     };
 
-    // Edit the most recent image in the conversation (attached or generated).
-    let Some(input_b64) = ctx.input_images.last() else {
-        return error_outcome(
-            call_id,
-            "no image to edit; ask the user to attach or generate one".into(),
-        );
+    // The image to edit: the model's explicit `image_ref` resolved against the
+    // store when given, else the most recent image in the conversation.
+    let input_b64 = match resolve_input_image(&args, ctx).await {
+        Ok(b64) => b64,
+        Err(detail) => return error_outcome(call_id, detail),
     };
 
     let _ = tx.send(TurnEvent::Status("preparing edit…".into())).await;
 
     let result = tokio::select! {
-        r = edit(cfg, http, &args, input_b64, tx) => r,
+        r = edit(cfg, http, &args, &input_b64, tx) => r,
         _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
     };
 
@@ -94,6 +100,72 @@ pub async fn run(
             error_outcome(call_id, detail)
         }
     }
+}
+
+/// The base64 of the image to edit. An explicit `image_ref` is resolved against
+/// the store and **must** resolve — a missing/unknown/garbled ref is an error
+/// (non-fatal: it folds into the tool message, so the model can retry with a
+/// valid ref), never a silent fall-back to a different image. Only when no
+/// `image_ref` is given do we default to the most recent image in the turn.
+async fn resolve_input_image(args: &ImageEditArgs, ctx: &TurnContext) -> Result<String, String> {
+    if let Some(reference) = args
+        .image_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // The model sometimes pastes a whole inline image it saw (`data:…;base64,…`)
+        // rather than a store reference. The bytes are right there — use them
+        // directly instead of failing (and echoing megabytes back in the error).
+        if let Some((_, b64)) = reference.split_once(";base64,") {
+            return Ok(b64.to_string());
+        }
+        let id = extract_ref_id(reference);
+        let store = ctx.images.as_ref().ok_or_else(|| {
+            "image references aren't available (no image store configured); omit \
+             image_ref to edit the most recent image"
+                .to_string()
+        })?;
+        let blob = store.get(id).await.ok_or_else(|| {
+            format!(
+                "no image with reference \"{}\" found in the conversation",
+                truncate_for_error(reference)
+            )
+        })?;
+        return Ok(base64::engine::general_purpose::STANDARD.encode(&blob.bytes));
+    }
+    ctx.input_images
+        .last()
+        .cloned()
+        .ok_or_else(|| "no image to edit; ask the user to attach or generate one".to_string())
+}
+
+/// Clamp a model-supplied reference for safe inclusion in an error message — a
+/// stray long paste must not bloat the tool result (which re-enters context).
+fn truncate_for_error(reference: &str) -> String {
+    const MAX: usize = 80;
+    if reference.chars().count() <= MAX {
+        return reference.to_string();
+    }
+    let head: String = reference.chars().take(MAX).collect();
+    format!("{head}…")
+}
+
+/// Pull the content id out of whatever the model passed as an image reference: a
+/// full `…/v1/files/<id>/content?…` URL, a site-relative path, or a bare id. The
+/// id is the run of our base64url charset after the marker (or the whole string
+/// when no marker is present). `store.get` rejects a malformed id, so a garbage
+/// reference resolves to `None` and errors upstream.
+fn extract_ref_id(reference: &str) -> &str {
+    const MARKER: &str = "/v1/files/";
+    let tail = match reference.find(MARKER) {
+        Some(i) => &reference[i + MARKER.len()..],
+        None => reference,
+    };
+    let end = tail
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(tail.len());
+    &tail[..end]
 }
 
 fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
@@ -243,6 +315,126 @@ fn load_image_with_placeholder(workflow: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn store(dir: std::path::PathBuf) -> crate::images::BlobStore {
+        crate::images::BlobStore::new(dir, "k", 3600, 1 << 20, None).unwrap()
+    }
+
+    #[test]
+    fn extract_ref_id_parses_url_relative_and_bare() {
+        assert_eq!(
+            extract_ref_id("https://host/v1/files/abc123/content?exp=1&sig=z"),
+            "abc123"
+        );
+        assert_eq!(extract_ref_id("/v1/files/DEF-_4/content"), "DEF-_4");
+        assert_eq!(extract_ref_id("abc123"), "abc123");
+    }
+
+    #[tokio::test]
+    async fn explicit_ref_edits_the_referenced_image_not_most_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path().to_path_buf());
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 1, 2, 3];
+        let id = store.put(png).await.unwrap();
+        let ctx = TurnContext {
+            images: Some(store),
+            input_images: vec!["MOSTRECENT".into()],
+            ..Default::default()
+        };
+        let args = ImageEditArgs {
+            prompt: "x".into(),
+            seed: None,
+            image_ref: Some(format!("/v1/files/{id}/content?exp=1&sig=z")),
+        };
+        let want = base64::engine::general_purpose::STANDARD.encode(png);
+        assert_eq!(resolve_input_image(&args, &ctx).await.unwrap(), want);
+    }
+
+    #[tokio::test]
+    async fn omitted_ref_defaults_to_most_recent() {
+        let ctx = TurnContext {
+            input_images: vec!["OLD".into(), "RECENT".into()],
+            ..Default::default()
+        };
+        let args = ImageEditArgs {
+            prompt: "x".into(),
+            seed: None,
+            image_ref: None,
+        };
+        assert_eq!(resolve_input_image(&args, &ctx).await.unwrap(), "RECENT");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_ref_errors_without_falling_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = TurnContext {
+            images: Some(store(tmp.path().to_path_buf())),
+            // A most-recent image exists but must NOT be substituted for a bad ref.
+            input_images: vec!["MOSTRECENT".into()],
+            ..Default::default()
+        };
+        let args = ImageEditArgs {
+            prompt: "x".into(),
+            seed: None,
+            image_ref: Some("/v1/files/deadbeef/content".into()),
+        };
+        let err = resolve_input_image(&args, &ctx).await.unwrap_err();
+        assert!(err.contains("deadbeef"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn full_url_and_markdown_refs_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path().to_path_buf());
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 4, 2];
+        let id = store.put(png).await.unwrap();
+        let want = base64::engine::general_purpose::STANDARD.encode(png);
+        let ctx = TurnContext {
+            images: Some(store),
+            ..Default::default()
+        };
+        // A model may paste the whole signed URL, or the entire markdown link it saw.
+        for reference in [
+            format!("https://host.example/v1/files/{id}/content?exp=1&sig=abc"),
+            format!("![edited](https://host.example/v1/files/{id}/content?exp=1&sig=abc)"),
+        ] {
+            let args = ImageEditArgs {
+                prompt: "x".into(),
+                seed: None,
+                image_ref: Some(reference.clone()),
+            };
+            assert_eq!(
+                resolve_input_image(&args, &ctx).await.unwrap(),
+                want,
+                "ref {reference:?} should resolve to the stored image"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn data_uri_ref_uses_its_bytes_directly() {
+        // No store needed: a pasted inline image carries its own payload.
+        let ctx = TurnContext::default();
+        let args = ImageEditArgs {
+            prompt: "x".into(),
+            seed: None,
+            image_ref: Some("data:image/png;base64,SGVsbG8=".into()),
+        };
+        assert_eq!(resolve_input_image(&args, &ctx).await.unwrap(), "SGVsbG8=");
+    }
+
+    #[test]
+    fn truncate_for_error_clamps_long_refs() {
+        assert_eq!(truncate_for_error("abc123"), "abc123");
+        let long = "x".repeat(500);
+        let out = truncate_for_error(&long);
+        assert!(out.ends_with('…'));
+        assert!(
+            out.chars().count() <= 81,
+            "clamped, got {}",
+            out.chars().count()
+        );
+    }
+
     fn cfg_with_edit_nodes() -> Config {
         let mut c = crate::config::tests_support::minimal();
         c.comfy_edit_prompt = crate::config::NodeInput::parse("8.text");
@@ -262,6 +454,7 @@ mod tests {
         let args = ImageEditArgs {
             prompt: "add a hat".into(),
             seed: Some(7),
+            image_ref: None,
         };
         inject_inputs(&cfg, &mut wf, &args, "uploaded.png").unwrap();
         assert_eq!(wf["8"]["inputs"]["text"], "add a hat");
@@ -285,6 +478,7 @@ mod tests {
         let args = ImageEditArgs {
             prompt: "make it night".into(),
             seed: None,
+            image_ref: None,
         };
         inject_inputs(&cfg, &mut wf, &args, "uploaded.png").unwrap();
         assert_eq!(wf["11"]["inputs"]["image"], "uploaded.png");
@@ -303,6 +497,7 @@ mod tests {
         let args = ImageEditArgs {
             prompt: "x".into(),
             seed: None,
+            image_ref: None,
         };
         let err = inject_inputs(&cfg, &mut wf, &args, "uploaded.png").unwrap_err();
         assert!(err.contains("no LoadImage node"), "{err}");
@@ -321,6 +516,7 @@ mod tests {
         let args = ImageEditArgs {
             prompt: "x".into(),
             seed: None,
+            image_ref: None,
         };
         let err = inject_inputs(&cfg, &mut wf, &args, "uploaded.png").unwrap_err();
         assert!(err.contains("LoadImage nodes"), "{err}");
@@ -341,6 +537,7 @@ mod tests {
         let args = ImageEditArgs {
             prompt: "x".into(),
             seed: None,
+            image_ref: None,
         };
         let err = inject_inputs(&cfg, &mut wf, &args, "uploaded.png").unwrap_err();
         assert!(err.contains("placeholder"), "{err}");
