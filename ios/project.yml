@@ -42,6 +42,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Phantasm
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
         NSPhotoLibraryAddUsageDescription: "Phantasm saves generated images to your photo library when you choose to save them."
         NSCameraUsageDescription: "Phantasm uses the camera so you can take a photo to attach to a message."

@@ -81,7 +81,8 @@ enum AskService {
         // suppress thinking tokens (`reasoning_effort: "none"`) exactly the way the
         // in-app turn does — the main reason a bare headless turn felt much slower:
         // a thinking model was generating (hidden) reasoning we then waited through.
-        let mode = await CapabilitiesClient(session: session).probe(base: base, token: token)
+        let mode = (try? await CapabilitiesClient(session: session).resolve(base: base, token: token).get())
+            ?? .plainChatOnly(models: [])
         guard let model = mode.resolvedChatModel(
             conversationModel: nil,
             defaultModel: profile.defaultModel

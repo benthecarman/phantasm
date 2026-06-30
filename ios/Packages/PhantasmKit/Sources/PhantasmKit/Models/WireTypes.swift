@@ -542,6 +542,23 @@ public enum BackendMode: Sendable, Equatable {
             || capabilities.hasToolSelector(ToolSelectorName.imageGeneration)
     }
 
+    public var connectionTestMessage: String {
+        switch self {
+        case .full(let caps):
+            let hasServerTools = caps.hasToolSelector(ToolSelectorName.webSearch)
+                || caps.hasToolSelector(ToolSelectorName.utilities)
+                || caps.hasToolSelector(ToolSelectorName.imageGeneration)
+            let toolNote = hasServerTools ? " Web access / image tools available." : " Chat only - no tools advertised."
+            return "Connected. \(Self.modelCount(caps.models.count)).\(toolNote)"
+        case .ollamaNative(let models):
+            let suffix = models.isEmpty ? "" : " \(Self.modelCount(models.count))."
+            return "Connected - native Ollama chat.\(suffix)"
+        case .plainChatOnly(let models):
+            let suffix = models.isEmpty ? "" : " \(Self.modelCount(models.count))."
+            return "Connected - chat only (no web search or image tools).\(suffix)"
+        }
+    }
+
     /// Turn modes (e.g. Deep Research) advertised by the backend whose required
     /// tool selectors are available. Empty for non-orchestrator backends.
     public var availableModes: [Capabilities.Mode] {
@@ -549,6 +566,10 @@ public enum BackendMode: Sendable, Equatable {
         return caps.modes.filter { mode in
             mode.requiredTools.allSatisfy { caps.hasToolSelector($0) }
         }
+    }
+
+    private static func modelCount(_ count: Int) -> String {
+        "\(count) model\(count == 1 ? "" : "s")"
     }
 
     public var usesOllamaNativeChat: Bool {

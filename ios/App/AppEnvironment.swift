@@ -200,7 +200,8 @@ final class AppEnvironment {
         isProbing = true
         let profileID = profile.id
         let token = keychain.token(for: profileID) ?? ""
-        let mode = await capabilitiesClient.probe(base: base, token: token)
+        let mode = (try? await capabilitiesClient.resolve(base: base, token: token).get())
+            ?? .plainChatOnly(models: [])
         guard isCurrentCapabilityRefresh(generation, profileID: profileID) else { return }
         backendMode = mode
         isProbing = false

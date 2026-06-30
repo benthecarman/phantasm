@@ -1,8 +1,7 @@
 import Foundation
 
-/// Probes `/v1/capabilities` and resolves a `BackendMode` (FR-A2). A 404 or
-/// connection failure degrades to native Ollama or generic plain chat rather
-/// than erroring, so the app stays usable against a bare Ollama.
+/// Resolves a backend by trying the Phantasm capabilities manifest first, then
+/// falling back to native Ollama and generic OpenAI-compatible model listing.
 public struct CapabilitiesClient: Sendable {
     private let session: URLSession
 
@@ -10,28 +9,9 @@ public struct CapabilitiesClient: Sendable {
         self.session = session
     }
 
-    public func probe(base: URL, token: String) async -> BackendMode {
-        var req = URLRequest(url: base.appendingPathComponent("v1/capabilities"))
-        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        req.timeoutInterval = 8
-
-        if let (data, response) = try? await session.data(for: req),
-           let http = response as? HTTPURLResponse, http.statusCode == 200,
-           let caps = try? Wire.decoder().decode(Capabilities.self, from: data) {
-            return .full(caps)
-        }
-        // Not an orchestrator (or unreachable) — degrade, discovering models if we can.
-        if let models = await fetchOllamaModelList(base: base, token: token) {
-            return .ollamaNative(models: models)
-        }
-        let models = await fetchOpenAIModelList(base: base, token: token)
-        return .plainChatOnly(models: models)
-    }
-
-    /// Validate reachability + auth for the Settings "Test connection" button
-    /// (FR-A1). Tries capabilities first; if that 404s (bare Ollama) confirms the
-    /// backend by listing `/v1/models` — no model name required, no generation.
-    public func validate(base: URL, token: String) async -> Result<BackendMode, AppError> {
+    /// Resolve reachability + auth without generating text. This is used by both
+    /// background probing and the Settings "Test Connection" buttons.
+    public func resolve(base: URL, token: String) async -> Result<BackendMode, AppError> {
         var req = URLRequest(url: base.appendingPathComponent("v1/capabilities"))
         if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 8
@@ -44,17 +24,16 @@ public struct CapabilitiesClient: Sendable {
                 if let caps = try? Wire.decoder().decode(Capabilities.self, from: data) {
                     return .success(.full(caps))
                 }
-                let models = await fetchOpenAIModelList(base: base, token: token)
-                return .success(.plainChatOnly(models: models))
+                return await confirmPlainBackend(base: base, token: token)
             case 401, 403:
                 return .failure(.authFailed)
-            case 404:
+            default:
                 // Not our orchestrator — prefer native Ollama, then generic OpenAI.
                 return await confirmPlainBackend(base: base, token: token)
-            default:
-                return .failure(.modelError("HTTP \(http.statusCode)"))
             }
         } catch {
+            let fallback = await confirmPlainBackend(base: base, token: token)
+            if case .success = fallback { return fallback }
             return .failure(.from(error))
         }
     }
@@ -62,7 +41,7 @@ public struct CapabilitiesClient: Sendable {
     /// Discover available model ids for the picker. Uses the orchestrator
     /// manifest when present, otherwise bare `/v1/models`. Empty on failure.
     public func models(base: URL, token: String) async -> [String] {
-        await probe(base: base, token: token).models
+        (try? await resolve(base: base, token: token).get().models) ?? []
     }
 
     /// Confirm a bare backend by listing models. Prefer native Ollama when

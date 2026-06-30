@@ -35,13 +35,13 @@ final class AuthHeaderTests: XCTestCase {
     }
 
     func testCapabilitiesOmitsHeaderWhenTokenEmpty() async {
-        _ = await CapabilitiesClient(session: session()).probe(base: base, token: "")
+        _ = await CapabilitiesClient(session: session()).resolve(base: base, token: "")
         // Outer optional: a request was made. Inner: no Authorization header set.
         XCTAssertEqual(CapturingProtocol.lastAuthorization, .some(.none))
     }
 
     func testCapabilitiesSendsBearerWhenTokenPresent() async {
-        _ = await CapabilitiesClient(session: session()).probe(base: base, token: "secret")
+        _ = await CapabilitiesClient(session: session()).resolve(base: base, token: "secret")
         XCTAssertEqual(CapturingProtocol.lastAuthorization, "Bearer secret")
     }
 

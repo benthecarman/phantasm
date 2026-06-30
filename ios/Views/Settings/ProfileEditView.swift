@@ -176,34 +176,17 @@ struct ProfileEditView: View {
         guard let base = URL(string: BackendProfile.normalizedBaseURLString(urlString)) else { return }
         isTesting = true
         testResult = nil
-        let result = await env.capabilitiesClient.validate(base: base, token: normalizedToken)
+        let result = await env.capabilitiesClient.resolve(base: base, token: normalizedToken)
         isTesting = false
         switch result {
         case .success(let mode):
             models = mode.models
             Haptics.notify(.success)
-            switch mode {
-            case .full(let caps):
-                let tools = caps.hasToolSelector(ToolSelectorName.webSearch)
-                    || caps.hasToolSelector(ToolSelectorName.utilities)
-                    || caps.hasToolSelector(ToolSelectorName.imageGeneration)
-                let toolNote = tools ? " Web access / image tools available." : " Chat only — no tools advertised."
-                testResult = .success("Connected. \(modelCount(caps.models.count)).\(toolNote)")
-            case .ollamaNative(let models):
-                let suffix = models.isEmpty ? "" : " \(modelCount(models.count))."
-                testResult = .success("Connected — native Ollama chat.\(suffix)")
-            case .plainChatOnly(let models):
-                let suffix = models.isEmpty ? "" : " \(modelCount(models.count))."
-                testResult = .success("Connected — chat only (no web search or image tools).\(suffix)")
-            }
+            testResult = .success(mode.connectionTestMessage)
         case .failure(let error):
             testResult = .failure(error.userMessage)
             Haptics.notify(.error)
         }
-    }
-
-    private func modelCount(_ n: Int) -> String {
-        "\(n) model\(n == 1 ? "" : "s")"
     }
 
     private func save() {

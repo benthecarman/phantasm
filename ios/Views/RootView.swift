@@ -17,6 +17,7 @@ struct RootView: View {
     /// start typing", not "every empty chat grabs the keyboard").
     @State private var initialChatID: UUID?
     @State private var showSettings = false
+    @State private var showOnboarding = false
     @State private var isDrawerOpen = false
     @State private var chatViewModels = ChatViewModelCache()
     /// Live drag translation while the user is swiping the drawer.
@@ -27,15 +28,24 @@ struct RootView: View {
     private let toolbarGestureExclusionHeight: CGFloat = 44
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            chatArea
-                .disabled(isDrawerOpen)
+        Group {
+            if showOnboarding {
+                OnboardingView {
+                    showOnboarding = false
+                    startNewChat()
+                }
+            } else {
+                ZStack(alignment: .leading) {
+                    chatArea
+                        .disabled(isDrawerOpen)
 
-            edgeOpenArea
-            scrim
-            drawer
+                    edgeOpenArea
+                    scrim
+                    drawer
+                }
+                .animation(.interactiveSpring(response: 0.35, dampingFraction: 0.85), value: isDrawerOpen)
+            }
         }
-        .animation(.interactiveSpring(response: 0.35, dampingFraction: 0.85), value: isDrawerOpen)
         .sheet(isPresented: $showSettings) {
             SettingsView(onHistoryCleared: { startNewChat() })
         }
@@ -45,7 +55,17 @@ struct RootView: View {
         .onChange(of: notificationRouter.pendingConversationID) { _, id in
             if let id { openConversation(id: id) }
         }
+        .onChange(of: env.profiles) { _, _ in
+            if shouldShowOnboarding {
+                showOnboarding = true
+                closeDrawer()
+            }
+        }
         .task {
+            if shouldShowOnboarding {
+                showOnboarding = true
+                return
+            }
             if selection == nil {
                 let chat = makeNewChat()
                 initialChatID = chat.id
@@ -57,6 +77,10 @@ struct RootView: View {
                 openConversation(id: id)
             }
         }
+    }
+
+    private var shouldShowOnboarding: Bool {
+        env.profiles.isEmpty
     }
 
     private var edgeOpenArea: some View {

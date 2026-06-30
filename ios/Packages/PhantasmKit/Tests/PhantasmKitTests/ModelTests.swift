@@ -47,6 +47,28 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(caps.modelEntries.last?.capabilities?.insert, true)
     }
 
+    func testConnectionTestMessageCoversBackendModes() throws {
+        let json = """
+        {"version":"0.3.0",
+         "models":[{"id":"qwen","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":false,"embedding":false}}],
+         "tool_selectors":[{"id":"web_search","label":"Web search","tools":["web_search"]}]}
+        """
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+
+        XCTAssertEqual(
+            BackendMode.full(caps).connectionTestMessage,
+            "Connected. 1 model. Web access / image tools available."
+        )
+        XCTAssertEqual(
+            BackendMode.ollamaNative(models: ["llama"]).connectionTestMessage,
+            "Connected - native Ollama chat. 1 model."
+        )
+        XCTAssertEqual(
+            BackendMode.plainChatOnly(models: ["gpt-oss", "local"]).connectionTestMessage,
+            "Connected - chat only (no web search or image tools). 2 models."
+        )
+    }
+
     func testManifestWithoutModelCapabilitiesIsUnknown() throws {
         let json = #"{"version":"x","models":[{"id":"m"}],"tool_selectors":[]}"#
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
@@ -475,7 +497,7 @@ final class ChatRequestEncodingTests: XCTestCase {
     }
 }
 
-final class CapabilityProbeTests: XCTestCase {
+final class CapabilityResolveTests: XCTestCase {
     final class RoutingProtocol: URLProtocol {
         nonisolated(unsafe) static var responses: [String: (status: Int, body: String)] = [:]
 
@@ -510,30 +532,43 @@ final class CapabilityProbeTests: XCTestCase {
         RoutingProtocol.responses = [:]
     }
 
-    func testProbeDetectsNativeOllamaAfterMissingCapabilities() async {
+    func testResolveDetectsNativeOllamaAfterMissingCapabilities() async {
         RoutingProtocol.responses = [
             "/v1/capabilities": (404, "not found"),
             "/api/tags": (200, #"{"models":[{"name":"native-model"}]}"#),
         ]
 
-        let mode = await CapabilitiesClient(session: session())
-            .probe(base: URL(string: "https://backend.example")!, token: "")
+        let result = await CapabilitiesClient(session: session())
+            .resolve(base: URL(string: "https://backend.example")!, token: "")
 
-        XCTAssertEqual(mode, .ollamaNative(models: ["native-model"]))
+        XCTAssertEqual(try? result.get(), .ollamaNative(models: ["native-model"]))
     }
 
-    func testProbeFallsBackToOpenAIModelsWhenNotOllama() async {
+    func testResolveDetectsNativeOllamaAfterNonOrchestratorCapabilitiesResponse() async {
+        RoutingProtocol.responses = [
+            "/v1/capabilities": (405, "method not allowed"),
+            "/api/tags": (200, #"{"models":[{"name":"native-model"}]}"#),
+        ]
+
+        let result = await CapabilitiesClient(session: session())
+            .resolve(base: URL(string: "https://backend.example")!, token: "")
+
+        XCTAssertEqual(try? result.get(), .ollamaNative(models: ["native-model"]))
+    }
+
+    func testResolveFallsBackToOpenAIModelsWhenNotOllama() async {
         RoutingProtocol.responses = [
             "/v1/capabilities": (404, "not found"),
             "/api/tags": (404, "not found"),
             "/v1/models": (200, #"{"data":[{"id":"generic-model"}]}"#),
         ]
 
-        let mode = await CapabilitiesClient(session: session())
-            .probe(base: URL(string: "https://backend.example")!, token: "")
+        let result = await CapabilitiesClient(session: session())
+            .resolve(base: URL(string: "https://backend.example")!, token: "")
 
-        XCTAssertEqual(mode, .plainChatOnly(models: ["generic-model"]))
+        XCTAssertEqual(try? result.get(), .plainChatOnly(models: ["generic-model"]))
     }
+
 }
 
 final class ErrorMappingTests: XCTestCase {

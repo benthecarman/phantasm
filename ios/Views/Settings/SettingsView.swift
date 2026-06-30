@@ -81,8 +81,13 @@ struct SettingsView: View {
                     } label: {
                         Label("Voice", systemImage: "waveform")
                     }
+                    NavigationLink {
+                        PrivacyDataView()
+                    } label: {
+                        Label("Privacy & Data", systemImage: "hand.raised")
+                    }
                 } footer: {
-                    Text("Read-aloud voice, auto-speak, and dictation.")
+                    Text("Read-aloud voice, auto-speak, dictation, and data controls.")
                 }
 
                 Section {
