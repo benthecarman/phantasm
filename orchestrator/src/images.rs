@@ -57,6 +57,13 @@ pub struct Blob {
     pub content_type: &'static str,
 }
 
+/// What the store currently holds on disk — for the dashboard.
+#[derive(Debug, serde::Serialize)]
+pub struct StoreUsage {
+    pub files: u64,
+    pub bytes: u64,
+}
+
 impl BlobStore {
     /// Build a store rooted at `dir`, creating it if needed. `key` is the HMAC
     /// signing key (the server auth token). Returns `Err` so startup can fail
@@ -183,6 +190,29 @@ impl BlobStore {
     /// base64url content-hash shape — the path-traversal guard.
     fn path_for(&self, id: &str) -> Option<PathBuf> {
         is_valid_id(id).then(|| self.inner.dir.join(id))
+    }
+
+    /// Sum the store directory's current file count and bytes. Best-effort
+    /// (`None` on an unreadable dir); the store is flat, so a plain scan is
+    /// the whole story.
+    pub async fn usage(&self) -> Option<StoreUsage> {
+        let dir = self.inner.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut usage = StoreUsage { files: 0, bytes: 0 };
+            for entry in std::fs::read_dir(&dir).ok()? {
+                let Ok(meta) = entry.and_then(|e| e.metadata()) else {
+                    continue;
+                };
+                if meta.is_file() {
+                    usage.files += 1;
+                    usage.bytes += meta.len();
+                }
+            }
+            Some(usage)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Remove blobs older than the store TTL. Best-effort: scan errors and

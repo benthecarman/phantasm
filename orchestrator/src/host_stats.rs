@@ -33,6 +33,12 @@ pub struct LoadStats {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DiskStats {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct GpuStats {
     pub name: String,
     pub memory_used_bytes: u64,
@@ -50,6 +56,32 @@ pub async fn collect() -> HostStats {
         query_nvidia_smi(NVIDIA_SMI_TIMEOUT)
     );
     HostStats { memory, load, gpus }
+}
+
+/// Size and free space of the filesystem holding `path`, via `df` (same
+/// shell-out-and-degrade approach as `nvidia-smi` — no extra dependency, and
+/// `None` on any failure just hides the panel).
+pub async fn disk(path: &std::path::Path) -> Option<DiskStats> {
+    let cmd = tokio::process::Command::new("df")
+        .arg("-B1") // exact bytes; the default 1K blocks would round
+        .args(["--output=size,avail"])
+        .arg(path)
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(NVIDIA_SMI_TIMEOUT, cmd).await {
+        Ok(Ok(out)) if out.status.success() => out,
+        _ => return None,
+    };
+    parse_df(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_df(text: &str) -> Option<DiskStats> {
+    // "         1B-blocks         Avail\n     1967315451904  1200000000000\n"
+    let mut fields = text.lines().nth(1)?.split_whitespace();
+    Some(DiskStats {
+        total_bytes: fields.next()?.parse().ok()?,
+        available_bytes: fields.next()?.parse().ok()?,
+    })
 }
 
 async fn read_meminfo() -> Option<MemoryStats> {
@@ -128,6 +160,16 @@ mod tests {
         assert_eq!(mem.total_bytes, 32_671_728 * 1024);
         assert_eq!(mem.available_bytes, 20_000_000 * 1024);
         assert!(parse_meminfo("garbage").is_none());
+    }
+
+    #[test]
+    fn df_output_parses_size_and_avail() {
+        let text = "     1B-blocks         Avail\n1967315451904 1200000000000\n";
+        let disk = parse_df(text).unwrap();
+        assert_eq!(disk.total_bytes, 1_967_315_451_904);
+        assert_eq!(disk.available_bytes, 1_200_000_000_000);
+        assert!(parse_df("df: no such file\n").is_none());
+        assert!(parse_df("").is_none());
     }
 
     #[test]

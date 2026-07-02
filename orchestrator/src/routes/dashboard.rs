@@ -60,6 +60,12 @@ pub struct DashboardData {
     /// shows the table only when more than one is configured — the aggregate
     /// stats above cover the single-upstream case.
     pub upstreams: Vec<UpstreamStatus>,
+    /// On-disk footprint of the image blob store; `None` when the store is
+    /// disabled (or its directory is unreadable).
+    pub image_store: Option<crate::images::StoreUsage>,
+    /// The filesystem holding the image store (or the working directory when
+    /// no store is configured — where the metrics DB lives by default).
+    pub disk: Option<crate::host_stats::DiskStats>,
     pub host: HostStats,
 }
 
@@ -108,8 +114,26 @@ pub async fn data(
     let ollama_fut = probe_ollama(&state);
     let upstreams_fut = probe_upstreams(&state);
     let host_fut = crate::host_stats::collect();
-    let (history, ollama, upstreams, host) =
-        tokio::join!(history_fut, ollama_fut, upstreams_fut, host_fut);
+    let image_store_fut = async {
+        match &state.images {
+            Some(store) => store.usage().await,
+            None => None,
+        }
+    };
+    let disk_path = state
+        .cfg
+        .image_store_dir
+        .clone()
+        .unwrap_or_else(|| ".".into());
+    let disk_fut = crate::host_stats::disk(&disk_path);
+    let (history, ollama, upstreams, host, image_store, disk) = tokio::join!(
+        history_fut,
+        ollama_fut,
+        upstreams_fut,
+        host_fut,
+        image_store_fut,
+        disk_fut
+    );
 
     let live = super::metrics::live_gauges(&state);
     Json(DashboardData {
@@ -127,6 +151,8 @@ pub async fn data(
         history,
         ollama,
         upstreams,
+        image_store,
+        disk,
         host,
     })
 }

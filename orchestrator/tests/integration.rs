@@ -1981,9 +1981,11 @@ async fn metrics_endpoint_is_gated_and_reports_turns_and_tokens() {
 async fn dashboard_page_public_and_data_gated_with_history() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("metrics.sqlite");
+    let images = dir.path().join("images");
     let ollama = spawn(mock_ollama()).await;
     let base = spawn_orchestrator_with_cfg(&ollama, |cfg| {
         cfg.metrics_db = Some(db.clone());
+        cfg.image_store_dir = Some(images.clone());
     })
     .await;
     let client = reqwest::Client::new();
@@ -2046,6 +2048,14 @@ async fn dashboard_page_public_and_data_gated_with_history() {
     // The mock serves no /api/ps: the panel reports unreachable, not an error.
     assert_eq!(data["ollama"]["reachable"], false, "{data}");
     assert!(data["host"].is_object(), "{data}");
+    // The image store is enabled (empty) and its filesystem has headroom.
+    assert_eq!(data["image_store"]["files"], 0, "{data}");
+    assert_eq!(data["image_store"]["bytes"], 0, "{data}");
+    assert!(
+        data["disk"]["total_bytes"].as_u64().unwrap_or(0) > 0,
+        "{data}"
+    );
+    assert!(data["disk"]["available_bytes"].is_u64(), "{data}");
 
     // The model filter scopes the range sections but not the per-model summary.
     let filtered: serde_json::Value = client
