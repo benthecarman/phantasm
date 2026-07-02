@@ -86,6 +86,7 @@
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const fmtN = n => n == null ? "—" : Intl.NumberFormat("en", {notation: n >= 100000 ? "compact" : "standard", maximumFractionDigits: 1}).format(n);
+const fmtRate = n => n == null ? "—" : Intl.NumberFormat("en", {minimumFractionDigits: 1, maximumFractionDigits: 1}).format(n);
 const fmtMs = ms => ms == null ? "—" : ms >= 60000 ? (ms/60000).toFixed(1) + " m" : ms >= 1000 ? (ms/1000).toFixed(1) + " s" : ms + " ms";
 const fmtBytes = b => b == null ? "—" : b >= 2**30 ? (b/2**30).toFixed(1) + " GiB" : (b/2**20).toFixed(0) + " MiB";
 const fmtUp = s => s >= 172800 ? Math.floor(s/86400) + " d" : s >= 3600 ? Math.floor(s/3600) + " h " + Math.floor(s%3600/60) + " m" : Math.floor(s/60) + " m";
@@ -147,7 +148,7 @@ function render(d) {
   const tk = h ? h.tokens : {};
   $("tokens").innerHTML =
     stat("prompt", fmtN(tk.prompt ?? 0)) + stat("completion", fmtN(tk.completion ?? 0)) +
-    stat("avg tok/s", tk.avg_tokens_per_sec == null ? "—" : tk.avg_tokens_per_sec.toFixed(1),
+    stat("avg tok/s", fmtRate(tk.avg_tokens_per_sec),
          tk.avg_tokens_per_sec == null ? "" : "ok") +
     stat("images", fmtN(d.images_generated));
 
@@ -217,7 +218,7 @@ function modelTable(models) {
   const rows = models.map(m => `<tr><td>${esc(m.model || "(unknown)")}</td><td>${fmtN(m.turns)}</td>
     <td class="${m.errored ? "err" : ""}">${fmtN(m.errored)}</td><td>${fmtMs(m.p95_ms)}</td>
     <td>${fmtN(m.prompt_tokens)} / ${fmtN(m.completion_tokens)}</td>
-    <td>${m.avg_tokens_per_sec == null ? "—" : m.avg_tokens_per_sec.toFixed(1)}</td></tr>`).join("");
+    <td>${fmtRate(m.avg_tokens_per_sec)}</td></tr>`).join("");
   return `<table><tr><th>model</th><th>turns</th><th>errors</th><th>p95</th><th title="prompt / completion tokens">tokens in / out</th><th>tok/s</th></tr>${rows}</table>`;
 }
 function toolTable(tools) {
