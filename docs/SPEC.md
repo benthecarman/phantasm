@@ -374,8 +374,24 @@ and must only read it back for the active turn. The orchestrator MUST NOT offer
 local filesystem search/read/write tools or local-docs indexing; tools may only
 read static operator-configured assets needed to run themselves (for example
 ComfyUI workflow JSON). Future side-effecting tools (email/calendar/file/
-database writes, shell/code execution, browser automation) require an explicit
-contract update and user-confirmation UI.
+database writes, browser automation) require an explicit contract update and
+user-confirmation UI.
+
+**Sandboxed code execution (`code_exec`).** The one execution tool this
+contract deliberately admits. The model runs short self-authored snippets in a
+hardened, single-use container (rootless by default): no host filesystem
+access, one container per execution — recycled afterward, so no state or
+artifacts survive between runs — and bounded CPU, memory, pids, runtime, and
+captured output. The same `code_exec` schema name appears in **both** selector
+buckets (§2.1): under `utilities` it is always offered like the other offline
+tools, and its listing under `web_search` is what lets a run reach the
+internet. The lane is chosen per turn from the web-access signal — the presence
+of other web-bucket tools in the request's selection — never from the tool
+name: web access off ⇒ the no-network lane (no egress at all); on ⇒ an
+egress-filtered lane (internet reachable, internal/metadata endpoints blocked
+by deployment firewalling). Execution stays server-side and invisible to the
+app like any other server tool; the tool honors the persistence boundary above
+(nothing it writes outlives the run).
 
 ## 3. Orchestration server requirements
 
@@ -384,10 +400,10 @@ contract update and user-confirmation UI.
 (snippet-first; FR-O4), ComfyUI image gen with progress relay (FR-O5), model
 listing (FR-O6), bearer auth → 401 (FR-O7), cancellation — on disconnect for a
 plain turn, or via `POST /v1/chat/cancel` for a resumable turn that survives
-disconnect (FR-O8, §2.2c), optional read-only tools for web fetch, current time,
-calculator, unit
-conversion, weather, places/geocoding, market data, GitHub reads, and OCR
-(FR-O9). Local docs/filesystem tools and side-effecting tools are out of scope.
+disconnect (FR-O8, §2.2c), optional self-contained tools for web fetch, current
+time, calculator, unit conversion, weather, places/geocoding, market data,
+GitHub reads, OCR, and sandboxed code execution (`code_exec`, §2.3) (FR-O9).
+Local docs/filesystem tools and other side-effecting tools are out of scope.
 
 **Non-functional:** co-location over localhost/LAN (NFR-O1), async concurrency
 with a configurable upstream generation limit (NFR-O2), low plain-chat latency

@@ -33,11 +33,14 @@ use crate::orchestrator::{ResearchPreset, TurnEvent};
 
 /// Narrow a set of tool schemas to those the client asked for this turn.
 ///
-/// `enabled` is the request's `x_tools` field: `None` => keep every schema
-/// (older clients that don't select tools), `Some(list)` => keep only schemas
-/// whose function name appears in the list (an empty list keeps none). The
-/// schemas themselves already reflect what the server can actually run, so this
-/// is purely a per-request narrowing — it can never add a tool.
+/// `enabled` is the per-request selection resolved from the standard OpenAI
+/// `tools`/`tool_choice` fields (SPEC §2.3, via
+/// [`ChatRequest::tool_selection`](crate::openai::types::ChatRequest::tool_selection)):
+/// `None` => keep every schema (older clients that don't select tools),
+/// `Some(list)` => keep only schemas whose function name appears in the list
+/// (an empty list keeps none). The schemas themselves already reflect what the
+/// server can actually run, so this is purely a per-request narrowing — it can
+/// never add a tool.
 pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec<Value> {
     let Some(allow) = enabled else {
         return schemas;
@@ -1723,8 +1726,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_tool_selection_takes_plain_fast_path() {
-        // Tools are configured, but the client opted out via `x_tools: []` — the
-        // turn must skip tool resolution entirely (no chat_once) and just stream.
+        // Tools are configured, but the client opted out (an empty `tools`
+        // selection / `tool_choice: "none"`) — the turn must skip tool
+        // resolution entirely (no chat_once) and just stream.
         let backend =
             ScriptedBackend::new(vec![assistant_calling("web_search")], vec!["hi".into()]);
         let tools = ScriptedTools {
