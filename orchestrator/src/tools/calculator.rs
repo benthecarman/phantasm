@@ -116,35 +116,25 @@ impl<'a> Parser<'a> {
     }
 
     fn term(&mut self) -> Result<f64, String> {
-        let mut value = self.power()?;
+        let mut value = self.unary()?;
         loop {
             self.skip_ws();
             match self.peek() {
                 Some('*') => {
                     self.bump();
-                    value *= self.power()?;
+                    value *= self.unary()?;
                 }
                 Some('/') => {
                     self.bump();
-                    value /= self.power()?;
+                    value /= self.unary()?;
                 }
                 _ => return Ok(value),
             }
         }
     }
 
-    fn power(&mut self) -> Result<f64, String> {
-        let base = self.unary()?;
-        self.skip_ws();
-        if self.peek() == Some('^') {
-            self.bump();
-            let exponent = self.power()?;
-            Ok(base.powf(exponent))
-        } else {
-            Ok(base)
-        }
-    }
-
+    // Unary sign binds *looser* than `^` (mathematical convention, matching
+    // Python): `-2^2` is `-(2^2) = -4`, while `(-2)^2 = 4` needs the parens.
     fn unary(&mut self) -> Result<f64, String> {
         self.skip_ws();
         match self.peek() {
@@ -156,7 +146,21 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(-self.unary()?)
             }
-            _ => self.primary(),
+            _ => self.power(),
+        }
+    }
+
+    // `^` is right-associative; the exponent goes through `unary` so `2^-3`
+    // parses (and `2^3^2` recurses into another power on the right).
+    fn power(&mut self) -> Result<f64, String> {
+        let base = self.primary()?;
+        self.skip_ws();
+        if self.peek() == Some('^') {
+            self.bump();
+            let exponent = self.unary()?;
+            Ok(base.powf(exponent))
+        } else {
+            Ok(base)
         }
     }
 
@@ -307,5 +311,20 @@ mod tests {
     #[test]
     fn rejects_long_expression() {
         assert!(evaluate(&"1+".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn exponent_binds_tighter_than_unary_minus() {
+        // Mathematical convention (and Python): -2^2 == -(2^2) == -4.
+        assert!(evaluate("-2^2").unwrap().contains("value: -4"));
+        assert!(evaluate("(-2)^2").unwrap().contains("value: 4"));
+        assert!(evaluate("-2^-2").unwrap().contains("value: -0.25"));
+    }
+
+    #[test]
+    fn exponent_accepts_negative_and_stays_right_associative() {
+        assert!(evaluate("2^-3").unwrap().contains("value: 0.125"));
+        // Right associativity: 2^3^2 == 2^(3^2) == 512.
+        assert!(evaluate("2^3^2").unwrap().contains("value: 512"));
     }
 }
