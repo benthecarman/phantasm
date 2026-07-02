@@ -397,9 +397,3 @@ public extension Array where Element == ChatMessage {
         return try? Wire.decoder().decode([WireToolCall].self, from: data)
     }
 }
-
-private extension Array {
-    subscript(safe index: Int) -> Element? {
-        indices.contains(index) ? self[index] : nil
-    }
-}

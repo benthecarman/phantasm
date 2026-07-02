@@ -71,18 +71,6 @@ public struct CapabilitiesClient: Sendable {
         }
     }
 
-    /// Best-effort model list (empty on any failure).
-    private func fetchOpenAIModelList(base: URL, token: String) async -> [String] {
-        var req = URLRequest(url: base.appendingPathComponent("v1/models"))
-        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        req.timeoutInterval = 8
-        guard let (data, response) = try? await session.data(for: req),
-              let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            return []
-        }
-        return decodeModelIDs(data)
-    }
-
     /// Probe each native-Ollama model's `/api/show` capabilities concurrently and
     /// return the set that declares `"vision"`. Used to gate image attachments
     /// when talking to a bare Ollama (no orchestrator manifest to consult).
