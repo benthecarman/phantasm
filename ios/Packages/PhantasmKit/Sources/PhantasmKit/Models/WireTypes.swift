@@ -250,8 +250,12 @@ extension WirePart: Codable {
         switch try container.decode(String.self, forKey: .type) {
         case "image_url":
             self = .imageURL(try container.decode(ImageURLBox.self, forKey: .imageURL).url)
-        default:
+        case "text":
             self = .text(try container.decode(String.self, forKey: .text))
+        default:
+            // Forward-compat: an unknown part type (e.g. a future input_audio)
+            // must not fail the whole message decode. Keep any text it carries.
+            self = .text(try container.decodeIfPresent(String.self, forKey: .text) ?? "")
         }
     }
 
