@@ -281,7 +281,14 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
     // spent, which in practice bounds the loop since each productive turn spends
     // at least one search.
     let mut searches_left = preset.searches_per_subq.max(1);
-    'agent: while searches_left > 0 {
+    // The search budget alone does NOT bound the loop: it only shrinks when a
+    // call is literally named `web_search`, so a model that keeps hallucinating
+    // other tool names would spin forever (unbounded `msgs` growth, GPU pinned).
+    // Cap the assistant round-trips independently: enough for every budgeted
+    // search to land on its own turn, with matching slack for wasted turns.
+    let mut rounds_left = searches_left * 2 + 1;
+    'agent: while searches_left > 0 && rounds_left > 0 {
+        rounds_left -= 1;
         if cancel.is_cancelled() {
             break;
         }
@@ -1151,6 +1158,78 @@ mod tests {
         assert!(
             !valid_block.contains("[9]"),
             "verify must not be told [9] is valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_loop_terminates_when_model_never_calls_web_search() {
+        // A model that keeps hallucinating tool names other than `web_search`
+        // never spends the search budget; the independent round-trip cap must
+        // still terminate the loop (and the compression call still runs).
+        #[derive(Clone)]
+        struct BogusCaller {
+            calls: Arc<Mutex<usize>>,
+        }
+
+        impl ChatBackend for BogusCaller {
+            async fn chat_once(
+                &self,
+                _model: &str,
+                messages: &[ChatMessage],
+                _tools: &[Value],
+                _options: &Map<String, Value>,
+            ) -> Result<ChatMessage, crate::error::AppError> {
+                *self.calls.lock().unwrap() += 1;
+                if Engine::system_text(messages).contains(COMPRESS_MARK) {
+                    return Ok(ass("nothing conclusive"));
+                }
+                Ok(ass_calling("not_a_real_tool"))
+            }
+
+            async fn chat_stream(
+                &self,
+                _model: &str,
+                _messages: &[ChatMessage],
+                _options: &Map<String, Value>,
+            ) -> Result<DeltaStream, crate::error::AppError> {
+                Err(crate::error::AppError::UpstreamError("unused".into()))
+            }
+        }
+
+        let backend = BogusCaller {
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let tools = RawPageTool {
+            executed: Arc::new(Mutex::new(vec![])),
+        };
+        let preset = quick();
+        let finding = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_subagent(
+                &backend,
+                &tools,
+                &Arc::new(Semaphore::new(2)),
+                preset,
+                "m",
+                &[],
+                &TurnContext::default(),
+                &Map::new(),
+                "q".into(),
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("sub-agent loop must terminate without spending the search budget");
+        assert_eq!(finding.sub_question, "q");
+
+        // Bounded round-trips: at most `budget * 2 + 1` agent turns plus the
+        // one compression call.
+        let cap = preset.searches_per_subq.max(1) * 2 + 1;
+        assert!(
+            *backend.calls.lock().unwrap() <= cap + 1,
+            "expected at most {} upstream calls, saw {}",
+            cap + 1,
+            *backend.calls.lock().unwrap()
         );
     }
 
