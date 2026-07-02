@@ -113,9 +113,34 @@ public struct OllamaNativeChatClient: ChatClienting {
 
     private func session(for token: String) -> URLSession {
         guard !token.isEmpty else { return session }
-        let config = URLSessionConfiguration.default
-        config.httpAdditionalHeaders = ["Authorization": "Bearer \(token)"]
-        return URLSession(configuration: config)
+        return Self.tokenedSessions.session(for: token)
+    }
+
+    /// One session per bearer token, reused across turns. Building a fresh
+    /// URLSession per streamed turn (and never invalidating it) accumulates
+    /// resources; Apple recommends session reuse.
+    private static let tokenedSessions = TokenedSessionCache()
+
+    private final class TokenedSessionCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var sessions: [String: URLSession] = [:]
+
+        func session(for token: String) -> URLSession {
+            lock.lock()
+            defer { lock.unlock() }
+            if let cached = sessions[token] { return cached }
+            let config = URLSessionConfiguration.default
+            config.httpAdditionalHeaders = ["Authorization": "Bearer \(token)"]
+            let session = URLSession(configuration: config)
+            // Profiles change tokens rarely; drop stale sessions instead of
+            // growing without bound.
+            if sessions.count >= 4 {
+                sessions.values.forEach { $0.finishTasksAndInvalidate() }
+                sessions.removeAll()
+            }
+            sessions[token] = session
+            return session
+        }
     }
 
     private func mapOllamaError(_ error: Error) -> AppError {
