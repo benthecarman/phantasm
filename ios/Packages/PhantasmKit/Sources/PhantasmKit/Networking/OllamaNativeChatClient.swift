@@ -17,7 +17,11 @@ public struct OllamaNativeChatClient: ChatClienting {
         -> AsyncThrowingStream<ChatStreamEvent, Error>
     {
         AsyncThrowingStream { continuation in
-            let task = Task { @MainActor in
+            // Deliberately not main-actor-isolated: mapping the full history to
+            // Ollama messages base64-decodes every image attachment, and chunk
+            // decoding runs per token — both would contend with UI work (NFR-A4).
+            // The Ollama client is created and consumed entirely inside this task.
+            let task = Task {
                 do {
                     guard let model = Ollama.Model.ID(rawValue: request.model) else {
                         throw AppError.modelError("Invalid Ollama model id: \(request.model)")
