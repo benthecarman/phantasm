@@ -310,10 +310,15 @@ impl ThinkTagNormalizer {
     fn normalize(&mut self, mut delta: StreamDelta) -> StreamDelta {
         // Scan content for inline <think> tags. Skip the scan only when the
         // upstream is already separating reasoning natively AND we are not
-        // mid-tag: once a tag is open we must keep scanning to find its close,
-        // even if a later chunk also carries a native reasoning field — otherwise
-        // the </think> leaks into visible content and `in_reasoning` stays stuck.
-        if !delta.content.is_empty() && (self.in_reasoning || delta.reasoning.is_empty()) {
+        // mid-tag AND nothing is pending: once a tag is open we must keep
+        // scanning to find its close, even if a later chunk also carries a
+        // native reasoning field — otherwise the </think> leaks into visible
+        // content and `in_reasoning` stays stuck. And a held-back partial-tag
+        // remainder must be resolved through the scan too, or it would only
+        // flush at `done` — after this chunk's content, reordering the output.
+        if !delta.content.is_empty()
+            && (self.in_reasoning || !self.pending.is_empty() || delta.reasoning.is_empty())
+        {
             let (content, reasoning) = self.process_content(&delta.content);
             delta.content = content;
             if delta.reasoning.is_empty() {
@@ -733,6 +738,30 @@ mod tests {
         assert_eq!(deltas[0].content, "bye");
         assert!(deltas[0].done);
         assert_eq!(deltas[0].done_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn think_tag_normalizer_keeps_order_when_native_reasoning_follows_partial_tag() {
+        let mut normalizer = ThinkTagNormalizer::default();
+
+        // A pure-content chunk ends in a possible tag prefix, held back as
+        // pending. The next chunk carries BOTH native reasoning and content:
+        // the scan must not be skipped, or the pending "<thi" would only flush
+        // at done — after this chunk's content, reordering the output.
+        let first = normalizer.normalize(StreamDelta::content("<thi", false, None));
+        assert_eq!(first.content, "");
+        assert_eq!(first.reasoning, "");
+
+        let second = normalizer.normalize(StreamDelta::new("s is text", "native", false, None));
+        assert_eq!(
+            second.content, "<this is text",
+            "pending prefix resolves in order with the chunk's content"
+        );
+        assert_eq!(second.reasoning, "native");
+
+        let done = normalizer.normalize(StreamDelta::content("", true, Some("stop".into())));
+        assert_eq!(done.content, "", "nothing left to flush at done");
+        assert_eq!(done.reasoning, "");
     }
 
     #[test]
