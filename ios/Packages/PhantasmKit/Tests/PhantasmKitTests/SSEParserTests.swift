@@ -26,6 +26,33 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(classifySSELine("data: x\r"), .event(data: "x"))
     }
 
+    private func lines(of text: String) async throws -> [String] {
+        let bytes = AsyncStream<UInt8> { continuation in
+            for byte in Data(text.utf8) { continuation.yield(byte) }
+            continuation.finish()
+        }
+        var out: [String] = []
+        for try await line in sseLines(bytes) { out.append(line) }
+        return out
+    }
+
+    func testSSELinesSplitsOnAllSpecTerminators() async throws {
+        // The SSE spec allows LF, CRLF, and bare CR as line terminators.
+        let lf = try await lines(of: "a\nb\n\nc")
+        XCTAssertEqual(lf, ["a", "b", "", "c"])
+
+        let crlf = try await lines(of: "a\r\nb\r\n\r\nc")
+        XCTAssertEqual(crlf, ["a", "b", "", "c"])
+
+        let cr = try await lines(of: "a\rb\r\rc")
+        XCTAssertEqual(cr, ["a", "b", "", "c"])
+    }
+
+    func testClassifyFieldLineWithoutColon() {
+        // A field line with no colon carries an empty value per the spec.
+        XCTAssertEqual(classifySSELine("data"), .event(data: ""))
+    }
+
     func testStreamYieldsTokensStatusAndDone() async throws {
         let lines = [
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}",

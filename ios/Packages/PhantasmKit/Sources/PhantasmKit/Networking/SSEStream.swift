@@ -18,6 +18,8 @@ public func classifySSELine(_ raw: String) -> SSELine {
     let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
     if line.isEmpty { return .blank }
     if line.hasPrefix(":") { return .comment }
+    // A field line with no colon carries an empty value per the SSE spec.
+    if line == "data" { return .event(data: "") }
     if let data = stripDataPrefix(line) {
         return data == "[DONE]" ? .done : .event(data: data)
     }
@@ -167,23 +169,32 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
 ///
 /// `URLSession.AsyncBytes.lines` silently drops blank lines, but SSE uses the
 /// blank line as its event boundary — without it, consecutive `data:` frames
-/// coalesce into one undecodable blob and every token is lost. We split on `\n`
-/// ourselves so the blank boundaries survive (a `\r` left on CRLF streams is
-/// stripped downstream by `classifySSELine`). Byte-level iteration matches what
-/// `AsyncLineSequence` already does internally, so there's no added cost.
+/// coalesce into one undecodable blob and every token is lost. We split on the
+/// spec's three terminators (LF, CRLF, bare CR) ourselves so the blank
+/// boundaries survive. Byte-level iteration matches what `AsyncLineSequence`
+/// already does internally, so there's no added cost.
 public func sseLines<Bytes: AsyncSequence & Sendable>(
     _ bytes: Bytes
 ) -> AsyncThrowingStream<String, Error> where Bytes.Element == UInt8 {
     AsyncThrowingStream { continuation in
         let task = Task {
             var buffer: [UInt8] = []
+            var lastWasCR = false
             do {
                 for try await byte in bytes {
                     try Task.checkCancellation()
-                    if byte == 0x0A { // newline: emit the line (possibly empty)
+                    switch byte {
+                    case 0x0D: // bare CR terminates a line (CRLF handled below)
                         continuation.yield(String(decoding: buffer, as: UTF8.self))
                         buffer.removeAll(keepingCapacity: true)
-                    } else {
+                        lastWasCR = true
+                    case 0x0A where lastWasCR: // the LF of a CRLF: already emitted
+                        lastWasCR = false
+                    case 0x0A:
+                        continuation.yield(String(decoding: buffer, as: UTF8.self))
+                        buffer.removeAll(keepingCapacity: true)
+                    default:
+                        lastWasCR = false
                         buffer.append(byte)
                     }
                 }
