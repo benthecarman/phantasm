@@ -98,12 +98,13 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                     }
                     return false // tolerate junk chunks (FR-A8)
                 }
-                if let status = chunk.xStatus {
-                    if let progress = chunk.xProgress {
-                        continuation.yield(.progress(status, min(max(progress, 0), 1)))
-                    } else {
-                        continuation.yield(.status(status))
-                    }
+                // x_status and x_progress are additive and independent (§2.3):
+                // progress without a status still surfaces (with an empty label)
+                // instead of being dropped.
+                if let progress = chunk.xProgress {
+                    continuation.yield(.progress(chunk.xStatus ?? "", min(max(progress, 0), 1)))
+                } else if let status = chunk.xStatus {
+                    continuation.yield(.status(status))
                 }
                 if let reasoning = chunk.choices.first?.delta.reasoningText,
                    !reasoning.isEmpty {
