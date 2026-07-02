@@ -6,7 +6,7 @@ pub use client::OllamaClient;
 use futures_util::Stream;
 use serde_json::{Map, Value};
 
-use crate::config::Config;
+use crate::config::UpstreamSpec;
 use crate::error::AppError;
 use crate::ollama::types::ModelMetadata;
 use crate::openai::types::ChatMessage;
@@ -80,18 +80,17 @@ pub enum UpstreamChatBackend {
 }
 
 impl UpstreamChatBackend {
-    pub fn from_config(kind: UpstreamKind, http: reqwest::Client, cfg: &Config) -> Self {
+    pub fn from_spec(kind: UpstreamKind, http: reqwest::Client, spec: &UpstreamSpec) -> Self {
         match kind {
-            UpstreamKind::NativeOllama => UpstreamChatBackend::NativeOllama(OllamaClient::new(
-                http,
-                cfg.upstream_base.clone(),
-            )),
+            UpstreamKind::NativeOllama => {
+                UpstreamChatBackend::NativeOllama(OllamaClient::new(http, spec.base.clone()))
+            }
             UpstreamKind::OpenAICompatible => {
                 UpstreamChatBackend::OpenAICompatible(OpenAICompatibleClient::new(
                     http,
-                    &cfg.upstream_base,
-                    cfg.upstream_api_key.as_deref(),
-                    cfg.upstream_thinking_hint,
+                    &spec.base,
+                    spec.api_key.as_deref(),
+                    spec.thinking_hint,
                 ))
             }
         }

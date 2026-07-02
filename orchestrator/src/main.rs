@@ -6,7 +6,7 @@ use anyhow::Context;
 use phantasm_orchestrator::config::{Config, LogFormat};
 use phantasm_orchestrator::state::AppState;
 use phantasm_orchestrator::{
-    build_http_client, build_state_with_upstream, detect_upstream, probe_capabilities, routes,
+    build_http_client, build_state_with_upstreams, detect_upstreams, probe_capabilities, routes,
 };
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -27,9 +27,20 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(cfg);
 
     let http = build_http_client().context("building HTTP client")?;
-    let upstream = detect_upstream(&cfg, &http).await;
-    let capabilities =
-        Arc::new(probe_capabilities(&cfg, &http, &upstream.backend, Some(&upstream.models)).await);
+    let upstreams = detect_upstreams(&cfg, &http).await;
+    for entry in upstreams.entries() {
+        info!(
+            upstream = %entry.name,
+            kind = ?entry.kind,
+            base = %entry.base,
+            models = entry.models().len(),
+            pinned = entry.pinned(),
+            max_concurrency = entry.max_concurrency,
+            "upstream configured"
+        );
+    }
+    // Detection just probed every upstream's models; reuse those lists.
+    let capabilities = Arc::new(probe_capabilities(&cfg, &http, &upstreams, true).await);
     let vision_models = capabilities
         .models
         .iter()
@@ -61,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .count();
     info!(
-        upstream = ?upstream.kind,
+        upstreams = upstreams.entries().len(),
         models = capabilities.models.len(),
         completion_models,
         vision_models,
@@ -72,8 +83,7 @@ async fn main() -> anyhow::Result<()> {
         "capabilities resolved"
     );
 
-    let state: AppState =
-        build_state_with_upstream(cfg.clone(), capabilities, http, upstream.backend);
+    let state: AppState = build_state_with_upstreams(cfg.clone(), capabilities, http, upstreams);
     let app = routes::router(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)

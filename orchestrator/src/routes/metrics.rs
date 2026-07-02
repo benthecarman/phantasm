@@ -12,8 +12,15 @@ use crate::state::AppState;
 
 pub(crate) fn live_gauges(state: &AppState) -> LiveGauges {
     let registry = state.turns.snapshot_counts();
-    let max = state.cfg.upstream_concurrency as u64;
-    let inflight = max.saturating_sub(state.upstream_sem.available_permits() as u64);
+    // Summed across upstreams: each entry has its own semaphore (per-host
+    // NFR-O2 bound), and these gauges report total in-flight generations.
+    let mut max = 0u64;
+    let mut inflight = 0u64;
+    for entry in state.upstreams.entries() {
+        let entry_max = entry.max_concurrency as u64;
+        max += entry_max;
+        inflight += entry_max.saturating_sub(entry.sem.available_permits() as u64);
+    }
     LiveGauges {
         registry_running: registry.running,
         registry_attached: registry.attached,

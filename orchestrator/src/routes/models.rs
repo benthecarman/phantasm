@@ -18,7 +18,7 @@ pub async fn models(State(state): State<AppState>) -> Json<Value> {
     let snapshot = state
         .capabilities
         .get_or_refresh(CAPABILITIES_TTL, || async {
-            probe_capabilities(&state.cfg, &state.http, &state.upstream, None).await
+            probe_capabilities(&state.cfg, &state.http, &state.upstreams, false).await
         })
         .await;
 

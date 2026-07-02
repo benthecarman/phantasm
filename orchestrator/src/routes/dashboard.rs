@@ -133,14 +133,13 @@ async fn query_history(
     .flatten()
 }
 
-/// Live "what's loaded in VRAM" probe against Ollama's `/api/ps`. Only for the
-/// native upstream; unreachable => `reachable: false` so the page shows a
-/// down badge instead of hiding the panel.
+/// Live "what's loaded in VRAM" probe against Ollama's `/api/ps`. Only for a
+/// native upstream (the first one, when several are configured); unreachable
+/// => `reachable: false` so the page shows a down badge instead of hiding the
+/// panel.
 async fn probe_ollama(state: &AppState) -> Option<OllamaStatus> {
-    if state.upstream.kind() != UpstreamKind::NativeOllama {
-        return None;
-    }
-    let url = state.cfg.upstream_base.join("/api/ps").ok()?;
+    let entry = state.upstreams.first_of_kind(UpstreamKind::NativeOllama)?;
+    let url = entry.base.join("/api/ps").ok()?;
     let resp = state.http.get(url).timeout(OLLAMA_PS_TIMEOUT).send().await;
     let Ok(resp) = resp else {
         return Some(OllamaStatus {

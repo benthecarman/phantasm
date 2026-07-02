@@ -46,10 +46,11 @@ use crate::orchestrator::tools::{ToolExecutor, TurnContext};
 use crate::orchestrator::turn::{select_schemas, stream_relay};
 use crate::orchestrator::{ResearchPreset, TurnEvent};
 
-/// Run one upstream `chat_once` while holding a permit from the shared
-/// `upstream_sem`, so research's fanned-out calls obey the global concurrency
-/// bound (NFR-O2) instead of riding on one whole-run permit. The permit is held
-/// only for the duration of the call and released as soon as it returns.
+/// Run one upstream `chat_once` while holding a permit from the turn's
+/// upstream semaphore (the one for the upstream this model routed to), so
+/// research's fanned-out calls obey that host's concurrency bound (NFR-O2)
+/// instead of riding on one whole-run permit. The permit is held only for the
+/// duration of the call and released as soon as it returns.
 ///
 /// Returns `None` on cancellation (either while queued for a permit or during
 /// the call); callers treat that exactly like the cancel branch of a bare
@@ -162,8 +163,9 @@ pub async fn run_research<B, T>(
 
     // `concurrency` is a soft scheduling hint: it bounds how many sub-agents we
     // poll at once, but the real ceiling on concurrent upstream work is the
-    // shared `upstream_sem` each sub-agent re-acquires per call (NFR-O2). With a
-    // single GPU the two usually coincide; with headroom the semaphore wins.
+    // routed upstream's semaphore each sub-agent re-acquires per call (NFR-O2).
+    // With a single GPU the two usually coincide; with headroom the semaphore
+    // wins.
     let findings: Vec<Finding> = stream::iter(plan.sub_questions.iter().cloned().enumerate())
         .map(|(i, sub_q)| {
             // Each sub-agent clones the context: the cache is SHARED (dedup

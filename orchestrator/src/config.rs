@@ -44,6 +44,29 @@ impl NodeInput {
     }
 }
 
+/// One configured upstream model host. The default upstream comes from the
+/// flat `UPSTREAM_*` vars; extra named upstreams are declared in `UPSTREAMS`
+/// and configured via `UPSTREAM_<NAME>_*` vars (see `.env.example`). Requests
+/// are routed to an upstream by the model id they ask for.
+#[derive(Debug, Clone)]
+pub struct UpstreamSpec {
+    /// Lowercase name used in logs and env-var lookups (`"default"` for the
+    /// flat-var upstream).
+    pub name: String,
+    /// `None` => auto-detect (native Ollama probed first, then OpenAI `/v1`).
+    pub kind: Option<UpstreamKind>,
+    pub base: Url,
+    pub api_key: Option<String>,
+    pub thinking_hint: bool,
+    /// Models this upstream serves. Non-empty => pinned: advertised and routed
+    /// as-is, never probed. Empty => probed from the upstream.
+    pub models: Vec<String>,
+    /// Per-upstream cap on simultaneous generations. `None` => the global
+    /// `UPSTREAM_MAX_CONCURRENCY`. Separate hosts get separate semaphores —
+    /// the point of a second upstream is usually a second GPU/box.
+    pub concurrency: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -75,6 +98,10 @@ pub struct Config {
     pub models: Vec<String>,
     pub max_tool_iters: u8,
     pub upstream_concurrency: usize,
+    /// Extra named upstreams (`UPSTREAMS=vllm,...` + `UPSTREAM_<NAME>_*` vars)
+    /// beyond the default one described by the flat fields above. See
+    /// [`Config::upstream_specs`].
+    pub extra_upstreams: Vec<UpstreamSpec>,
 
     // Resumable turns (see `TurnRegistry`). A streaming turn started with an
     // `Idempotency-Key` keeps running across client disconnects (e.g. the app
@@ -307,6 +334,7 @@ impl Config {
         let default_model =
             env_or_alias("UPSTREAM_DEFAULT_MODEL", "OLLAMA_DEFAULT_MODEL", "llama3.1");
         let models = csv_alias("UPSTREAM_MODELS", "OLLAMA_MODELS");
+        let extra_upstreams = parse_extra_upstreams()?;
 
         let web_search_enabled = env_bool("TOOL_WEB_SEARCH", false);
         let brave_base = parse_url("BRAVE_BASE_URL", "https://api.search.brave.com")?;
@@ -329,6 +357,7 @@ impl Config {
             upstream_thinking_hint,
             default_model,
             models,
+            extra_upstreams,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
             upstream_concurrency: env_parse_alias(
                 "UPSTREAM_MAX_CONCURRENCY",
@@ -461,6 +490,26 @@ impl Config {
             log_content: env_bool("LOG_MESSAGE_CONTENT", false),
             presets: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Every configured upstream, in routing-priority order: the default one
+    /// (the flat `upstream_*` fields, named `"default"`) first, then the extra
+    /// named upstreams in `UPSTREAMS` declaration order. The global
+    /// `UPSTREAM_MODELS` pin applies to the default upstream, keeping its
+    /// single-upstream meaning unchanged.
+    pub fn upstream_specs(&self) -> Vec<UpstreamSpec> {
+        let mut specs = Vec::with_capacity(1 + self.extra_upstreams.len());
+        specs.push(UpstreamSpec {
+            name: "default".into(),
+            kind: self.upstream_kind,
+            base: self.upstream_base.clone(),
+            api_key: self.upstream_api_key.clone(),
+            thinking_hint: self.upstream_thinking_hint,
+            models: self.models.clone(),
+            concurrency: None,
+        });
+        specs.extend(self.extra_upstreams.iter().cloned());
+        specs
     }
 
     /// The research preset table for this deployment, built once from the
@@ -653,10 +702,11 @@ fn parse_url_alias(primary: &str, legacy: &str, default: &str) -> Result<Url> {
 }
 
 fn parse_upstream_kind() -> Result<Option<UpstreamKind>> {
-    let Some(raw) = std::env::var("UPSTREAM_KIND")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    else {
+    parse_upstream_kind_key("UPSTREAM_KIND")
+}
+
+fn parse_upstream_kind_key(key: &str) -> Result<Option<UpstreamKind>> {
+    let Some(raw) = std::env::var(key).ok().filter(|s| !s.trim().is_empty()) else {
         return Ok(None);
     };
 
@@ -668,9 +718,76 @@ fn parse_upstream_kind() -> Result<Option<UpstreamKind>> {
             Ok(Some(UpstreamKind::OpenAICompatible))
         }
         _ => anyhow::bail!(
-            "UPSTREAM_KIND must be auto, ollama, native_ollama, openai_compatible, vllm, or llama_cpp"
+            "{key} must be auto, ollama, native_ollama, openai_compatible, vllm, or llama_cpp"
         ),
     }
+}
+
+/// Parse the extra named upstreams: `UPSTREAMS` is a CSV of names, each
+/// configured via `UPSTREAM_<NAME>_*` vars (name uppercased, `-` => `_`).
+/// A declared name missing its `BASE_URL` is a hard startup error — a silently
+/// dropped upstream would strand the models meant to route to it.
+fn parse_extra_upstreams() -> Result<Vec<UpstreamSpec>> {
+    let names = csv("UPSTREAMS");
+    let mut specs: Vec<UpstreamSpec> = Vec::with_capacity(names.len());
+    for raw_name in names {
+        let name = raw_name.to_ascii_lowercase();
+        if name == "default" {
+            anyhow::bail!(
+                "UPSTREAMS must not contain \"default\" — that name is reserved for the \
+                 upstream configured by the flat UPSTREAM_* vars"
+            );
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!(
+                "UPSTREAMS entry {raw_name:?} must be alphanumeric (plus `_`/`-`) so it can \
+                 name UPSTREAM_<NAME>_* env vars"
+            );
+        }
+        if specs.iter().any(|s| s.name == name) {
+            anyhow::bail!("UPSTREAMS lists {name:?} more than once");
+        }
+        let prefix = format!("UPSTREAM_{}", name.to_ascii_uppercase().replace('-', "_"));
+        let base_key = format!("{prefix}_BASE_URL");
+        let raw_base = std::env::var(&base_key)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .with_context(|| {
+                format!("upstream {name:?} is declared in UPSTREAMS but {base_key} is unset")
+            })?;
+        let base = Url::parse(raw_base.trim())
+            .with_context(|| format!("{base_key} must be a valid URL (got {raw_base:?})"))?;
+        specs.push(UpstreamSpec {
+            kind: parse_upstream_kind_key(&format!("{prefix}_KIND"))?,
+            base,
+            api_key: std::env::var(format!("{prefix}_API_KEY"))
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            thinking_hint: env_bool(&format!("{prefix}_THINKING_HINT"), true),
+            models: csv(&format!("{prefix}_MODELS")),
+            concurrency: parse_opt_usize(&format!("{prefix}_MAX_CONCURRENCY"))?.map(|n| n.max(1)),
+            name,
+        });
+    }
+    Ok(specs)
+}
+
+/// Parse an optional integer env var: absent/blank => `None`; present-but-
+/// invalid is a hard startup error rather than a silent fallback (matching the
+/// BASE_URL/KIND handling above — a typo'd value should not quietly run with
+/// the default).
+fn parse_opt_usize(key: &str) -> Result<Option<usize>> {
+    let Some(raw) = std::env::var(key).ok().filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let n = raw
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("{key} must be a non-negative integer (got {raw:?})"))?;
+    Ok(Some(n))
 }
 
 /// Parse an optional URL env var: absent/blank => `None`; present-but-invalid is
@@ -703,6 +820,7 @@ pub mod tests_support {
             upstream_thinking_hint: true,
             default_model: "m".into(),
             models: vec![],
+            extra_upstreams: vec![],
             max_tool_iters: 5,
             upstream_concurrency: 4,
             turn_result_ttl_s: 24 * 60 * 60,
@@ -800,8 +918,8 @@ pub mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        csv_alias, env_node, env_or_alias, env_parse_alias, parse_upstream_kind, parse_url_alias,
-        NodeInput,
+        csv_alias, env_node, env_or_alias, env_parse_alias, parse_extra_upstreams,
+        parse_upstream_kind, parse_url_alias, NodeInput,
     };
     use crate::ollama::UpstreamKind;
     use std::sync::{Mutex, OnceLock};
@@ -930,6 +1048,85 @@ mod tests {
         ] {
             std::env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn extra_upstreams_parse_named_env_vars() {
+        let _guard = env_lock();
+        let keys = [
+            "UPSTREAMS",
+            "UPSTREAM_VLLM_KIND",
+            "UPSTREAM_VLLM_BASE_URL",
+            "UPSTREAM_VLLM_API_KEY",
+            "UPSTREAM_VLLM_MODELS",
+            "UPSTREAM_VLLM_MAX_CONCURRENCY",
+            "UPSTREAM_VLLM_THINKING_HINT",
+        ];
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        // No UPSTREAMS => no extras (the back-compat single-upstream path).
+        assert!(parse_extra_upstreams().unwrap().is_empty());
+
+        // A declared upstream without a base URL is a startup error, not a
+        // silently dropped backend.
+        std::env::set_var("UPSTREAMS", "vllm");
+        let err = parse_extra_upstreams().unwrap_err().to_string();
+        assert!(err.contains("UPSTREAM_VLLM_BASE_URL"), "got: {err}");
+
+        std::env::set_var("UPSTREAM_VLLM_KIND", "vllm");
+        std::env::set_var("UPSTREAM_VLLM_BASE_URL", "http://localhost:8000");
+        std::env::set_var("UPSTREAM_VLLM_API_KEY", "sk-test");
+        std::env::set_var("UPSTREAM_VLLM_MODELS", "qwen3-32b, qwen3-32b-awq");
+        std::env::set_var("UPSTREAM_VLLM_MAX_CONCURRENCY", "2");
+        std::env::set_var("UPSTREAM_VLLM_THINKING_HINT", "false");
+        let specs = parse_extra_upstreams().unwrap();
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert_eq!(spec.name, "vllm");
+        assert_eq!(spec.kind, Some(UpstreamKind::OpenAICompatible));
+        assert_eq!(spec.base.as_str(), "http://localhost:8000/");
+        assert_eq!(spec.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(spec.models, ["qwen3-32b", "qwen3-32b-awq"]);
+        assert_eq!(spec.concurrency, Some(2));
+        assert!(!spec.thinking_hint);
+
+        // Reserved / duplicate names are rejected.
+        std::env::set_var("UPSTREAMS", "default");
+        assert!(parse_extra_upstreams().is_err());
+        std::env::set_var("UPSTREAMS", "vllm,vllm");
+        assert!(parse_extra_upstreams().is_err());
+
+        // An unparseable concurrency is a startup error, not a silent default.
+        std::env::set_var("UPSTREAMS", "vllm");
+        std::env::set_var("UPSTREAM_VLLM_MAX_CONCURRENCY", "two");
+        let err = parse_extra_upstreams().unwrap_err().to_string();
+        assert!(err.contains("UPSTREAM_VLLM_MAX_CONCURRENCY"), "got: {err}");
+
+        for key in keys {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn upstream_specs_put_the_default_upstream_first() {
+        let mut cfg = crate::config::tests_support::minimal();
+        cfg.models = vec!["small".into()];
+        cfg.extra_upstreams = vec![super::UpstreamSpec {
+            name: "vllm".into(),
+            kind: Some(UpstreamKind::OpenAICompatible),
+            base: "http://localhost:8000".parse().unwrap(),
+            api_key: None,
+            thinking_hint: true,
+            models: vec!["big".into()],
+            concurrency: None,
+        }];
+        let specs = cfg.upstream_specs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "default");
+        assert_eq!(specs[0].models, ["small"]);
+        assert_eq!(specs[1].name, "vllm");
     }
 
     #[test]

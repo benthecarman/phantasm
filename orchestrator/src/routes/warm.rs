@@ -30,14 +30,19 @@ pub async fn warm(
     State(state): State<AppState>,
     Json(req): Json<WarmRequest>,
 ) -> Json<WarmResponse> {
-    let model = req
+    let requested = req
         .model
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| state.cfg.default_model.clone());
+    // Research modes ride the model id (`<base>:<mode>`); warm the base model —
+    // it's what routes and what the upstream actually loads, same as chat.
+    let (model, _preset) = state.cfg.presets().resolve_model(&requested);
 
-    // Bound concurrent upstream load against in-flight generations (NFR-O2).
-    let _permit = state.upstream_sem.acquire().await;
-    let warmed = match state.upstream.warm_model(&model).await {
+    // Bound concurrent load against in-flight generations on the upstream this
+    // model routes to (NFR-O2).
+    let entry = state.upstreams.route(&model);
+    let _permit = entry.sem.acquire().await;
+    let warmed = match entry.backend.warm_model(&model).await {
         Ok(warmed) => warmed,
         Err(e) => {
             tracing::warn!(model = %model, error = %e, "warm preload failed");

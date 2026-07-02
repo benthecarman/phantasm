@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::ollama::UpstreamChatBackend;
 use crate::openai::types::ChatMessage;
+use crate::upstreams::UpstreamSet;
 
 /// How long a stashed continuation (a turn paused on an app-hosted tool call,
 /// holding co-occurring server-call results) survives before eviction. Sized for
@@ -32,9 +32,11 @@ pub const CAPABILITIES_TTL: Duration = Duration::from_secs(60);
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub http: reqwest::Client,
-    pub upstream: UpstreamChatBackend,
-    /// Bounds simultaneous in-flight upstream generations (NFR-O2 downstream limit).
-    pub upstream_sem: Arc<Semaphore>,
+    /// Every configured upstream model host, in routing-priority order. Each
+    /// entry carries its own backend client and concurrency semaphore
+    /// (NFR-O2's bound is per-upstream — separate hosts, separate GPUs);
+    /// requests route to an upstream by model id (see `UpstreamSet::route`).
+    pub upstreams: Arc<UpstreamSet>,
     pub capabilities: CapabilitiesCache,
     /// Intra-turn continuation store: holds the resolved history of a turn paused
     /// on an app-hosted tool call when server calls co-occurred, so the

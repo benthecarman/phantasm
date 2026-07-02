@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use axum::Router;
 use phantasm_orchestrator::config::Config;
-use phantasm_orchestrator::{build_state, detect_upstream, probe_capabilities, routes};
+use phantasm_orchestrator::{
+    build_state_with_upstreams, detect_upstreams, probe_capabilities, routes,
+};
 use reqwest::RequestBuilder;
 use serde_json::Value;
 
@@ -56,8 +58,8 @@ impl RealHarness {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("build probe client");
-        let upstream = detect_upstream(&cfg, &probe_http).await;
-        let model = selected_model(&cfg, &upstream.models);
+        let upstreams = detect_upstreams(&cfg, &probe_http).await;
+        let model = selected_model(&cfg, &upstreams.primary().models());
         assert!(
             !model.trim().is_empty(),
             "set UPSTREAM_DEFAULT_MODEL, or expose at least one model from the upstream"
@@ -68,11 +70,10 @@ impl RealHarness {
             .ok()
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
 
-        let capabilities = Arc::new(
-            probe_capabilities(&cfg, &probe_http, &upstream.backend, Some(&upstream.models)).await,
-        );
+        let capabilities = Arc::new(probe_capabilities(&cfg, &probe_http, &upstreams, true).await);
         let cfg = Arc::new(cfg);
-        let state = build_state(cfg, capabilities, upstream.kind);
+        let http = phantasm_orchestrator::build_http_client().expect("build http client");
+        let state = build_state_with_upstreams(cfg, capabilities, http, upstreams);
         let base = spawn(routes::router(state)).await;
 
         let client = reqwest::Client::builder()

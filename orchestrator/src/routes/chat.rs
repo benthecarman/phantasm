@@ -239,7 +239,12 @@ async fn spawn_turn(
     let (tx, rx) = mpsc::channel::<TurnEvent>(64);
 
     let cfg = state.cfg.clone();
-    let backend = state.upstream.clone();
+    // Route to the upstream serving the resolved base model; the entry's own
+    // semaphore bounds concurrency on that host (NFR-O2, per-upstream).
+    let entry = state.upstreams.route(&model);
+    let backend = entry.backend.clone();
+    let sem = entry.sem.clone();
+    let upstream_name = entry.name.clone();
     let tools = ToolRegistry::new(
         state.cfg.clone(),
         state.http.clone(),
@@ -247,7 +252,6 @@ async fn spawn_turn(
         state.metrics.clone(),
         model.clone(),
     );
-    let sem = state.upstream_sem.clone();
     let images = state.images.clone();
 
     // Per-turn structured logging (NFR-O7). Message content is never logged
@@ -275,7 +279,7 @@ async fn spawn_turn(
 
     tokio::spawn(async move {
         let started = std::time::Instant::now();
-        tracing::info!(turn_id, model = %log_model, stream, tools_offered, mode, "turn started");
+        tracing::info!(turn_id, model = %log_model, upstream = %upstream_name, stream, tools_offered, mode, "turn started");
         run_turn(
             cfg,
             backend,

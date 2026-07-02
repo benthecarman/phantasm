@@ -19,85 +19,97 @@ pub mod routes;
 pub mod state;
 pub mod tools;
 pub mod turn_registry;
+pub mod upstreams;
 
-use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::warn;
 
-use crate::config::Config;
+use crate::config::{Config, UpstreamSpec};
 use crate::ollama::{UpstreamChatBackend, UpstreamKind};
 use crate::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo, ToolSelector};
+use crate::upstreams::{UpstreamEntry, UpstreamSet};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Clone)]
-pub struct UpstreamDetection {
-    pub kind: UpstreamKind,
-    pub models: Vec<String>,
-    pub backend: UpstreamChatBackend,
+/// Detect every configured upstream (the default `UPSTREAM_*` one plus each
+/// `UPSTREAMS` extra) and return them as a routing-ready [`UpstreamSet`].
+/// Upstreams are probed concurrently, so startup pays for the slowest host
+/// rather than the sum. Detection failures are per-upstream and non-fatal: an
+/// unreachable upstream keeps its configured (or empty) model list and simply
+/// routes nothing until a later capabilities re-probe finds it up.
+pub async fn detect_upstreams(cfg: &Config, http: &reqwest::Client) -> UpstreamSet {
+    let specs = cfg.upstream_specs();
+    let detections =
+        futures_util::future::join_all(specs.iter().map(|spec| detect_one(spec, http))).await;
+    let entries = specs
+        .iter()
+        .zip(detections)
+        .map(|(spec, (kind, models, backend))| entry_from_spec(spec, cfg, kind, backend, models))
+        .collect();
+    UpstreamSet::new(entries)
 }
 
-impl fmt::Debug for UpstreamDetection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UpstreamDetection")
-            .field("kind", &self.kind)
-            .field("models", &self.models)
-            .finish()
-    }
+/// Build the routing entry for one configured upstream. The single owner of
+/// the per-upstream concurrency resolution (spec override, else the global
+/// default, floored at 1) — keep [`detect_upstreams`] and [`build_state`] on
+/// this path so they can't diverge.
+fn entry_from_spec(
+    spec: &UpstreamSpec,
+    cfg: &Config,
+    kind: UpstreamKind,
+    backend: UpstreamChatBackend,
+    probed_models: Vec<String>,
+) -> UpstreamEntry {
+    UpstreamEntry::new(
+        spec.name.clone(),
+        kind,
+        spec.base.clone(),
+        backend,
+        spec.concurrency.unwrap_or(cfg.upstream_concurrency).max(1),
+        spec.models.clone(),
+        probed_models,
+    )
 }
 
-/// Detect which upstream chat API is exposed by `UPSTREAM_BASE_URL`.
+/// Detect which upstream chat API one configured host exposes.
 ///
 /// Native Ollama is preferred because it has the tool-call behavior this
-/// orchestrator was built around. If `UPSTREAM_KIND` is unset/`auto` and
+/// orchestrator was built around. If the spec's kind is unset/`auto` and
 /// `/api/tags` is unavailable, fall back to OpenAI-compatible `/v1/models`.
-pub async fn detect_upstream(cfg: &Config, http: &reqwest::Client) -> UpstreamDetection {
-    if let Some(kind) = cfg.upstream_kind {
-        let backend = UpstreamChatBackend::from_config(kind, http.clone(), cfg);
+async fn detect_one(
+    spec: &UpstreamSpec,
+    http: &reqwest::Client,
+) -> (UpstreamKind, Vec<String>, UpstreamChatBackend) {
+    if let Some(kind) = spec.kind {
+        let backend = UpstreamChatBackend::from_spec(kind, http.clone(), spec);
         let models = probe_backend_models(&backend).await.unwrap_or_else(|| {
             warn!(
-                upstream = ?kind,
+                upstream = %spec.name,
+                kind = ?kind,
                 "could not list configured upstream models; continuing with configured model list"
             );
             Vec::new()
         });
-        return UpstreamDetection {
-            kind,
-            models,
-            backend,
-        };
+        return (kind, models, backend);
     }
 
-    let native = UpstreamChatBackend::from_config(UpstreamKind::NativeOllama, http.clone(), cfg);
+    let native = UpstreamChatBackend::from_spec(UpstreamKind::NativeOllama, http.clone(), spec);
     if let Some(models) = probe_backend_models(&native).await {
-        return UpstreamDetection {
-            kind: UpstreamKind::NativeOllama,
-            models,
-            backend: native,
-        };
+        return (UpstreamKind::NativeOllama, models, native);
     }
 
-    let openai =
-        UpstreamChatBackend::from_config(UpstreamKind::OpenAICompatible, http.clone(), cfg);
+    let openai = UpstreamChatBackend::from_spec(UpstreamKind::OpenAICompatible, http.clone(), spec);
     if let Some(models) = probe_backend_models(&openai).await {
-        return UpstreamDetection {
-            kind: UpstreamKind::OpenAICompatible,
-            models,
-            backend: openai,
-        };
+        return (UpstreamKind::OpenAICompatible, models, openai);
     }
 
-    warn!("could not detect upstream type; defaulting to native Ollama mode");
-    let backend = UpstreamChatBackend::from_config(UpstreamKind::NativeOllama, http.clone(), cfg);
-    UpstreamDetection {
-        kind: UpstreamKind::NativeOllama,
-        models: Vec::new(),
-        backend,
-    }
+    warn!(upstream = %spec.name, "could not detect upstream type; defaulting to native Ollama mode");
+    let backend = UpstreamChatBackend::from_spec(UpstreamKind::NativeOllama, http.clone(), spec);
+    (UpstreamKind::NativeOllama, Vec::new(), backend)
 }
 
 async fn probe_backend_models(backend: &UpstreamChatBackend) -> Option<Vec<String>> {
@@ -108,42 +120,68 @@ async fn probe_backend_models(backend: &UpstreamChatBackend) -> Option<Vec<Strin
 }
 
 /// Compute the capabilities manifest from config + bounded startup probes (FR-O1).
+///
+/// With several upstreams the advertised model list is the union of every
+/// upstream's models, deduped by [`UpstreamSet::claimed_models`] — the same
+/// precedence as [`UpstreamSet::route`], so what is advertised is what routes.
+/// Each successful re-probe also refreshes the entry's routing model list.
+/// `reuse_probed` skips re-listing and trusts each entry's current list — used
+/// at startup, right after detection already probed every upstream. Probes run
+/// concurrently across upstreams so one slow/down host doesn't stall the rest
+/// (this path blocks `/v1/models` requests on capability-TTL expiry).
 pub async fn probe_capabilities(
     cfg: &Config,
     http: &reqwest::Client,
-    upstream: &UpstreamChatBackend,
-    probed_models: Option<&[String]>,
+    upstreams: &UpstreamSet,
+    reuse_probed: bool,
 ) -> CapabilitySnapshot {
-    let models = if !cfg.models.is_empty() {
-        cfg.models.clone()
-    } else if let Some(models) = probed_models.filter(|models| !models.is_empty()) {
-        models.to_vec()
-    } else if let Some(models) = probe_backend_models(upstream)
-        .await
-        .filter(|models| !models.is_empty())
-    {
-        models
-    } else {
-        warn!("could not list upstream models; advertising none");
-        Vec::new()
-    };
+    // Refresh every non-pinned entry's routing model list, concurrently.
+    if !reuse_probed {
+        futures_util::future::join_all(
+            upstreams
+                .entries()
+                .iter()
+                .filter(|entry| !entry.pinned())
+                .map(|entry| async move {
+                    if let Some(fresh) = probe_backend_models(&entry.backend).await {
+                        entry.set_probed_models(fresh);
+                    } else {
+                        // A transiently unreachable upstream keeps its last-known
+                        // list so routing (and the advertised set) doesn't flap
+                        // with one bad probe.
+                        warn!(upstream = %entry.name, "could not list upstream models; keeping last-known list");
+                    }
+                }),
+        )
+        .await;
+    }
 
     // Per-model vision + tool support is only knowable for native Ollama (via
-    // `/api/show`). For an OpenAI-compatible upstream we omit model capabilities
-    // so clients can distinguish unknown from known-unsupported.
-    let model_metadata = match upstream.kind() {
-        UpstreamKind::NativeOllama => detect_model_metadata(upstream, &models).await,
-        UpstreamKind::OpenAICompatible => vec![(None, None); models.len()],
-    };
-    let models: Vec<ModelInfo> = models
+    // `/api/show`). For an OpenAI-compatible upstream we omit model
+    // capabilities so clients can distinguish unknown from known-unsupported.
+    let claimed = upstreams.claimed_models();
+    let per_entry = futures_util::future::join_all(upstreams.entries().iter().zip(&claimed).map(
+        |(entry, ids)| async move {
+            let metadata = match entry.kind {
+                UpstreamKind::NativeOllama => detect_model_metadata(&entry.backend, ids).await,
+                UpstreamKind::OpenAICompatible => vec![(None, None); ids.len()],
+            };
+            ids.iter().cloned().zip(metadata).collect::<Vec<_>>()
+        },
+    ))
+    .await;
+    let models: Vec<ModelInfo> = per_entry
         .into_iter()
-        .zip(model_metadata)
+        .flatten()
         .map(|(id, (capabilities, context_length))| ModelInfo {
             id,
             capabilities,
             context_length,
         })
         .collect();
+    if models.is_empty() {
+        warn!("no upstream reported any models; advertising none");
+    }
 
     let brave_web_search = cfg.web_search_usable();
     let tool_selectors = tool_selectors(cfg, http).await;
@@ -330,27 +368,37 @@ pub fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
-/// Build `AppState` from a loaded config and explicit upstream kind. Kept for
-/// tests that force one provider; production should reuse the backend returned by
-/// [`detect_upstream`] via [`build_state_with_upstream`].
+/// Build `AppState` from a loaded config and explicit upstream kind for the
+/// upstreams (no auto-detection). Kept for tests that force one provider;
+/// production should use the set returned by [`detect_upstreams`] via
+/// [`build_state_with_upstreams`].
 pub fn build_state(
     cfg: Arc<Config>,
     capabilities: Arc<CapabilitySnapshot>,
     upstream_kind: UpstreamKind,
 ) -> state::AppState {
     let http = build_http_client().expect("building HTTP client");
-    let upstream = UpstreamChatBackend::from_config(upstream_kind, http.clone(), &cfg);
-    build_state_with_upstream(cfg, capabilities, http, upstream)
+    let entries = cfg
+        .upstream_specs()
+        .iter()
+        .map(|spec| {
+            let kind = spec.kind.unwrap_or(upstream_kind);
+            let backend = UpstreamChatBackend::from_spec(kind, http.clone(), spec);
+            entry_from_spec(spec, &cfg, kind, backend, Vec::new())
+        })
+        .collect();
+    build_state_with_upstreams(cfg, capabilities, http, UpstreamSet::new(entries))
 }
 
-/// Build `AppState` using an already-selected upstream backend. This keeps
-/// startup detection, chat, warm, and capability refreshes pinned to one provider
-/// kind unless the process is restarted with different config.
-pub fn build_state_with_upstream(
+/// Build `AppState` using already-detected upstream backends. This keeps
+/// startup detection, chat, warm, and capability refreshes pinned to one
+/// provider kind per upstream unless the process is restarted with different
+/// config.
+pub fn build_state_with_upstreams(
     cfg: Arc<Config>,
     capabilities: Arc<CapabilitySnapshot>,
     http: reqwest::Client,
-    mut upstream: UpstreamChatBackend,
+    mut upstreams: UpstreamSet,
 ) -> state::AppState {
     let capabilities = state::CapabilitiesCache::new(capabilities);
     // Stand up the server-hosted image store when configured. A configured-but-
@@ -435,12 +483,11 @@ pub fn build_state_with_upstream(
         }
     });
     let metrics = metrics::Metrics::new(store);
-    upstream.attach_metrics(metrics.clone());
+    upstreams.attach_metrics(metrics.clone());
     state::AppState {
-        upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.upstream_concurrency)),
         cfg,
         http,
-        upstream,
+        upstreams: Arc::new(upstreams),
         capabilities,
         continuations: state::ContinuationCache::new(),
         turns,

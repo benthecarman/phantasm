@@ -11,6 +11,7 @@ use axum::Router;
 use phantasm_orchestrator::config::{Config, LogFormat};
 use phantasm_orchestrator::ollama::{UpstreamChatBackend, UpstreamKind};
 use phantasm_orchestrator::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo};
+use phantasm_orchestrator::upstreams::{UpstreamEntry, UpstreamSet};
 use phantasm_orchestrator::{probe_capabilities, routes};
 use tokio::sync::Mutex;
 
@@ -334,6 +335,7 @@ fn test_config(upstream_base: &str) -> Config {
         upstream_thinking_hint: true,
         default_model: "m".into(),
         models: vec!["m".into()],
+        extra_upstreams: vec![],
         max_tool_iters: 5,
         upstream_concurrency: 4,
         turn_result_ttl_s: 24 * 60 * 60,
@@ -829,47 +831,55 @@ async fn mixed_tool_calls_hold_server_work_and_resume() {
 #[tokio::test]
 async fn detects_openai_compatible_upstream_when_tags_absent() {
     let openai = spawn(mock_openai_compatible()).await;
-    let cfg = test_config(&openai);
-    let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
+    let mut cfg = test_config(&openai);
+    cfg.models = vec![];
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &reqwest::Client::new()).await;
 
-    assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
-    assert_eq!(detection.backend.kind(), detection.kind);
-    assert_eq!(detection.models, ["m".to_string()]);
+    let primary = upstreams.primary();
+    assert_eq!(primary.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(primary.backend.kind(), primary.kind);
+    assert_eq!(primary.models(), ["m".to_string()]);
 }
 
 #[tokio::test]
 async fn detects_openai_compatible_upstream_when_tags_returns_json_error() {
     let openai = spawn(mock_openai_compatible_with_json_tags_error()).await;
-    let cfg = test_config(&openai);
-    let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
+    let mut cfg = test_config(&openai);
+    cfg.models = vec![];
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &reqwest::Client::new()).await;
 
-    assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
-    assert_eq!(detection.backend.kind(), detection.kind);
-    assert_eq!(detection.models, ["m".to_string()]);
+    let primary = upstreams.primary();
+    assert_eq!(primary.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(primary.backend.kind(), primary.kind);
+    assert_eq!(primary.models(), ["m".to_string()]);
 }
 
 #[tokio::test]
 async fn explicit_openai_compatible_upstream_skips_native_ollama_probe() {
     let openai = spawn(mock_openai_compatible()).await;
     let mut cfg = test_config(&openai);
+    cfg.models = vec![];
     cfg.upstream_kind = Some(UpstreamKind::OpenAICompatible);
-    let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &reqwest::Client::new()).await;
 
-    assert_eq!(detection.kind, UpstreamKind::OpenAICompatible);
-    assert_eq!(detection.backend.kind(), detection.kind);
-    assert_eq!(detection.models, ["m".to_string()]);
+    let primary = upstreams.primary();
+    assert_eq!(primary.kind, UpstreamKind::OpenAICompatible);
+    assert_eq!(primary.backend.kind(), primary.kind);
+    assert_eq!(primary.models(), ["m".to_string()]);
 }
 
 #[tokio::test]
 async fn explicit_native_ollama_upstream_does_not_fallback_to_openai_compatible() {
     let openai = spawn(mock_openai_compatible()).await;
     let mut cfg = test_config(&openai);
+    cfg.models = vec![];
     cfg.upstream_kind = Some(UpstreamKind::NativeOllama);
-    let detection = phantasm_orchestrator::detect_upstream(&cfg, &reqwest::Client::new()).await;
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &reqwest::Client::new()).await;
 
-    assert_eq!(detection.kind, UpstreamKind::NativeOllama);
-    assert_eq!(detection.backend.kind(), detection.kind);
-    assert!(detection.models.is_empty());
+    let primary = upstreams.primary();
+    assert_eq!(primary.kind, UpstreamKind::NativeOllama);
+    assert_eq!(primary.backend.kind(), primary.kind);
+    assert!(primary.models().is_empty());
 }
 
 #[tokio::test]
@@ -878,10 +888,9 @@ async fn native_capabilities_omit_metadata_when_show_errors() {
     let mut cfg = test_config(&ollama);
     cfg.models = vec![];
     let http = reqwest::Client::new();
-    let detection = phantasm_orchestrator::detect_upstream(&cfg, &http).await;
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &http).await;
 
-    let capabilities =
-        probe_capabilities(&cfg, &http, &detection.backend, Some(&detection.models)).await;
+    let capabilities = probe_capabilities(&cfg, &http, &upstreams, true).await;
 
     assert_eq!(capabilities.models.len(), 1);
     assert_eq!(capabilities.models[0].id, "m");
@@ -898,13 +907,148 @@ async fn capability_refresh_uses_fixed_backend_kind() {
     let mut cfg = test_config(&openai);
     cfg.models = vec![];
     let http = reqwest::Client::new();
-    let native = UpstreamChatBackend::from_config(UpstreamKind::NativeOllama, http.clone(), &cfg);
+    let spec = &cfg.upstream_specs()[0];
+    let native = UpstreamChatBackend::from_spec(UpstreamKind::NativeOllama, http.clone(), spec);
+    let upstreams = UpstreamSet::new(vec![UpstreamEntry::new(
+        spec.name.clone(),
+        UpstreamKind::NativeOllama,
+        spec.base.clone(),
+        native,
+        4,
+        vec![],
+        vec![],
+    )]);
 
-    let capabilities = probe_capabilities(&cfg, &http, &native, None).await;
+    let capabilities = probe_capabilities(&cfg, &http, &upstreams, false).await;
 
     assert!(
         capabilities.models.is_empty(),
         "fixed native refresh must not redetect /v1/models from the same base URL"
+    );
+}
+
+/// A second OpenAI-compatible mock standing in for vLLM: it serves one model
+/// ("big") and streams distinct content, so a response proves which upstream a
+/// chat was routed to.
+fn mock_vllm_big_model() -> Router {
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<serde_json::Value>| async move {
+                let streaming = body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                if streaming {
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"vllm\"},\"finish_reason\":null}]}\n\n\
+                                data: {\"choices\":[{\"delta\":{\"content\":\" says hi\"},\"finish_reason\":null}]}\n\n\
+                                data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                                data: [DONE]\n\n";
+                    ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
+                } else {
+                    axum::Json(serde_json::json!({
+                        "choices": [{
+                            "message": { "role": "assistant", "content": "vllm says hi" },
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { axum::Json(serde_json::json!({"data":[{"id":"big"}]})) }),
+        )
+}
+
+/// End-to-end multi-upstream flow: an Ollama-style default upstream plus a
+/// named vLLM-style extra. `/v1/models` advertises the union, and chats route
+/// to whichever upstream serves the requested model (unknown ids fall back to
+/// the default upstream).
+#[tokio::test]
+async fn multiple_upstreams_union_models_and_route_by_model() {
+    let ollama = spawn(mock_ollama()).await;
+    let vllm = spawn(mock_vllm_big_model()).await;
+
+    let mut cfg = test_config(&ollama);
+    cfg.models = vec![]; // default upstream's list comes from its /api/tags probe
+    cfg.extra_upstreams = vec![phantasm_orchestrator::config::UpstreamSpec {
+        name: "vllm".into(),
+        kind: Some(UpstreamKind::OpenAICompatible),
+        base: vllm.parse().unwrap(),
+        api_key: None,
+        thinking_hint: true,
+        models: vec![], // probed from its /v1/models
+        concurrency: Some(2),
+    }];
+
+    let http = phantasm_orchestrator::build_http_client().unwrap();
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &http).await;
+    let cfg = Arc::new(cfg);
+    let capabilities = Arc::new(probe_capabilities(&cfg, &http, &upstreams, true).await);
+    let state =
+        phantasm_orchestrator::build_state_with_upstreams(cfg, capabilities, http, upstreams);
+    let base = spawn(routes::router(state)).await;
+
+    // The advertised model list is the union across upstreams.
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/v1/models"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"m"),
+        "default upstream's model advertised: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"big"),
+        "extra upstream's model advertised: {ids:?}"
+    );
+
+    let chat = |model: &'static str| {
+        let base = base.clone();
+        async move {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {TOKEN}"))
+                .json(&serde_json::json!({
+                    "model": model,
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_success(), "chat with {model} failed");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    assert_eq!(
+        chat("big").await,
+        "vllm says hi",
+        "big routes to the vllm upstream"
+    );
+    assert_eq!(
+        chat("m").await,
+        "Hello world",
+        "m routes to the default upstream"
+    );
+    assert_eq!(
+        chat("nope").await,
+        "Hello world",
+        "unknown models fall back to the default upstream"
     );
 }
 
