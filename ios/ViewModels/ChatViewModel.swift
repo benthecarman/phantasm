@@ -54,6 +54,7 @@ final class ChatViewModel {
     /// new chat this is an in-memory draft that isn't written until the first send.
     private var conversation: Conversation?
     private var task: Task<Void, Never>?
+    private var startingTurn: StartingTurn?
     private var pendingAssistantMessageID: UUID?
     private var pendingAssistantPreviewMessageID: UUID?
     private var isSceneActive = true
@@ -67,6 +68,19 @@ final class ChatViewModel {
     private enum EmptyPendingDisposition {
         case delete
         case keepForRecovery
+    }
+
+    /// The first writes of a turn (conversation + user message), held until
+    /// `runTurn` lands them. GRDB honors Task cancellation, so cancelling the
+    /// turn task (stop, background expiry) can kill those writes before the
+    /// user's message persists — `finish` re-runs them from an uncancelled
+    /// task while this is still set.
+    private struct StartingTurn {
+        var conversation: Conversation
+        var userMessage: Message
+        var attachments: [Attachment]
+        var model: String
+        var store: ChatStore
     }
 
     init() {
@@ -383,6 +397,13 @@ final class ChatViewModel {
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
         errorMessage = nil
+        startingTurn = StartingTurn(
+            conversation: conversation,
+            userMessage: userMessage,
+            attachments: messageAttachments,
+            model: model,
+            store: store
+        )
         Task { await notifications.requestAuthorizationIfNeeded() }
 
         let snapshot = conversation
@@ -414,13 +435,21 @@ final class ChatViewModel {
         store: ChatStore
     ) async {
         do {
-            // Lazy create (idempotent) + refresh metadata + persist the user message.
-            try await store.insertConversation(conversation)
-            try await store.updateConversation(
-                id: conversation.id, title: conversation.title,
-                modelID: model, updatedAt: conversation.updatedAt
+            // Lazy create (idempotent) + refresh metadata + persist the user
+            // message. Idempotent because `finish`'s rescue re-runs it when a
+            // cancellation kills these writes mid-flight.
+            try await Self.persistStartingTurn(
+                conversation: conversation,
+                userMessage: userMessage,
+                attachments: attachments,
+                model: model,
+                store: store
             )
-            try await store.insertMessage(userMessage, attachments: attachments)
+            // ID-checked so a stale turn resuming after stop → send can't clear
+            // the new turn's snapshot.
+            if startingTurn?.userMessage.id == userMessage.id {
+                startingTurn = nil
+            }
             guard await insertPendingAssistantMessage(
                 conversationId: conversation.id,
                 store: store
@@ -435,6 +464,30 @@ final class ChatViewModel {
             conversationId: conversation.id, model: model,
             base: base, token: token, env: env, store: store
         )
+    }
+
+    private static func persistStartingTurn(
+        conversation: Conversation,
+        userMessage: Message,
+        attachments: [Attachment],
+        model: String,
+        store: ChatStore
+    ) async throws {
+        try await store.insertConversation(conversation)
+        try await store.updateConversation(
+            id: conversation.id, title: conversation.title,
+            modelID: model, updatedAt: conversation.updatedAt
+        )
+        do {
+            try await store.insertMessage(userMessage, attachments: attachments)
+        } catch {
+            // The turn task and `finish`'s rescue can both attempt this
+            // insert; the loser hits the unique constraint. Swallow only when
+            // the row actually landed — anything else is a real write error.
+            guard try await store.hasMessage(id: userMessage.id, in: conversation.id) else {
+                throw error
+            }
+        }
     }
 
     /// Re-ask from an edited earlier message (FR-A: edit a previous message).
@@ -773,10 +826,10 @@ final class ChatViewModel {
         conversationId: UUID,
         store: ChatStore
     ) async -> UUID? {
-        // stop() may have run while an earlier await was in flight (GRDB writes
-        // don't observe Swift cancellation): the VM already finished, so a row
-        // inserted now would be an orphan nobody owns — and the recovery path
-        // would silently restart the turn the user explicitly stopped.
+        // stop() may have run while an earlier await was in flight: the VM
+        // already finished, so a row inserted now would be an orphan nobody
+        // owns — and the recovery path would silently restart the turn the
+        // user explicitly stopped.
         guard isStreaming, !Task.isCancelled else { return nil }
         let assistant = Message(
             conversationId: conversationId,
@@ -1077,6 +1130,29 @@ final class ChatViewModel {
         statusText = nil
         statusProgress = nil
         task = nil
+        // Rescue an unpersisted user turn: cancelling the turn task (stop, or
+        // the background task expiring) makes its in-flight GRDB writes throw
+        // before the user's message lands. Re-run the idempotent persist from
+        // an uncancelled task, chained onto `commitTask` so a fast follow-up
+        // send (and recovery) reads a history that includes the message.
+        if let startingTurn {
+            self.startingTurn = nil
+            let priorCommit = commitTask
+            commitTask = Task { [weak self] in
+                await priorCommit?.value
+                do {
+                    try await Self.persistStartingTurn(
+                        conversation: startingTurn.conversation,
+                        userMessage: startingTurn.userMessage,
+                        attachments: startingTurn.attachments,
+                        model: startingTurn.model,
+                        store: startingTurn.store
+                    )
+                } catch {
+                    self?.errorMessage = AppError.from(error).userMessage
+                }
+            }
+        }
         if emptyPendingDisposition != .keepForRecovery {
             suspendedByScene = false
         }
@@ -1381,5 +1457,15 @@ private extension String {
             stripped = String(stripped[..<range.lowerBound])
         }
         return stripped
+    }
+}
+
+private extension ChatStore {
+    /// Membership check used only when `insertMessage` fails, to tell a benign
+    /// duplicate-key race from a real write error. It loads the full
+    /// conversation (messages + attachment data), so keep it off hot paths.
+    func hasMessage(id: UUID, in conversationID: UUID) async throws -> Bool {
+        let detail = try await conversationDetail(id: conversationID)
+        return detail?.messages.contains { $0.message.id == id } == true
     }
 }
