@@ -58,10 +58,15 @@ pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec
 /// on — which is what upgrades the single `code_exec` tool to its internet-capable
 /// lane (the same-named tool lives in both the utilities and web-access buckets, so
 /// its name alone can't carry that signal).
+///
+/// Must stay consistent with the `web_search` selector bucket built in
+/// `crate::offline_tool_selectors` (minus the dual-homed `code_exec`, which by
+/// design can't carry the signal); a unit test below asserts that.
 const WEB_ACCESS_TOOLS: &[&str] = &[
     "web_search",
     "web_fetch",
     "weather",
+    "sports",
     "maps_places",
     "market_data",
     "github",
@@ -1588,6 +1593,40 @@ mod tests {
         );
         let folded = seen_tool_result(&backend).expect("a tool result was fed back");
         assert!(folded.contains("not offered"));
+    }
+
+    #[test]
+    fn web_access_tools_matches_the_capabilities_web_bucket() {
+        // The web-access signal must recognize exactly the tools the
+        // capabilities manifest advertises under the `web_search` selector
+        // (crate::offline_tool_selectors), or a bucket member could slip past
+        // the privacy toggle's signal. `code_exec` is excluded by design: it is
+        // dual-homed (utilities too), so its name cannot carry the signal.
+        let mut cfg = crate::config::tests_support::minimal();
+        cfg.web_search_enabled = true;
+        cfg.brave_token = Some("k".into());
+        cfg.web_fetch_enabled = true;
+        cfg.weather_enabled = true;
+        cfg.sports_enabled = true;
+        cfg.maps_places_enabled = true;
+        cfg.market_data_enabled = true;
+        cfg.alpha_vantage_token = Some("k".into());
+        cfg.github_enabled = true;
+
+        let selectors = crate::offline_tool_selectors(&cfg);
+        let bucket: Vec<&str> = selectors
+            .iter()
+            .find(|s| s.id == "web_search")
+            .expect("web bucket advertised")
+            .tools
+            .iter()
+            .map(String::as_str)
+            .filter(|t| *t != "code_exec")
+            .collect();
+        assert_eq!(
+            bucket, WEB_ACCESS_TOOLS,
+            "WEB_ACCESS_TOOLS diverged from the lib.rs web_search bucket"
+        );
     }
 
     #[test]
