@@ -244,7 +244,18 @@ public extension ChatClienting {
 public struct ChatClient: ChatClienting {
     private let session: URLSession
 
-    public init(session: URLSession = .shared) {
+    /// Streaming-tuned session. `URLSession.shared`'s 60 s idle timeout kills
+    /// the first turn against a cold backend that is still loading a model
+    /// (auto-warm is off by default), surfacing "backend unreachable" for a
+    /// healthy server. Allow long idle gaps; bound the total turn instead.
+    private static let streamingSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 60 * 60
+        return URLSession(configuration: config)
+    }()
+
+    public init(session: URLSession = ChatClient.streamingSession) {
         self.session = session
     }
 
