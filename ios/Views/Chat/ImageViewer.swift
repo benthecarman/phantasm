@@ -3,10 +3,35 @@ import SwiftUI
 import UIKit
 
 /// One image in the conversation-wide gallery. `id` is stable across rebuilds
-/// (`"<messageID>:<ordinal>"`) so a tap can resolve to its position in the gallery.
+/// (`"<messageID>:<ordinal>"`) so a tap can resolve to its position in the
+/// gallery. Carries encoded bytes where possible so a long, image-heavy chat
+/// doesn't decode every image the moment the viewer opens; pages decode on
+/// demand via `load()`.
 struct GalleryImage: Identifiable, Equatable {
+    enum Source {
+        case encoded(Data)
+        case decoded(UIImage)
+    }
+
     let id: String
-    let image: UIImage
+    let source: Source
+
+    init(id: String, data: Data) {
+        self.id = id
+        self.source = .encoded(data)
+    }
+
+    init(id: String, image: UIImage) {
+        self.id = id
+        self.source = .decoded(image)
+    }
+
+    func load() -> UIImage? {
+        switch source {
+        case .encoded(let data): return UIImage(data: data)
+        case .decoded(let image): return image
+        }
+    }
 
     static func == (lhs: GalleryImage, rhs: GalleryImage) -> Bool { lhs.id == rhs.id }
 }
@@ -23,9 +48,7 @@ enum ConversationImages {
             if m.role == "user" {
                 let images = cm.attachments.filter { $0.kind == AttachmentKind.image.rawValue }
                 for (i, att) in images.enumerated() {
-                    if let ui = UIImage(data: att.data) {
-                        out.append(GalleryImage(id: "\(m.id):\(i)", image: ui))
-                    }
+                    out.append(GalleryImage(id: "\(m.id):\(i)", data: att.data))
                 }
             } else {
                 // Mirror MarkdownMessageView: inline cached server images, then
@@ -37,8 +60,8 @@ enum ConversationImages {
                 let resolved = ServerImageRef.inlineCached(m.content, cache: cache)
                 let extracted = Base64ImageExtractor().extractCached(resolved)
                 for index in extracted.images.keys.sorted() {
-                    if let data = extracted.images[index], let ui = UIImage(data: data) {
-                        out.append(GalleryImage(id: "\(m.id):\(index)", image: ui))
+                    if let data = extracted.images[index] {
+                        out.append(GalleryImage(id: "\(m.id):\(index)", data: data))
                     }
                 }
             }
@@ -67,7 +90,11 @@ struct ImageViewerView: View {
     }
 
     private var current: UIImage? {
-        images.first { $0.id == selection }?.image
+        images.first { $0.id == selection }?.load()
+    }
+
+    private var selectedIndex: Int? {
+        images.firstIndex { $0.id == selection }
     }
 
     var body: some View {
@@ -75,10 +102,15 @@ struct ImageViewerView: View {
             Color.black.ignoresSafeArea()
 
             TabView(selection: $selection) {
-                ForEach(images) { item in
-                    ZoomableImage(image: item.image)
-                        .ignoresSafeArea()
-                        .tag(item.id)
+                // Paged TabViews materialize every child up front, so each page
+                // defers its decode until it (or a neighbor) is selected — a
+                // long, image-heavy chat must not decode everything on open.
+                ForEach(Array(images.enumerated()), id: \.element.id) { index, item in
+                    GalleryPage(
+                        item: item,
+                        isActive: selectedIndex.map { abs(index - $0) <= 1 } ?? false
+                    )
+                    .tag(item.id)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: images.count > 1 ? .automatic : .never))
@@ -105,6 +137,29 @@ struct ImageViewerView: View {
                 .background(.black.opacity(0.4), in: Circle())
         }
         .accessibilityLabel("Close")
+    }
+}
+
+/// One gallery page: decodes its image when it first becomes the selection (or
+/// its neighbor), not when the viewer opens.
+private struct GalleryPage: View {
+    let item: GalleryImage
+    let isActive: Bool
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                ZoomableImage(image: image)
+                    .ignoresSafeArea()
+            } else {
+                Color.clear
+            }
+        }
+        .onChange(of: isActive, initial: true) { _, active in
+            guard active, image == nil else { return }
+            image = item.load()
+        }
     }
 }
 
