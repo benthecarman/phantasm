@@ -15,6 +15,14 @@ use tracing_subscriber::{prelude::*, EnvFilter};
 async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env().context("loading configuration from environment")?;
     init_tracing(cfg.log_format);
+    // Logged here, not in `Config::from_env`: that runs before `init_tracing`,
+    // where a warning would go to the no-op subscriber and never be seen.
+    if cfg.auth_disabled() {
+        tracing::warn!(
+            "PHANTASM_AUTH_TOKEN is unset or empty: bearer auth is DISABLED, all \
+             requests will be accepted unauthenticated"
+        );
+    }
 
     let cfg = Arc::new(cfg);
 

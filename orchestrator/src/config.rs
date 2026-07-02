@@ -265,16 +265,14 @@ impl Config {
             .context("PHANTASM_BIND must be a socket address like 0.0.0.0:8080")?;
 
         // Unset or empty => auth disabled (open server). Set => bearer-gated.
+        // The loud warning for that state is logged from `main` via
+        // `Config::auth_disabled` — `from_env` runs before tracing is
+        // initialized, so a warning emitted here would vanish into the
+        // pre-init no-op subscriber.
         let auth_token = std::env::var("PHANTASM_AUTH_TOKEN")
             .ok()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
-        if auth_token.is_none() {
-            tracing::warn!(
-                "PHANTASM_AUTH_TOKEN is unset or empty: bearer auth is DISABLED, all \
-                 requests will be accepted unauthenticated"
-            );
-        }
 
         let upstream_kind = parse_upstream_kind()?;
         let upstream_base = parse_url_alias(
@@ -444,6 +442,14 @@ impl Config {
                 self,
             )))
         })
+    }
+
+    /// Whether bearer auth is disabled (no `PHANTASM_AUTH_TOKEN`): every request
+    /// is accepted unauthenticated. Surfaced as a method so `main` can log the
+    /// warning *after* `init_tracing` — a warning emitted during `from_env`
+    /// would go to the no-op subscriber and never be seen.
+    pub fn auth_disabled(&self) -> bool {
+        self.auth_token.is_none()
     }
 
     /// Whether the web-search tool can actually run (toggle on + key present).
@@ -768,6 +774,14 @@ mod tests {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn auth_disabled_reflects_missing_token() {
+        let mut cfg = crate::config::tests_support::minimal();
+        assert!(!cfg.auth_disabled(), "a set token means auth is on");
+        cfg.auth_token = None;
+        assert!(cfg.auth_disabled(), "no token means the server is open");
     }
 
     #[test]
