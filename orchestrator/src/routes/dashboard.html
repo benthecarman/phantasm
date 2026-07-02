@@ -218,7 +218,7 @@ function modelTable(models) {
     <td class="${m.errored ? "err" : ""}">${fmtN(m.errored)}</td><td>${fmtMs(m.p95_ms)}</td>
     <td>${fmtN(m.prompt_tokens)} / ${fmtN(m.completion_tokens)}</td>
     <td>${m.avg_tokens_per_sec == null ? "—" : m.avg_tokens_per_sec.toFixed(1)}</td></tr>`).join("");
-  return `<table><tr><th>model</th><th>turns</th><th>errors</th><th>p95</th><th>tokens p/c</th><th>tok/s</th></tr>${rows}</table>`;
+  return `<table><tr><th>model</th><th>turns</th><th>errors</th><th>p95</th><th title="prompt / completion tokens">tokens in / out</th><th>tok/s</th></tr>${rows}</table>`;
 }
 function toolTable(tools) {
   const rows = tools.map(t => `<tr><td>${esc(t.tool)}</td><td>${fmtN(t.calls)}</td>
