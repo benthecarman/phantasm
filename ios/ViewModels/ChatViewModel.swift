@@ -843,15 +843,15 @@ final class ChatViewModel {
         let token = env.activeToken ?? ""
 
         task = Task { [weak self] in
-            let text = await result()
-            if Task.isCancelled {
-                self?.finishAfterStreamFailure(CancellationError())
-                return
-            }
+            // Persist the result row first, run the side effect, then record
+            // the outcome in place. Some results are non-idempotent (the
+            // Calendar write): running them before any persistence meant a
+            // failed insert re-raised the prompt on recovery, and a second
+            // confirm duplicated the event.
             let toolMessage = Message(
                 conversationId: conversation.id,
                 role: "tool",
-                content: text,
+                content: "(confirmed — outcome pending)",
                 isComplete: true,
                 toolCallId: toolCallId,
                 name: toolName
@@ -860,6 +860,15 @@ final class ChatViewModel {
                 try await store.insertMessage(toolMessage, attachments: [])
             } catch {
                 self?.finish(error: AppError.from(error))
+                return
+            }
+            let text = await result()
+            try? await store.updateMessage(
+                id: toolMessage.id, content: text, reasoning: "",
+                isComplete: true, createdAt: nil
+            )
+            if Task.isCancelled {
+                self?.finishAfterStreamFailure(CancellationError())
                 return
             }
             // Restamp so the pending row sorts after the tool result just
