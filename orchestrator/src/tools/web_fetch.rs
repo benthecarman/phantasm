@@ -140,7 +140,11 @@ async fn fetch(cfg: &Config, args: &WebFetchArgs, ctx: &TurnContext) -> Result<S
             .take(cap)
             .collect()
     };
-    let out = format!("Fetched page:\nurl: {cache_key}\n\n{text}");
+    // The page body is third-party content: frame it as untrusted so the model
+    // treats it as data (the framed form is what gets cached).
+    let out = crate::tools::web_search::frame_untrusted(&format!(
+        "Fetched page:\nurl: {cache_key}\n\n{text}"
+    ));
     cache_page(ctx, &cache_key, Some(out.clone()));
     Ok(out)
 }
