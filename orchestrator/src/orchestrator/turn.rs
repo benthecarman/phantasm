@@ -293,7 +293,8 @@ pub async fn run_turn<B, T>(
                         resp.tool_calls = Some(calls.clone());
                         messages.push(resp);
                         let Some(outcomes) =
-                            execute_calls(&tools, &server_calls, &ctx, &tx, &cancel).await
+                            execute_calls(&tools, &server_calls, &server_names, &ctx, &tx, &cancel)
+                                .await
                         else {
                             return;
                         };
@@ -333,7 +334,9 @@ pub async fn run_turn<B, T>(
                 // no images, so the clone is cheap and needs no downscaling.
                 push_vision(&mut vision, &resp);
                 messages.push(resp); // assistant message carrying the tool_calls
-                let Some(outcomes) = execute_calls(&tools, &calls, &ctx, &tx, &cancel).await else {
+                let Some(outcomes) =
+                    execute_calls(&tools, &calls, &server_names, &ctx, &tx, &cancel).await
+                else {
                     return;
                 };
                 for outcome in outcomes {
@@ -386,16 +389,39 @@ pub async fn run_turn<B, T>(
 /// and we run them at once. Returns `None` if the turn is cancelled mid-flight —
 /// the caller should abandon the turn (each tool already `select!`s on `cancel`,
 /// so in-flight work stops promptly when the join future is dropped).
+///
+/// Only calls whose name is in `offered` — the server schemas actually offered
+/// this turn after the client's `tools`/`tool_choice` narrowing — are
+/// dispatched. A hallucinated call to a configured-but-unselected tool (e.g.
+/// `web_search` with the web-access toggle off) must not run: SPEC §2.3 says a
+/// present `tools` selection means *only* the named tools. Such calls get a
+/// non-fatal "not offered" tool result instead, so the model recovers (NFR-O6).
 async fn execute_calls<T: ToolExecutor>(
     tools: &T,
     calls: &[ToolCall],
+    offered: &HashSet<String>,
     ctx: &TurnContext,
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> Option<Vec<ToolOutcome>> {
-    let runs = calls
-        .iter()
-        .map(|call| tools.execute(call, ctx, tx.clone(), cancel.clone()));
+    let runs = calls.iter().map(|call| async move {
+        if offered.contains(&call.function.name) {
+            return tools.execute(call, ctx, tx.clone(), cancel.clone()).await;
+        }
+        tracing::warn!(
+            tool = %call.function.name,
+            "model called a tool not offered this turn; refusing to dispatch"
+        );
+        let name = &call.function.name;
+        ToolOutcome {
+            message: ChatMessage::tool_result(
+                call.id.clone().unwrap_or_default(),
+                name,
+                format!("tool `{name}` is not offered for this turn"),
+            ),
+            append_to_answer: None,
+        }
+    });
     tokio::select! {
         outcomes = join_all(runs) => Some(outcomes),
         _ = cancel.cancelled() => None,
@@ -779,7 +805,11 @@ mod tests {
                 .unwrap()
                 .push(call.function.name.clone());
             ToolOutcome {
-                message: ChatMessage::tool_result("call_1", &call.function.name, "ok"),
+                message: ChatMessage::tool_result(
+                    call.id.clone().unwrap_or_default(),
+                    &call.function.name,
+                    "ok",
+                ),
                 append_to_answer: None,
             }
         }
@@ -796,7 +826,7 @@ mod tests {
 
     impl ToolExecutor for ImageTools {
         fn schemas(&self) -> Vec<Value> {
-            vec![serde_json::json!({"type":"function"})]
+            vec![named_schema("image_generation"), named_schema("image_edit")]
         }
         async fn execute(
             &self,
@@ -898,7 +928,7 @@ mod tests {
             ScriptedBackend::new(vec![assistant_calling("web_search")], vec!["answer".into()]);
         let executed = Arc::new(Mutex::new(vec![]));
         let tools = ScriptedTools {
-            schemas: Arc::new(vec![serde_json::json!({"type":"function"})]),
+            schemas: Arc::new(vec![named_schema("web_search")]),
             executed: executed.clone(),
         };
         let (tx, rx) = mpsc::channel(64);
@@ -993,7 +1023,7 @@ mod tests {
         let backend = ScriptedBackend::new(infinite, vec!["capped".into()]);
         let executed = Arc::new(Mutex::new(vec![]));
         let tools = ScriptedTools {
-            schemas: Arc::new(vec![serde_json::json!({"type":"function"})]),
+            schemas: Arc::new(vec![named_schema("web_search")]),
             executed: executed.clone(),
         };
         let (tx, rx) = mpsc::channel(256);
@@ -1370,6 +1400,103 @@ mod tests {
     fn select_schemas_empty_list_keeps_none() {
         let schemas = vec![named_schema("web_search")];
         assert!(select_schemas(schemas, &Some(vec![])).is_empty());
+    }
+
+    /// The text content of the first `tool`-role message the backend saw on its
+    /// most recent `chat_once`, if any.
+    fn seen_tool_result(backend: &ScriptedBackend) -> Option<String> {
+        backend
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.role == "tool")
+            .and_then(|m| m.content.clone())
+            .and_then(|c| c.into_text_and_images().0)
+    }
+
+    #[tokio::test]
+    async fn call_to_unselected_tool_is_not_dispatched() {
+        // web_search is configured server-side but the request's selection only
+        // names image_generation (e.g. the web-access toggle is off). A
+        // hallucinated web_search call must not run a live query (SPEC §2.3):
+        // it gets a non-fatal "not offered" result and the model continues.
+        let backend =
+            ScriptedBackend::new(vec![assistant_calling("web_search")], vec!["answer".into()]);
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![
+                named_schema("web_search"),
+                named_schema("image_generation"),
+            ]),
+            executed: executed.clone(),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            Some(vec!["image_generation".into()]),
+            Vec::new(),
+            None,
+            None,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let events = drain(rx).await;
+        assert!(
+            executed.lock().unwrap().is_empty(),
+            "an unselected tool must never be dispatched"
+        );
+        let folded = seen_tool_result(&backend).expect("a tool result was fed back");
+        assert!(
+            folded.contains("not offered"),
+            "the model gets a non-fatal refusal, got: {folded}"
+        );
+        assert_eq!(collect_text(&events), "answer", "the turn still completes");
+    }
+
+    #[tokio::test]
+    async fn forced_tool_choice_refuses_other_server_tools() {
+        // tool_choice forcing a single function narrows the selection to that
+        // tool; a call to any other configured tool is refused, not dispatched.
+        let backend =
+            ScriptedBackend::new(vec![assistant_calling("web_search")], vec!["done".into()]);
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![named_schema("web_search"), named_schema("calculator")]),
+            executed: executed.clone(),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            // What ChatRequest::tool_selection resolves a forced tool_choice to.
+            Some(vec!["calculator".into()]),
+            Vec::new(),
+            None,
+            None,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let _ = drain(rx).await;
+        assert!(
+            executed.lock().unwrap().is_empty(),
+            "only the forced tool may run; web_search was not it"
+        );
+        let folded = seen_tool_result(&backend).expect("a tool result was fed back");
+        assert!(folded.contains("not offered"));
     }
 
     #[test]
