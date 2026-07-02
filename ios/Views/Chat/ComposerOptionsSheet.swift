@@ -25,6 +25,9 @@ struct ComposerOptionsSheet: View {
     let supportsHealth: Bool
     let supportsCalendar: Bool
     let modelSupportsTools: Bool
+    /// Whether the backend exposes the app's Thinking control at all. Non-
+    /// Phantasm backends hide the row completely.
+    let showsThinkingToggle: Bool
     /// Whether the selected model can produce reasoning output. When false the
     /// Thinking row renders disabled + pinned off rather than hidden.
     let modelSupportsThinking: Bool
@@ -78,14 +81,16 @@ struct ComposerOptionsSheet: View {
                     ) { showFileImporter = true }
                 }
 
-                Section("Response") {
-                    optionRow(
-                        "Thinking",
-                        systemImage: "brain.head.profile",
-                        available: modelSupportsThinking,
-                        disabledReason: "This model can't think",
-                        isOn: thinkingEnabled
-                    )
+                if showsThinkingToggle {
+                    Section("Response") {
+                        optionRow(
+                            "Thinking",
+                            systemImage: "brain.head.profile",
+                            available: modelSupportsThinking,
+                            disabledReason: "This model can't think",
+                            isOn: thinkingEnabled
+                        )
+                    }
                 }
 
                 Section("Tools") {

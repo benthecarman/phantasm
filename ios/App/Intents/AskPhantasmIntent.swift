@@ -102,13 +102,12 @@ enum AskService {
         return answer
     }
 
-    /// `"none"` for backends that honor it (orchestrator + native Ollama),
-    /// suppressing thinking tokens; `nil` for generic OpenAI, which may reject an
-    /// unsupported value. Mirrors `AppEnvironment.disabledReasoningEffort`.
+    /// `"none"` only for Phantasm/orchestrator backends. Plain OpenAI-compatible
+    /// and native Ollama backends do not participate in the app's Thinking toggle.
     private static func disabledReasoningEffort(for mode: BackendMode) -> String? {
         switch mode {
-        case .full, .ollamaNative: return ReasoningEffort.disabled
-        case .plainChatOnly: return nil
+        case .full: return ReasoningEffort.disabled
+        case .ollamaNative, .plainChatOnly: return nil
         }
     }
 }

@@ -576,8 +576,8 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
 
     func disabledReasoningEffortForCurrentBackend() -> String? {
         switch backendMode {
-        case .full, .ollamaNative: return ReasoningEffort.disabled
-        case .plainChatOnly: return nil
+        case .full: return ReasoningEffort.disabled
+        case .ollamaNative, .plainChatOnly: return nil
         }
     }
 

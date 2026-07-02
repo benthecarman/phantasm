@@ -56,8 +56,7 @@ final class AppEnvironment {
     /// undetectable for this backend, so tools are allowed optimistically. The
     /// server tools also require the backend to advertise them (`backendMode`).
     var toolModels: Set<String>?
-    /// Models known to support reasoning/thinking. `nil` means it's undetectable
-    /// for this backend, so the Thinking toggle is offered optimistically.
+    /// Models known to support reasoning/thinking on a Phantasm backend.
     var thinkingModels: Set<String>?
     /// Per-model context window sizes, when the backend reports them. Empty/missing
     /// for a model ⇒ the picker omits the size badge and no overflow warning shows.
@@ -294,9 +293,11 @@ final class AppEnvironment {
         return toolModels.contains(model)
     }
 
-    /// Whether `model` can produce reasoning/thinking output. Unknown backends
-    /// return `true` (optimistic) so we never hide a capability that may exist.
+    /// Whether `model` can produce reasoning/thinking output through the Phantasm
+    /// orchestrator. Plain OpenAI-compatible and native Ollama backends do not
+    /// expose the app's Thinking toggle.
     func supportsThinking(_ model: String?) -> Bool {
+        guard case .full = backendMode else { return false }
         guard let thinkingModels else { return true }
         guard let model else { return false }
         return thinkingModels.contains(model)
@@ -317,19 +318,9 @@ final class AppEnvironment {
     }
 
     func disabledReasoningEffortForCurrentBackend() -> String? {
-        disabledReasoningEffort
-    }
-
-    private var disabledReasoningEffort: String? {
-        // `reasoning_effort: "none"` is useful for the orchestrator and native
-        // Ollama path, where it suppresses thinking tokens. Generic OpenAI-
-        // compatible endpoints may reject unsupported request fields, so omit the
-        // no-op value in plain-chat mode.
         switch backendMode {
-        case .full, .ollamaNative:
-            return ReasoningEffort.disabled
-        case .plainChatOnly:
-            return nil
+        case .full: return ReasoningEffort.disabled
+        case .ollamaNative, .plainChatOnly: return nil
         }
     }
 

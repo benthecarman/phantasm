@@ -86,10 +86,16 @@ struct ChatView: View {
         env.supportsTools(currentModelID)
     }
 
-    /// Whether the selected model can produce reasoning output. Gates the
-    /// Thinking toggle; unknown backends stay optimistic (allowed).
+    /// Whether the selected model can produce reasoning output through Phantasm.
+    /// Non-Phantasm backends do not expose the app's Thinking toggle.
     private var modelSupportsThinking: Bool {
         env.supportsThinking(currentModelID)
+    }
+
+    /// Whether this backend exposes the app's Thinking control at all.
+    private var showsThinkingToggle: Bool {
+        if case .full = env.backendMode { return true }
+        return false
     }
 
     /// Token estimate for the current history, recomputed only when `messages`
@@ -171,6 +177,7 @@ struct ChatView: View {
                     supportsHealth: supportsAppTools,
                     supportsCalendar: supportsAppTools,
                     modelSupportsTools: modelSupportsTools,
+                    showsThinkingToggle: showsThinkingToggle,
                     modelSupportsThinking: modelSupportsThinking,
                     webSearchEnabled: Binding(
                         get: { vm.webSearchEnabled },
@@ -562,6 +569,8 @@ struct ComposerView: View {
     let supportsCalendar: Bool
     /// Whether the selected model supports tool/function calling.
     let modelSupportsTools: Bool
+    /// Whether the backend exposes the app's Thinking control at all.
+    let showsThinkingToggle: Bool
     /// Whether the selected model supports reasoning/thinking output.
     let modelSupportsThinking: Bool
     let webSearchEnabled: Binding<Bool>
@@ -692,6 +701,7 @@ struct ComposerView: View {
                 supportsHealth: supportsHealth,
                 supportsCalendar: supportsCalendar,
                 modelSupportsTools: modelSupportsTools,
+                showsThinkingToggle: showsThinkingToggle,
                 modelSupportsThinking: modelSupportsThinking,
                 webSearchEnabled: webSearchEnabled,
                 imageGenerationEnabled: imageGenerationEnabled,
