@@ -27,12 +27,12 @@ public struct OllamaNativeChatClient: ChatClienting {
                         throw AppError.modelError("Invalid Ollama model id: \(request.model)")
                     }
 
-                    let client = Ollama.Client(
+                    let client = await Ollama.Client(
                         session: session(for: token),
                         host: base,
                         userAgent: "Phantasm"
                     )
-                    let stream = try client.chatStream(
+                    let stream = try await client.chatStream(
                         model: model,
                         messages: request.messages.map(\.ollamaMessage),
                         tools: ollamaTools(from: request.tools),

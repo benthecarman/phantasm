@@ -267,8 +267,8 @@ public struct ChatClient: ChatClienting {
         return URLSession(configuration: config)
     }()
 
-    public init(session: URLSession = ChatClient.streamingSession) {
-        self.session = session
+    public init(session: URLSession? = nil) {
+        self.session = session ?? ChatClient.streamingSession
     }
 
     public func stream(_ request: ChatRequest, base: URL, token: String, turnID: String?)
@@ -324,9 +324,9 @@ public struct ChatClient: ChatClienting {
     /// "context length exceeded" surfaces its detail, not just "HTTP 400".
     /// Auth/not-found keep their taxonomy (they drive distinct UI).
     private static func enriched(
-        _ error: AppError, status: Int, body: URLSession.AsyncBytes
+        _ appError: AppError, status: Int, body: URLSession.AsyncBytes
     ) async -> AppError {
-        guard case .modelError = error else { return error }
+        guard case .modelError = appError else { return appError }
         var data = Data()
         do {
             for try await byte in body {
@@ -334,11 +334,11 @@ public struct ChatClient: ChatClienting {
                 if data.count > 64 * 1024 { break }
             }
         } catch {
-            return error
+            return appError
         }
         guard let envelope = try? Wire.decoder().decode(StreamErrorEnvelope.self, from: data),
               let message = envelope.error.message
-        else { return error }
+        else { return appError }
         return .modelError("HTTP \(status): \(message)")
     }
 

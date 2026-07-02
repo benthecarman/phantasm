@@ -191,7 +191,7 @@ final class CalendarProvider: CalendarProviding {
         return .failure(.unavailable("no writable Calendar is available on this device."))
     }
 
-    private static func eventMatchesText(_ event: EKEvent, query: CalendarEventQuery) -> Bool {
+    nonisolated private static func eventMatchesText(_ event: EKEvent, query: CalendarEventQuery) -> Bool {
         guard let needle = query.matching?.trimmingCharacters(in: .whitespacesAndNewlines),
               !needle.isEmpty else { return true }
         let haystack = [
@@ -205,7 +205,7 @@ final class CalendarProvider: CalendarProviding {
         }
     }
 
-    private static func calendarEvent(
+    nonisolated private static func calendarEvent(
         from event: EKEvent, includeNotes: Bool
     ) -> CalendarEvent {
         CalendarEvent(
@@ -219,13 +219,13 @@ final class CalendarProvider: CalendarProviding {
         )
     }
 
-    private static func truncated(_ value: String?, maxLength: Int) -> String? {
+    nonisolated private static func truncated(_ value: String?, maxLength: Int) -> String? {
         guard let value else { return nil }
         guard value.count > maxLength else { return value }
         return String(value.prefix(maxLength)) + "..."
     }
 
-    private static func trimmed(_ value: String?) -> String? {
+    nonisolated private static func trimmed(_ value: String?) -> String? {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !value.isEmpty else { return nil }
         return value
