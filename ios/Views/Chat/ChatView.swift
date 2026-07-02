@@ -92,13 +92,18 @@ struct ChatView: View {
         env.supportsThinking(currentModelID)
     }
 
+    /// Token estimate for the current history, recomputed only when `messages`
+    /// change (`.onChange` below). Computing it inline in `body` re-scanned
+    /// every message's characters — megabytes with inline-base64 images — on
+    /// every body evaluation.
+    @State private var estimatedTokens = 0
+
     /// Estimated context-window usage for this conversation, or `nil` when the
     /// model's window is unknown (then no warning shows).
     private var contextUsage: ContextUsage? {
-        ContextWindow.usage(
-            for: messages,
-            contextLength: currentModelID.flatMap { env.contextLengths?[$0] }
-        )
+        guard let length = currentModelID.flatMap({ env.contextLengths?[$0] }),
+              length > 0 else { return nil }
+        return ContextUsage(estimatedTokens: estimatedTokens, contextLength: length)
     }
 
     /// The active orchestrator manifest, or nil for raw Ollama / generic OpenAI.
@@ -215,7 +220,11 @@ struct ChatView: View {
                 }
             }
         }
+        .onChange(of: messages) { _, updated in
+            estimatedTokens = ContextWindow.estimatedTokens(for: updated)
+        }
         .task(id: conversation.id) {
+            estimatedTokens = ContextWindow.estimatedTokens(for: messages)
             vm.setViewVisible(true)
             vm.configure(
                 env: env,
