@@ -74,6 +74,24 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(events, [.token("ok"), .done])
     }
 
+    func testMidStreamErrorEventThrowsModelError() async throws {
+        // OpenAI-compatible servers report mid-stream failures as a terminal
+        // `data: {"error":{…}}` event; it must surface as an error, not be
+        // swallowed as junk (which would commit a truncated message).
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}",
+            "",
+            "data: {\"error\":{\"message\":\"context length exceeded\",\"type\":\"invalid_request_error\"}}",
+            "",
+        ]
+        do {
+            _ = try await collect(chatEventStream(lines: linesStream(lines)))
+            XCTFail("expected the error event to throw")
+        } catch let error as AppError {
+            XCTAssertEqual(error, .modelError("context length exceeded"))
+        }
+    }
+
     func testAbsentXStatusDoesNotBreakDecoding() async throws {
         let lines = ["data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}", "", "data: [DONE]"]
         let events = try await collect(chatEventStream(lines: linesStream(lines)))

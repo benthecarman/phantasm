@@ -46,6 +46,14 @@ func mergeToolCall(_ call: WireToolCall, into acc: inout [Int: WireToolCall], ke
     acc[key] = merged
 }
 
+/// The standard OpenAI mid-stream error event: `data: {"error":{"message":…}}`.
+private struct StreamErrorEnvelope: Decodable {
+    struct Payload: Decodable {
+        let message: String?
+    }
+    let error: Payload
+}
+
 /// A domain event consumed by the chat UI.
 public enum ChatStreamEvent: Sendable, Equatable {
     case token(String)      // append delta.content
@@ -73,12 +81,21 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
             // frame before `.done`.
             var toolCalls: [Int: WireToolCall] = [:]
 
-            func flush() -> Bool {
+            func flush() throws -> Bool {
                 // Returns true if the stream should end (decoded a finish).
                 guard !dataBuffer.isEmpty else { return false }
                 let payload = dataBuffer.joined(separator: "\n")
                 dataBuffer.removeAll(keepingCapacity: true)
-                guard let chunk = try? decoder.decode(ChatChunk.self, from: Data(payload.utf8)) else {
+                let data = Data(payload.utf8)
+                guard let chunk = try? decoder.decode(ChatChunk.self, from: data) else {
+                    // OpenAI-compatible servers report mid-stream failures (rate
+                    // limit, context overflow, upstream crash) as a terminal
+                    // `data: {"error":{…}}` event. Surfacing it as a thrown error
+                    // keeps the truncated text from being committed as a normal
+                    // complete message.
+                    if let envelope = try? decoder.decode(StreamErrorEnvelope.self, from: data) {
+                        throw AppError.modelError(envelope.error.message ?? "stream error")
+                    }
                     return false // tolerate junk chunks (FR-A8)
                 }
                 if let status = chunk.xStatus {
@@ -116,14 +133,14 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                     case .event(let data):
                         dataBuffer.append(data)
                     case .blank:
-                        if flush() {
+                        if try flush() {
                             emitToolCallsIfAny()
                             continuation.yield(.done)
                             continuation.finish()
                             return
                         }
                     case .done:
-                        _ = flush()
+                        _ = try flush()
                         emitToolCallsIfAny()
                         continuation.yield(.done)
                         continuation.finish()
@@ -132,7 +149,7 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                         continue
                     }
                 }
-                _ = flush() // trailing frame without a closing blank line
+                _ = try flush() // trailing frame without a closing blank line
                 emitToolCallsIfAny()
                 continuation.finish()
             } catch is CancellationError {
