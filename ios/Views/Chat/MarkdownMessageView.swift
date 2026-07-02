@@ -300,11 +300,11 @@ private struct ImageActions: View {
         } label: {
             Label("Save to Photos", systemImage: "square.and.arrow.down")
         }
-        if let data = image.pngData() {
-            ShareLink(item: Image(uiImage: image), preview: .init("Generated image", image: Image(uiImage: image))) {
-                Label("Share", systemImage: "square.and.arrow.up")
-            }
-            .id(data.count)
+        ShareLink(
+            item: Image(uiImage: image),
+            preview: .init("Generated image", image: Image(uiImage: image))
+        ) {
+            Label("Share", systemImage: "square.and.arrow.up")
         }
     }
 }
