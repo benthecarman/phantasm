@@ -167,6 +167,49 @@ public final class AppDatabase: Sendable {
                 t.add(column: "calendarEnabled", .boolean).notNull().defaults(to: false)
             }
         }
+
+        // Full-text search moves to a sanitized projection: indexing raw
+        // content tokenized megabytes of inline base64 image payload into FTS
+        // (slow commits, permanent index bloat, garbage hits). `searchText` is
+        // content with data-URI payloads stripped; the FTS index re-points at it.
+        migrator.registerMigration("v10_search_projection") { db in
+            try db.alter(table: "message") { t in
+                t.add(column: "searchText", .text).notNull().defaults(to: "")
+            }
+            // Most rows carry no data URI: copy content wholesale.
+            try db.execute(sql: """
+                UPDATE message SET searchText = content
+                WHERE content NOT LIKE '%](data:image/%'
+                """)
+            // Sanitize the (few) image-bearing rows in Swift.
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT id, content FROM message WHERE content LIKE '%](data:image/%'
+                """)
+            for row in rows {
+                let id: UUID = row["id"]
+                let content: String = row["content"]
+                try db.execute(
+                    sql: "UPDATE message SET searchText = ? WHERE id = ?",
+                    arguments: [Message.searchProjection(content), id]
+                )
+            }
+            // Replace the FTS index (and the sync triggers GRDB installed for
+            // it) with one over the sanitized column. Recreating it re-indexes
+            // from the message table, shedding the base64 already in the index.
+            let triggers = try String.fetchAll(db, sql: """
+                SELECT name FROM sqlite_master
+                WHERE type = 'trigger' AND tbl_name = 'message' AND sql LIKE '%message_ft%'
+                """)
+            for trigger in triggers {
+                try db.execute(sql: "DROP TRIGGER \"\(trigger)\"")
+            }
+            try db.execute(sql: "DROP TABLE message_ft")
+            try db.create(virtualTable: "message_ft", using: FTS5()) { t in
+                t.synchronize(withTable: "message")
+                t.tokenizer = .unicode61()
+                t.column("searchText")
+            }
+        }
         return migrator
     }
 }
@@ -219,6 +262,7 @@ extension AppDatabase: ChatStore {
         try await dbWriter.write { db in
             guard var message = try Message.fetchOne(db, key: id) else { return }
             message.content = content
+            message.searchText = Message.searchProjection(content)
             message.reasoning = reasoning
             message.isComplete = isComplete
             if let createdAt { message.createdAt = createdAt }
@@ -285,6 +329,7 @@ extension AppDatabase: ChatStore {
             try Self.messagesAfter(db, message, inclusive: false)
                 .deleteAll(db)
             message.content = newContent
+            message.searchText = Message.searchProjection(newContent)
             message.updatedAt = now
             try message.update(db)
             // Bump the conversation so the edit re-sorts it to the top.

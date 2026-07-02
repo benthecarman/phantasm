@@ -150,6 +150,11 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
     public var toolCallId: String?
     /// The tool name (a `tool`-role result), e.g. `ask_user`.
     public var name: String?
+    /// What the full-text index stores for this message: `content` with inline
+    /// base64 image payloads stripped. Indexing raw content tokenized megabytes
+    /// of base64 into FTS — slow commits, permanent index bloat, and garbage
+    /// search hits. Maintained by the store whenever `content` changes.
+    public var searchText: String
 
     public init(
         id: UUID = UUID(),
@@ -175,6 +180,13 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
         self.name = name
+        self.searchText = Message.searchProjection(content)
+    }
+
+    /// The searchable projection of message content: inline base64 images are
+    /// reduced to a placeholder so their payloads never reach the FTS index.
+    public static func searchProjection(_ content: String) -> String {
+        Base64ImageExtractor.streamingSanitized(content)
     }
 
     public static let databaseTableName = "message"

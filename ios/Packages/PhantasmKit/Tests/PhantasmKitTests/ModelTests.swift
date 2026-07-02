@@ -1160,6 +1160,26 @@ final class PersistenceTests: XCTestCase {
         XCTAssertNotNil(results.first?.snippet)
     }
 
+    func testSearchIgnoresInlineImagePayloadsButFindsSurroundingText() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "Untitled")
+        try await store.insertConversation(convo)
+        // A distinctive fake payload: raw content keeps it, but the FTS
+        // projection must not index it.
+        let payload = "zebrafish" + String(repeating: "A", count: 64)
+        try await store.insertMessage(
+            Message(
+                conversationId: convo.id, role: "assistant",
+                content: "Here is your sunset ![generated](data:image/png;base64,\(payload)) enjoy"
+            ),
+            attachments: []
+        )
+        let byText = try await store.searchConversations(matching: "sunset")
+        XCTAssertEqual(byText.map(\.conversation.id), [convo.id])
+        let byPayload = try await store.searchConversations(matching: "zebrafish")
+        XCTAssertTrue(byPayload.isEmpty, "base64 payloads must not be searchable")
+    }
+
     func testSearchMatchesTitle() async throws {
         let store = try AppDatabase.empty()
         let convo = Conversation(title: "Dinner recipes")
