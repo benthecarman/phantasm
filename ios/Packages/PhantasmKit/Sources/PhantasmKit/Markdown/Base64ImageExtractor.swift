@@ -49,7 +49,9 @@ public struct Base64ImageExtractor: Sendable {
             output += ns.substring(with: NSRange(location: cursor, length: full.location - cursor))
 
             let payload = ns.substring(with: payloadRange)
-            if let data = Data(base64Encoded: payload) {
+            // The pattern admits whitespace (wrapped base64), which the strict
+            // decoder rejects; ignore it so wrapped payloads still decode.
+            if let data = Data(base64Encoded: payload, options: .ignoreUnknownCharacters) {
                 images[index] = data
                 output += "![generated](phantasm-img://\(index))"
                 index += 1

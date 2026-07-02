@@ -629,6 +629,18 @@ final class Base64ImageExtractorTests: XCTestCase {
         XCTAssertTrue(result.images.isEmpty)
     }
 
+    func testDecodesWhitespaceWrappedBase64() {
+        // The regex admits whitespace in the payload (wrapped base64); the
+        // decoder must tolerate it instead of degrading the image to *(image)*.
+        let raw = Data("hello".utf8).base64EncodedString()
+        let wrapped = raw.enumerated()
+            .map { $0.offset == 4 ? "\n\($0.element)" : String($0.element) }
+            .joined()
+        let md = "![generated](data:image/png;base64,\(wrapped))"
+        let result = Base64ImageExtractor().extract(md)
+        XCTAssertEqual(result.images[0], Data("hello".utf8))
+    }
+
     func testCachedMatchesUncachedAndRepeats() {
         let payload = Data("hello".utf8).base64EncodedString()
         let md = "Here: ![generated](data:image/png;base64,\(payload)) done"
