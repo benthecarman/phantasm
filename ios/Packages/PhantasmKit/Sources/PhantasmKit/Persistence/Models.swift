@@ -331,7 +331,10 @@ public extension Array where Element == ChatMessage {
             }
 
             if let calls = decodeToolCalls(m.toolCalls), !calls.isEmpty {
-                out.append(WireMessage(assistantToolCalls: calls))
+                // Keep any preamble text the model wrote with the calls — it is
+                // part of the model's own context, and dropping it desyncs what
+                // the model believes it already told the user.
+                out.append(WireMessage(assistantToolCalls: calls, content: m.content))
                 // Emit every stored `tool` result that follows this batch, tracking
                 // which call ids got answered.
                 var answered = Set<String>()

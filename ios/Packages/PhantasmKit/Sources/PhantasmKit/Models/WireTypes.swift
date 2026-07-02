@@ -154,10 +154,11 @@ public struct WireMessage: Codable, Sendable, Equatable {
         self.content = content
     }
 
-    /// An assistant message carrying forwarded tool calls (empty text body).
-    public init(assistantToolCalls: [WireToolCall]) {
+    /// An assistant message carrying forwarded tool calls, plus any text the
+    /// model emitted alongside them (OpenAI permits text + tool_calls together).
+    public init(assistantToolCalls: [WireToolCall], content: String = "") {
         self.role = "assistant"
-        self.content = .text("")
+        self.content = .text(content)
         self.toolCalls = assistantToolCalls
     }
 

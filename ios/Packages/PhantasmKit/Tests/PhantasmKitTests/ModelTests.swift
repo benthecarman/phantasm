@@ -941,8 +941,9 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(detail?.messages.first?.message.isComplete, true)
         XCTAssertEqual(detail?.messages.first?.message.toolCalls, json)
         // It round-trips into wire history as an assistant tool_call (+ synthetic
-        // dismissed result, since nothing answered it).
+        // dismissed result, since nothing answered it) with its content intact.
         XCTAssertEqual(detail?.wireHistory().first?.toolCalls?.first?.id, "call_1")
+        XCTAssertEqual(detail?.wireHistory().first?.content.plainText, "already-streamed image")
     }
 
     func testReasoningIsPersistedButExcludedFromWireHistory() async throws {
