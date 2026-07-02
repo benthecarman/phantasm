@@ -155,20 +155,15 @@ struct ProfileEditView: View {
         token.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// The discovered models, plus the currently-saved model if it's not in the
-    /// list (so a previously-chosen value still shows as selected).
     private var pickerOptions: [String] {
-        var opts = models
-        if !defaultModel.isEmpty && !opts.contains(defaultModel) {
-            opts.insert(defaultModel, at: 0)
-        }
-        return opts
+        models
     }
 
     private func loadModels() async {
         guard let base = URL(string: BackendProfile.normalizedBaseURLString(urlString)) else { return }
         loadingModels = true
         models = await env.capabilitiesClient.models(base: base, token: normalizedToken)
+        clearStaleDefaultModel()
         loadingModels = false
     }
 
@@ -181,6 +176,7 @@ struct ProfileEditView: View {
         switch result {
         case .success(let mode):
             models = mode.models
+            clearStaleDefaultModel()
             Haptics.notify(.success)
             testResult = .success(mode.connectionTestMessage)
         case .failure(let error):
@@ -201,5 +197,12 @@ struct ProfileEditView: View {
         env.upsert(profile, token: token.isEmpty ? nil : token)
         Haptics.notify(.success)
         dismiss()
+    }
+
+    private func clearStaleDefaultModel() {
+        guard !models.isEmpty,
+              !defaultModel.isEmpty,
+              !models.contains(defaultModel) else { return }
+        defaultModel = ""
     }
 }

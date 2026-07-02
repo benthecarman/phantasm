@@ -63,6 +63,46 @@ targets:
       path: App/Phantasm.entitlements
       properties:
         com.apple.developer.healthkit: true
+    preBuildScripts:
+      - name: Warn when SSH keychain blocks signing
+        basedOnDependencyAnalysis: false
+        script: |
+          if [[ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]]; then
+            exit 0
+          fi
+          if [[ "${SDK_NAME:-}" != iphoneos* ]]; then
+            exit 0
+          fi
+          if [[ "${CODE_SIGNING_ALLOWED:-YES}" == "NO" ]]; then
+            exit 0
+          fi
+
+          identity="${EXPANDED_CODE_SIGN_IDENTITY:-}"
+          if [[ -z "$identity" ]]; then
+            identity="$(security find-identity -v -p codesigning | awk '/Apple Development/ {print $2; exit}')"
+          fi
+          if [[ -z "$identity" ]]; then
+            echo "warning: SSH iOS build has no Apple Development signing identity available." >&2
+            exit 0
+          fi
+
+          probe_dir="$(mktemp -d)"
+          trap 'rm -rf "$probe_dir"' EXIT
+          probe="$probe_dir/codesign-probe.sh"
+          printf '#!/bin/sh\nexit 0\n' > "$probe"
+          chmod +x "$probe"
+
+          if ! /usr/bin/codesign --force --sign "$identity" --timestamp=none "$probe" >/dev/null 2>&1; then
+            cat >&2 <<'EOF'
+          error: SSH iOS build cannot access the Apple Development signing key.
+          error: Unlock the login keychain in this SSH session, then rerun the build:
+          error:   security unlock-keychain -p '<your-mac-login-password>' ~/Library/Keychains/login.keychain-db
+          error:
+          error: If this keeps happening, grant codesign persistent access once:
+          error:   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k '<your-mac-login-password>' ~/Library/Keychains/login.keychain-db
+          EOF
+            exit 1
+          fi
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.phantasm.app

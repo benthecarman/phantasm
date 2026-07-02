@@ -111,15 +111,9 @@ final class AppEnvironment {
 
     /// Models to offer in the picker for the active backend. Prefers the live
     /// probe result, falls back to the per-backend cache (so the full list shows
-    /// instantly on launch, before the probe completes). The saved default is
-    /// included even if it was not advertised, so existing selections remain
-    /// visible.
+    /// instantly on launch, before the probe completes).
     var availableModels: [String] {
-        var models = discoveredModels
-        if let defaultModel = activeDefaultModel, !models.contains(defaultModel) {
-            models.append(defaultModel)
-        }
-        return models.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        discoveredModels.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
     /// The active profile's configured default model, if any. Surfaced so the
@@ -209,6 +203,7 @@ final class AppEnvironment {
         let models = mode.models
         if !models.isEmpty {
             profileStore.cacheModels(models, for: profileID)
+            clearStaleDefaultModel(for: profileID, availableModels: models)
         }
         let modelCapabilities = await modelCapabilities(for: mode, base: base, token: token)
         guard isCurrentCapabilityRefresh(generation, profileID: profileID) else { return }
@@ -221,6 +216,15 @@ final class AppEnvironment {
 
     private func isCurrentCapabilityRefresh(_ generation: Int, profileID: UUID) -> Bool {
         generation == capabilityRefreshGeneration && activeProfileID == profileID
+    }
+
+    private func clearStaleDefaultModel(for profileID: UUID, availableModels: [String]) {
+        guard let idx = profiles.firstIndex(where: { $0.id == profileID }),
+              let defaultModel = profiles[idx].defaultModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !defaultModel.isEmpty,
+              !availableModels.contains(defaultModel) else { return }
+        profiles[idx].defaultModel = nil
+        profileStore.save(profiles)
     }
 
     /// Resolve which models accept images / can drive tools for the current
