@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
-use crate::tools::http_util;
+use crate::tools::http_util::{self, required};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -146,14 +146,6 @@ fn alpha_error(v: &Value) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("missing required `{name}`"))
 }
 
 fn format_stock_quote(symbol: &str, v: &Value) -> Result<String, String> {

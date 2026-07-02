@@ -122,7 +122,7 @@ async fn resolve_input_image(args: &ImageEditArgs, ctx: &TurnContext) -> Result<
         if let Some((_, b64)) = reference.split_once(";base64,") {
             return Ok(b64.to_string());
         }
-        let id = extract_ref_id(reference);
+        let id = crate::tools::http_util::file_ref_id_or_bare(reference);
         let store = ctx.images.as_ref().ok_or_else(|| {
             "image references aren't available (no image store configured); omit \
              image_ref to edit the most recent image"
@@ -151,23 +151,6 @@ fn truncate_for_error(reference: &str) -> String {
     }
     let head: String = reference.chars().take(MAX).collect();
     format!("{head}…")
-}
-
-/// Pull the content id out of whatever the model passed as an image reference: a
-/// full `…/v1/files/<id>/content?…` URL, a site-relative path, or a bare id. The
-/// id is the run of our base64url charset after the marker (or the whole string
-/// when no marker is present). `store.get` rejects a malformed id, so a garbage
-/// reference resolves to `None` and errors upstream.
-fn extract_ref_id(reference: &str) -> &str {
-    const MARKER: &str = "/v1/files/";
-    let tail = match reference.find(MARKER) {
-        Some(i) => &reference[i + MARKER.len()..],
-        None => reference,
-    };
-    let end = tail
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .unwrap_or(tail.len());
-    &tail[..end]
 }
 
 fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
@@ -319,16 +302,6 @@ mod tests {
 
     fn store(dir: std::path::PathBuf) -> crate::images::BlobStore {
         crate::images::BlobStore::new(dir, "k", 3600, 1 << 20, None).unwrap()
-    }
-
-    #[test]
-    fn extract_ref_id_parses_url_relative_and_bare() {
-        assert_eq!(
-            extract_ref_id("https://host/v1/files/abc123/content?exp=1&sig=z"),
-            "abc123"
-        );
-        assert_eq!(extract_ref_id("/v1/files/DEF-_4/content"), "DEF-_4");
-        assert_eq!(extract_ref_id("abc123"), "abc123");
     }
 
     #[tokio::test]

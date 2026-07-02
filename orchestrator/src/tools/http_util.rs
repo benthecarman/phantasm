@@ -43,6 +43,47 @@ pub const JSON_TIMEOUT: Duration = Duration::from_secs(30);
 /// can make us buffer.
 pub const JSON_BODY_CAP: usize = 2 * 1024 * 1024;
 
+/// A required, non-blank string argument, trimmed — or a uniform
+/// "missing required" error naming the field. Shared by the tools that take
+/// operation-dependent optional args (github, market_data).
+pub fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("missing required `{name}`"))
+}
+
+/// Marker preceding a stored image id in a `/v1/files/<id>` reference.
+const FILES_MARKER: &str = "/v1/files/";
+
+/// The leading run of file-id characters (the base64url alphabet) in `s`.
+fn id_run(s: &str) -> &str {
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Extract the `<id>` from a `…/v1/files/<id>…` reference (a full signed URL,
+/// a site-relative path, or a markdown link target). `None` when the marker is
+/// absent or no id follows it — a plain external URL is not an id.
+pub fn file_ref_id(target: &str) -> Option<&str> {
+    let start = target.find(FILES_MARKER)? + FILES_MARKER.len();
+    let id = id_run(&target[start..]);
+    (!id.is_empty()).then_some(id)
+}
+
+/// Like [`file_ref_id`], but a marker-less reference is treated as a bare id
+/// (the image-edit tool accepts `image_ref: "<id>"`). May return an empty
+/// slice for garbage input; the blob store rejects malformed ids downstream.
+pub fn file_ref_id_or_bare(reference: &str) -> &str {
+    match reference.find(FILES_MARKER) {
+        Some(i) => id_run(&reference[i + FILES_MARKER.len()..]),
+        None => id_run(reference),
+    }
+}
+
 /// Render a reqwest error without its URL. reqwest's default `Display`
 /// includes the full request URL — query string and all — which can leak
 /// query-borne secrets into logs and model-visible tool errors.
@@ -146,6 +187,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("503"), "{err}");
+    }
+
+    #[test]
+    fn required_trims_and_rejects_blank() {
+        assert_eq!(required(&Some(" x ".into()), "f").unwrap(), "x");
+        assert!(required(&Some("   ".into()), "f").is_err());
+        assert_eq!(
+            required(&None, "symbol").unwrap_err(),
+            "missing required `symbol`"
+        );
+    }
+
+    #[test]
+    fn file_ref_id_parses_url_and_relative_targets() {
+        assert_eq!(
+            file_ref_id("https://host/v1/files/abc123/content?exp=1&sig=z"),
+            Some("abc123")
+        );
+        assert_eq!(file_ref_id("/v1/files/DEF-_4/content"), Some("DEF-_4"));
+        // No marker, or nothing after it: not an id.
+        assert_eq!(file_ref_id("https://example.com/image.png"), None);
+        assert_eq!(file_ref_id("/v1/files//content"), None);
+    }
+
+    #[test]
+    fn file_ref_id_or_bare_accepts_bare_ids() {
+        assert_eq!(file_ref_id_or_bare("abc123"), "abc123");
+        assert_eq!(
+            file_ref_id_or_bare("https://host/v1/files/abc123/content"),
+            "abc123"
+        );
     }
 
     #[test]

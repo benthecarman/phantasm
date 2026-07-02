@@ -68,10 +68,10 @@ pub async fn inline_image_refs(text: &str, store: &BlobStore) -> String {
     }
     let mut out = text.to_string();
     for (range, target) in targets.into_iter().rev() {
-        let Some(id) = ref_id(target) else {
+        let Some(id) = crate::tools::http_util::file_ref_id(target) else {
             continue;
         };
-        if let Some(blob) = store.get(&id).await {
+        if let Some(blob) = store.get(id).await {
             out.replace_range(range, &comfy::to_data_uri(&blob.bytes, blob.content_type));
         }
     }
@@ -101,17 +101,6 @@ fn parse_data_uri(uri: &str) -> Option<(String, Vec<u8>)> {
     let (mime, b64) = uri.strip_prefix("data:")?.split_once(";base64,")?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     Some((mime.to_string(), bytes))
-}
-
-/// Extract the `<id>` from a `…/v1/files/<id>/content…` reference target.
-fn ref_id(target: &str) -> Option<String> {
-    let marker = "/v1/files/";
-    let start = target.find(marker)? + marker.len();
-    let id: String = target[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    (!id.is_empty()).then_some(id)
 }
 
 #[cfg(test)]

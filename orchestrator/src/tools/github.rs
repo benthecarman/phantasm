@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
-use crate::tools::http_util;
+use crate::tools::http_util::{self, required};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -181,14 +181,6 @@ fn repo_content_url(base: &Url, owner: &str, repo: &str, path: &str) -> Result<U
         }
     }
     Ok(url)
-}
-
-fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("missing required `{name}`"))
 }
 
 fn format_repo_results(query: &str, repos: &[RepoItem]) -> String {
