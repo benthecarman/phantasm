@@ -359,6 +359,13 @@ pub async fn run_turn<B, T>(
                     return;
                 }
 
+                // Keep the pushed assistant message's ids in sync with the
+                // normalized `calls` used for execution: a compat upstream may
+                // omit ids, and history where `tool` results echo minted ids the
+                // assistant `tool_calls` message lacks gets a 400 from strict
+                // servers on the very next call.
+                let mut resp = resp;
+                resp.tool_calls = Some(calls.clone());
                 // Mirror into the vision projection (when active) so the next
                 // upstream call sees the same continuation. These messages carry
                 // no images, so the clone is cheap and needs no downscaling.
@@ -772,6 +779,16 @@ mod tests {
         }
     }
 
+    /// Like [`assistant_calling`] but with no call id — what a compat upstream
+    /// that omits ids produces.
+    fn assistant_calling_without_id(tool: &str) -> ChatMessage {
+        let mut m = assistant_calling(tool);
+        for c in m.tool_calls.as_mut().unwrap() {
+            c.id = None;
+        }
+        m
+    }
+
     impl ChatBackend for ScriptedBackend {
         async fn chat_once(
             &self,
@@ -988,6 +1005,63 @@ mod tests {
         // chat_once called twice: once -> tool_call, twice -> no tools (final)
         assert_eq!(*backend.once_calls.lock().unwrap(), 2);
         assert_eq!(collect_text(&events), "answer");
+    }
+
+    #[tokio::test]
+    async fn minted_call_ids_reach_the_pushed_assistant_message() {
+        // A compat upstream may omit tool-call ids; the loop mints them for the
+        // tool results. The assistant message pushed to history must carry the
+        // SAME minted ids, or strict OpenAI-compatible servers 400 the next
+        // call (tool messages referencing ids the assistant message lacks).
+        let backend = ScriptedBackend::new(
+            vec![assistant_calling_without_id("web_search")],
+            vec!["ok".into()],
+        );
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![named_schema("web_search")]),
+            executed: Arc::new(Mutex::new(vec![])),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![user(MessageContent::Text("hi".into()))],
+            "m".into(),
+            Map::new(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            tx,
+            CancellationToken::new(),
+            false,
+        )
+        .await;
+        let _ = drain(rx).await;
+
+        // Inspect the history the SECOND chat_once saw: assistant tool_calls
+        // ids must exist and match the tool result's tool_call_id.
+        let seen = backend.seen.lock().unwrap().clone();
+        let assistant = seen
+            .iter()
+            .find(|m| m.tool_calls.is_some())
+            .expect("assistant tool_calls message is in the history");
+        let id = assistant.tool_calls.as_ref().unwrap()[0]
+            .id
+            .clone()
+            .expect("the pushed assistant message carries the minted id");
+        assert!(!id.is_empty());
+        let tool_msg = seen
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool result is in the history");
+        assert_eq!(
+            tool_msg.tool_call_id.as_deref(),
+            Some(id.as_str()),
+            "assistant call id and tool result id must agree"
+        );
     }
 
     #[tokio::test]
