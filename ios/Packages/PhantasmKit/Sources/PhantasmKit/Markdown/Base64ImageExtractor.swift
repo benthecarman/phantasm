@@ -95,7 +95,10 @@ private final class ExtractionCache: @unchecked Sendable {
         let key = markdown as NSString
         if let hit = cache.object(forKey: key) { return hit.result }
         let result = extractor.extract(markdown)
-        let cost = result.images.values.reduce(0) { $0 + $1.count }
+        // Count the stored markdown too: a no-image entry keeps a full copy of
+        // the (possibly large) string, which used to cost 0 and sit outside the
+        // byte budget.
+        let cost = result.images.values.reduce(result.markdown.utf8.count) { $0 + $1.count }
         cache.setObject(Box(result), forKey: key, cost: cost)
         return result
     }
