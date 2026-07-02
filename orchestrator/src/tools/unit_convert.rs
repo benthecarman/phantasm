@@ -61,7 +61,10 @@ fn convert(value: f64, from_unit: &str, to_unit: &str) -> Result<String, String>
     let from = normalize(from_unit);
     let to = normalize(to_unit);
 
-    if let (Some(from_temp), Some(to_temp)) = (temperature_unit(&from), temperature_unit(&to)) {
+    if let (Some(from_temp), Some(to_temp)) = (
+        resolve(&from, temperature_unit),
+        resolve(&to, temperature_unit),
+    ) {
         let c = match from_temp {
             "c" => value,
             "f" => (value - 32.0) * 5.0 / 9.0,
@@ -77,8 +80,10 @@ fn convert(value: f64, from_unit: &str, to_unit: &str) -> Result<String, String>
         return Ok(format_conversion(value, from_unit, out, to_unit));
     }
 
-    let from = unit_factor(&from).ok_or_else(|| format!("unknown source unit `{from_unit}`"))?;
-    let to = unit_factor(&to).ok_or_else(|| format!("unknown destination unit `{to_unit}`"))?;
+    let from =
+        resolve(&from, unit_factor).ok_or_else(|| format!("unknown source unit `{from_unit}`"))?;
+    let to =
+        resolve(&to, unit_factor).ok_or_else(|| format!("unknown destination unit `{to_unit}`"))?;
     if from.category != to.category {
         return Err(format!(
             "incompatible units: `{from_unit}` is {}, `{to_unit}` is {}",
@@ -95,15 +100,16 @@ fn format_conversion(value: f64, from_unit: &str, out: f64, to_unit: &str) -> St
 }
 
 fn normalize(unit: &str) -> String {
-    let mut out = unit
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '_'], "")
-        .to_string();
-    if out.ends_with('s') && !out.contains('/') && out != "celsius" {
-        out.pop();
-    }
-    out
+    unit.trim().to_ascii_lowercase().replace([' ', '_'], "")
+}
+
+/// Look up a normalized unit, trying the string as sent first and stripping a
+/// trailing `s` (plural) only as a fallback. Stripping *before* lookup broke
+/// units that legitimately end in `s` — "mps" became "mp" (its alias was dead
+/// code) and "celsius" needed a special case — while irregular plurals such as
+/// "feet"/"inches" are handled by their own aliases in the tables.
+fn resolve<T>(unit: &str, lookup: impl Fn(&str) -> Option<T>) -> Option<T> {
+    lookup(unit).or_else(|| unit.strip_suffix('s').and_then(lookup))
 }
 
 struct Unit {
@@ -129,11 +135,11 @@ fn unit_factor(unit: &str) -> Option<Unit> {
             category: "length",
             factor_to_base: 0.001,
         },
-        "inch" | "in" => Unit {
+        "inch" | "inches" | "in" => Unit {
             category: "length",
             factor_to_base: 0.0254,
         },
-        "foot" | "ft" => Unit {
+        "foot" | "feet" | "ft" => Unit {
             category: "length",
             factor_to_base: 0.3048,
         },
@@ -322,5 +328,36 @@ mod tests {
     #[test]
     fn rejects_incompatible_units() {
         assert!(convert(1.0, "kg", "mile").is_err());
+    }
+
+    #[test]
+    fn mps_alias_resolves_without_plural_stripping() {
+        // "mps" used to be singularized to "mp" before lookup, making its
+        // alias dead code and failing the conversion.
+        let out = convert(1.0, "mps", "km/h").unwrap();
+        assert!(out.contains("3.6"), "{out}");
+    }
+
+    #[test]
+    fn irregular_plurals_feet_and_inches_convert() {
+        let feet = convert(3.0, "feet", "m").unwrap();
+        assert!(feet.contains("0.9144"), "{feet}");
+        let inches = convert(2.0, "inches", "cm").unwrap();
+        assert!(inches.contains("5.08"), "{inches}");
+    }
+
+    #[test]
+    fn regular_plurals_still_convert() {
+        let out = convert(2.0, "meters", "cm").unwrap();
+        assert!(out.contains("200"), "{out}");
+    }
+
+    #[test]
+    fn celsius_is_not_singularized() {
+        let out = convert(100.0, "celsius", "fahrenheit").unwrap();
+        assert!(out.contains("212"), "{out}");
+        // And plural temperature spellings still fall back cleanly.
+        let k = convert(0.0, "kelvins", "celsius").unwrap();
+        assert!(k.contains("-273.14"), "{k}"); // -273.15 modulo f64 rounding
     }
 }
