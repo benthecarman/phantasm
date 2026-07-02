@@ -87,6 +87,13 @@ final class CalendarToolTests: XCTestCase {
         )
     }
 
+    func testParseDateRejectsRolledOverComponents() {
+        // Out-of-range components must fail, not normalize into a wrong date.
+        XCTAssertNil(CalendarTool.parseDate("2026-02-31", calendar: utc))
+        XCTAssertNil(CalendarTool.parseDate("2026-13-01", calendar: utc))
+        XCTAssertNotNil(CalendarTool.parseDate("2026-02-28", calendar: utc))
+    }
+
     func testParseQueryRejectsTooWideRange() {
         let query = CalendarTool.parseQuery(
             #"{"start_date":"2026-06-01","end_date":"2026-07-10"}"#,

@@ -303,6 +303,10 @@ public struct CalendarTool: AutoResolvedTool {
         components.year = year
         components.month = month
         components.day = day
+        // Calendar.date(from:) normalizes out-of-range components ("2026-02-31"
+        // becomes Mar 3); a model typo must be an error, not a silently wrong
+        // range.
+        guard components.isValidDate(in: calendar) else { return nil }
         return calendar.date(from: components).map(calendar.startOfDay(for:))
     }
 

@@ -96,6 +96,16 @@ final class HealthToolTests: XCTestCase {
         XCTAssertEqual(range.end, day(2026, 6, 8)) // exclusive end = day after the 7th
     }
 
+    func testDateRangeRejectsRolledOverComponents() {
+        // "2026-02-31" must not normalize to Mar 3; an invalid explicit date
+        // falls back to the period default instead of a silently wrong range.
+        let range = HealthTool.dateRange(
+            period: nil, startDate: "2026-02-31", endDate: "2026-13-01",
+            now: day(2026, 6, 29), calendar: utc)
+        XCTAssertEqual(range.start, day(2026, 6, 29))
+        XCTAssertEqual(range.end, day(2026, 6, 30))
+    }
+
     func testParseGranularityDefaultsToSummaryAndAcceptsDaily() {
         let summary = HealthTool.parseQuery(
             #"{"metrics":["steps"]}"#, now: day(2026, 6, 29), calendar: utc
