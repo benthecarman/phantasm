@@ -139,15 +139,23 @@ fn inject_inputs(cfg: &Config, workflow: &mut Value, args: &ImageGenArgs) -> Res
         let _ = comfy::set_input(workflow, node, Value::String(neg.clone()));
     }
     if let (Some(node), Some(w)) = (&cfg.comfy_gen_width, args.width) {
-        let _ = comfy::set_input(workflow, node, Value::from(w));
+        let _ = comfy::set_input(workflow, node, Value::from(clamp_dimension(w)));
     }
     if let (Some(node), Some(h)) = (&cfg.comfy_gen_height, args.height) {
-        let _ = comfy::set_input(workflow, node, Value::from(h));
+        let _ = comfy::set_input(workflow, node, Value::from(clamp_dimension(h)));
     }
     if let Some(node) = &cfg.comfy_gen_seed {
         let _ = comfy::set_input(workflow, node, Value::from(seed_value(args.seed)));
     }
     Ok(())
+}
+
+/// Clamp a model-supplied pixel dimension to a sane range, snapped down to a
+/// multiple of 8 (the latent-space stride the SD-family workflows expect).
+/// These values are model-controlled: an unclamped 16384×16384 request would
+/// be a one-call VRAM OOM on the ComfyUI box.
+fn clamp_dimension(px: u64) -> u64 {
+    (px.clamp(64, 2048) / 8) * 8
 }
 
 /// Use the caller's seed, else derive a pseudo-random one without an extra dep.
@@ -191,6 +199,35 @@ mod tests {
         assert_eq!(wf["27"]["inputs"]["width"], 1024);
         assert_eq!(wf["27"]["inputs"]["height"], 768);
         assert_eq!(wf["25"]["inputs"]["noise_seed"], 42);
+    }
+
+    #[test]
+    fn oversized_dimensions_are_clamped() {
+        assert_eq!(clamp_dimension(16384), 2048, "VRAM-OOM sizes are capped");
+        assert_eq!(clamp_dimension(1), 64, "degenerate sizes are floored");
+        assert_eq!(
+            clamp_dimension(1023),
+            1016,
+            "snapped down to a multiple of 8"
+        );
+        assert_eq!(clamp_dimension(1024), 1024, "in-range values untouched");
+
+        let cfg = cfg_with_gen_nodes();
+        let mut wf = serde_json::json!({
+            "6": { "inputs": { "text": "" } },
+            "27": { "inputs": { "width": 512, "height": 512 } },
+            "25": { "inputs": { "noise_seed": 0 } },
+        });
+        let args = ImageGenArgs {
+            prompt: "a cat".into(),
+            negative_prompt: None,
+            width: Some(16384),
+            height: Some(16384),
+            seed: None,
+        };
+        inject_inputs(&cfg, &mut wf, &args).unwrap();
+        assert_eq!(wf["27"]["inputs"]["width"], 2048);
+        assert_eq!(wf["27"]["inputs"]["height"], 2048);
     }
 
     #[test]
