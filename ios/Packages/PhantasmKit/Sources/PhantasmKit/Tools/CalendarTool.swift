@@ -283,7 +283,13 @@ public struct CalendarTool: AutoResolvedTool {
         if let instant = internetDateWithFractionalSecondsFormatter.date(from: value) {
             return instant
         }
-        return localDateTimeFormatter(calendar: calendar).date(from: value)
+        if let local = localDateTimeFormatter(calendar: calendar).date(from: value) {
+            return local
+        }
+        // Models commonly emit minutes precision with no seconds
+        // ("2026-07-04T15:00"); rejecting it silently degraded reads to the
+        // default range and swallowed create-event confirmations.
+        return localDateTimeMinutesFormatter(calendar: calendar).date(from: value)
     }
 
     private static func parseDay(_ value: String, calendar: Calendar) -> Date? {
@@ -323,6 +329,15 @@ public struct CalendarTool: AutoResolvedTool {
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return formatter
+    }
+
+    private static func localDateTimeMinutesFormatter(calendar: Calendar) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
         return formatter
     }
 

@@ -69,6 +69,24 @@ final class CalendarToolTests: XCTestCase {
         XCTAssertTrue(query?.includeNotes ?? false)
     }
 
+    func testParseDateAcceptsMinutesPrecisionDateTime() {
+        // Models commonly emit "YYYY-MM-DDTHH:mm" (no seconds); it must parse
+        // instead of silently falling back to the default query range.
+        XCTAssertEqual(
+            CalendarTool.parseDate("2026-07-04T15:00", calendar: utc),
+            day(2026, 7, 4, hour: 15)
+        )
+        // Seconds and full ISO offsets still parse.
+        XCTAssertEqual(
+            CalendarTool.parseDate("2026-07-04T15:00:00", calendar: utc),
+            day(2026, 7, 4, hour: 15)
+        )
+        XCTAssertEqual(
+            CalendarTool.parseDate("2026-07-04T15:00:00Z", calendar: utc),
+            day(2026, 7, 4, hour: 15)
+        )
+    }
+
     func testParseQueryRejectsTooWideRange() {
         let query = CalendarTool.parseQuery(
             #"{"start_date":"2026-06-01","end_date":"2026-07-10"}"#,
