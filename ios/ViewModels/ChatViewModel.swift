@@ -308,7 +308,11 @@ final class ChatViewModel {
         hasAssistantPreview = false
     }
 
-    func send(_ rawText: String, attachments: [PendingAttachment] = []) {
+    /// Returns whether the text was consumed (a turn started, or it answered a
+    /// pending prompt) — the composer clears its draft only then, so a rejected
+    /// send (no model yet, backend missing) doesn't eat the typed message.
+    @discardableResult
+    func send(_ rawText: String, attachments: [PendingAttachment] = []) -> Bool {
         // A typed message while an `ask_user` prompt is pending IS the answer.
         // Prompts that require explicit buttons (Calendar writes) block ordinary
         // sends until the user confirms or cancels in the prompt UI.
@@ -317,14 +321,15 @@ final class ChatViewModel {
                 let answer = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !answer.isEmpty {
                     answerPendingPrompt(answer)
+                    return true
                 }
             }
-            return
+            return false
         }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!text.isEmpty || !attachments.isEmpty), canSend,
               let env, let store, var conversation,
-              let base = env.activeProfile?.baseURL else { return }
+              let base = env.activeProfile?.baseURL else { return false }
         let token = env.activeToken ?? ""
 
         guard let model = env.backendMode.resolvedChatModel(
@@ -334,7 +339,7 @@ final class ChatViewModel {
             errorMessage = AppError.modelError(
                 "No chat model is selected. Choose a model in Settings or wait for model discovery to finish."
             ).userMessage
-            return
+            return false
         }
 
         // Update the conversation's metadata. A new chat's placeholder title is
@@ -389,6 +394,7 @@ final class ChatViewModel {
                 store: store
             )
         }
+        return true
     }
 
     /// Persist the user turn (lazily creating the conversation), then stream the

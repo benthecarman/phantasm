@@ -434,19 +434,24 @@ struct ChatView: View {
         let animateLogo = isEmpty
         let text = input
         let pending = attachments
-        input = ""
-        attachments = []
         composerFocused = false
         // Sending is an explicit "take me to the latest" intent: re-pin so the
         // committed message and the streamed reply are followed even if the user
         // had scrolled up while reading.
         isPinnedToBottom = true
+        let accepted: Bool
         if animateLogo {
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
+            accepted = withAnimation(.spring(response: 0.42, dampingFraction: 0.86)) {
                 vm.send(text, attachments: pending)
             }
         } else {
-            vm.send(text, attachments: pending)
+            accepted = vm.send(text, attachments: pending)
+        }
+        // Clear the draft only when the send was accepted, so a rejected send
+        // (no model selected yet, missing backend) doesn't eat the message.
+        if accepted {
+            input = ""
+            attachments = []
         }
     }
 
