@@ -1050,6 +1050,27 @@ async fn multiple_upstreams_union_models_and_route_by_model() {
         "Hello world",
         "unknown models fall back to the default upstream"
     );
+
+    // The dashboard reports one health row per upstream, in routing order.
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/dashboard/data"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let rows = body["upstreams"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "one row per upstream: {rows:?}");
+    assert_eq!(rows[0]["name"], "default");
+    assert_eq!(rows[0]["kind"], "ollama");
+    assert_eq!(rows[0]["reachable"], true);
+    assert_eq!(rows[1]["name"], "vllm");
+    assert_eq!(rows[1]["kind"], "openai");
+    assert_eq!(rows[1]["reachable"], true);
+    assert_eq!(rows[1]["max_concurrency"], 2);
+    assert_eq!(rows[1]["inflight"], 0);
+    assert_eq!(rows[1]["models"], 1);
 }
 
 #[tokio::test]

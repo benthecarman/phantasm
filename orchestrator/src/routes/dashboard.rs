@@ -24,6 +24,7 @@ use crate::turn_registry::RegistryCounts;
 
 const PAGE: &str = include_str!("dashboard.html");
 const OLLAMA_PS_TIMEOUT: Duration = Duration::from_millis(1500);
+const UPSTREAM_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub async fn page() -> Html<&'static str> {
     Html(PAGE)
@@ -55,7 +56,23 @@ pub struct DashboardData {
     pub history: Option<DashboardHistory>,
     /// `None` when the upstream is not native Ollama.
     pub ollama: Option<OllamaStatus>,
+    /// One row per configured upstream, in routing-priority order. The page
+    /// shows the table only when more than one is configured — the aggregate
+    /// stats above cover the single-upstream case.
+    pub upstreams: Vec<UpstreamStatus>,
     pub host: HostStats,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpstreamStatus {
+    pub name: String,
+    /// `"ollama"` or `"openai"` — how the backend is spoken to.
+    pub kind: &'static str,
+    pub reachable: bool,
+    pub inflight: u64,
+    pub max_concurrency: u64,
+    /// Models this upstream currently claims for routing (pinned or probed).
+    pub models: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,8 +106,10 @@ pub async fn data(
 
     let history_fut = query_history(&state, since_ts, bucket_seconds, model);
     let ollama_fut = probe_ollama(&state);
+    let upstreams_fut = probe_upstreams(&state);
     let host_fut = crate::host_stats::collect();
-    let (history, ollama, host) = tokio::join!(history_fut, ollama_fut, host_fut);
+    let (history, ollama, upstreams, host) =
+        tokio::join!(history_fut, ollama_fut, upstreams_fut, host_fut);
 
     let live = super::metrics::live_gauges(&state);
     Json(DashboardData {
@@ -107,8 +126,35 @@ pub async fn data(
         sse_disconnects: state.metrics.sse_disconnects.get(),
         history,
         ollama,
+        upstreams,
         host,
     })
+}
+
+/// One health row per configured upstream: a bounded live reachability probe
+/// (through the backend client, so API keys apply) plus that host's own
+/// in-flight/max from its semaphore. Probes run concurrently, so one down
+/// host costs the page a single timeout, not one per upstream.
+async fn probe_upstreams(state: &AppState) -> Vec<UpstreamStatus> {
+    futures_util::future::join_all(state.upstreams.entries().iter().map(|entry| async move {
+        let reachable = tokio::time::timeout(UPSTREAM_PROBE_TIMEOUT, entry.backend.list_models())
+            .await
+            .ok()
+            .is_some_and(|r| r.is_ok());
+        let max = entry.max_concurrency as u64;
+        UpstreamStatus {
+            name: entry.name.clone(),
+            kind: match entry.kind {
+                UpstreamKind::NativeOllama => "ollama",
+                UpstreamKind::OpenAICompatible => "openai",
+            },
+            reachable,
+            inflight: max.saturating_sub(entry.sem.available_permits() as u64),
+            max_concurrency: max,
+            models: entry.models().len(),
+        }
+    }))
+    .await
 }
 
 /// Run the range queries on a blocking thread against a read-only connection.

@@ -72,7 +72,7 @@
   <div class="card"><h2>Turns <span class="meta" id="rangeLabel"></span></h2><div class="stats" id="turns"></div></div>
   <div class="card"><h2>Latency</h2><div class="stats" id="latency"></div></div>
   <div class="card"><h2>Tokens</h2><div class="stats" id="tokens"></div></div>
-  <div class="card"><h2>Backend</h2><div id="backend" class="stats"></div><div id="loadedModels" class="empty" style="margin-top:8px"></div></div>
+  <div class="card"><h2>Backend</h2><div id="backend" class="stats"></div><div id="upstreams" style="margin-top:8px"></div><div id="loadedModels" class="empty" style="margin-top:8px"></div></div>
   <div class="card"><h2>Host</h2><div id="host"></div></div>
   <div class="card"><h2>Server</h2><div class="stats" id="server"></div></div>
   <div class="card wide"><h2>Turns / errors over time</h2><canvas id="chartTurns"></canvas></div>
@@ -154,6 +154,15 @@ function render(d) {
   let backend = stat("in flight", `${d.upstream_inflight}/${d.upstream_max}`);
   if (d.ollama) backend += `<div class="stat"><div class="v ${d.ollama.reachable ? "ok" : "err"}">${d.ollama.reachable ? "up" : "down"}</div><div class="k">ollama</div></div>`;
   $("backend").innerHTML = backend;
+  // Per-upstream health only earns its rows with several backends; the
+  // aggregate stats above already cover a single one.
+  $("upstreams").innerHTML = d.upstreams.length > 1
+    ? `<table><tr><th>upstream</th><th>kind</th><th>status</th><th>in flight</th><th>models</th></tr>` +
+      d.upstreams.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.kind)}</td>
+        <td class="${u.reachable ? "ok" : "err"}" style="color:var(--${u.reachable ? "ok" : "err"})">${u.reachable ? "up" : "down"}</td>
+        <td>${u.inflight}/${u.max_concurrency}</td>
+        <td${u.models ? "" : ' style="color:var(--err)"'}>${u.models}</td></tr>`).join("") + "</table>"
+    : "";
   $("loadedModels").innerHTML = d.ollama && d.ollama.models.length
     ? d.ollama.models.map(m => `${esc(m.name)} <span style="color:var(--dim)">(${fmtBytes(m.size_vram_bytes)} VRAM)</span>`).join("<br>")
     : (d.ollama ? "no models loaded" : "");
