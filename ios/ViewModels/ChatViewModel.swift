@@ -752,6 +752,11 @@ final class ChatViewModel {
         conversationId: UUID,
         store: ChatStore
     ) async -> UUID? {
+        // stop() may have run while an earlier await was in flight (GRDB writes
+        // don't observe Swift cancellation): the VM already finished, so a row
+        // inserted now would be an orphan nobody owns — and the recovery path
+        // would silently restart the turn the user explicitly stopped.
+        guard isStreaming, !Task.isCancelled else { return nil }
         let assistant = Message(
             conversationId: conversationId,
             role: "assistant",
@@ -761,6 +766,11 @@ final class ChatViewModel {
         )
         do {
             try await store.insertMessage(assistant, attachments: [])
+            if !isStreaming || Task.isCancelled {
+                // stop() raced the insert itself: remove the orphan.
+                try? await store.deleteMessage(id: assistant.id)
+                return nil
+            }
             pendingAssistantMessageID = assistant.id
             return assistant.id
         } catch {

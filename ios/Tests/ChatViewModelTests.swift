@@ -81,6 +81,40 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNil(vm.errorMessage)
     }
 
+    func testStopImmediatelyAfterSendLeavesNoOrphanRow() async throws {
+        // stop() right after send() cancels the task while the store writes are
+        // still in flight. The pending assistant row must not be created (or
+        // must be cleaned up) — an orphaned incomplete row used to auto-restart
+        // the explicitly stopped turn on the next foreground.
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        vm.setViewVisible(true)
+
+        client.enqueue(events: [.token("late"), .done], leadingDelayNanoseconds: 400_000_000)
+
+        vm.send("stop me now")
+        vm.stop()
+
+        try await waitUntil {
+            guard let detail = try await store.conversationDetail(id: conversation.id) else {
+                return false
+            }
+            return detail.messages.map(\.message.role) == ["user"]
+        }
+
+        // Recovery hooks must not resurrect the stopped turn.
+        vm.setViewVisible(false)
+        vm.setViewVisible(true)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let detail = try await self.detail(store, conversation.id)
+        XCTAssertEqual(detail.messages.map(\.message.role), ["user"])
+        XCTAssertFalse(vm.isStreaming)
+        XCTAssertTrue(client.requests.isEmpty, "the stopped turn must never reach the backend")
+    }
+
     func testStreamErrorDeletesPendingAssistantRowAndSurfacesMessage() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
