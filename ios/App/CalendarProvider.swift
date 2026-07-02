@@ -38,15 +38,24 @@ final class CalendarProvider: CalendarProviding {
             end: query.end,
             calendars: matchedCalendars
         )
-        let events = store.events(matching: predicate)
-            .filter { eventMatchesText($0, query: query) }
-            .sorted {
-                if $0.startDate != $1.startDate { return $0.startDate < $1.startDate }
-                return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
-            }
-            .prefix(query.maxResults)
-            .map { Self.calendarEvent(from: $0, includeNotes: query.includeNotes) }
-        return .success(Array(events))
+        // events(matching:) is a synchronous fetch Apple documents as
+        // background-thread work, and the range is model-controlled — a large
+        // calendar window must not stall the main actor mid-turn. EKEventStore
+        // is thread-safe; only value types cross back.
+        let store = self.store
+        let events = await Task.detached(priority: .userInitiated) {
+            Array(
+                store.events(matching: predicate)
+                    .filter { Self.eventMatchesText($0, query: query) }
+                    .sorted {
+                        if $0.startDate != $1.startDate { return $0.startDate < $1.startDate }
+                        return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+                    }
+                    .prefix(query.maxResults)
+                    .map { Self.calendarEvent(from: $0, includeNotes: query.includeNotes) }
+            )
+        }.value
+        return .success(events)
     }
 
     func createEvent(_ draft: CalendarEventDraft) async -> Result<CalendarEvent, CalendarLookupError> {
@@ -182,7 +191,7 @@ final class CalendarProvider: CalendarProviding {
         return .failure(.unavailable("no writable Calendar is available on this device."))
     }
 
-    private func eventMatchesText(_ event: EKEvent, query: CalendarEventQuery) -> Bool {
+    private static func eventMatchesText(_ event: EKEvent, query: CalendarEventQuery) -> Bool {
         guard let needle = query.matching?.trimmingCharacters(in: .whitespacesAndNewlines),
               !needle.isEmpty else { return true }
         let haystack = [
