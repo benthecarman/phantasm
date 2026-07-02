@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::ToolCall;
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
 use crate::tools::http_util;
@@ -84,32 +84,22 @@ pub async fn run(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let args: MapsPlacesArgs = match call.function.arguments.parse() {
-        Ok(a) => a,
-        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
-    };
-    let status = if args.near_location().is_some() {
-        "searching nearby places…"
-    } else {
-        "searching places…"
-    };
-    let _ = tx.send(TurnEvent::Status(status.into())).await;
-
-    let result = tokio::select! {
-        r = search(cfg, http, &args) => r,
-        _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
-    };
-
-    match result {
-        Ok(text) => ToolOutcome {
-            message: ChatMessage::tool_result(call_id, "maps_places", text),
-            append_to_answer: None,
+    crate::tools::run_simple(
+        "maps_places",
+        call,
+        call_id,
+        tx,
+        cancel,
+        |args: &MapsPlacesArgs| {
+            if args.near_location().is_some() {
+                "searching nearby places…".into()
+            } else {
+                "searching places…".into()
+            }
         },
-        Err(e) => {
-            tracing::warn!(error = %e, "maps_places failed");
-            error_outcome(call_id, e)
-        }
-    }
+        |args| async move { search(cfg, http, &args).await },
+    )
+    .await
 }
 
 impl MapsPlacesArgs {
@@ -567,17 +557,6 @@ impl OverpassElement {
             parts.push(city.clone());
         }
         (!parts.is_empty()).then(|| parts.join(", "))
-    }
-}
-
-fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(
-            call_id,
-            "maps_places",
-            format!("maps_places failed: {detail}"),
-        ),
-        append_to_answer: None,
     }
 }
 

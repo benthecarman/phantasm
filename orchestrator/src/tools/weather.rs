@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::ToolCall;
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
 use crate::tools::http_util;
@@ -46,27 +46,16 @@ pub async fn run(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let args: WeatherArgs = match call.function.arguments.parse() {
-        Ok(a) => a,
-        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
-    };
-    let _ = tx.send(TurnEvent::Status("checking weather…".into())).await;
-
-    let result = tokio::select! {
-        r = weather(cfg, http, &args) => r,
-        _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
-    };
-
-    match result {
-        Ok(text) => ToolOutcome {
-            message: ChatMessage::tool_result(call_id, "weather", text),
-            append_to_answer: None,
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "weather failed");
-            error_outcome(call_id, e)
-        }
-    }
+    crate::tools::run_simple(
+        "weather",
+        call,
+        call_id,
+        tx,
+        cancel,
+        |_: &WeatherArgs| "checking weather…".into(),
+        |args| async move { weather(cfg, http, &args).await },
+    )
+    .await
 }
 
 async fn weather(
@@ -307,13 +296,6 @@ fn weather_code(code: u64) -> &'static str {
         95 => "thunderstorm",
         96 | 99 => "thunderstorm with hail",
         _ => "unknown",
-    }
-}
-
-fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(call_id, "weather", format!("weather failed: {detail}")),
-        append_to_answer: None,
     }
 }
 

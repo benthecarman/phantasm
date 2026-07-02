@@ -164,14 +164,7 @@ pub async fn run(
 }
 
 fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(
-            call_id,
-            "web_search",
-            format!("web_search failed: {detail}"),
-        ),
-        append_to_answer: None,
-    }
+    crate::tools::error_outcome("web_search", call_id, detail)
 }
 
 async fn do_search(

@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::config::Config;
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::ToolCall;
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
 use crate::tools::http_util::{self, required};
@@ -60,27 +60,16 @@ pub async fn run(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let args: GitHubArgs = match call.function.arguments.parse() {
-        Ok(a) => a,
-        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
-    };
-    let _ = tx.send(TurnEvent::Status("checking GitHub…".into())).await;
-
-    let result = tokio::select! {
-        r = github(cfg, http, &args) => r,
-        _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
-    };
-
-    match result {
-        Ok(text) => ToolOutcome {
-            message: ChatMessage::tool_result(call_id, "github", text),
-            append_to_answer: None,
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "github failed");
-            error_outcome(call_id, e)
-        }
-    }
+    crate::tools::run_simple(
+        "github",
+        call,
+        call_id,
+        tx,
+        cancel,
+        |_: &GitHubArgs| "checking GitHub…".into(),
+        |args| async move { github(cfg, http, &args).await },
+    )
+    .await
 }
 
 async fn github(cfg: &Config, http: &reqwest::Client, args: &GitHubArgs) -> Result<String, String> {
@@ -266,13 +255,6 @@ struct ContentResponse {
     content: Option<String>,
     #[serde(default)]
     html_url: Option<String>,
-}
-
-fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(call_id, "github", format!("github failed: {detail}")),
-        append_to_answer: None,
-    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::ToolCall;
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome, TurnContext};
 use crate::orchestrator::TurnEvent;
 
@@ -46,29 +46,16 @@ pub async fn run(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let args: OcrArgs = match call.function.arguments.parse() {
-        Ok(a) => a,
-        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
-    };
-    let _ = tx
-        .send(TurnEvent::Status("reading image text…".into()))
-        .await;
-
-    let result = tokio::select! {
-        r = ocr(cfg, &args, ctx) => r,
-        _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
-    };
-
-    match result {
-        Ok(text) => ToolOutcome {
-            message: ChatMessage::tool_result(call_id, "ocr", text),
-            append_to_answer: None,
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "ocr failed");
-            error_outcome(call_id, e)
-        }
-    }
+    crate::tools::run_simple(
+        "ocr",
+        call,
+        call_id,
+        tx,
+        cancel,
+        |_: &OcrArgs| "reading image text…".into(),
+        |args| async move { ocr(cfg, &args, ctx).await },
+    )
+    .await
 }
 
 async fn ocr(cfg: &Config, args: &OcrArgs, ctx: &TurnContext) -> Result<String, String> {
@@ -139,13 +126,6 @@ fn validate_language(language: &str) -> Result<(), String> {
         return Err("language contains unsupported characters".into());
     }
     Ok(())
-}
-
-fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(call_id, "ocr", format!("ocr failed: {detail}")),
-        append_to_answer: None,
-    }
 }
 
 #[cfg(test)]

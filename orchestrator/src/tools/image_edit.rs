@@ -154,14 +154,7 @@ fn truncate_for_error(reference: &str) -> String {
 }
 
 fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(
-            call_id,
-            "image_edit",
-            format!("image_edit failed: {detail}"),
-        ),
-        append_to_answer: None,
-    }
+    crate::tools::error_outcome("image_edit", call_id, detail)
 }
 
 async fn edit(

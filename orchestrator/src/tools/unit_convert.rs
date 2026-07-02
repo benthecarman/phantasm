@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::ToolCall;
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
 
@@ -36,22 +36,16 @@ pub async fn run(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let args: UnitConvertArgs = match call.function.arguments.parse() {
-        Ok(a) => a,
-        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
-    };
-    let _ = tx.send(TurnEvent::Status("converting units…".into())).await;
-
-    tokio::select! {
-        result = async { convert(args.value, &args.from_unit, &args.to_unit) } => match result {
-            Ok(text) => ToolOutcome {
-                message: ChatMessage::tool_result(call_id, "unit_convert", text),
-                append_to_answer: None,
-            },
-            Err(e) => error_outcome(call_id, e),
-        },
-        _ = cancel.cancelled() => error_outcome(call_id, "cancelled".into()),
-    }
+    crate::tools::run_simple(
+        "unit_convert",
+        call,
+        call_id,
+        tx,
+        cancel,
+        |_: &UnitConvertArgs| "converting units…".into(),
+        |args| async move { convert(args.value, &args.from_unit, &args.to_unit) },
+    )
+    .await
 }
 
 fn convert(value: f64, from_unit: &str, to_unit: &str) -> Result<String, String> {
@@ -295,17 +289,6 @@ fn temperature_unit(unit: &str) -> Option<&'static str> {
         "f" | "fahrenheit" => Some("f"),
         "k" | "kelvin" => Some("k"),
         _ => None,
-    }
-}
-
-fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(
-            call_id,
-            "unit_convert",
-            format!("unit_convert failed: {detail}"),
-        ),
-        append_to_answer: None,
     }
 }
 

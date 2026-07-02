@@ -95,14 +95,7 @@ pub async fn run(
 }
 
 fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(
-            call_id,
-            "image_generation",
-            format!("image_generation failed: {detail}"),
-        ),
-        append_to_answer: None,
-    }
+    crate::tools::error_outcome("image_generation", call_id, detail)
 }
 
 async fn generate(

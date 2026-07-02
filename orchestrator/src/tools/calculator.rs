@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::ToolCall;
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
 
@@ -35,22 +35,16 @@ pub async fn run(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let args: CalculatorArgs = match call.function.arguments.parse() {
-        Ok(a) => a,
-        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
-    };
-    let _ = tx.send(TurnEvent::Status("calculating…".into())).await;
-
-    tokio::select! {
-        result = async { evaluate(&args.expression) } => match result {
-            Ok(text) => ToolOutcome {
-                message: ChatMessage::tool_result(call_id, "calculator", text),
-                append_to_answer: None,
-            },
-            Err(e) => error_outcome(call_id, e),
-        },
-        _ = cancel.cancelled() => error_outcome(call_id, "cancelled".into()),
-    }
+    crate::tools::run_simple(
+        "calculator",
+        call,
+        call_id,
+        tx,
+        cancel,
+        |_: &CalculatorArgs| "calculating…".into(),
+        |args| async move { evaluate(&args.expression) },
+    )
+    .await
 }
 
 fn evaluate(expression: &str) -> Result<String, String> {
@@ -278,17 +272,6 @@ impl<'a> Parser<'a> {
         if let Some(c) = self.peek() {
             self.pos += c.len_utf8();
         }
-    }
-}
-
-fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(
-            call_id,
-            "calculator",
-            format!("calculator failed: {detail}"),
-        ),
-        append_to_answer: None,
     }
 }
 

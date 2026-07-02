@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::ToolCall;
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
 use crate::tools::http_util;
@@ -191,27 +191,16 @@ pub async fn run(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let args: SportsArgs = match call.function.arguments.parse() {
-        Ok(a) => a,
-        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
-    };
-    let _ = tx.send(TurnEvent::Status("checking scores…".into())).await;
-
-    let result = tokio::select! {
-        r = scoreboard(cfg, http, &args) => r,
-        _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
-    };
-
-    match result {
-        Ok(text) => ToolOutcome {
-            message: ChatMessage::tool_result(call_id, "sports", text),
-            append_to_answer: None,
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "sports failed");
-            error_outcome(call_id, e)
-        }
-    }
+    crate::tools::run_simple(
+        "sports",
+        call,
+        call_id,
+        tx,
+        cancel,
+        |_: &SportsArgs| "checking scores…".into(),
+        |args| async move { scoreboard(cfg, http, &args).await },
+    )
+    .await
 }
 
 async fn scoreboard(
@@ -396,13 +385,6 @@ struct StatusType {
     /// Human-readable status, e.g. "Final", "7:30 PM ET", "2nd Quarter".
     #[serde(default)]
     detail: Option<String>,
-}
-
-fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(call_id, "sports", format!("sports failed: {detail}")),
-        append_to_answer: None,
-    }
 }
 
 #[cfg(test)]

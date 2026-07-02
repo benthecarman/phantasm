@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::net_guard;
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::ToolCall;
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome, TurnContext};
 use crate::orchestrator::TurnEvent;
 use crate::tools::web_search::html_to_text;
@@ -48,27 +48,16 @@ pub async fn run(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> ToolOutcome {
-    let args: WebFetchArgs = match call.function.arguments.parse() {
-        Ok(a) => a,
-        Err(e) => return error_outcome(call_id, format!("invalid arguments: {e}")),
-    };
-    let _ = tx.send(TurnEvent::Status("fetching page…".into())).await;
-
-    let result = tokio::select! {
-        r = fetch(cfg, &args, ctx) => r,
-        _ = cancel.cancelled() => return error_outcome(call_id, "cancelled".into()),
-    };
-
-    match result {
-        Ok(text) => ToolOutcome {
-            message: ChatMessage::tool_result(call_id, "web_fetch", text),
-            append_to_answer: None,
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "web_fetch failed");
-            error_outcome(call_id, e)
-        }
-    }
+    crate::tools::run_simple(
+        "web_fetch",
+        call,
+        call_id,
+        tx,
+        cancel,
+        |_: &WebFetchArgs| "fetching page…".into(),
+        |args| async move { fetch(cfg, &args, ctx).await },
+    )
+    .await
 }
 
 async fn fetch(cfg: &Config, args: &WebFetchArgs, ctx: &TurnContext) -> Result<String, String> {
@@ -152,17 +141,6 @@ async fn fetch(cfg: &Config, args: &WebFetchArgs, ctx: &TurnContext) -> Result<S
 fn cache_page(ctx: &TurnContext, url: &str, text: Option<String>) {
     if let Ok(mut cache) = ctx.cache.lock() {
         cache.pages.insert(url.to_string(), text);
-    }
-}
-
-fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
-    ToolOutcome {
-        message: ChatMessage::tool_result(
-            call_id,
-            "web_fetch",
-            format!("web_fetch failed: {detail}"),
-        ),
-        append_to_answer: None,
     }
 }
 
