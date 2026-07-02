@@ -99,18 +99,18 @@ async fn ocr(cfg: &Config, args: &OcrArgs, ctx: &TurnContext) -> Result<String, 
     temp.write_all(&bytes).map_err(|e| e.to_string())?;
     let path = temp.path().to_path_buf();
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(cfg.ocr_timeout_s),
-        Command::new(&cfg.tesseract_bin)
-            .arg(&path)
-            .arg("stdout")
-            .arg("-l")
-            .arg(language)
-            .output(),
-    )
-    .await
-    .map_err(|_| "OCR timed out".to_string())?
-    .map_err(|e| format!("cannot run tesseract: {e}"))?;
+    let mut cmd = Command::new(&cfg.tesseract_bin);
+    cmd.arg(&path)
+        .arg("stdout")
+        .arg("-l")
+        .arg(language)
+        // If the future is dropped (timeout, or the turn's cancel `select!`),
+        // kill the tesseract process rather than leaving it spinning orphaned.
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(cfg.ocr_timeout_s), cmd.output())
+        .await
+        .map_err(|_| "OCR timed out".to_string())?
+        .map_err(|e| format!("cannot run tesseract: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
