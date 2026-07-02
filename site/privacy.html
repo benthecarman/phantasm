@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Privacy Policy — Phantasm</title>
+  <meta name="description" content="Phantasm's privacy policy. Short version: we collect nothing. Your chats live on your device and your own server.">
+  <link rel="icon" type="image/png" href="/assets/favicon.png">
+  <link rel="canonical" href="https://getphantasm.com/privacy.html">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <header>
+    <nav>
+      <a class="brand" href="/">
+        <img src="/assets/icon.png" alt="" width="32" height="32">
+        Phantasm
+      </a>
+      <div class="nav-links">
+        <a href="/#features">Features</a>
+        <a href="/support.html">Support</a>
+        <a href="https://github.com/benthecarman/phantasm">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main class="prose">
+    <h1>Privacy Policy</h1>
+    <p class="updated">Last updated: July 2, 2026</p>
+
+    <p><strong>Short version: we don't collect anything.</strong> Phantasm has
+       no accounts, no analytics, no telemetry, and no servers of ours in the
+       middle. Your conversations exist in exactly two places: on your device,
+       and on the backend server <em>you</em> configure and control.</p>
+
+    <h2>What the app collects</h2>
+    <p>Nothing. Phantasm's App Store privacy manifest declares zero collected
+       data types and no tracking, and the app contains no analytics, crash
+       reporting, advertising, or tracking SDKs. We — the developers — have no
+       way to see your conversations, your settings, or even whether you use
+       the app at all.</p>
+
+    <h2>Where your data lives</h2>
+    <ul>
+      <li><strong>On your device.</strong> Conversations are stored locally.
+          Deleting a chat, or the app, deletes them.</li>
+      <li><strong>On your server.</strong> When you send a message, it goes
+          only to the backend URL you entered in Settings — typically a machine
+          on your own network. What happens there is governed by you, because
+          you run it.</li>
+    </ul>
+
+    <h2>Device permissions</h2>
+    <p>Phantasm can optionally use device capabilities as tools for the AI
+       model. Every one of them is off by default, enabled per-chat by you,
+       and sends data only to your own configured backend:</p>
+    <ul>
+      <li><strong>Health</strong> — read-only, shared with the model only when
+          you turn on the Health tool for a chat and the model requests it.
+          The app never writes to Apple Health.</li>
+      <li><strong>Location</strong> — shared only when you turn on the
+          Location tool for a chat and the model requests it.</li>
+      <li><strong>Calendar</strong> — events are shared only when you turn on
+          the Calendar tool; creating an event always requires your
+          confirmation.</li>
+      <li><strong>Camera &amp; photo library</strong> — used only when you
+          attach a photo to a message or save a generated image.</li>
+      <li><strong>Microphone &amp; speech recognition</strong> — used for
+          dictation; transcription runs on-device.</li>
+    </ul>
+
+    <h2>This website</h2>
+    <p>getphantasm.com is a static site. It sets no cookies and runs no
+       analytics or tracking scripts. It is served by Cloudflare, which
+       processes standard request data (such as IP addresses) to deliver and
+       secure the site, per
+       <a href="https://www.cloudflare.com/privacypolicy/">Cloudflare's privacy
+       policy</a>.</p>
+
+    <h2>Third parties</h2>
+    <p>Apple may collect standard App Store install and diagnostics data under
+       your device's analytics settings; that collection is governed by
+       Apple's privacy policy, not ours. Beyond distribution through the App
+       Store, Phantasm involves no third-party services — the backend it talks
+       to is yours.</p>
+
+    <h2>Changes</h2>
+    <p>If this policy changes, the update will be published on this page. The
+       app and this site are open source, so every change is also visible in
+       the <a href="https://github.com/benthecarman/phantasm">public
+       repository</a>.</p>
+
+    <h2>Contact</h2>
+    <p>Questions about privacy? Open an issue on
+       <a href="https://github.com/benthecarman/phantasm/issues">GitHub</a>.</p>
+  </main>
+
+  <footer>
+    <p>Phantasm &mdash; self-hosted AI chat for iOS.</p>
+    <p class="footer-links">
+      <a href="/">Home</a> &middot;
+      <a href="/privacy.html">Privacy</a> &middot;
+      <a href="/support.html">Support</a>
+    </p>
+  </footer>
+
+</body>
+</html>

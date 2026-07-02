@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Support — Phantasm</title>
+  <meta name="description" content="Get help with Phantasm — setup guides, troubleshooting, and where to report issues.">
+  <link rel="icon" type="image/png" href="/assets/favicon.png">
+  <link rel="canonical" href="https://getphantasm.com/support.html">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <header>
+    <nav>
+      <a class="brand" href="/">
+        <img src="/assets/icon.png" alt="" width="32" height="32">
+        Phantasm
+      </a>
+      <div class="nav-links">
+        <a href="/#features">Features</a>
+        <a href="/privacy.html">Privacy</a>
+        <a href="https://github.com/benthecarman/phantasm">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main class="prose">
+    <h1>Support</h1>
+
+    <h2>Getting started</h2>
+    <p>Phantasm needs a backend to talk to. The quickest path:</p>
+    <ol>
+      <li>Install <a href="https://ollama.com">Ollama</a> on a machine you own
+          and pull a model.</li>
+      <li>Optionally run the
+          <a href="https://github.com/benthecarman/phantasm/tree/master/orchestrator">Phantasm
+          orchestrator</a> next to it for web search and image generation
+          (<code>docker compose up</code>).</li>
+      <li>In the app, open Settings and enter your server's URL and token.</li>
+    </ol>
+    <p>The <a href="https://github.com/benthecarman/phantasm">README</a> has
+       the full setup guide, and the
+       <a href="https://github.com/benthecarman/phantasm/blob/master/docs/SPEC.md">spec</a>
+       documents how the app and server talk to each other.</p>
+
+    <h2>Common issues</h2>
+    <ul>
+      <li><strong>"Can't connect"</strong> — make sure your phone can reach
+          the server's address (same Wi-Fi network, or your own VPN/tunnel if
+          you're remote), and that the URL includes the right port.</li>
+      <li><strong>No web search or image buttons</strong> — those appear only
+          when the app is pointed at the orchestrator and it advertises those
+          capabilities. Against a bare Ollama, the app is plain chat by
+          design.</li>
+      <li><strong>Model list is empty</strong> — check the auth token, and
+          that Ollama has at least one model pulled.</li>
+    </ul>
+
+    <h2>Bugs &amp; feature requests</h2>
+    <p>Phantasm is open source. Report bugs or request features on the
+       <a href="https://github.com/benthecarman/phantasm/issues">GitHub issue
+       tracker</a> — it's the fastest way to reach the developers, and your
+       report helps everyone.</p>
+
+    <h2>Privacy questions</h2>
+    <p>See the <a href="/privacy.html">privacy policy</a>. The short version:
+       we collect nothing, and your data never touches our servers because we
+       don't have any.</p>
+  </main>
+
+  <footer>
+    <p>Phantasm &mdash; self-hosted AI chat for iOS.</p>
+    <p class="footer-links">
+      <a href="/">Home</a> &middot;
+      <a href="/privacy.html">Privacy</a> &middot;
+      <a href="/support.html">Support</a>
+    </p>
+  </footer>
+
+</body>
+</html>

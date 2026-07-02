@@ -282,6 +282,57 @@ code {
   font-size: 1.1rem;
 }
 
+/* ---------- prose pages (privacy, support) ---------- */
+
+.prose {
+  max-width: 680px;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.prose h1 {
+  font-size: 2.2rem;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.5rem;
+}
+
+.prose .updated {
+  color: var(--text-dim);
+  font-size: 0.9rem;
+  margin-bottom: 2rem;
+}
+
+.prose h2 {
+  font-size: 1.35rem;
+  text-align: left;
+  margin: 2.25rem 0 0.75rem;
+}
+
+.prose p,
+.prose li {
+  color: var(--text-dim);
+}
+
+.prose strong {
+  color: var(--text);
+}
+
+.prose ul,
+.prose ol {
+  padding-left: 1.4rem;
+  margin: 0.75rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.prose a {
+  color: var(--gold);
+}
+
+.prose a:hover {
+  color: var(--gold-bright);
+}
+
 /* ---------- footer ---------- */
 
 footer {
@@ -290,4 +341,17 @@ footer {
   padding: 2rem 1.5rem;
   color: var(--text-dim);
   font-size: 0.9rem;
+}
+
+.footer-links {
+  margin-top: 0.5rem;
+}
+
+.footer-links a {
+  color: var(--text-dim);
+  text-decoration: none;
+}
+
+.footer-links a:hover {
+  color: var(--gold-bright);
 }
