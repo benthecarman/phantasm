@@ -407,7 +407,7 @@ cancellation — Stop calls `POST /v1/chat/cancel` for a resumable turn (FR-A9,
 turn with `Idempotency-Key` and reconnects to replay it on foreground (FR-A11),
 connection handling distinguishing unreachable/auth/model errors (FR-A10).
 
-**Non-functional:** iOS 17+ (NFR-A1), token in Keychain (NFR-A2), local SwiftData
+**Non-functional:** iOS 18+ (NFR-A1), token in Keychain (NFR-A2), local SwiftData
 persistence (NFR-A3), smooth streaming off the main thread (NFR-A4), fast cold
 start (NFR-A5), optional multiple backend profiles (NFR-A6).
 
