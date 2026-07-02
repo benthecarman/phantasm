@@ -513,6 +513,10 @@ final class ChatViewModel {
         statusProgress = nil
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
+        // Resend/regenerate truncates the history, deleting the tool_calls row a
+        // parked prompt would answer. A stale prompt answered later would insert
+        // a tool row with no matching call — invalid history for strict backends.
+        pendingPrompt = nil
         suspendedByScene = false
         errorMessage = nil
         Task { await notifications.requestAuthorizationIfNeeded() }
