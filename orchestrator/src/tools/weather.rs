@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
+use crate::tools::http_util;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WeatherArgs {
@@ -79,8 +80,8 @@ async fn weather(
         .open_meteo_base
         .join("/v1/forecast")
         .map_err(|e| e.to_string())?;
-    let resp: ForecastResponse = http
-        .get(url)
+    let resp: ForecastResponse = http_util::get_json(
+        http.get(url)
         .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
         .query(&[
             ("latitude", place.latitude.to_string()),
@@ -95,13 +96,9 @@ async fn weather(
             ),
             ("forecast_days", days),
             ("timezone", "auto".into()),
-        ])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        ]),
+    )
+    .await?;
 
     Ok(format_forecast(&place, &resp))
 }
@@ -138,21 +135,17 @@ async fn resolve_place(
                 .open_meteo_geocoding_base
                 .join("/v1/search")
                 .map_err(|e| e.to_string())?;
-            let geo: GeocodeResponse = http
-                .get(url)
-                .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
-                .query(&[
-                    ("name", name),
-                    ("count", "1"),
-                    ("language", "en"),
-                    ("format", "json"),
-                ])
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
-                .json()
-                .await
-                .map_err(|e| e.to_string())?;
+            let geo: GeocodeResponse = http_util::get_json(
+                http.get(url)
+                    .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
+                    .query(&[
+                        ("name", name),
+                        ("count", "1"),
+                        ("language", "en"),
+                        ("format", "json"),
+                    ]),
+            )
+            .await?;
             geo.results
                 .into_iter()
                 .next()

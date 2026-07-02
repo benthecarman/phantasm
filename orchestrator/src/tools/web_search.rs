@@ -214,7 +214,9 @@ async fn do_search(
         return Err(format!("Brave returned {}", resp.status()));
     }
 
-    let body: BraveResponse = resp.json().await.map_err(|e| e.to_string())?;
+    // Capped body read (the request deadline above covers the body too).
+    let body: BraveResponse =
+        crate::tools::http_util::read_json(resp, crate::tools::http_util::JSON_BODY_CAP).await?;
     let results = body.web.map(|w| w.results).unwrap_or_default();
 
     if results.is_empty() {

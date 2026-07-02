@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
+use crate::tools::http_util;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -129,26 +130,16 @@ async fn alpha_query(
         .alpha_vantage_base
         .join("/query")
         .map_err(|e| e.to_string())?;
-    let v: Value = http
-        .get(url)
-        .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
-        .query(params)
-        .send()
-        .await
-        .map_err(redact_reqwest_err)?
-        .json()
-        .await
-        .map_err(redact_reqwest_err)?;
+    // Via the shared helper: per-request deadline, capped body, and errors
+    // rendered without the URL (the `apikey` rides the query string).
+    let v: Value = http_util::get_json(
+        http.get(url)
+            .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
+            .query(params),
+    )
+    .await?;
     alpha_error(&v)?;
     Ok(v)
-}
-
-/// Render a reqwest error without its URL. The Alpha Vantage `apikey` rides the
-/// query string, and reqwest's default `Display` includes the full URL — so the
-/// raw message would leak the key into warn logs and the model-visible tool
-/// error. Strip the URL before the error goes anywhere.
-fn redact_reqwest_err(e: reqwest::Error) -> String {
-    e.without_url().to_string()
 }
 
 fn alpha_error(v: &Value) -> Result<(), String> {
@@ -238,22 +229,5 @@ mod tests {
     fn reports_alpha_errors() {
         let v = serde_json::json!({"Note": "rate limited"});
         assert!(alpha_error(&v).is_err());
-    }
-
-    #[tokio::test]
-    async fn reqwest_errors_do_not_leak_query_secrets() {
-        // Bind then drop a loopback listener so the port is closed: the send
-        // fails with a real reqwest connect error that carries the request URL
-        // (query string included). The redacted form must not echo the key.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let url = format!("http://127.0.0.1:{port}/query?apikey=SUPERSECRETKEY");
-        let err = reqwest::Client::new().get(&url).send().await.unwrap_err();
-        let msg = redact_reqwest_err(err);
-        assert!(!msg.contains("SUPERSECRETKEY"), "leaked key: {msg}");
-        assert!(!msg.contains("apikey"), "leaked query string: {msg}");
     }
 }

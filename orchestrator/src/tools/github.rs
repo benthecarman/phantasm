@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
+use crate::tools::http_util;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -101,16 +102,10 @@ async fn search_repositories(
         .github_base
         .join("/search/repositories")
         .map_err(|e| e.to_string())?;
-    let resp: RepoSearchResponse = github_get(cfg, http, url)
-        .query(&[("q", query), ("per_page", &limit)])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp: RepoSearchResponse = http_util::get_json(
+        github_get(cfg, http, url).query(&[("q", query), ("per_page", &limit)]),
+    )
+    .await?;
     Ok(format_repo_results(query, &resp.items))
 }
 
@@ -125,16 +120,10 @@ async fn search_code(
         .github_base
         .join("/search/code")
         .map_err(|e| e.to_string())?;
-    let resp: CodeSearchResponse = github_get(cfg, http, url)
-        .query(&[("q", query), ("per_page", &limit)])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp: CodeSearchResponse = http_util::get_json(
+        github_get(cfg, http, url).query(&[("q", query), ("per_page", &limit)]),
+    )
+    .await?;
     Ok(format_code_results(query, &resp.items))
 }
 
@@ -147,15 +136,7 @@ async fn get_file(
     let repo = required(&args.repo, "repo")?;
     let path = required(&args.path, "path")?;
     let url = repo_content_url(&cfg.github_base, owner, repo, path)?;
-    let file: ContentResponse = github_get(cfg, http, url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let file: ContentResponse = http_util::get_json(github_get(cfg, http, url)).await?;
     if file.kind.as_deref() != Some("file") {
         return Err("requested path is not a file".into());
     }

@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
+use crate::tools::http_util;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SportsArgs {
@@ -231,13 +232,7 @@ async fn scoreboard(
         req = req.query(&[("dates", compact_date(date)?)]);
     }
 
-    let resp: ScoreboardResponse = req
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp: ScoreboardResponse = http_util::get_json(req).await?;
 
     Ok(format_scoreboard(args, &resp))
 }

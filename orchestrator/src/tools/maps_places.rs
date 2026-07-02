@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::{tool_envelope, ToolOutcome};
 use crate::orchestrator::TurnEvent;
+use crate::tools::http_util;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MapsPlacesArgs {
@@ -292,18 +293,12 @@ async fn overpass(
         .overpass_base
         .join("/api/interpreter")
         .map_err(|e| e.to_string())?;
-    let resp: OverpassResponse = http
-        .post(url)
-        .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
-        .form(&[("data", query)])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp: OverpassResponse = http_util::get_json(
+        http.post(url)
+            .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
+            .form(&[("data", query)]),
+    )
+    .await?;
     Ok(resp.elements)
 }
 
@@ -445,12 +440,7 @@ async fn nominatim_search(
     if let Some(country) = country {
         req = req.query(&[("countrycodes", country)]);
     }
-    req.send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+    http_util::get_json(req).await
 }
 
 fn format_places(query: &str, places: &[PlaceResult]) -> String {

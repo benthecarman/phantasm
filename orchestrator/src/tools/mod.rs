@@ -3,6 +3,7 @@ pub mod code_exec;
 pub mod code_exec_pool;
 pub mod comfy;
 pub mod github;
+pub mod http_util;
 pub mod image_delivery;
 pub mod image_edit;
 pub mod image_gen;

@@ -38,6 +38,11 @@ use crate::orchestrator::TurnEvent;
 // mirror on the back end: VAE decode + save run after sampling hits 100% but emit
 // no progress, so the bar would otherwise sit frozen at 100% — this labels the
 // tail as active instead.
+/// Raw-body cap for the `/history/<id>` JSON. A prompt's history holds node
+/// outputs and metadata (not image bytes), but complex workflows can make it
+/// large — so it gets a roomier cap than the shared JSON default.
+const HISTORY_BODY_CAP: usize = 8 * 1024 * 1024;
+
 const STATUS_QUEUED: &str = "queued…";
 const STATUS_LOADING_MODEL: &str = "loading model…";
 const STATUS_GENERATING: &str = "generating image…";
@@ -539,14 +544,15 @@ async fn fetch_image(
         .comfy_base
         .join(&format!("/history/{prompt_id}"))
         .map_err(|e| e.to_string())?;
-    let hist: Value = http
-        .get(hist_url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    // Deadlined + capped via the shared helper. History entries carry node
+    // outputs and metadata for the whole prompt, so allow well beyond the
+    // default JSON cap — still bounded.
+    let hist: Value = crate::tools::http_util::send_json(
+        http.get(hist_url),
+        Duration::from_secs(cfg.comfy_timeout_s),
+        HISTORY_BODY_CAP,
+    )
+    .await?;
 
     let image = find_first_image(&hist, prompt_id)
         .ok_or_else(|| "no image in ComfyUI output".to_string())?;
