@@ -189,9 +189,15 @@ fn mock_openai_compatible() -> Router {
             post(|body: axum::extract::Json<serde_json::Value>| async move {
                 let streaming = body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
                 if streaming {
+                    assert_eq!(
+                        body.0["stream_options"]["include_usage"],
+                        true,
+                        "OpenAI-compatible streams should request usage"
+                    );
                     let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
                                 data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
                                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                                data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n\
                                 data: [DONE]\n\n";
                     ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
                 } else {
@@ -231,6 +237,31 @@ fn mock_openai_compatible_erroring() -> Router {
         .route(
             "/v1/chat/completions",
             post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "upstream boom").into_response() }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { axum::Json(serde_json::json!({"data":[{"id":"m"}]})) }),
+        )
+}
+
+fn mock_openai_compatible_strict_stream_options(requests: RecordedRequests) -> Router {
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    requests.lock().await.push(body.0.clone());
+                    if body.0.get("stream_options").is_some() {
+                        return (StatusCode::BAD_REQUEST, "unknown field stream_options")
+                            .into_response();
+                    }
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"strict\"},\"finish_reason\":null}]}\n\n\
+                                data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                                data: [DONE]\n\n";
+                    ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
+                }
+            }),
         )
         .route(
             "/v1/models",
@@ -1416,8 +1447,9 @@ async fn regular_native_chat_omits_keep_alive() {
 async fn openai_compatible_upstream_streams_tokens() {
     let openai = spawn(mock_openai_compatible()).await;
     let base = spawn_orchestrator_with_kind(&openai, UpstreamKind::OpenAICompatible).await;
+    let client = reqwest::Client::new();
 
-    let resp = reqwest::Client::new()
+    let resp = client
         .post(format!("{base}/v1/chat/completions"))
         .header("Authorization", format!("Bearer {TOKEN}"))
         .json(&serde_json::json!({
@@ -1448,6 +1480,64 @@ async fn openai_compatible_upstream_streams_tokens() {
     }
     assert_eq!(content, "Hello world");
     assert!(saw_done, "expected a [DONE] sentinel");
+
+    let mut metrics = String::new();
+    for _ in 0..100 {
+        let resp = client
+            .get(format!("{base}/metrics"))
+            .header("Authorization", format!("Bearer {TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        metrics = resp.text().await.unwrap();
+        if metrics.contains("phantasm_completion_tokens_total{model=\"m\"} 2") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        metrics.contains("phantasm_prompt_tokens_total{model=\"m\"} 7"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phantasm_completion_tokens_total{model=\"m\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phantasm_generation_tokens_per_second_count{model=\"m\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_stream_retries_without_usage_for_strict_servers() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let openai = spawn(mock_openai_compatible_strict_stream_options(
+        requests.clone(),
+    ))
+    .await;
+    let base = spawn_orchestrator_with_kind(&openai, UpstreamKind::OpenAICompatible).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("strict"), "{body}");
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].get("stream_options").is_some());
+    assert!(requests[1].get("stream_options").is_none());
 }
 
 #[tokio::test]

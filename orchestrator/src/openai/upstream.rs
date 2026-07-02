@@ -10,6 +10,8 @@ use futures_util::{Stream, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
+use std::time::Instant;
 use url::Url;
 
 use crate::error::AppError;
@@ -27,11 +29,10 @@ pub struct OpenAICompatibleClient {
     /// On for template-driven hosts (vLLM/llama.cpp); a deployment pointing at a
     /// strict `/v1` server that rejects unknown body fields turns it off.
     thinking_hint: bool,
-    /// Metrics registry for token-usage recording (best-effort: only what the
-    /// upstream's `usage` object reports, and only on non-streaming responses —
-    /// stream usage would require `stream_options.include_usage`, which strict
-    /// servers may reject). `None` => record nothing.
-    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    /// Metrics registry for token-usage recording. OpenAI-compatible hosts that
+    /// honor `stream_options.include_usage` report final streaming token counts;
+    /// for those we use the observed stream duration as the throughput window.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl OpenAICompatibleClient {
@@ -54,7 +55,7 @@ impl OpenAICompatibleClient {
         }
     }
 
-    pub fn set_metrics(&mut self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::Metrics>) {
         self.metrics = Some(metrics);
     }
 
@@ -95,6 +96,13 @@ impl OpenAICompatibleClient {
         body.insert("model".into(), Value::String(model.to_string()));
         body.insert("messages".into(), messages_value(messages));
         body.insert("stream".into(), Value::Bool(stream));
+        if stream {
+            body.entry("stream_options").or_insert_with(|| {
+                json!({
+                    "include_usage": true
+                })
+            });
+        }
         if !tools.is_empty() {
             body.insert("tools".into(), Value::Array(tools.to_vec()));
         } else {
@@ -222,33 +230,73 @@ impl ChatBackend for OpenAICompatibleClient {
         messages: &[ChatMessage],
         options: &Map<String, Value>,
     ) -> Result<DeltaStream, AppError> {
-        let request = Self::build_request(model, messages, &[], options, true, self.thinking_hint);
-        let resp = self
+        let mut request =
+            Self::build_request(model, messages, &[], options, true, self.thinking_hint);
+        let mut resp = self
             .authed_post(&self.chat_url())
             .json(&request)
             .send()
             .await
             .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
+        if is_stream_options_rejection(resp.status()) {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                model = %model,
+                %status,
+                detail = %detail,
+                "OpenAI-compatible upstream rejected streaming usage; retrying without stream_options"
+            );
+            if let Value::Object(body) = &mut request {
+                body.remove("stream_options");
+            }
+            resp = self
+                .authed_post(&self.chat_url())
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
             return Err(AppError::UpstreamError(format!("{status}: {detail}")));
         }
-        Ok(Box::pin(sse_bytes_to_deltas(resp.bytes_stream())))
+        Ok(Box::pin(sse_bytes_to_deltas(
+            resp.bytes_stream(),
+            self.metrics
+                .clone()
+                .map(|metrics| (metrics, model.to_string())),
+        )))
     }
+}
+
+fn is_stream_options_rejection(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            | reqwest::StatusCode::NOT_IMPLEMENTED
+    )
 }
 
 /// Turn the raw byte stream of an OpenAI `text/event-stream` response into
 /// `StreamDelta`s, buffering partial lines across chunk boundaries. We only care
 /// about `data:` lines; the `data: [DONE]` sentinel ends the stream, and blank
 /// separators / comments (`:`) / other SSE fields (`event:`, `id:`) are ignored.
-fn sse_bytes_to_deltas<S>(mut bytes: S) -> impl Stream<Item = Result<StreamDelta, AppError>>
+fn sse_bytes_to_deltas<S>(
+    mut bytes: S,
+    metrics: Option<(Arc<crate::metrics::Metrics>, String)>,
+) -> impl Stream<Item = Result<StreamDelta, AppError>>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
     try_stream! {
         let mut buf = BytesMut::new();
         let mut think_tags = ThinkTagNormalizer::default();
+        let started_at = Instant::now();
+        let mut recorded_usage = false;
+        let mut pending_done_reason: Option<String> = None;
         'read: while let Some(next) = bytes.next().await {
             let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
             buf.extend_from_slice(&chunk);
@@ -259,11 +307,22 @@ where
                     continue;
                 };
                 if payload == b"[DONE]" {
+                    if metrics.is_some() {
+                        yield StreamDelta::new("", "", true, pending_done_reason.take());
+                    }
                     break 'read;
                 }
                 let value: Value = serde_json::from_slice(payload)
                     .map_err(|e| AppError::UpstreamError(format!("bad SSE data line: {e}")))?;
-                yield think_tags.normalize(delta_from_openai_chunk(&value));
+                if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
+                    continue;
+                }
+                let mut delta = delta_from_openai_chunk(&value);
+                if metrics.is_some() && delta.done {
+                    pending_done_reason = delta.done_reason.clone();
+                    delta.done = false;
+                }
+                yield think_tags.normalize(delta);
             }
         }
 
@@ -275,11 +334,45 @@ where
         if let Some(payload) = sse_data_payload(buf.as_ref()) {
             if payload != b"[DONE]" {
                 if let Ok(value) = serde_json::from_slice::<Value>(payload) {
+                    if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
+                        return;
+                    }
                     yield think_tags.normalize(delta_from_openai_chunk(&value));
                 }
             }
         }
     }
+}
+
+fn record_stream_usage(
+    metrics: &Option<(Arc<crate::metrics::Metrics>, String)>,
+    value: &Value,
+    started_at: Instant,
+    recorded: &mut bool,
+) -> bool {
+    let Some(usage) = value.get("usage") else {
+        return false;
+    };
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let prompt_tokens = count("prompt_tokens");
+    let completion_tokens = count("completion_tokens");
+    if *recorded || (prompt_tokens.is_none() && completion_tokens.is_none()) {
+        return true;
+    }
+    if let Some((metrics, model)) = metrics {
+        let eval_duration_ns = completion_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|_| started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        metrics.record_usage(
+            model,
+            prompt_tokens,
+            completion_tokens,
+            eval_duration_ns,
+            None,
+        );
+    }
+    *recorded = true;
+    true
 }
 
 /// The payload of an SSE `data:` line (trimmed), or `None` for a blank
@@ -504,7 +597,7 @@ mod tests {
                 b"llo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
             )),
         ];
-        let deltas: Vec<StreamDelta> = sse_bytes_to_deltas(stream::iter(chunks))
+        let deltas: Vec<StreamDelta> = sse_bytes_to_deltas(stream::iter(chunks), None)
             .map(|r| r.unwrap())
             .collect()
             .await;
@@ -525,9 +618,35 @@ mod tests {
 
         let chunks: Vec<reqwest::Result<Bytes>> =
             vec![Ok(Bytes::from_static(b"data: {not json}\n\n"))];
-        let mut got = Box::pin(sse_bytes_to_deltas(stream::iter(chunks)));
+        let mut got = Box::pin(sse_bytes_to_deltas(stream::iter(chunks), None));
         let first = got.next().await.expect("one item");
         assert!(matches!(first, Err(AppError::UpstreamError(_))));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_usage_records_tokens_and_throughput() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let metrics = crate::metrics::Metrics::without_store();
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<StreamDelta> =
+            sse_bytes_to_deltas(stream::iter(chunks), Some((metrics.clone(), "m".into())))
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+
+        assert_eq!(deltas.len(), 3, "usage-only chunks are not relayed");
+        assert!(deltas[2].done);
+        let stats = metrics.model("m");
+        assert_eq!(stats.prompt_tokens.get(), 7);
+        assert_eq!(stats.completion_tokens.get(), 3);
+        assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
     }
 
     #[test]
@@ -751,7 +870,7 @@ mod tests {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"bye\"},\"finish_reason\":\"stop\"}]}",
         ))];
-        let deltas: Vec<StreamDelta> = sse_bytes_to_deltas(stream::iter(chunks))
+        let deltas: Vec<StreamDelta> = sse_bytes_to_deltas(stream::iter(chunks), None)
             .map(|r| r.unwrap())
             .collect()
             .await;

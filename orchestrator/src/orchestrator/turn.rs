@@ -655,10 +655,10 @@ async fn stream_relay_inner<B: ChatBackend>(
                 {
                     return; // client gone
                 }
+                if let Some(r) = delta.done_reason.clone() {
+                    reason = r;
+                }
                 if delta.done {
-                    if let Some(r) = delta.done_reason {
-                        reason = r;
-                    }
                     break;
                 }
             }
