@@ -273,7 +273,10 @@ final class ChatViewModelTests: XCTestCase {
                 )
             ),
         ]
-        client.enqueue(events: [.toolCalls(calls), .done])
+        // The orchestrator flushes answer content queued by earlier server tools
+        // (e.g. a generated image) as a token ahead of the tool_calls chunk; it
+        // must survive onto the committed tool-call row, not just the preview.
+        client.enqueue(events: [.token("![img](data:image/png;base64,AA==)"), .toolCalls(calls), .done])
         client.enqueue(events: [.token("Final answer"), .done])
 
         vm.send("needs tool")
@@ -284,6 +287,7 @@ final class ChatViewModelTests: XCTestCase {
         var detail = try await detail(store, conversation.id)
         XCTAssertEqual(detail.messages.map(\.message.role), ["user", "assistant", "tool"])
         XCTAssertEqual(detail.messages[1].message.toolCalls?.isEmpty, false)
+        XCTAssertEqual(detail.messages[1].message.content, "![img](data:image/png;base64,AA==)")
         XCTAssertEqual(detail.messages[2].message.toolCallId, "time_call")
         XCTAssertEqual(detail.messages[2].message.name, ToolName.currentTime)
 

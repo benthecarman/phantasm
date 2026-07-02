@@ -921,6 +921,11 @@ final class ChatViewModel {
         let pendingID = pendingAssistantMessageID
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
+        // Any text already streamed this turn (e.g. an image a server tool
+        // generated in an earlier iteration, flushed ahead of the batch) belongs
+        // to this row — commit it, or it vanishes from history and the model's
+        // context on resume.
+        let streamedContent = streamingText
         streamingText = ""
         streamingReasoning = ""
 
@@ -929,7 +934,9 @@ final class ChatViewModel {
             // follows is attributed to this batch.
             do {
                 if let pendingID {
-                    try await store.completeToolCallMessage(id: pendingID, toolCalls: json)
+                    try await store.completeToolCallMessage(
+                        id: pendingID, toolCalls: json, content: streamedContent
+                    )
                 }
             } catch {
                 self?.finish(error: AppError.from(error))

@@ -271,10 +271,12 @@ extension AppDatabase: ChatStore {
         }
     }
 
-    public func completeToolCallMessage(id: UUID, toolCalls: String) async throws {
+    public func completeToolCallMessage(id: UUID, toolCalls: String, content: String) async throws {
         try await dbWriter.write { db in
             guard var message = try Message.fetchOne(db, key: id) else { return }
             message.toolCalls = toolCalls
+            message.content = content
+            message.searchText = Message.searchProjection(content)
             message.isComplete = true
             message.updatedAt = Date()
             try message.update(db)

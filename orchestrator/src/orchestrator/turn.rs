@@ -315,6 +315,14 @@ pub async fn run_turn<B, T>(
                         held = held.is_some(),
                         "forwarding app-hosted tool calls; co-occurring server calls executed inline"
                     );
+                    // Content queued for the final answer (e.g. an image a server
+                    // tool generated in an EARLIER iteration) would be silently
+                    // dropped by ending the turn here — while the model's context
+                    // already claims the user saw it. Flush it to the stream
+                    // before the tool_calls chunk so the app renders it.
+                    if !appends.is_empty() {
+                        let _ = tx.send(TurnEvent::Token(appends.join("\n\n"))).await;
+                    }
                     let _ = tx
                         .send(TurnEvent::ToolCalls {
                             app: app_calls,
@@ -1362,6 +1370,59 @@ mod tests {
         let events = drain(rx).await;
         assert_eq!(forwarded_names(&events), vec!["ask_user".to_string()]);
         assert!(held_history(&events).is_none(), "nothing to hold");
+    }
+
+    #[tokio::test]
+    async fn earlier_generated_image_streams_before_forwarded_app_call() {
+        // Iteration 1 generates an image server-side (queued for the final
+        // answer); iteration 2 forwards an app-hosted call, ending the turn.
+        // The queued image must still reach the stream — before the tool_calls
+        // chunk — rather than being silently dropped while the model's context
+        // claims the user saw it.
+        let backend = ScriptedBackend::new(
+            vec![
+                assistant_calling("image_generation"),
+                assistant_calling("ask_user"),
+            ],
+            vec!["unused".into()],
+        );
+        let tools = ImageTools {
+            edit_saw: Arc::new(Mutex::new(vec![])),
+        };
+        let (tx, rx) = mpsc::channel(64);
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![user(MessageContent::Text("draw a cat then ask me".into()))],
+            "m".into(),
+            Map::new(),
+            None,
+            vec![app_schema("ask_user")],
+            None,
+            None,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let events = drain(rx).await;
+
+        let image_pos = events
+            .iter()
+            .position(|e| matches!(e, TurnEvent::Token(t) if t.contains("GENIMG")))
+            .expect("the generated image reaches the stream");
+        let calls_pos = events
+            .iter()
+            .position(|e| matches!(e, TurnEvent::ToolCalls { .. }))
+            .expect("the app call is forwarded");
+        assert!(
+            image_pos < calls_pos,
+            "the image token precedes the tool_calls chunk"
+        );
+        assert!(
+            matches!(events.last(), Some(TurnEvent::Done { reason }) if reason == "tool_calls")
+        );
     }
 
     #[test]

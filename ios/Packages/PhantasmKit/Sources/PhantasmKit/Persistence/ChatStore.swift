@@ -64,9 +64,11 @@ public protocol ChatStore: Sendable {
     func addAttachments(messageID: UUID, attachments: [Attachment]) async throws
 
     /// Finalize a pending assistant row as one that forwarded app-hosted tool
-    /// calls: store the JSON-encoded `[WireToolCall]` and mark it complete. Used
-    /// when a turn ends with the model calling an app tool (e.g. `ask_user`).
-    func completeToolCallMessage(id: UUID, toolCalls: String) async throws
+    /// calls: store the JSON-encoded `[WireToolCall]`, keep any answer text the
+    /// turn streamed before the batch (e.g. an image a server tool produced in
+    /// an earlier iteration), and mark it complete. Used when a turn ends with
+    /// the model calling an app tool (e.g. `ask_user`).
+    func completeToolCallMessage(id: UUID, toolCalls: String, content: String) async throws
 
     /// Remove one message and its attachments. A no-op if the message no longer
     /// exists.

@@ -954,11 +954,15 @@ final class PersistenceTests: XCTestCase {
             id: "call_1", name: ToolName.askUser,
             arguments: #"{"question":"Q","options":["A","B"]}"#
         )
-        try await store.completeToolCallMessage(id: pending.id, toolCalls: json)
+        try await store.completeToolCallMessage(
+            id: pending.id, toolCalls: json, content: "already-streamed image"
+        )
 
         let detail = try await store.conversationDetail(id: convo.id)
         XCTAssertEqual(detail?.messages.first?.message.isComplete, true)
         XCTAssertEqual(detail?.messages.first?.message.toolCalls, json)
+        // Answer text streamed ahead of the batch is kept on the row.
+        XCTAssertEqual(detail?.messages.first?.message.content, "already-streamed image")
         // It round-trips into wire history as an assistant tool_call (+ synthetic
         // dismissed result, since nothing answered it) with its content intact.
         XCTAssertEqual(detail?.wireHistory().first?.toolCalls?.first?.id, "call_1")
