@@ -8,16 +8,16 @@ A static site — plain HTML + CSS, no build step, no dependencies.
 python3 -m http.server 8080 --directory site
 ```
 
-## Deploy to Cloudflare Pages
+## Deploy to Cloudflare
 
-Direct upload (no build config needed):
+The site deploys as an assets-only Worker; [`wrangler.jsonc`](../wrangler.jsonc)
+at the repo root points at this directory. Manual deploy:
 
 ```sh
-npx wrangler pages deploy site --project-name phantasm
+npx wrangler deploy
 ```
 
-Or connect the repo in the Cloudflare dashboard (Workers & Pages → Create →
-Pages → Connect to Git) with:
-
-- **Build command:** *(none)*
-- **Build output directory:** `site`
+Automatic deploys are handled by the Workers Builds Git integration
+(Cloudflare dashboard → Workers & Pages → the `phantasm` project): every push
+to `master` deploys production, and non-production branches get preview
+builds. Build command is empty; the deploy command is `npx wrangler deploy`.

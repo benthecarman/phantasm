@@ -1,0 +1,10 @@
+// Cloudflare Workers config for the marketing site (assets-only, no Worker
+// script). The Workers Builds Git integration runs `npx wrangler deploy`,
+// which reads this file and uploads site/ as static assets.
+{
+  "name": "phantasm",
+  "compatibility_date": "2026-07-02",
+  "assets": {
+    "directory": "./site"
+  }
+}
