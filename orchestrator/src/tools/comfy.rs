@@ -76,13 +76,25 @@ async fn ws_image_delivery(cfg: &Config, http: &reqwest::Client) -> bool {
 }
 
 /// Tells ComfyUI to abandon a submitted prompt, freeing the GPU. Best-effort:
-/// `POST /interrupt` stops the prompt if it is currently executing, and
-/// `POST /queue {delete:[id]}` removes it if it is still queued. Errors are
-/// ignored — this runs on a cancellation/cleanup path where there is no caller
-/// left to surface them to.
-async fn interrupt_comfy(comfy_base: &Url, http: &reqwest::Client, prompt_id: &str) {
-    if let Ok(url) = comfy_base.join("/interrupt") {
-        let _ = http.post(url).send().await;
+/// errors are ignored — this runs on a cancellation/cleanup path where there is
+/// no caller left to surface them to.
+///
+/// `POST /interrupt` is **global**: it aborts whatever prompt ComfyUI is
+/// currently executing, not a specific one. It is only sent when `executing`
+/// says OUR prompt had started running (per the WS `executing`/`progress`
+/// frames) — firing it for a still-queued prompt would kill someone else's
+/// generation. The `POST /queue {delete:[id]}` removal is scoped to our
+/// prompt id and is always safe, so it is always issued.
+async fn interrupt_comfy(
+    comfy_base: &Url,
+    http: &reqwest::Client,
+    prompt_id: &str,
+    executing: bool,
+) {
+    if executing {
+        if let Ok(url) = comfy_base.join("/interrupt") {
+            let _ = http.post(url).send().await;
+        }
     }
     if let Ok(url) = comfy_base.join("/queue") {
         let _ = http
@@ -91,7 +103,17 @@ async fn interrupt_comfy(comfy_base: &Url, http: &reqwest::Client, prompt_id: &s
             .send()
             .await;
     }
-    tracing::info!(prompt_id, "interrupted ComfyUI generation");
+    tracing::info!(prompt_id, executing, "interrupted ComfyUI generation");
+}
+
+/// Whether our prompt has begun executing, given the progress phase marker
+/// `last_pct` (see [`run_workflow`]): `-2` means nothing seen yet (queued at
+/// most), and every later phase (`-1`, `0..=100`, `101`) is only entered off
+/// an `executing` frame checked against our prompt id, or a `progress` frame
+/// (which ComfyUI addresses to the submitting client). Gates the global
+/// `/interrupt` in [`interrupt_comfy`].
+fn execution_started(last_pct: i64) -> bool {
+    last_pct > -2
 }
 
 /// Drop guard that interrupts a submitted-but-unfinished ComfyUI prompt. The
@@ -105,6 +127,9 @@ struct InterruptOnDrop {
     comfy_base: Url,
     http: reqwest::Client,
     prompt_id: Option<String>,
+    /// Whether our prompt was seen executing (vs. still queued). Decides if the
+    /// drop may send the global `/interrupt` or only the scoped queue delete.
+    executing: bool,
 }
 
 impl Drop for InterruptOnDrop {
@@ -112,6 +137,7 @@ impl Drop for InterruptOnDrop {
         let Some(prompt_id) = self.prompt_id.take() else {
             return; // never submitted, or completed — nothing to interrupt
         };
+        let executing = self.executing;
         // Drop is synchronous, so the interrupt is spawned detached. Guard on a
         // live runtime: during shutdown the drop can run with no runtime, where
         // `tokio::spawn` would panic. Then the process is exiting anyway, so the
@@ -122,7 +148,7 @@ impl Drop for InterruptOnDrop {
         let comfy_base = self.comfy_base.clone();
         let http = self.http.clone();
         handle.spawn(async move {
-            interrupt_comfy(&comfy_base, &http, &prompt_id).await;
+            interrupt_comfy(&comfy_base, &http, &prompt_id, executing).await;
         });
     }
 }
@@ -216,6 +242,7 @@ pub async fn run_workflow(
         comfy_base: cfg.comfy_base.clone(),
         http: http.clone(),
         prompt_id: None,
+        executing: false,
     };
 
     // Submit the workflow.
@@ -272,6 +299,9 @@ pub async fn run_workflow(
                 Some(Ok(Message::Text(txt))) => {
                     let prev_pct = last_pct;
                     let done = handle_ws_message(&txt, &prompt_id, &mut last_pct, tx).await;
+                    // Once our prompt is seen executing, a drop/bail-out may use
+                    // the global /interrupt (before that, only the queue delete).
+                    interrupt.executing = execution_started(last_pct);
                     if first_progress_at.is_none() && prev_pct < 0 && (0..=100).contains(&last_pct) {
                         first_progress_at = Some(submit_at.elapsed());
                     }
@@ -827,6 +857,33 @@ mod tests {
             rx.try_recv(),
             Ok(TurnEvent::Progress { progress, .. }) if (progress - 0.10).abs() < 1e-9
         ));
+    }
+
+    #[tokio::test]
+    async fn foreign_executing_frame_does_not_mark_our_prompt_started() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut last = -2;
+        // Another turn's prompt starts executing: ours is still queued, so the
+        // drop guard must NOT be allowed to fire the global /interrupt (that
+        // would abort the other turn's generation).
+        let other = r#"{"type":"executing","data":{"node":"3","prompt_id":"other"}}"#;
+        handle_ws_message(other, "pid", &mut last, &tx).await;
+        assert!(!execution_started(last));
+
+        // Our own executing frame flips it: the interrupt is now about us.
+        let ours = r#"{"type":"executing","data":{"node":"3","prompt_id":"pid"}}"#;
+        handle_ws_message(ours, "pid", &mut last, &tx).await;
+        assert!(execution_started(last));
+    }
+
+    #[tokio::test]
+    async fn progress_frames_mark_execution_started() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut last = -2;
+        assert!(!execution_started(last), "queued-only must not interrupt");
+        let progress = r#"{"type":"progress","data":{"value":1,"max":20}}"#;
+        handle_ws_message(progress, "pid", &mut last, &tx).await;
+        assert!(execution_started(last));
     }
 
     #[tokio::test]
