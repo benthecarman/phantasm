@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phantasm — Self-hosted AI chat for iOS</title>
+  <meta name="description" content="A fast, self-hostable AI chat app for iOS that talks to a backend you control. Your models, your hardware, your data.">
+  <meta property="og:title" content="Phantasm — Self-hosted AI chat for iOS">
+  <meta property="og:description" content="A fast, self-hostable AI chat app for iOS that talks to a backend you control. Your models, your hardware, your data.">
+  <meta property="og:image" content="/assets/icon.png">
+  <meta property="og:type" content="website">
+  <link rel="icon" type="image/png" href="/assets/favicon.png">
+  <link rel="apple-touch-icon" href="/assets/icon.png">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <header>
+    <nav>
+      <a class="brand" href="/">
+        <img src="/assets/icon.png" alt="" width="32" height="32">
+        Phantasm
+      </a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="https://github.com/benthecarman/phantasm">GitHub</a>
+      </div>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <img class="hero-icon" src="/assets/icon.png" alt="Phantasm app icon" width="120" height="120">
+      <h1>Your AI. Your hardware.<br><span class="accent">Your data.</span></h1>
+      <p class="tagline">
+        Phantasm is a fast, self-hostable AI chat app for iOS that talks to a
+        backend <em>you</em> control. Point it at your own machine and chat with
+        local models — no accounts, no cloud, no one in the middle.
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://github.com/benthecarman/phantasm">Get started</a>
+        <a class="btn btn-ghost" href="#how">See how it works</a>
+      </div>
+    </section>
+
+    <section id="features">
+      <h2>Everything runs on machines you own</h2>
+      <div class="grid">
+        <div class="card">
+          <div class="card-icon">&#128274;</div>
+          <h3>Private by design</h3>
+          <p>Your conversations never leave your network. The app takes a URL
+             and a token — nothing else. No account, no telemetry, no third party.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">&#9889;</div>
+          <h3>Fast, native iOS</h3>
+          <p>A lean SwiftUI client built for streaming. Smooth token-by-token
+             responses, markdown rendering, and image support that feels at home
+             on iPhone.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">&#128268;</div>
+          <h3>Works with what you have</h3>
+          <p>OpenAI-compatible at its core. Point it straight at a bare Ollama
+             instance for plain chat, or add the orchestrator for more.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">&#127760;</div>
+          <h3>Web search built in</h3>
+          <p>The optional orchestration server gives your local models live web
+             search and page fetching — answers grounded in today, not the
+             training cutoff.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">&#127912;</div>
+          <h3>Image generation</h3>
+          <p>Hook up ComfyUI and generate images right in the chat. The server
+             handles the pipeline; the app just shows the picture.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">&#128230;</div>
+          <h3>One app, many backends</h3>
+          <p>Capabilities are detected at runtime, so the app adapts to whatever
+             your server offers. Upgrade the backend; the app follows.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="how">
+      <h2>How it works</h2>
+      <ol class="steps">
+        <li>
+          <span class="step-num">1</span>
+          <div>
+            <h3>Run the backend</h3>
+            <p>Spin up Ollama on any machine you own — a home server, a gaming
+               PC, a Mac in the closet. Optionally add the Phantasm orchestrator
+               (one Rust binary, <code>docker&nbsp;compose&nbsp;up</code>) for
+               web search and image generation.</p>
+          </div>
+        </li>
+        <li>
+          <span class="step-num">2</span>
+          <div>
+            <h3>Point the app at it</h3>
+            <p>Open Phantasm on your iPhone, enter your server's URL and token.
+               That's the entire setup — the app discovers models and
+               capabilities on its own.</p>
+          </div>
+        </li>
+        <li>
+          <span class="step-num">3</span>
+          <div>
+            <h3>Chat</h3>
+            <p>Streaming responses, tool use, and generated images — all served
+               from your own hardware. Nothing to subscribe to, nothing to leak.</p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section class="open-source">
+      <h2>Open source, end to end</h2>
+      <p>The iOS app, the orchestration server, and the interface contract
+         between them are all open. Read the code, run it yourself, make it
+         yours.</p>
+      <a class="btn btn-primary" href="https://github.com/benthecarman/phantasm">View on GitHub</a>
+    </section>
+  </main>
+
+  <footer>
+    <p>Phantasm &mdash; self-hosted AI chat for iOS.</p>
+  </footer>
+
+</body>
+</html>

@@ -6,6 +6,9 @@
 .env
 *.env.local
 
+# Cloudflare
+.wrangler/
+
 # iOS / Xcode
 ios/Phantasm.xcodeproj/
 ios/build/
