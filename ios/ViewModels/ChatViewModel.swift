@@ -30,6 +30,12 @@ final class ChatViewModel {
     private(set) var streamingStartedAt = Date.now
     private(set) var statusText: String?
     private(set) var statusProgress: Double?
+    /// Whether the assistant-preview bubble has content to show. Stored — not
+    /// computed from the per-token properties — so views that only need the
+    /// coarse fact (the empty-state check) don't re-evaluate on every token.
+    /// Maintained at turn transitions: true when a turn starts, false when the
+    /// preview is cleared (prompt park, recovery keep, reconcile after commit).
+    private(set) var hasAssistantPreview = false
     var errorMessage: String?
     /// A pending interactive app-tool prompt (e.g. `ask_user`'s multiple choice
     /// or a Calendar write confirmation) awaiting the user. Prompt views resolve
@@ -280,14 +286,6 @@ final class ChatViewModel {
         return !isStreaming
     }
 
-    var hasAssistantPreview: Bool {
-        isStreaming
-            || !(statusText?.isEmpty ?? true)
-            || statusProgress != nil
-            || !streamingText.isEmpty
-            || !streamingReasoning.isEmpty
-    }
-
     func shouldShowAssistantPreview(alongside messages: [ChatMessage]) -> Bool {
         guard hasAssistantPreview else { return false }
         guard let pendingAssistantPreviewMessageID else { return true }
@@ -307,6 +305,7 @@ final class ChatViewModel {
         streamingReasoning = ""
         statusText = nil
         statusProgress = nil
+        hasAssistantPreview = false
     }
 
     func send(_ rawText: String, attachments: [PendingAttachment] = []) {
@@ -365,6 +364,7 @@ final class ChatViewModel {
         }
 
         isStreaming = true
+        hasAssistantPreview = true
         streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
@@ -505,6 +505,7 @@ final class ChatViewModel {
         }
 
         isStreaming = true
+        hasAssistantPreview = true
         streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
@@ -703,6 +704,7 @@ final class ChatViewModel {
         ) else { return }
 
         isStreaming = true
+        hasAssistantPreview = true
         streamingStartedAt = pending.message.createdAt
         // Start empty: the orchestrator replays the resumed turn from the start
         // (we omit `Last-Event-ID`), so the replayed tokens rebuild the message —
@@ -806,6 +808,7 @@ final class ChatViewModel {
         pendingPrompt = nil
 
         isStreaming = true
+        hasAssistantPreview = true
         streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
@@ -953,6 +956,7 @@ final class ChatViewModel {
     /// row (unlike `finish`, which would try to flush empty streamed text).
     private func enterPromptWait(conversationId: UUID, store: ChatStore) {
         isStreaming = false
+        hasAssistantPreview = false
         statusText = nil
         statusProgress = nil
         task = nil
@@ -1040,8 +1044,11 @@ final class ChatViewModel {
             streamingText = ""
             streamingReasoning = ""
             pendingAssistantPreviewMessageID = nil
+            hasAssistantPreview = false
             endBackgroundStreamingTask()
         } else if let store, let conversation, !committed.isEmpty {
+            // The preview stays visible (hasAssistantPreview remains true) until
+            // the committed row lands and reconcileAssistantPreview clears it.
             if let pendingID {
                 pendingAssistantPreviewMessageID = pendingID
                 if shouldAutoSpeak { env?.speak(committed, messageID: pendingID) }
@@ -1107,6 +1114,7 @@ final class ChatViewModel {
             streamingText = ""
             streamingReasoning = ""
             pendingAssistantPreviewMessageID = nil
+            hasAssistantPreview = false
             endBackgroundStreamingTask()
         }
 
@@ -1120,6 +1128,7 @@ final class ChatViewModel {
         pendingAssistantPreviewMessageID = nil
         streamingText = ""
         streamingReasoning = ""
+        hasAssistantPreview = false
         errorMessage = AppError.from(error).userMessage
     }
 

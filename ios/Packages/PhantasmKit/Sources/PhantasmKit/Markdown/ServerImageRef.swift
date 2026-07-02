@@ -53,14 +53,30 @@ public enum ServerImageRef {
     /// network while their URL is valid).
     public static func inlineCached(_ text: String, cache: [String: CachedImage]) -> String {
         guard !cache.isEmpty else { return text }
+        // Memoized: committed rows re-render on every layout/scroll pass, and
+        // re-encoding cached image bytes to base64 each time is main-thread
+        // work proportional to the image sizes. Ids are content hashes, so
+        // (text, ids) fully determines the result.
+        let key = (text + "|" + cache.keys.sorted().joined(separator: ",")) as NSString
+        if let hit = memo.object(forKey: key) { return hit as String }
         var result = text
         for ref in references(in: text) {
             guard let img = cache[ref.id] else { continue }
             let uri = "data:\(img.mime);base64,\(img.data.base64EncodedString())"
             result = result.replacingOccurrences(of: ref.url, with: uri)
         }
+        memo.setObject(result as NSString, forKey: key, cost: result.utf8.count)
         return result
     }
+
+    /// Process-wide memo for `inlineCached`, byte-budgeted (inlined results
+    /// embed full base64 payloads) and evicted under memory pressure.
+    private static let memo: NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 64
+        cache.totalCostLimit = 48 * 1024 * 1024
+        return cache
+    }()
 
     /// Matches a markdown link target `](<url>)` whose URL is a
     /// `/v1/files/<id>/content` reference. Group 1 = full URL, group 2 = id.

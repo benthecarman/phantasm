@@ -244,7 +244,7 @@ struct StreamingBubble: View {
                 if text.isEmpty && reasoning.isEmpty && (status?.isEmpty ?? true) {
                     ConjuringLoader(seed: startedAt)
                 } else if !text.isEmpty {
-                    MarkdownMessageView(text: text)
+                    MarkdownMessageView(text: text, isStreaming: true)
                 }
             }
             Spacer(minLength: 40)

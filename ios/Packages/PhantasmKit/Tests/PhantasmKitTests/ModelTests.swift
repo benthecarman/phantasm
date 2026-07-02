@@ -629,6 +629,25 @@ final class Base64ImageExtractorTests: XCTestCase {
         XCTAssertTrue(result.images.isEmpty)
     }
 
+    func testStreamingSanitizerStripsWithoutDecoding() {
+        let payload = Data("hello".utf8).base64EncodedString()
+        // A complete image is replaced by the placeholder.
+        let complete = "Before ![generated](data:image/png;base64,\(payload)) after"
+        XCTAssertEqual(
+            Base64ImageExtractor.streamingSanitized(complete),
+            "Before *(image)* after"
+        )
+        // A still-open trailing data-URI truncates from its opening "![" so
+        // partial base64 never reaches the markdown parser.
+        let open = "Text ![generated](data:image/png;base64,AAAA"
+        XCTAssertEqual(
+            Base64ImageExtractor.streamingSanitized(open),
+            "Text *(image)*"
+        )
+        // Plain text is untouched.
+        XCTAssertEqual(Base64ImageExtractor.streamingSanitized("plain"), "plain")
+    }
+
     func testDecodesWhitespaceWrappedBase64() {
         // The regex admits whitespace in the payload (wrapped base64); the
         // decoder must tolerate it instead of degrading the image to *(image)*.

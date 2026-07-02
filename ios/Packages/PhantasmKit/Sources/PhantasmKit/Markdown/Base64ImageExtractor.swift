@@ -13,9 +13,45 @@ public struct Base64ImageExtractor: Sendable {
         public let markdown: String
         /// Decoded image bytes keyed by placeholder index.
         public let images: [Int: Data]
+
+        public init(markdown: String, images: [Int: Data]) {
+            self.markdown = markdown
+            self.images = images
+        }
     }
 
     public init() {}
+
+    /// Streaming-path sanitizer: strips data-URI images — complete or still
+    /// arriving — **without decoding base64**. The live preview re-renders on
+    /// every token, so the committed path's regex-plus-decode (multi-MB work on
+    /// the main actor) is unaffordable there; images render when the message
+    /// commits. A trailing, still-open data-URI (its base64 is mid-stream)
+    /// truncates to the placeholder so megabytes of base64 never reach the
+    /// markdown parser.
+    public static func streamingSanitized(_ markdown: String) -> String {
+        let marker = "](data:image/"
+        guard markdown.contains(marker) else { return markdown }
+        var text = markdown
+        // Complete images: same pattern as extraction, replaced without decode.
+        if let regex = dataURIImageRegex {
+            let ns = text as NSString
+            text = regex.stringByReplacingMatches(
+                in: text,
+                range: NSRange(location: 0, length: ns.length),
+                withTemplate: "*(image)*"
+            )
+        }
+        // A still-open trailing data-URI: cut from its opening "![" (nothing
+        // legitimate follows mid-stream until the payload closes).
+        if let markerRange = text.range(of: marker) {
+            let head = text[..<markerRange.lowerBound]
+            let start = head.range(of: "![", options: .backwards)?.lowerBound
+                ?? markerRange.lowerBound
+            text = String(text[..<start]) + "*(image)*"
+        }
+        return text
+    }
 
     /// Memoized `extract`. Committed messages re-render on every layout/scroll
     /// pass with stable content, so caching by content avoids re-running the

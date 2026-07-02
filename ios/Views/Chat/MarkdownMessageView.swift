@@ -11,13 +11,21 @@ struct MarkdownMessageView: View {
     /// present here renders from local bytes (offline / after URL expiry) instead
     /// of refetching; absent ones still load over the network.
     var cachedImages: [String: ServerImageRef.CachedImage] = [:]
+    /// Live streaming preview: the view re-renders per token, so inline base64
+    /// images are stripped without decoding (no multi-MB regex/decode on the
+    /// main actor per token); they render when the message commits.
+    var isStreaming = false
     /// Tapping an inline image opens the full-screen viewer. Reports the image's
     /// ordinal within this message (its `phantasm-img://` index) and decoded bytes.
     var onTapImage: (Int, UIImage) -> Void = { _, _ in }
 
     var body: some View {
-        let resolved = ServerImageRef.inlineCached(text, cache: cachedImages)
-        let extracted = Base64ImageExtractor().extractCached(resolved)
+        let extracted = isStreaming
+            ? Base64ImageExtractor.Result(
+                markdown: Base64ImageExtractor.streamingSanitized(text), images: [:]
+            )
+            : Base64ImageExtractor()
+                .extractCached(ServerImageRef.inlineCached(text, cache: cachedImages))
         Markdown(extracted.markdown)
             .markdownTheme(.phantasmChat)
             .markdownImageProvider(PhantasmImageProvider(images: extracted.images, onTap: onTapImage))

@@ -315,15 +315,11 @@ struct ChatView: View {
                             onTapImage: openImageViewer
                         )
                     }
-                    if vm.shouldShowAssistantPreview(alongside: messages) {
-                        StreamingBubble(
-                            text: vm.streamingText,
-                            reasoning: vm.streamingReasoning,
-                            status: vm.statusText,
-                            progress: vm.statusProgress,
-                            startedAt: vm.streamingStartedAt
-                        )
-                    }
+                    StreamingPreviewSection(
+                        vm: vm,
+                        messages: messages,
+                        onGrow: { followTail(proxy) }
+                    )
                     Color.clear.frame(height: 1).id(bottomID)
                 }
                 .padding()
@@ -354,11 +350,6 @@ struct ChatView: View {
                     isPinnedToBottom = false
                 }
             }
-            // Tokens arrive many-per-second; follow the tail without animation
-            // (`followTail`) so overlapping animations don't jank. Discrete jumps
-            // (new committed message, first appear) animate via `scrollToBottom`.
-            .onChange(of: vm.streamingText) { _, _ in followTail(proxy) }
-            .onChange(of: vm.streamingReasoning) { _, _ in followTail(proxy) }
             .onChange(of: messages) { _, _ in
                 vm.reconcileAssistantPreview(with: messages)
                 if isPinnedToBottom { scrollToBottom(proxy) }
@@ -473,6 +464,40 @@ struct ChatView: View {
         let text = editingText
         editingMessageID = nil
         vm.resend(afterEditing: id, newText: text)
+    }
+}
+
+/// Isolates the per-token `@Observable` reads (`streamingText`, `statusText`,
+/// …) in their own view so only THIS view re-evaluates per streamed token.
+/// When `ChatView.body` read them directly, every token re-rendered the whole
+/// visible transcript — every bubble re-ran chart decoding and image extraction
+/// on the main actor, dropping frames exactly during streaming (NFR-A4).
+///
+/// The tail-follow scrolling rides along here for the same reason: an
+/// `.onChange(of: vm.streamingText)` in the parent would re-register the
+/// parent's dependency on the per-token property.
+private struct StreamingPreviewSection: View {
+    let vm: ChatViewModel
+    let messages: [ChatMessage]
+    /// Called when streamed content grows (token/reasoning): the parent scrolls
+    /// the tail into view. Tokens arrive many-per-second; the parent follows
+    /// without animation so overlapping animations don't jank.
+    let onGrow: () -> Void
+
+    var body: some View {
+        Group {
+            if vm.shouldShowAssistantPreview(alongside: messages) {
+                StreamingBubble(
+                    text: vm.streamingText,
+                    reasoning: vm.streamingReasoning,
+                    status: vm.statusText,
+                    progress: vm.statusProgress,
+                    startedAt: vm.streamingStartedAt
+                )
+            }
+        }
+        .onChange(of: vm.streamingText) { _, _ in onGrow() }
+        .onChange(of: vm.streamingReasoning) { _, _ in onGrow() }
     }
 }
 
