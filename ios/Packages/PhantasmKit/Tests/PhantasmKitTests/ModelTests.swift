@@ -69,6 +69,23 @@ final class CapabilityDecodeTests: XCTestCase {
         )
     }
 
+    func testManifestWithPartialModelCapabilitiesStaysOptimistic() throws {
+        // An orchestrator that omits individual capability fields (older build,
+        // future rename) must not fail the manifest decode — that used to
+        // silently degrade the whole backend to plain chat. Missing fields stay
+        // optimistic (spec §2.1); present fields are honored.
+        let json = """
+        {"version":"0.3.0",
+         "models":[{"id":"m","capabilities":{"completion":true,"vision":false,"tools":true}}],
+         "tool_selectors":[]}
+        """
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+        XCTAssertEqual(caps.models, ["m"])
+        XCTAssertEqual(caps.visionModelIDs, [])
+        XCTAssertEqual(caps.toolModelIDs, ["m"])
+        XCTAssertEqual(caps.modelEntries.first?.capabilities?.thinking, true)
+    }
+
     func testManifestWithoutModelCapabilitiesIsUnknown() throws {
         let json = #"{"version":"x","models":[{"id":"m"}],"tool_selectors":[]}"#
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))

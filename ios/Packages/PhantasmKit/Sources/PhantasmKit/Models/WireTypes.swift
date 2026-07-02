@@ -320,6 +320,25 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         public let thinking: Bool
         public let embedding: Bool
 
+        private enum CodingKeys: String, CodingKey {
+            case completion, vision, audio, tools, insert, thinking, embedding
+        }
+
+        public init(from decoder: Decoder) throws {
+            // Spec §2.1: unknown capabilities stay optimistic. An orchestrator
+            // version that omits an individual field (older build, renamed key)
+            // must not fail the whole manifest decode — that would silently
+            // degrade the backend to plain chat.
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            completion = try container.decodeIfPresent(Bool.self, forKey: .completion) ?? true
+            vision = try container.decodeIfPresent(Bool.self, forKey: .vision) ?? true
+            audio = try container.decodeIfPresent(Bool.self, forKey: .audio) ?? true
+            tools = try container.decodeIfPresent(Bool.self, forKey: .tools) ?? true
+            insert = try container.decodeIfPresent(Bool.self, forKey: .insert) ?? true
+            thinking = try container.decodeIfPresent(Bool.self, forKey: .thinking) ?? true
+            embedding = try container.decodeIfPresent(Bool.self, forKey: .embedding) ?? true
+        }
+
         public init(
             completion: Bool,
             vision: Bool,
