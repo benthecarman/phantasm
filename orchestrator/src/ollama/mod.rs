@@ -97,6 +97,16 @@ impl UpstreamChatBackend {
         }
     }
 
+    /// Attach the metrics registry so both client kinds record token usage
+    /// where they already parse upstream responses. Called once at startup;
+    /// kept off the `ChatBackend` trait so scripted test impls stay untouched.
+    pub fn attach_metrics(&mut self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
+        match self {
+            UpstreamChatBackend::NativeOllama(client) => client.set_metrics(metrics),
+            UpstreamChatBackend::OpenAICompatible(client) => client.set_metrics(metrics),
+        }
+    }
+
     pub fn kind(&self) -> UpstreamKind {
         match self {
             UpstreamChatBackend::NativeOllama(_) => UpstreamKind::NativeOllama,

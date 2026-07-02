@@ -53,6 +53,9 @@ pub struct AppState {
     /// available; `None` otherwise (the tools are then not offered). Long-lived —
     /// must not be rebuilt per request.
     pub code_exec: Option<crate::tools::code_exec_pool::CodeExecPools>,
+    /// In-memory metrics registry (`/metrics` + dashboard live gauges). Holds
+    /// the handle to the optional SQLite history store internally.
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 /// Server-side store for turns paused mid-flight on an app-hosted tool call.

@@ -35,6 +35,7 @@ pub(crate) fn error_outcome(tool: &str, call_id: &str, detail: String) -> ToolOu
     ToolOutcome {
         message: ChatMessage::tool_result(call_id, tool, format!("{tool} failed: {detail}")),
         append_to_answer: None,
+        is_error: true,
     }
 }
 
@@ -75,6 +76,7 @@ where
         Ok(text) => ToolOutcome {
             message: ChatMessage::tool_result(call_id, tool, text),
             append_to_answer: None,
+            is_error: false,
         },
         Err(e) => {
             tracing::warn!(error = %e, tool, "tool call failed");

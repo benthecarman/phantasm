@@ -70,6 +70,16 @@ pub struct OllamaChatChunk {
     pub done: bool,
     #[serde(default)]
     pub done_reason: Option<String>,
+    // Final-chunk generation stats (absent on intermediate chunks). Durations
+    // are nanoseconds, per the native API. Feed the metrics registry only.
+    #[serde(default)]
+    pub prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    pub eval_count: Option<u64>,
+    #[serde(default)]
+    pub eval_duration: Option<u64>,
+    #[serde(default)]
+    pub load_duration: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -42,6 +42,9 @@ url = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
 tempfile = "3"
+# Durable metrics history for the dashboard (`metrics_store`). `bundled`
+# compiles SQLite in, so deployments need no system libsqlite.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # systemd readiness/`Type=notify` integration. Pure-Rust (no libsystemd link),
 # unix-only; a no-op unless `$NOTIFY_SOCKET` is set, so dev/Docker are unaffected.

@@ -37,10 +37,12 @@ pub async fn run(
         result = async { current_time_result() } => ToolOutcome {
             message: ChatMessage::tool_result(call_id, "time", result),
             append_to_answer: None,
+            is_error: false,
         },
         _ = cancel.cancelled() => ToolOutcome {
             message: ChatMessage::tool_result(call_id, "time", "time lookup cancelled"),
             append_to_answer: None,
+            is_error: true,
         },
     }
 }

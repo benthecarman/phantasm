@@ -92,6 +92,7 @@ pub async fn run(
                      markdown, or any placeholder such as \"[image goes here]\".",
                 ),
                 append_to_answer: Some(markdown),
+                is_error: false,
             }
         }
         Err(detail) => {

@@ -87,8 +87,12 @@ fn mock_ollama_with_recorder(requests: Option<RecordedRequests>) -> Router {
                         requests.lock().await.push(body.0.clone());
                     }
                     if streaming {
+                        // The final chunk carries Ollama's generation stats, like
+                        // the real API — the metrics tests assert these flow into
+                        // the token counters.
                         "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n\
-                         {\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+                         {\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\",\
+                          \"prompt_eval_count\":7,\"eval_count\":30,\"eval_duration\":1500000000}\n"
                     } else {
                         "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello world\"},\"done\":true}"
                     }
@@ -322,6 +326,7 @@ fn test_config(upstream_base: &str) -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: Some(TOKEN.into()),
+        metrics_token: None,
         cors_allowed_origins: vec![],
         upstream_kind: None,
         upstream_base: upstream_base.parse().unwrap(),
@@ -413,6 +418,9 @@ fn test_config(upstream_base: &str) -> Config {
         research_quick_searches_per_subq: 2,
         research_quick_verify: false,
         research_fanout_concurrency: 2,
+        dashboard_enabled: true,
+        metrics_db: None,
+        metrics_retention_days: 90,
         log_format: LogFormat::Text,
         log_content: false,
         presets: Default::default(),
@@ -448,6 +456,20 @@ async fn spawn_orchestrator_with_kind(upstream_base: &str, upstream_kind: Upstre
     let cfg = Arc::new(test_config(upstream_base));
     let capabilities = Arc::new(test_capabilities());
     let state = phantasm_orchestrator::build_state(cfg, capabilities, upstream_kind);
+    spawn(routes::router(state)).await
+}
+
+/// Like `spawn_orchestrator`, but with a config tweak (e.g. metrics store path,
+/// dashboard toggle) applied before the state is built.
+async fn spawn_orchestrator_with_cfg(
+    upstream_base: &str,
+    tweak: impl FnOnce(&mut Config),
+) -> String {
+    let mut cfg = test_config(upstream_base);
+    tweak(&mut cfg);
+    let cfg = Arc::new(cfg);
+    let capabilities = Arc::new(test_capabilities());
+    let state = phantasm_orchestrator::build_state(cfg, capabilities, UpstreamKind::NativeOllama);
     spawn(routes::router(state)).await
 }
 
@@ -1703,4 +1725,308 @@ async fn image_delete_requires_auth_then_removes() {
 
     let gone = client.get(format!("{base}{signed}")).send().await.unwrap();
     assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+// ---- Observability: /metrics + dashboard -----------------------------------
+
+/// Drive one streaming chat turn and return the concatenated streamed content.
+async fn drive_streaming_turn(client: &reqwest::Client, base: &str) -> String {
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    resp.text().await.unwrap()
+}
+
+/// `GET /metrics` is bearer-gated, serves the Prometheus text format, and
+/// reflects a completed turn's per-model counters — including the token counts
+/// parsed from the mock's final NDJSON chunk.
+#[tokio::test]
+async fn metrics_endpoint_is_gated_and_reports_turns_and_tokens() {
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator(&ollama).await;
+    let client = reqwest::Client::new();
+
+    let bare = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(bare.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    drive_streaming_turn(&client, &base).await;
+
+    // Turn completion is recorded by a detached forwarder task after the SSE
+    // body ends, so poll briefly rather than assert immediately.
+    let mut body = String::new();
+    for _ in 0..100 {
+        let resp = client
+            .get(format!("{base}/metrics"))
+            .header("Authorization", format!("Bearer {TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("text/plain")));
+        body = resp.text().await.unwrap();
+        if body.contains("phantasm_turns_completed_total{model=\"m\"} 1") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        body.contains("phantasm_turns_started_total{model=\"m\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("phantasm_turns_completed_total{model=\"m\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("phantasm_turns_plain_total{model=\"m\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("phantasm_prompt_tokens_total{model=\"m\"} 7"),
+        "{body}"
+    );
+    assert!(
+        body.contains("phantasm_completion_tokens_total{model=\"m\"} 30"),
+        "{body}"
+    );
+    assert!(
+        body.contains("# TYPE phantasm_turn_duration_seconds histogram"),
+        "{body}"
+    );
+    assert!(body.contains("phantasm_build_info"), "{body}");
+}
+
+/// The dashboard page is public (it carries no data); the data endpoint is
+/// bearer-gated, reports the turn from the SQLite history, honors the model
+/// filter, and keeps the live-probe fields null-safe when the upstream lacks
+/// `/api/ps`.
+#[tokio::test]
+async fn dashboard_page_public_and_data_gated_with_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("metrics.sqlite");
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator_with_cfg(&ollama, |cfg| {
+        cfg.metrics_db = Some(db.clone());
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let page = client
+        .get(format!("{base}/dashboard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    let ct = page
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(ct.starts_with("text/html"), "{ct}");
+    let html = page.text().await.unwrap();
+    assert!(html.contains("Phantasm"));
+    assert!(
+        !html.contains(TOKEN),
+        "the public page must not embed the token"
+    );
+
+    let bare = client
+        .get(format!("{base}/dashboard/data"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    drive_streaming_turn(&client, &base).await;
+
+    // The turn row lands via forwarder task -> store writer thread; poll.
+    let mut data = serde_json::Value::Null;
+    for _ in 0..200 {
+        let resp = client
+            .get(format!("{base}/dashboard/data?range=3h"))
+            .header("Authorization", format!("Bearer {TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        data = resp.json().await.unwrap();
+        if data["history"]["outcomes"]["completed"].as_u64() == Some(1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(data["history"]["outcomes"]["completed"], 1, "{data}");
+    assert_eq!(data["history"]["outcomes"]["plain"], 1, "{data}");
+    assert_eq!(data["history"]["tokens"]["prompt"], 7, "{data}");
+    assert_eq!(data["history"]["models"][0]["model"], "m", "{data}");
+    assert!(
+        data["history"]["latency"]["p50_ms"].is_u64()
+            || data["history"]["latency"]["p50_ms"].is_number(),
+        "{data}"
+    );
+    // The mock serves no /api/ps: the panel reports unreachable, not an error.
+    assert_eq!(data["ollama"]["reachable"], false, "{data}");
+    assert!(data["host"].is_object(), "{data}");
+
+    // The model filter scopes the range sections but not the per-model summary.
+    let filtered: serde_json::Value = client
+        .get(format!("{base}/dashboard/data?range=3h&model=nope"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered["history"]["outcomes"]["completed"], 0,
+        "{filtered}"
+    );
+    assert_eq!(filtered["history"]["models"][0]["model"], "m", "{filtered}");
+}
+
+/// `PHANTASM_DASHBOARD=false` removes both dashboard routes entirely; /metrics
+/// stays available (authed).
+#[tokio::test]
+async fn dashboard_disabled_removes_routes_but_keeps_metrics() {
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator_with_cfg(&ollama, |cfg| {
+        cfg.dashboard_enabled = false;
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let page = client
+        .get(format!("{base}/dashboard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), reqwest::StatusCode::NOT_FOUND);
+    let data = client
+        .get(format!("{base}/dashboard/data"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(data.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let metrics = client
+        .get(format!("{base}/metrics"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), reqwest::StatusCode::OK);
+}
+
+/// The SQLite history survives a full state rebuild (the restart story).
+#[tokio::test]
+async fn metrics_history_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("metrics.sqlite");
+    let ollama = spawn(mock_ollama()).await;
+    let client = reqwest::Client::new();
+
+    let base = spawn_orchestrator_with_cfg(&ollama, |cfg| {
+        cfg.metrics_db = Some(db.clone());
+    })
+    .await;
+    drive_streaming_turn(&client, &base).await;
+    // Wait until the row is durably visible before "restarting".
+    for _ in 0..200 {
+        let data: serde_json::Value = client
+            .get(format!("{base}/dashboard/data"))
+            .header("Authorization", format!("Bearer {TOKEN}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if data["history"]["outcomes"]["completed"].as_u64() == Some(1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // A second orchestrator over the same DB file sees the old turn.
+    let base2 = spawn_orchestrator_with_cfg(&ollama, |cfg| {
+        cfg.metrics_db = Some(db.clone());
+    })
+    .await;
+    let data: serde_json::Value = client
+        .get(format!("{base2}/dashboard/data"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(data["history"]["outcomes"]["completed"], 1, "{data}");
+}
+
+/// With `PHANTASM_METRICS_TOKEN` set, the observability routes accept ONLY it
+/// (the main API token stops working there), and it grants nothing on the
+/// chat/API routes. Unset, they fall back to the main token (covered by
+/// `metrics_endpoint_is_gated_and_reports_turns_and_tokens`).
+#[tokio::test]
+async fn metrics_token_is_separate_from_api_auth() {
+    const METRICS_TOKEN: &str = "metrics-only-token";
+    let ollama = spawn(mock_ollama()).await;
+    let base = spawn_orchestrator_with_cfg(&ollama, |cfg| {
+        cfg.metrics_token = Some(METRICS_TOKEN.into());
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let get = |path: &str, tok: &str| {
+        client
+            .get(format!("{base}{path}"))
+            .header("Authorization", format!("Bearer {tok}"))
+            .send()
+    };
+
+    // Observability routes: metrics token works, the main API token does not.
+    assert_eq!(get("/metrics", METRICS_TOKEN).await.unwrap().status(), 200);
+    assert_eq!(get("/metrics", TOKEN).await.unwrap().status(), 401);
+    assert_eq!(
+        get("/dashboard/data", METRICS_TOKEN)
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(get("/dashboard/data", TOKEN).await.unwrap().status(), 401);
+
+    // API routes: the metrics token opens nothing; the main token still works.
+    assert_eq!(
+        get("/v1/models", METRICS_TOKEN).await.unwrap().status(),
+        401
+    );
+    assert_eq!(get("/v1/models", TOKEN).await.unwrap().status(), 200);
+    let chat = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {METRICS_TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chat.status(), 401);
 }

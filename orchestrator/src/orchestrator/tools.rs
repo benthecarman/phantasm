@@ -27,6 +27,11 @@ use crate::tools::{
 pub struct ToolOutcome {
     pub message: ChatMessage,
     pub append_to_answer: Option<String>,
+    /// Whether this outcome is a folded-in failure (NFR-O6 keeps it non-fatal —
+    /// the model reads it and continues). Metrics is the consumer: failures are
+    /// otherwise invisible outside logs, and the message text is deliberately
+    /// not sniffed (tools word their errors freely).
+    pub is_error: bool,
 }
 
 /// A within-turn dedup cache, shared (cheaply, behind `Arc<Mutex<_>>`) across
@@ -99,14 +104,28 @@ pub struct ToolRegistry {
     /// Shared warm pools (offline + online lanes) for the code-exec tools (cloned
     /// in from `AppState`, never built here). `None` when disabled/unavailable.
     code_exec: Option<CodeExecPools>,
+    /// Metrics registry; `execute` records every dispatch (count, latency,
+    /// error) here — the one choke point all tool calls pass through.
+    metrics: Arc<crate::metrics::Metrics>,
+    /// The model driving this turn, for per-model tool attribution. The
+    /// registry is built per turn (in `spawn_turn`), so one model per instance.
+    model: String,
 }
 
 impl ToolRegistry {
-    pub fn new(cfg: Arc<Config>, http: reqwest::Client, code_exec: Option<CodeExecPools>) -> Self {
+    pub fn new(
+        cfg: Arc<Config>,
+        http: reqwest::Client,
+        code_exec: Option<CodeExecPools>,
+        metrics: Arc<crate::metrics::Metrics>,
+        model: String,
+    ) -> Self {
         ToolRegistry {
             cfg,
             http,
             code_exec,
+            metrics,
+            model,
         }
     }
 }
@@ -179,6 +198,7 @@ impl ToolExecutor for ToolRegistry {
         // input. Individual tools add their own `warn!` for the failure *cause*;
         // this records that the call happened and how long it took, uniformly.
         let started = std::time::Instant::now();
+        let mut known = true;
         let arg_bytes = call.function.arguments.to_json_string().len();
         tracing::info!(tool = %name, call_id = %call_id, arg_bytes, "tool call started");
         if self.cfg.log_content {
@@ -240,6 +260,7 @@ impl ToolExecutor for ToolRegistry {
                         "code execution is not available",
                     ),
                     append_to_answer: None,
+                    is_error: true,
                 },
             },
             "image_generation" if self.cfg.image_gen_usable() => {
@@ -254,10 +275,12 @@ impl ToolExecutor for ToolRegistry {
                     tool = %other,
                     "model called an unknown or disabled tool"
                 );
+                known = false;
                 let msg = format!("tool `{other}` is not available");
                 ToolOutcome {
                     message: ChatMessage::tool_result(&call_id, other, msg),
                     append_to_answer: None,
+                    is_error: true,
                 }
             }
         };
@@ -267,6 +290,14 @@ impl ToolExecutor for ToolRegistry {
             call_id = %call_id,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "tool call finished"
+        );
+        // `known` clamps model-invented names to the "other" metrics bucket.
+        self.metrics.record_tool_call(
+            name,
+            known,
+            &self.model,
+            started.elapsed(),
+            outcome.is_error,
         );
         outcome
     }

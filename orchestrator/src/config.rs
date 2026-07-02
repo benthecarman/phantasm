@@ -51,6 +51,11 @@ pub struct Config {
     /// auth entirely — every request is accepted unauthenticated. Unset/empty
     /// `PHANTASM_AUTH_TOKEN` => `None` (opt-in to an open server).
     pub auth_token: Option<String>,
+    /// Separate bearer token for the observability routes (`/metrics`,
+    /// `/dashboard/data`), so a scraper/browser credential never grants chat
+    /// access — and the main token never opens metrics. Unset/empty => those
+    /// routes fall back to `auth_token`.
+    pub metrics_token: Option<String>,
     /// Browser CORS allow-list. Empty => CORS disabled (no `Access-Control-*`
     /// headers, no preflight handling) — the default, since the iOS app is not a
     /// browser and needs none. A single `*` entry allows any origin; otherwise
@@ -248,6 +253,17 @@ pub struct Config {
     pub comfy_edit_image: Option<NodeInput>,
     pub comfy_edit_seed: Option<NodeInput>,
 
+    // Observability. `/metrics` (Prometheus, authed) is always on; the pair of
+    // dashboard routes is gated because the HTML page itself is public.
+    pub dashboard_enabled: bool,
+    /// SQLite file backing the dashboard's durable history (per-turn/tool/usage
+    /// rows — counts and timings only, never message content). `None` (explicit
+    /// empty `PHANTASM_METRICS_DB`) => memory-only metrics: `/metrics` still
+    /// works, the dashboard loses history across restarts.
+    pub metrics_db: Option<PathBuf>,
+    /// Rows older than this are pruned hourly by the store's writer thread.
+    pub metrics_retention_days: u32,
+
     // Logging
     pub log_format: LogFormat,
     pub log_content: bool,
@@ -270,6 +286,10 @@ impl Config {
         // initialized, so a warning emitted here would vanish into the
         // pre-init no-op subscriber.
         let auth_token = std::env::var("PHANTASM_AUTH_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let metrics_token = std::env::var("PHANTASM_METRICS_TOKEN")
             .ok()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
@@ -301,6 +321,7 @@ impl Config {
         Ok(Config {
             bind_addr,
             auth_token,
+            metrics_token,
             cors_allowed_origins: csv("PHANTASM_CORS_ALLOWED_ORIGINS"),
             upstream_kind,
             upstream_base,
@@ -422,6 +443,16 @@ impl Config {
             comfy_edit_prompt: env_node("COMFYUI_EDIT_PROMPT")?,
             comfy_edit_image: env_node("COMFYUI_EDIT_IMAGE")?,
             comfy_edit_seed: env_node("COMFYUI_EDIT_SEED")?,
+            dashboard_enabled: env_bool("PHANTASM_DASHBOARD", true),
+            // Unset => the default file next to the process; set-but-empty =>
+            // memory-only (the opt-out), matching the "empty disables" idiom of
+            // the other optional vars.
+            metrics_db: match std::env::var("PHANTASM_METRICS_DB") {
+                Ok(v) if v.trim().is_empty() => None,
+                Ok(v) => Some(PathBuf::from(v.trim())),
+                Err(_) => Some(PathBuf::from("phantasm-metrics.sqlite")),
+            },
+            metrics_retention_days: env_parse("PHANTASM_METRICS_RETENTION_DAYS", 90u32).max(1),
             log_format: if env_or("LOG_FORMAT", "text").eq_ignore_ascii_case("json") {
                 LogFormat::Json
             } else {
@@ -664,6 +695,7 @@ pub mod tests_support {
         Config {
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             auth_token: Some("test-token".into()),
+            metrics_token: None,
             cors_allowed_origins: vec![],
             upstream_kind: None,
             upstream_base: "http://localhost:11434".parse().unwrap(),
@@ -755,6 +787,9 @@ pub mod tests_support {
             comfy_edit_prompt: None,
             comfy_edit_image: None,
             comfy_edit_seed: None,
+            dashboard_enabled: true,
+            metrics_db: None,
+            metrics_retention_days: 90,
             log_format: LogFormat::Text,
             log_content: false,
             presets: std::sync::OnceLock::new(),

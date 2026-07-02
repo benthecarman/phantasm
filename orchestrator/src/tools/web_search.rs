@@ -149,6 +149,7 @@ pub async fn run(
         Ok(text) => ToolOutcome {
             message: ChatMessage::tool_result(call_id, "web_search", text),
             append_to_answer: None,
+            is_error: false,
         },
         Err(detail) => {
             // The detail never contains message content (NFR-O7) — only the

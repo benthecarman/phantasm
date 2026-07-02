@@ -96,7 +96,7 @@ pub async fn chat_completions(
         // Replay from the client's cursor (or the start); the iOS app rebuilds
         // from scratch and so omits `Last-Event-ID`.
         let start = last_event_id.map(|n| n + 1).unwrap_or(0);
-        return attach_response(model_name, active, start, spill);
+        return attach_response(model_name, active, start, spill, state.metrics.clone());
     }
 
     // Legacy / standard-client path: the turn is bound to this connection and
@@ -113,19 +113,38 @@ pub async fn chat_completions(
 
 /// Tracks an attached SSE responder on an `ActiveTurn` for its lifetime, so the
 /// watchdog can tell a backgrounded-but-watched turn from an abandoned one.
+/// Also the resumable path's disconnect signal: a guard dropped before
+/// [`AttachGuard::mark_finished`] means the response stream was dropped
+/// mid-poll — the client went away (backgrounded or lost the connection)
+/// rather than reading to the end.
 struct AttachGuard {
     turn: Arc<ActiveTurn>,
+    metrics: Arc<crate::metrics::Metrics>,
+    finished: bool,
 }
 
 impl AttachGuard {
-    fn new(turn: Arc<ActiveTurn>) -> Self {
+    fn new(turn: Arc<ActiveTurn>, metrics: Arc<crate::metrics::Metrics>) -> Self {
         turn.attach();
-        Self { turn }
+        Self {
+            turn,
+            metrics,
+            finished: false,
+        }
+    }
+
+    /// The stream reached a deliberate end (terminal event replayed or the turn
+    /// task ended); dropping past this point is not a disconnect.
+    fn mark_finished(&mut self) {
+        self.finished = true;
     }
 }
 
 impl Drop for AttachGuard {
     fn drop(&mut self) {
+        if !self.finished {
+            self.metrics.sse_disconnects.inc();
+        }
         self.turn.detach();
     }
 }
@@ -225,6 +244,8 @@ async fn spawn_turn(
         state.cfg.clone(),
         state.http.clone(),
         state.code_exec.clone(),
+        state.metrics.clone(),
+        model.clone(),
     );
     let sem = state.upstream_sem.clone();
     let images = state.images.clone();
@@ -243,6 +264,15 @@ async fn spawn_turn(
         tracing::debug!(turn_id, messages = ?messages, "turn content");
     }
 
+    let recorder = crate::metrics::TurnRecorder::new(state.metrics.clone());
+    let observed = observe_turn(
+        state.metrics.clone(),
+        model.clone(),
+        mode.map(str::to_string),
+        recorder.clone(),
+        rx,
+    );
+
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         tracing::info!(turn_id, model = %log_model, stream, tools_offered, mode, "turn started");
@@ -258,6 +288,7 @@ async fn spawn_turn(
             app_tools,
             preset,
             images,
+            recorder,
             tx,
             cancel,
             hard_cancel,
@@ -271,7 +302,65 @@ async fn spawn_turn(
         );
     });
 
-    rx
+    observed
+}
+
+/// Wrap a turn's event channel in a forwarding task that records lifecycle
+/// metrics: outcome (a closed channel without a terminal event is the existing
+/// "cancelled" semantic), total duration, time-to-first-token, and mid-stream
+/// consumer disconnects. This sits upstream of BOTH consumers — the resumable
+/// pump and the legacy connection-bound responders — so every turn is recorded
+/// once, uniformly.
+///
+/// Invariant: when the outbound send fails (the legacy consumer dropped its
+/// receiver), the forwarder breaks and drops the inner `rx`, so the producer's
+/// sends start failing exactly as they did when the consumer held `rx`
+/// directly — `run_turn` relies on that to notice a departed client.
+fn observe_turn(
+    metrics: Arc<crate::metrics::Metrics>,
+    model: String,
+    mode: Option<String>,
+    recorder: crate::metrics::TurnRecorder,
+    mut rx: mpsc::Receiver<TurnEvent>,
+) -> mpsc::Receiver<TurnEvent> {
+    use crate::metrics::TurnOutcome;
+
+    // Capacity matches the producer channel in `spawn_turn`, so the extra hop
+    // adds buffering but no new backpressure cliff.
+    let (tx, out) = mpsc::channel::<TurnEvent>(64);
+    metrics.record_turn_started(&model);
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut ttft = None;
+        let mut outcome = TurnOutcome::Cancelled;
+        let mut disconnected = false;
+        while let Some(ev) = rx.recv().await {
+            match &ev {
+                TurnEvent::Token(_) | TurnEvent::Reasoning(_) if ttft.is_none() => {
+                    ttft = Some(started.elapsed());
+                }
+                TurnEvent::Done { .. } => outcome = TurnOutcome::Completed,
+                TurnEvent::Error(_) => outcome = TurnOutcome::Errored,
+                _ => {}
+            }
+            if tx.send(ev).await.is_err() {
+                disconnected = true;
+                break;
+            }
+        }
+        if disconnected {
+            metrics.sse_disconnects.inc();
+        }
+        metrics.record_turn_finished(
+            &model,
+            mode.as_deref(),
+            outcome,
+            started.elapsed(),
+            ttft,
+            recorder.used_tools(),
+        );
+    });
+    out
 }
 
 /// Drain a turn's events into its `ActiveTurn` log so they survive client
@@ -326,6 +415,7 @@ fn attach_response(
     active: Arc<ActiveTurn>,
     start: usize,
     spill: Option<crate::images::BlobStore>,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Response {
     use crate::tools::image_delivery::inline_image_refs;
     let factory = ChunkFactory::new(model);
@@ -334,7 +424,7 @@ fn attach_response(
         // Count this responder as attached for as long as the stream lives, so the
         // abandoned-turn watchdog only reclaims turns with no listener. Dropping
         // the stream (client disconnect) drops the guard, restarting that clock.
-        let _attach = AttachGuard::new(active.clone());
+        let mut attach = AttachGuard::new(active.clone(), metrics);
         yield factory.role_open();
         let mut idx = start;
         loop {
@@ -365,11 +455,13 @@ fn attach_response(
                         yield factory.token(&format!("\n\nWARNING: {e}"));
                         yield factory.finish("stop");
                         yield done_event();
+                        attach.mark_finished();
                         return;
                     }
                     TurnEvent::Done { reason } => {
                         yield factory.finish(&reason).id(id);
                         yield done_event();
+                        attach.mark_finished();
                         return;
                     }
                 }
@@ -386,6 +478,7 @@ fn attach_response(
                     yield factory.token(&format!("\n\nWARNING: {e}"));
                     yield factory.finish("stop");
                     yield done_event();
+                    attach.mark_finished();
                     return;
                 }
                 // Terminal without an explicit Done/Error event (e.g. a turn
@@ -398,6 +491,9 @@ fn attach_response(
                 break;
             }
         }
+        // Server-side stream end (turn cancelled / task gone) — not a client
+        // disconnect.
+        attach.mark_finished();
     };
 
     Sse::new(body.map(Ok::<Event, Infallible>))
@@ -715,5 +811,102 @@ mod tests {
             name: None,
         }];
         assert!(validate_image_limits(&messages, 16, 100).is_ok());
+    }
+
+    fn forwarder_fixture() -> (
+        Arc<crate::metrics::Metrics>,
+        mpsc::Sender<TurnEvent>,
+        mpsc::Receiver<TurnEvent>,
+    ) {
+        let metrics = crate::metrics::Metrics::without_store();
+        let (tx, rx) = mpsc::channel::<TurnEvent>(64);
+        let recorder = crate::metrics::TurnRecorder::new(metrics.clone());
+        let out = observe_turn(metrics.clone(), "m".into(), None, recorder, rx);
+        (metrics, tx, out)
+    }
+
+    /// Poll a model stat until the forwarder task has recorded the finish (it
+    /// runs on its own task, so completion is asynchronous).
+    async fn wait_for(check: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("forwarder never recorded the expected metric");
+    }
+
+    #[tokio::test]
+    async fn forwarder_records_completed_turn_with_ttft() {
+        let (metrics, tx, mut out) = forwarder_fixture();
+        assert_eq!(metrics.turns_active.get(), 1, "started recorded eagerly");
+        tx.send(TurnEvent::Token("hi".into())).await.unwrap();
+        tx.send(TurnEvent::Done {
+            reason: "stop".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        // Drain like a live consumer; events pass through unchanged.
+        assert!(matches!(out.recv().await, Some(TurnEvent::Token(t)) if t == "hi"));
+        assert!(matches!(out.recv().await, Some(TurnEvent::Done { .. })));
+        assert!(out.recv().await.is_none());
+        let stats = metrics.model("m");
+        wait_for(|| stats.turns_completed.get() == 1).await;
+        assert_eq!(stats.turn_ttft.snapshot().count, 1);
+        assert_eq!(stats.turn_duration.snapshot().count, 1);
+        assert_eq!(metrics.turns_active.get(), 0);
+        assert_eq!(metrics.sse_disconnects.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn forwarder_records_error_and_bare_close_as_cancelled() {
+        let (metrics, tx, mut out) = forwarder_fixture();
+        tx.send(TurnEvent::Error("boom".into())).await.unwrap();
+        drop(tx);
+        while out.recv().await.is_some() {}
+        let stats = metrics.model("m");
+        wait_for(|| stats.turns_errored.get() == 1).await;
+
+        // A channel that closes without any terminal event is the existing
+        // "cancelled" semantic.
+        let (metrics, tx, mut out) = forwarder_fixture();
+        tx.send(TurnEvent::Status("working…".into())).await.unwrap();
+        drop(tx);
+        while out.recv().await.is_some() {}
+        let stats = metrics.model("m");
+        wait_for(|| stats.turns_cancelled.get() == 1).await;
+        assert_eq!(
+            stats.turn_ttft.snapshot().count,
+            0,
+            "status events are not first tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_propagates_consumer_drop_to_producer() {
+        // The legacy client-gone signal: when the downstream receiver is
+        // dropped, the forwarder must drop the inner rx so the producer's
+        // sends fail exactly as they did pre-forwarder — and count it.
+        let (metrics, tx, out) = forwarder_fixture();
+        drop(out);
+        let mut producer_saw_closure = false;
+        for _ in 0..200 {
+            // The forwarder only notices on a send, and channel buffering can
+            // absorb early ones.
+            if tx.send(TurnEvent::Token("x".into())).await.is_err() {
+                producer_saw_closure = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            producer_saw_closure,
+            "producer sends must start failing after the consumer drops"
+        );
+        drop(tx);
+        wait_for(|| metrics.sse_disconnects.get() == 1).await;
+        wait_for(|| metrics.turns_active.get() == 0).await;
     }
 }

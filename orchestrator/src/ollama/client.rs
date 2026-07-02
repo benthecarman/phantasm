@@ -20,11 +20,24 @@ const WARM_KEEP_ALIVE: &str = "30m";
 pub struct OllamaClient {
     http: reqwest::Client,
     base: Url,
+    /// Metrics registry for token-usage recording. Attached once at startup;
+    /// `None` in tests and probes, which record nothing. Living here (not in
+    /// the `ChatBackend` trait) keeps the trait — and its scripted test
+    /// impls — untouched.
+    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
 }
 
 impl OllamaClient {
     pub fn new(http: reqwest::Client, base: Url) -> Self {
-        OllamaClient { http, base }
+        OllamaClient {
+            http,
+            base,
+            metrics: None,
+        }
+    }
+
+    pub fn set_metrics(&mut self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
+        self.metrics = Some(metrics);
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, AppError> {
@@ -172,6 +185,7 @@ impl ChatBackend for OllamaClient {
             .json()
             .await
             .map_err(|e| AppError::UpstreamError(e.to_string()))?;
+        record_chunk_usage(&usage_recorder(&self.metrics, model), &chunk);
         Ok(chunk.message.unwrap_or_default().into_openai())
     }
 
@@ -200,14 +214,42 @@ impl ChatBackend for OllamaClient {
             return Err(AppError::UpstreamError(format!("{status}: {detail}")));
         }
 
-        let stream = ndjson_to_deltas(resp.bytes_stream());
+        let stream = ndjson_to_deltas(resp.bytes_stream(), usage_recorder(&self.metrics, model));
         Ok(Box::pin(stream))
+    }
+}
+
+/// A metrics handle bound to the model of one request, for recording the
+/// final chunk's generation stats. `None` => record nothing.
+type UsageRecorder = Option<(std::sync::Arc<crate::metrics::Metrics>, String)>;
+
+fn usage_recorder(
+    metrics: &Option<std::sync::Arc<crate::metrics::Metrics>>,
+    model: &str,
+) -> UsageRecorder {
+    metrics.as_ref().map(|m| (m.clone(), model.to_string()))
+}
+
+/// Feed a chunk's generation stats (present only on the final chunk) into the
+/// registry. Intermediate chunks carry no counts and record nothing.
+fn record_chunk_usage(recorder: &UsageRecorder, chunk: &OllamaChatChunk) {
+    if let Some((metrics, model)) = recorder {
+        metrics.record_usage(
+            model,
+            chunk.prompt_eval_count,
+            chunk.eval_count,
+            chunk.eval_duration,
+            chunk.load_duration,
+        );
     }
 }
 
 /// Turn a stream of raw byte chunks (NDJSON) into a stream of `StreamDelta`s,
 /// buffering partial lines across chunk boundaries.
-fn ndjson_to_deltas<S>(mut bytes: S) -> impl Stream<Item = Result<StreamDelta, AppError>>
+fn ndjson_to_deltas<S>(
+    mut bytes: S,
+    usage: UsageRecorder,
+) -> impl Stream<Item = Result<StreamDelta, AppError>>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
@@ -226,6 +268,7 @@ where
                 }
                 let parsed: OllamaChatChunk = serde_json::from_slice(trimmed)
                     .map_err(|e| AppError::UpstreamError(format!("bad NDJSON line: {e}")))?;
+                record_chunk_usage(&usage, &parsed);
                 yield delta_from(parsed);
             }
         }
@@ -234,6 +277,7 @@ where
         let rest = buf.as_ref();
         if !rest.iter().all(|b| b.is_ascii_whitespace()) {
             if let Ok(parsed) = serde_json::from_slice::<OllamaChatChunk>(rest) {
+                record_chunk_usage(&usage, &parsed);
                 yield delta_from(parsed);
             }
         }
@@ -273,7 +317,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn collect(chunks: Vec<reqwest::Result<Bytes>>) -> Vec<Result<StreamDelta, AppError>> {
-        ndjson_to_deltas(stream::iter(chunks)).collect().await
+        ndjson_to_deltas(stream::iter(chunks), None).collect().await
     }
 
     #[tokio::test]
@@ -339,6 +383,30 @@ mod tests {
             .collect();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].content, "x");
+    }
+
+    #[tokio::test]
+    async fn ndjson_final_chunk_records_usage() {
+        let metrics = crate::metrics::Metrics::without_store();
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\
+               \"prompt_eval_count\":10,\"eval_count\":30,\"eval_duration\":1500000000,\"load_duration\":2000000000}\n",
+        ))];
+        let deltas: Vec<StreamDelta> =
+            ndjson_to_deltas(stream::iter(chunks), Some((metrics.clone(), "m1".into())))
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|r| r.unwrap())
+                .collect();
+        assert_eq!(deltas.len(), 2);
+        let stats = metrics.model("m1");
+        assert_eq!(stats.prompt_tokens.get(), 10);
+        assert_eq!(stats.completion_tokens.get(), 30);
+        // 30 tokens / 1.5s = 20 tok/s.
+        assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
+        assert_eq!(stats.model_load.snapshot().count, 1);
     }
 
     #[tokio::test]

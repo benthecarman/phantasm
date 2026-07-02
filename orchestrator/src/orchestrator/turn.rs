@@ -112,6 +112,7 @@ pub async fn run_turn<B, T>(
     app_tools: Vec<Value>,
     preset: Option<&'static ResearchPreset>,
     images: Option<crate::images::BlobStore>,
+    recorder: crate::metrics::TurnRecorder,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
     hard_cancel: bool,
@@ -162,6 +163,12 @@ pub async fn run_turn<B, T>(
     // acquire would otherwise contend with the permit we still hold.)
     if let Some(p) = preset {
         drop(_permit);
+        // Research always drives tools; lifecycle/TTFT/duration metrics come
+        // from the event forwarder in `routes::chat` — the phase histograms
+        // below don't map onto the research engine's stages, so they are
+        // intentionally not recorded for research turns.
+        recorder.mark_used_tools();
+        recorder.metrics.model(&model).turns_with_tools.inc();
         crate::orchestrator::research::run_research(
             cfg,
             backend,
@@ -208,6 +215,9 @@ pub async fn run_turn<B, T>(
 
     // Plain fast path: no tools to offer => one streaming call.
     if schemas.is_empty() {
+        let model_stats = recorder.metrics.model(&model);
+        model_stats.turns_plain.inc();
+        let streaming_started = std::time::Instant::now();
         stream_final(
             &backend,
             &model,
@@ -218,6 +228,9 @@ pub async fn run_turn<B, T>(
             &cancel,
         )
         .await;
+        model_stats
+            .streaming_phase
+            .observe_duration(streaming_started.elapsed());
         return;
     }
 
@@ -236,6 +249,11 @@ pub async fn run_turn<B, T>(
         deliver_image_refs,
         ..Default::default()
     };
+
+    recorder.mark_used_tools();
+    let model_stats = recorder.metrics.model(&model);
+    model_stats.turns_with_tools.inc();
+    let resolution_started = std::time::Instant::now();
 
     for iter in 0..cfg.max_tool_iters {
         if cancel.is_cancelled() {
@@ -266,6 +284,10 @@ pub async fn run_turn<B, T>(
             None => {
                 // Model produced a final answer — re-issue as a stream for live tokens.
                 tracing::debug!(iter, "model produced final answer; streaming");
+                model_stats
+                    .resolution_phase
+                    .observe_duration(resolution_started.elapsed());
+                let streaming_started = std::time::Instant::now();
                 stream_final(
                     &backend,
                     &model,
@@ -276,6 +298,9 @@ pub async fn run_turn<B, T>(
                     &cancel,
                 )
                 .await;
+                model_stats
+                    .streaming_phase
+                    .observe_duration(streaming_started.elapsed());
                 return;
             }
             Some(calls) => {
@@ -409,7 +434,12 @@ pub async fn run_turn<B, T>(
         max_tool_iters = cfg.max_tool_iters,
         "tool-resolution hit the iteration cap; forcing final answer"
     );
+    model_stats.turn_cap_hits.inc();
+    model_stats
+        .resolution_phase
+        .observe_duration(resolution_started.elapsed());
     let _ = tx.send(TurnEvent::Status("finishing up…".into())).await;
+    let streaming_started = std::time::Instant::now();
     stream_final(
         &backend,
         &model,
@@ -420,6 +450,9 @@ pub async fn run_turn<B, T>(
         &cancel,
     )
     .await;
+    model_stats
+        .streaming_phase
+        .observe_duration(streaming_started.elapsed());
 }
 
 /// Execute a batch of tool calls concurrently, returning outcomes in call
@@ -460,6 +493,7 @@ async fn execute_calls<T: ToolExecutor>(
                 format!("tool `{name}` is not offered for this turn"),
             ),
             append_to_answer: None,
+            is_error: true,
         }
     });
     tokio::select! {
@@ -477,6 +511,7 @@ fn held_result_message(outcome: ToolOutcome) -> ChatMessage {
     let ToolOutcome {
         mut message,
         append_to_answer,
+        is_error: _,
     } = outcome;
     if let Some(extra) = append_to_answer {
         let existing = message
@@ -861,6 +896,7 @@ mod tests {
                     "ok",
                 ),
                 append_to_answer: None,
+                is_error: false,
             }
         }
     }
@@ -893,6 +929,7 @@ mod tests {
                         "Image generated successfully and shown to the user.",
                     ),
                     append_to_answer: Some("![generated](data:image/png;base64,GENIMG)".into()),
+                    is_error: false,
                 },
                 "image_edit" => {
                     *self.edit_saw.lock().unwrap() = ctx.input_images.clone();
@@ -903,11 +940,13 @@ mod tests {
                             "Image edited successfully and shown to the user.",
                         ),
                         append_to_answer: Some("![edited](data:image/png;base64,EDITIMG)".into()),
+                        is_error: false,
                     }
                 }
                 other => ToolOutcome {
                     message: ChatMessage::tool_result("call_1", other, "ok"),
                     append_to_answer: None,
+                    is_error: false,
                 },
             }
         }
@@ -926,6 +965,11 @@ mod tests {
         let mut c = crate::config::tests_support::minimal();
         c.max_tool_iters = n;
         Arc::new(c)
+    }
+
+    /// A memory-only per-turn recorder (no SQLite store behind it).
+    fn test_recorder() -> crate::metrics::TurnRecorder {
+        crate::metrics::TurnRecorder::new(crate::metrics::Metrics::without_store())
     }
 
     fn collect_text(events: &[TurnEvent]) -> String {
@@ -958,6 +1002,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -995,6 +1040,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1037,6 +1083,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1099,6 +1146,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1149,6 +1197,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1195,6 +1244,7 @@ mod tests {
             Vec::new(),
             preset,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1234,6 +1284,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             cancel,
             false,
@@ -1326,6 +1377,7 @@ mod tests {
             vec![app_schema("ask_user")],
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1372,6 +1424,7 @@ mod tests {
             vec![app_schema("web_search")],
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1417,6 +1470,7 @@ mod tests {
             vec![app_schema("ask_user")],
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1471,6 +1525,7 @@ mod tests {
             vec![app_schema("ask_user")],
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1511,6 +1566,7 @@ mod tests {
             vec![app_schema("ask_user")],
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1615,6 +1671,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1658,6 +1715,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,
@@ -1748,6 +1806,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            test_recorder(),
             tx,
             CancellationToken::new(),
             false,

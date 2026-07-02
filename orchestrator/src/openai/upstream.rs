@@ -27,6 +27,11 @@ pub struct OpenAICompatibleClient {
     /// On for template-driven hosts (vLLM/llama.cpp); a deployment pointing at a
     /// strict `/v1` server that rejects unknown body fields turns it off.
     thinking_hint: bool,
+    /// Metrics registry for token-usage recording (best-effort: only what the
+    /// upstream's `usage` object reports, and only on non-streaming responses —
+    /// stream usage would require `stream_options.include_usage`, which strict
+    /// servers may reject). `None` => record nothing.
+    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
 }
 
 impl OpenAICompatibleClient {
@@ -45,7 +50,12 @@ impl OpenAICompatibleClient {
             api_base: openai_api_base(base),
             api_key,
             thinking_hint,
+            metrics: None,
         }
+    }
+
+    pub fn set_metrics(&mut self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// A POST builder carrying the bearer token when one is configured.
@@ -183,6 +193,18 @@ impl ChatBackend for OpenAICompatibleClient {
             .json()
             .await
             .map_err(|e| AppError::UpstreamError(e.to_string()))?;
+
+        if let Some(metrics) = &self.metrics {
+            let usage = response.get("usage");
+            let count = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
+            metrics.record_usage(
+                model,
+                count("prompt_tokens"),
+                count("completion_tokens"),
+                None,
+                None,
+            );
+        }
 
         response
             .get("choices")

@@ -6,8 +6,11 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod host_stats;
 pub mod image_norm;
 pub mod images;
+pub mod metrics;
+pub mod metrics_store;
 pub mod net_guard;
 pub mod ollama;
 pub mod openai;
@@ -347,7 +350,7 @@ pub fn build_state_with_upstream(
     cfg: Arc<Config>,
     capabilities: Arc<CapabilitySnapshot>,
     http: reqwest::Client,
-    upstream: UpstreamChatBackend,
+    mut upstream: UpstreamChatBackend,
 ) -> state::AppState {
     let capabilities = state::CapabilitiesCache::new(capabilities);
     // Stand up the server-hosted image store when configured. A configured-but-
@@ -415,6 +418,24 @@ pub fn build_state_with_upstream(
         g => g.min(Duration::from_secs(60)),
     };
     turns.spawn_watchdog(abandon_grace, tick);
+    // Durable metrics history for the dashboard. An unopenable database
+    // degrades to memory-only metrics (`/metrics` still works) — storage is
+    // never fatal.
+    let store = cfg.metrics_db.as_ref().and_then(|path| {
+        match metrics_store::spawn(path.clone(), cfg.metrics_retention_days) {
+            Ok(handle) => {
+                tracing::info!(db = %path.display(), "metrics store enabled");
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::warn!(db = %path.display(), error = %e,
+                    "metrics store unavailable; falling back to memory-only metrics");
+                None
+            }
+        }
+    });
+    let metrics = metrics::Metrics::new(store);
+    upstream.attach_metrics(metrics.clone());
     state::AppState {
         upstream_sem: Arc::new(tokio::sync::Semaphore::new(cfg.upstream_concurrency)),
         cfg,
@@ -425,6 +446,7 @@ pub fn build_state_with_upstream(
         turns,
         images,
         code_exec,
+        metrics,
     }
 }
 

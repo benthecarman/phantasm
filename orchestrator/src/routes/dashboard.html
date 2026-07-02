@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Phantasm — Dashboard</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,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">
+<style>
+  :root {
+    --bg: #0e1116; --card: #161b23; --edge: #242c38; --text: #dbe2ec;
+    --dim: #8b96a5; --accent: #7aa2f7; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: baseline; margin-bottom: 16px; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  header .meta { color: var(--dim); font-size: 12.5px; }
+  header .spacer { flex: 1; }
+  .badge { display: inline-block; padding: 1px 9px; border-radius: 99px; font-size: 12px; border: 1px solid var(--edge); }
+  /* The author display on .badge would otherwise beat the UA [hidden] rule. */
+  [hidden] { display: none !important; }
+  .badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .badge.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+  .badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+  select {
+    background: var(--card); color: var(--text); border: 1px solid var(--edge);
+    border-radius: 7px; padding: 4px 8px; font: inherit; font-size: 13px;
+  }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--edge); border-radius: 11px; padding: 14px 16px; min-width: 0; }
+  .card.wide { grid-column: 1 / -1; }
+  .card h2 { margin: 0 0 10px; font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px 22px; }
+  .stat .v { font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .stat .v.ok { color: var(--ok); } .stat .v.err { color: var(--err); } .stat .v.warn { color: var(--warn); }
+  .stat .k { font-size: 11.5px; color: var(--dim); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td:first-child { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+  th { color: var(--dim); font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; }
+  tr + tr td { border-top: 1px solid var(--edge); }
+  canvas { width: 100%; height: 130px; display: block; }
+  .empty { color: var(--dim); font-size: 13px; }
+  .bar { height: 6px; border-radius: 4px; background: var(--edge); overflow: hidden; margin-top: 4px; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Phantasm</h1>
+  <span class="meta" id="meta">—</span>
+  <span id="stale" class="badge warn" hidden>stale</span>
+  <span class="spacer"></span>
+  <label class="meta">model
+    <select id="model"><option value="all">all</option></select>
+  </label>
+  <label class="meta">range
+    <select id="range">
+      <option value="3h">3 h</option>
+      <option value="24h">24 h</option>
+      <option value="7d">7 d</option>
+    </select>
+  </label>
+</header>
+
+<div class="grid">
+  <div class="card"><h2>Turns <span class="meta" id="rangeLabel"></span></h2><div class="stats" id="turns"></div></div>
+  <div class="card"><h2>Latency</h2><div class="stats" id="latency"></div></div>
+  <div class="card"><h2>Tokens</h2><div class="stats" id="tokens"></div></div>
+  <div class="card"><h2>Backend</h2><div id="backend" class="stats"></div><div id="loadedModels" class="empty" style="margin-top:8px"></div></div>
+  <div class="card"><h2>Host</h2><div id="host"></div></div>
+  <div class="card"><h2>Server</h2><div class="stats" id="server"></div></div>
+  <div class="card wide"><h2>Turns / errors over time</h2><canvas id="chartTurns"></canvas></div>
+  <div class="card wide"><h2>Tokens over time</h2><canvas id="chartTokens"></canvas></div>
+  <div class="card wide"><h2>Models</h2><div id="models"></div></div>
+  <div class="card wide"><h2>Tools</h2><div id="tools"></div></div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmtN = n => n == null ? "—" : Intl.NumberFormat("en", {notation: n >= 100000 ? "compact" : "standard", maximumFractionDigits: 1}).format(n);
+const fmtMs = ms => ms == null ? "—" : ms >= 60000 ? (ms/60000).toFixed(1) + " m" : ms >= 1000 ? (ms/1000).toFixed(1) + " s" : ms + " ms";
+const fmtBytes = b => b == null ? "—" : b >= 2**30 ? (b/2**30).toFixed(1) + " GiB" : (b/2**20).toFixed(0) + " MiB";
+const fmtUp = s => s >= 172800 ? Math.floor(s/86400) + " d" : s >= 3600 ? Math.floor(s/3600) + " h " + Math.floor(s%3600/60) + " m" : Math.floor(s/60) + " m";
+const stat = (k, v, cls) => `<div class="stat"><div class="v ${cls||""}">${v}</div><div class="k">${esc(k)}</div></div>`;
+
+function token() {
+  let t = localStorage.getItem("phantasm_token");
+  if (t === null) {
+    t = prompt("Phantasm metrics token (PHANTASM_METRICS_TOKEN, or the main token if unset; leave empty if auth is disabled)") || "";
+    localStorage.setItem("phantasm_token", t);
+  }
+  return t;
+}
+
+let timer = null;
+async function refresh() {
+  const params = new URLSearchParams({range: $("range").value, model: $("model").value});
+  let resp;
+  try {
+    const headers = {};
+    const t = token();
+    if (t) headers["Authorization"] = "Bearer " + t;
+    resp = await fetch("dashboard/data?" + params, {headers});
+  } catch (e) {
+    $("stale").hidden = false;
+    return;
+  }
+  if (resp.status === 401) {
+    localStorage.removeItem("phantasm_token");
+    $("stale").hidden = false;
+    if (!document.hidden) refreshSoon(0); // re-prompt for the token
+    return;
+  }
+  if (!resp.ok) { $("stale").hidden = false; return; }
+  render(await resp.json());
+  $("stale").hidden = true;
+}
+function refreshSoon(ms) { clearTimeout(timer); timer = setTimeout(() => { refresh().finally(() => refreshSoon(5000)); }, ms); }
+
+function render(d) {
+  $("meta").textContent = `v${d.version} · up ${fmtUp(d.uptime_seconds)}`;
+  $("rangeLabel").textContent = "· last " + $("range").value;
+  const h = d.history;
+
+  const o = h ? h.outcomes : {};
+  $("turns").innerHTML =
+    stat("active now", d.turns_active, d.turns_active > 0 ? "ok" : "") +
+    stat("completed", fmtN(o.completed ?? 0)) +
+    stat("errored", fmtN(o.errored ?? 0), (o.errored ?? 0) > 0 ? "err" : "") +
+    stat("cancelled", fmtN(o.cancelled ?? 0)) +
+    stat("with tools", fmtN(o.with_tools ?? 0)) +
+    stat("plain", fmtN(o.plain ?? 0));
+
+  const l = h ? h.latency : {};
+  $("latency").innerHTML =
+    stat("p50 turn", fmtMs(l.p50_ms)) + stat("p95 turn", fmtMs(l.p95_ms)) +
+    stat("p50 first token", fmtMs(l.ttft_p50_ms)) + stat("p95 first token", fmtMs(l.ttft_p95_ms));
+
+  const tk = h ? h.tokens : {};
+  $("tokens").innerHTML =
+    stat("prompt", fmtN(tk.prompt ?? 0)) + stat("completion", fmtN(tk.completion ?? 0)) +
+    stat("avg tok/s", tk.avg_tokens_per_sec == null ? "—" : tk.avg_tokens_per_sec.toFixed(1),
+         tk.avg_tokens_per_sec == null ? "" : "ok") +
+    stat("images", fmtN(d.images_generated));
+
+  let backend = stat("in flight", `${d.upstream_inflight}/${d.upstream_max}`);
+  if (d.ollama) backend += `<div class="stat"><div class="v ${d.ollama.reachable ? "ok" : "err"}">${d.ollama.reachable ? "up" : "down"}</div><div class="k">ollama</div></div>`;
+  $("backend").innerHTML = backend;
+  $("loadedModels").innerHTML = d.ollama && d.ollama.models.length
+    ? d.ollama.models.map(m => `${esc(m.name)} <span style="color:var(--dim)">(${fmtBytes(m.size_vram_bytes)} VRAM)</span>`).join("<br>")
+    : (d.ollama ? "no models loaded" : "");
+
+  let host = "";
+  if (d.host.memory) {
+    const used = d.host.memory.total_bytes - d.host.memory.available_bytes;
+    host += `<div class="stat"><div class="v">${fmtBytes(used)} / ${fmtBytes(d.host.memory.total_bytes)}</div><div class="k">RAM</div><div class="bar"><i style="width:${(100*used/d.host.memory.total_bytes).toFixed(0)}%"></i></div></div>`;
+  }
+  if (d.host.load) host += `<div class="stat" style="margin-top:8px"><div class="v">${d.host.load.load_1m.toFixed(2)} <span style="font-size:13px;color:var(--dim)">/ ${d.host.load.cores} cores</span></div><div class="k">load 1m</div></div>`;
+  // GPU core temp: green is normal-under-load, amber approaches the throttle
+  // band, red is at/over NVIDIA's rated maximum (90°C on Blackwell/RTX 5090,
+  // where the card throttles; ~83°C on Ada — 90 keeps a loaded 5090 green
+  // instead of crying wolf).
+  const tempColor = t => t >= 90 ? "var(--err)" : t >= 80 ? "var(--warn)" : "var(--ok)";
+  for (const g of d.host.gpus) {
+    const temp = g.temperature_c == null ? ""
+      : ` · <span style="color:${tempColor(g.temperature_c)}">${g.temperature_c}°C</span>`;
+    host += `<div class="stat" style="margin-top:8px"><div class="v">${g.utilization_pct}%<span style="font-size:13px">${temp}</span> <span style="font-size:13px;color:var(--dim)">· ${fmtBytes(g.memory_used_bytes)} / ${fmtBytes(g.memory_total_bytes)}</span></div><div class="k">${esc(g.name)}</div><div class="bar"><i style="width:${(100*g.memory_used_bytes/g.memory_total_bytes).toFixed(0)}%"></i></div></div>`;
+  }
+  $("host").innerHTML = host || '<div class="empty">unavailable</div>';
+
+  $("server").innerHTML =
+    stat("buffered running", d.registry.running) +
+    stat("detached", d.registry.detached_running, d.registry.detached_running > 0 ? "warn" : "") +
+    stat("replayable", d.registry.buffered_terminal) +
+    stat("disconnects", fmtN(d.sse_disconnects)) +
+    stat("401s", fmtN(d.http_unauthorized), d.http_unauthorized > 0 ? "warn" : "");
+
+  updateModelPicker(h);
+  $("models").innerHTML = h && h.models.length ? modelTable(h.models) : '<div class="empty">no history yet</div>';
+  $("tools").innerHTML = h && h.tools.length ? toolTable(h.tools) : '<div class="empty">no tool calls in range</div>';
+  drawSeries($("chartTurns"), h, d, [
+    {get: p => p.turns, color: "#7aa2f7", label: "turns"},
+    {get: p => p.errors, color: "#f87171", label: "errors"},
+  ]);
+  drawSeries($("chartTokens"), h, d, [
+    {get: p => p.completion_tokens, color: "#4ade80", label: "completion"},
+    {get: p => p.prompt_tokens, color: "#8b96a5", label: "prompt"},
+  ]);
+}
+
+function modelTable(models) {
+  const rows = models.map(m => `<tr><td>${esc(m.model || "(unknown)")}</td><td>${fmtN(m.turns)}</td>
+    <td class="${m.errored ? "err" : ""}">${fmtN(m.errored)}</td><td>${fmtMs(m.p95_ms)}</td>
+    <td>${fmtN(m.prompt_tokens)} / ${fmtN(m.completion_tokens)}</td>
+    <td>${m.avg_tokens_per_sec == null ? "—" : m.avg_tokens_per_sec.toFixed(1)}</td></tr>`).join("");
+  return `<table><tr><th>model</th><th>turns</th><th>errors</th><th>p95</th><th>tokens p/c</th><th>tok/s</th></tr>${rows}</table>`;
+}
+function toolTable(tools) {
+  const rows = tools.map(t => `<tr><td>${esc(t.tool)}</td><td>${fmtN(t.calls)}</td>
+    <td style="${t.errors ? "color:var(--err)" : ""}">${fmtN(t.errors)}</td>
+    <td>${t.calls ? (100*t.errors/t.calls).toFixed(0) + "%" : "—"}</td><td>${fmtMs(t.p95_ms)}</td></tr>`).join("");
+  return `<table><tr><th>tool</th><th>calls</th><th>errors</th><th>error rate</th><th>p95</th></tr>${rows}</table>`;
+}
+
+function updateModelPicker(h) {
+  const sel = $("model");
+  const current = sel.value;
+  const names = new Set(["all"]);
+  if (h) for (const m of h.models) if (m.model) names.add(m.model);
+  const existing = [...sel.options].map(o => o.value).join(",");
+  if (existing !== [...names].join(",")) {
+    sel.innerHTML = [...names].map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    sel.value = names.has(current) ? current : "all";
+  }
+}
+
+// Minimal bar/step chart over the bucketed series, zero-filling gaps.
+function drawSeries(canvas, h, d, layers) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, ht = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = ht * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, ht);
+  if (!h || !h.series.length) {
+    ctx.fillStyle = "#8b96a5"; ctx.font = "12px sans-serif";
+    ctx.fillText("no data in range", 8, 20);
+    return;
+  }
+  const bucket = d.bucket_seconds;
+  const end = Math.floor(Date.now() / 1000 / bucket) * bucket;
+  const start = end - d.range_seconds + bucket;
+  const n = Math.floor((end - start) / bucket) + 1;
+  const byT = new Map(h.series.map(p => [p.t, p]));
+  const slots = Array.from({length: n}, (_, i) => byT.get(start + i * bucket) || null);
+  const max = Math.max(1, ...slots.filter(Boolean).flatMap(p => layers.map(l => l.get(p))));
+  const bw = w / n;
+  // Later layers paint on top; order them so the overlay (errors, prompt) is
+  // never hidden under the base layer.
+  for (const layer of layers) {
+    ctx.fillStyle = layer.color;
+    slots.forEach((p, i) => {
+      if (!p) return;
+      const v = layer.get(p);
+      if (!v) return;
+      const hgt = Math.max(2, (ht - 16) * v / max);
+      ctx.fillRect(i * bw + 0.5, ht - hgt, Math.max(1, bw - 1.5), hgt);
+    });
+  }
+  ctx.font = "11px sans-serif";
+  let x = 4;
+  for (const layer of layers) {
+    ctx.fillStyle = layer.color;
+    ctx.fillText("■ " + layer.label, x, 11);
+    x += ctx.measureText("■ " + layer.label).width + 14;
+  }
+  ctx.fillStyle = "#8b96a5";
+  ctx.fillText("max " + fmtN(max) + "/bucket", x, 11);
+}
+
+$("range").addEventListener("change", () => refreshSoon(0));
+$("model").addEventListener("change", () => refreshSoon(0));
+refresh().finally(() => refreshSoon(5000));
+</script>
+</body>
+</html>

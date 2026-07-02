@@ -156,6 +156,19 @@ impl ActiveTurn {
     }
 }
 
+/// Counts reported by [`TurnRegistry::snapshot_counts`] for metrics.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct RegistryCounts {
+    /// Buffered turns still executing.
+    pub running: u64,
+    /// Responders currently attached across all turns.
+    pub attached: u64,
+    /// Running turns with no attached responder (backgrounded clients).
+    pub detached_running: u64,
+    /// Terminal turns retained for replay.
+    pub buffered_terminal: u64,
+}
+
 /// Store of buffered resumable turns, keyed by the client's `Idempotency-Key`.
 #[derive(Clone)]
 pub struct TurnRegistry {
@@ -192,6 +205,25 @@ impl TurnRegistry {
     /// Look up a live turn without creating one (the cancel endpoint, phase 2).
     pub fn get(&self, key: &str) -> Option<Arc<ActiveTurn>> {
         self.map.lock().unwrap().get(key).cloned()
+    }
+
+    /// Point-in-time counts for metrics — one pass under the map lock.
+    pub fn snapshot_counts(&self) -> RegistryCounts {
+        let map = self.map.lock().unwrap();
+        let mut counts = RegistryCounts::default();
+        for turn in map.values() {
+            let log = turn.inner.lock().unwrap();
+            counts.attached += log.attached as u64;
+            if log.done {
+                counts.buffered_terminal += 1;
+            } else {
+                counts.running += 1;
+                if log.attached == 0 {
+                    counts.detached_running += 1;
+                }
+            }
+        }
+        counts
     }
 
     /// Drop a turn from the registry (e.g. after an explicit cancel).

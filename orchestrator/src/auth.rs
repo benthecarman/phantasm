@@ -4,6 +4,11 @@
 //! non-matching `Authorization: Bearer <token>` header is rejected with 401
 //! before any handler runs. When no token is configured (`auth_token` is
 //! `None`), auth is disabled and every request passes through unauthenticated.
+//!
+//! The observability routes (`/metrics`, `/dashboard/data`) are gated by their
+//! own token so the credential handed to a Prometheus scraper (or stored in a
+//! dashboard browser) never grants chat access — and vice versa. When no
+//! metrics token is configured they fall back to the main token.
 
 use axum::extract::State;
 use axum::http::{header::AUTHORIZATION, Request};
@@ -13,18 +18,50 @@ use axum::response::{IntoResponse, Response};
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Gate for the main API routes, against `PHANTASM_AUTH_TOKEN`.
 pub async fn require_bearer(
     State(state): State<AppState>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let Some(expected) = state.cfg.auth_token.as_deref() else {
+    let expected = state.cfg.auth_token.clone();
+    gate(expected, state, req, next).await
+}
+
+/// Gate for `/metrics` + `/dashboard/data`, against `PHANTASM_METRICS_TOKEN`.
+/// Unset => the main token gates them too (zero-config compatibility); set =>
+/// it is the ONLY accepted token here, and it opens nothing else.
+pub async fn require_metrics_bearer(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let expected = state
+        .cfg
+        .metrics_token
+        .clone()
+        .or_else(|| state.cfg.auth_token.clone());
+    gate(expected, state, req, next).await
+}
+
+async fn gate(
+    expected: Option<String>,
+    state: AppState,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let Some(expected) = expected else {
         // Auth disabled (no token configured): accept everything.
         return next.run(req).await;
     };
     match extract_token(&req) {
-        Some(token) if constant_time_eq(token, expected) => next.run(req).await,
-        _ => AppError::Unauthorized.into_response(),
+        Some(token) if constant_time_eq(token, &expected) => next.run(req).await,
+        _ => {
+            // For an internet-exposed self-hosted server, a spike here is the
+            // closest thing to a security signal — count it for the dashboard.
+            state.metrics.http_unauthorized.inc();
+            AppError::Unauthorized.into_response()
+        }
     }
 }
 

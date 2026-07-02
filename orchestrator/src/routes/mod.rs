@@ -1,7 +1,9 @@
 pub mod capabilities;
 pub mod chat;
+pub mod dashboard;
 pub mod health;
 pub mod images;
+pub mod metrics;
 pub mod models;
 pub mod warm;
 
@@ -37,13 +39,33 @@ pub fn router(state: AppState) -> Router {
             crate::auth::require_bearer,
         ));
 
+    // Observability routes, behind their own token (falling back to the main
+    // one when `PHANTASM_METRICS_TOKEN` is unset) so a scraper or dashboard
+    // credential never grants chat access. Conditional routes must be added
+    // BEFORE `route_layer` — it only covers routes already present.
+    let mut observability = Router::new().route("/metrics", get(metrics::prometheus));
+    if state.cfg.dashboard_enabled {
+        observability = observability.route("/dashboard/data", get(dashboard::data));
+    }
+    let observability = observability.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        crate::auth::require_metrics_bearer,
+    ));
+
     // Signature-gated, auth-exempt image fetch (Files-style content path), merged
     // alongside the bearer-gated DELETE on the resource.
-    let public = Router::new()
+    let mut public = Router::new()
         .route("/healthz", get(health::healthz))
         .route("/v1/files/{id}/content", get(images::get_image));
+    if state.cfg.dashboard_enabled {
+        // The page itself carries no data — its JS fetches `/dashboard/data`
+        // (gated by the metrics token) with a token the user enters in the
+        // browser.
+        public = public.route("/dashboard", get(dashboard::page));
+    }
 
     authed
+        .merge(observability)
         .merge(public)
         .layer(DefaultBodyLimit::max(body_limit))
         // CORS is the outermost layer so a browser preflight (OPTIONS) is

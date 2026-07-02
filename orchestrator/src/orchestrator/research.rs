@@ -954,6 +954,7 @@ mod tests {
                     format!("results: {RAW_PAGE_SENTINEL} https://src.example/a"),
                 ),
                 append_to_answer: None,
+                is_error: false,
             }
         }
     }

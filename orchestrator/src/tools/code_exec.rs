@@ -93,6 +93,7 @@ pub async fn run(
         Ok(out) => ToolOutcome {
             message: ChatMessage::tool_result(call_id, "code_exec", format_output(&language, &out)),
             append_to_answer: None,
+            is_error: false,
         },
         Err(e) => {
             tracing::warn!(error = %e, "code_exec failed");
@@ -160,6 +161,7 @@ fn error_outcome(call_id: &str, detail: String) -> ToolOutcome {
             format!("code execution failed: {detail}"),
         ),
         append_to_answer: None,
+        is_error: true,
     }
 }
 
