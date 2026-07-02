@@ -18,6 +18,9 @@ struct HistoryDrawer: View {
     let onSelect: (Conversation) -> Void
     let onNewChat: () -> Void
     let onOpenSettings: () -> Void
+    /// Called with the ids being deleted, before the rows are removed — the
+    /// owner stops any in-flight turn for them and drops their cached VMs.
+    var onDeleted: ([UUID]) -> Void = { _ in }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -177,6 +180,9 @@ struct HistoryDrawer: View {
 
     private func deleteConversations(ids: [UUID]) {
         guard !ids.isEmpty else { return }
+        // Stop in-flight turns first: a deleted chat's stream must not keep
+        // running (holding the backend) or commit into rows being removed.
+        onDeleted(ids)
         if let selectionID = selection?.id, ids.contains(selectionID) { onNewChat() }
         let store = env.store
         Task {

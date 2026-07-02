@@ -144,7 +144,8 @@ struct RootView: View {
             selection: selection,
             onSelect: { open($0) },
             onNewChat: { startNewChat() },
-            onOpenSettings: { showSettings = true; closeDrawer() }
+            onOpenSettings: { showSettings = true; closeDrawer() },
+            onDeleted: { chatViewModels.discard(ids: $0) }
         )
         .frame(width: drawerWidth)
         .frame(maxHeight: .infinity)
@@ -256,12 +257,31 @@ struct RootView: View {
 @MainActor
 private final class ChatViewModelCache {
     private var models: [UUID: ChatViewModel] = [:]
+    private let capacity = 16
 
     func viewModel(for id: UUID) -> ChatViewModel {
         if let model = models[id] { return model }
+        // Bound the cache: idle VMs for long-closed chats are recreated
+        // cheaply, but a streaming VM must survive (it owns the live turn).
+        if models.count >= capacity {
+            for (key, model) in models where !model.isStreaming {
+                models.removeValue(forKey: key)
+                if models.count < capacity { break }
+            }
+        }
         let model = ChatViewModel()
         models[id] = model
         return model
+    }
+
+    /// Stop any in-flight turn and drop the cached VMs for deleted chats — a
+    /// deleted conversation's stream must not keep running or commit into
+    /// rows that no longer exist.
+    func discard(ids: [UUID]) {
+        for id in ids {
+            guard let model = models.removeValue(forKey: id) else { continue }
+            if model.isStreaming { model.stop() }
+        }
     }
 
     func setSceneActive(_ active: Bool) {
