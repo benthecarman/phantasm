@@ -510,6 +510,19 @@ fn extract_blocks(html: &str, tags: &[&str]) -> String {
         let mut from = 0;
         while let Some(rel) = lower[from..].find(&open_prefix) {
             let open_at = from + rel;
+            // Tag-boundary check (same as `remove_blocks`): "<p" must not
+            // match `<pre>`/`<picture>`/`<path>` — only '>', '/', or
+            // whitespace may follow the tag name.
+            let after = open_at + open_prefix.len();
+            let boundary = lower[after..]
+                .chars()
+                .next()
+                .map(|c| c == '>' || c == '/' || c.is_whitespace())
+                .unwrap_or(true);
+            if !boundary {
+                from = after;
+                continue;
+            }
             // Find the end of the opening tag.
             let Some(gt) = lower[open_at..].find('>') else {
                 break;
@@ -665,6 +678,19 @@ mod tests {
         assert!(out.contains("The actual article body."));
         assert!(!out.contains("Copyright boilerplate"));
         assert!(!out.contains("Home About Contact"));
+    }
+
+    #[test]
+    fn extract_blocks_does_not_match_pre_or_picture_as_p() {
+        // "<p" without a boundary check used to catch <pre>/<picture>, pulling
+        // their content (up to some real </p>) into the "main content".
+        let html = "<body><pre>var leak = 'code dump';</pre>\
+            <picture><source srcset=\"x.webp\">img fallback</picture>\
+            <p>The real paragraph.</p></body>";
+        let out = html_to_text(html, 4000);
+        assert!(out.contains("The real paragraph."), "{out}");
+        assert!(!out.contains("code dump"), "{out}");
+        assert!(!out.contains("img fallback"), "{out}");
     }
 
     #[test]
