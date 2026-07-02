@@ -236,7 +236,9 @@ struct StreamingBubble: View {
                     StatusPill(text: status, isAnimated: true, progress: progress)
                 }
                 if !reasoning.isEmpty {
-                    ThinkingDisclosure(text: reasoning)
+                    // Reasoning is "live" until the answer starts streaming; after
+                    // that the trace is complete and the chip settles.
+                    ThinkingDisclosure(text: reasoning, isStreaming: text.isEmpty)
                 }
                 // Show the loader until there's something to render. Gate on an
                 // empty-or-nil status (not just nil) so a blank `x_status` value
@@ -252,28 +254,130 @@ struct StreamingBubble: View {
     }
 }
 
+/// The model's reasoning trace, collapsed behind a compact tappable chip. The
+/// chip hugs its label (no full-width bar); while reasoning tokens are still
+/// arriving it shimmers like the app's other activity indicators.
 struct ThinkingDisclosure: View {
     let text: String
+    /// Whether reasoning tokens are still streaming in — drives the shimmer.
+    var isStreaming = false
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
+    @State private var sweep = false
+    @State private var pulse = false
+
+    private var shouldAnimate: Bool { isStreaming && !reduceMotion }
 
     var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            Text(text)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 6)
-        } label: {
-            Label("Thinking", systemImage: "brain.head.profile")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(reduceMotion ? nil : .snappy(duration: 0.3)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                chip
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Thinking")
+            .accessibilityHint(isExpanded ? "Collapses the reasoning" : "Expands the reasoning")
+
+            if isExpanded {
+                reasoningBody
+                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .top)))
+            }
         }
-        .padding(10)
-        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        .onAppear(perform: startAnimationIfNeeded)
+        .onChange(of: shouldAnimate) { _, _ in startAnimationIfNeeded() }
+    }
+
+    private var chip: some View {
+        chipLabel(dimmed: true)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.primary.opacity(0.05), in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .overlay {
+                if shouldAnimate {
+                    chipLabel(dimmed: false)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .mask(shimmerBand)
+                }
+            }
+            .contentShape(Capsule())
+    }
+
+    /// The chip content twice: the resting secondary version, and a brighter
+    /// copy masked to the moving band so a glint travels across the glyphs.
+    private func chipLabel(dimmed: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "brain.head.profile")
+                .scaleEffect(shouldAnimate ? (pulse ? 1.08 : 0.94) : 1)
+            Text(isStreaming ? "Thinking…" : "Thinking")
+            Image(systemName: "chevron.down")
+                .font(.system(size: 8, weight: .bold))
+                .rotationEffect(.degrees(isExpanded ? -180 : 0))
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(dimmed ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+    }
+
+    private var shimmerBand: some View {
+        GeometryReader { proxy in
+            LinearGradient(
+                colors: [.clear, .white, .clear],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .frame(width: 50)
+            .offset(x: sweep ? proxy.size.width + 25 : -75)
+        }
+    }
+
+    private var reasoningBody: some View {
+        Text(text)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 12)
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Color.primary.opacity(0.12))
+                    .frame(width: 2)
+            }
+            .padding(.top, 8)
+            .padding(.leading, 8)
+    }
+
+    private func startAnimationIfNeeded() {
+        guard shouldAnimate else {
+            sweep = false
+            pulse = false
+            return
+        }
+        withAnimation(.linear(duration: 1.6).repeatForever(autoreverses: false)) {
+            sweep = true
+        }
+        withAnimation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true)) {
+            pulse = true
+        }
+    }
+}
+
+#Preview("Thinking") {
+    VStack(alignment: .leading, spacing: 16) {
+        ThinkingDisclosure(
+            text: "The user is asking about X. Let me consider the trade-offs before answering.",
+            isStreaming: true
+        )
+        ThinkingDisclosure(
+            text: "The user is asking about X. Let me consider the trade-offs before answering."
         )
     }
+    .padding(24)
 }

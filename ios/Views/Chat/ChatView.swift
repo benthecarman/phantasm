@@ -32,6 +32,10 @@ struct ChatView: View {
     /// only follows the streaming tail while this is true; once the user scrolls
     /// up to read history it goes false and we stop yanking them back down.
     @State private var isPinnedToBottom = true
+    /// Whether the user's finger is currently on the transcript (tracking or
+    /// dragging). While true, tail-follow scrolls are suppressed so per-token
+    /// `scrollTo`s can't fight the gesture.
+    @State private var isUserScrolling = false
     @Namespace private var logoNamespace
 
     init(
@@ -366,6 +370,14 @@ struct ChatView: View {
                     isPinnedToBottom = false
                 }
             }
+            // A finger on the transcript always beats tail-following. Without
+            // this, streaming phases where content height is constant (e.g. the
+            // collapsed thinking chip while reasoning tokens arrive) would issue
+            // a `scrollTo(bottom)` per token that snaps the view back mid-drag,
+            // making it impossible to scroll up and escape the re-pin zone.
+            .onScrollPhaseChange { _, newPhase in
+                isUserScrolling = newPhase == .tracking || newPhase == .interacting
+            }
             .onChange(of: messages) { _, _ in
                 vm.reconcileAssistantPreview(with: messages)
                 if isPinnedToBottom { scrollToBottom(proxy) }
@@ -428,10 +440,11 @@ struct ChatView: View {
     /// scroll-up rather than scroll jitter.
     private let scrollUpDeadzone: CGFloat = 4
 
-    /// Follow the streaming tail without animation, but only while pinned — so
-    /// scrolling up to read history isn't fought by per-token scrolls.
+    /// Follow the streaming tail without animation, but only while pinned and
+    /// the user's finger is off the transcript — so scrolling up to read
+    /// history isn't fought by per-token scrolls.
     private func followTail(_ proxy: ScrollViewProxy) {
-        if isPinnedToBottom { scrollToBottom(proxy, animated: false) }
+        if isPinnedToBottom && !isUserScrolling { scrollToBottom(proxy, animated: false) }
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
