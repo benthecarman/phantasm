@@ -272,7 +272,16 @@ impl TurnRegistry {
                 });
             match victim {
                 Some(k) => {
-                    map.remove(&k);
+                    if let Some(turn) = map.remove(&k) {
+                        // A still-running eviction victim must be cancelled (as
+                        // sweep_abandoned does): once it leaves the map, its
+                        // token is unreachable from the cancel endpoint and the
+                        // watchdog, so an un-fired token would orphan the
+                        // generation with no way to ever stop it.
+                        if !turn.is_terminal() {
+                            turn.cancel.cancel();
+                        }
+                    }
                 }
                 None => break,
             }
@@ -379,6 +388,34 @@ mod tests {
         assert!(reg.map.lock().unwrap().len() <= 2);
         // k3 (the newest) survived.
         assert!(reg.get("k3").is_some());
+    }
+
+    #[test]
+    fn over_cap_eviction_cancels_a_running_victim() {
+        // With only running turns to choose from, purge evicts the oldest one —
+        // and must fire its token, or the evicted generation would keep running
+        // with no way left to cancel it (its token is gone from the map).
+        let reg = TurnRegistry::new(Duration::from_secs(900), 2);
+        let (running, _) = reg.get_or_create("old-running");
+        let (finished, _) = reg.get_or_create("old-finished");
+        finished.finish();
+
+        let (_new, is_new) = reg.get_or_create("new");
+        assert!(is_new);
+        // The terminal turn goes first and needs no cancel; nothing running was
+        // touched yet.
+        assert!(reg.get("old-finished").is_none());
+        assert!(!finished.cancel.is_cancelled(), "terminal eviction: no-op");
+        assert!(!running.cancel.is_cancelled());
+
+        // Next insert must evict the running turn — and cancel it.
+        let (_newer, is_new) = reg.get_or_create("newer");
+        assert!(is_new);
+        assert!(reg.get("old-running").is_none(), "running turn evicted");
+        assert!(
+            running.cancel.is_cancelled(),
+            "evicted running turn must be cancelled, not orphaned"
+        );
     }
 
     #[test]
