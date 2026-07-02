@@ -46,6 +46,10 @@ final class ChatViewModel {
 
     private var env: (any ChatViewModelEnvironment)?
     private var store: ChatStore?
+    /// The in-flight assistant row commit from the previous turn's finish. The
+    /// next turn's history read awaits it so a fast follow-up send can't load
+    /// a history that is missing the last reply.
+    private var commitTask: Task<Void, Never>?
     /// The active conversation's metadata (a value, not the stored history). For a
     /// new chat this is an in-memory draft that isn't written until the first send.
     private var conversation: Conversation?
@@ -544,6 +548,9 @@ final class ChatViewModel {
         env: any ChatViewModelEnvironment,
         store: ChatStore
     ) async {
+        // Wait for the previous turn's row commit (not its follow-up work) so
+        // a fast follow-up send can't read a history missing the last reply.
+        await commitTask?.value
         guard let detail = try? await store.conversationDetail(id: conversationId) else {
             finish(error: .modelError("Could not load the conversation history."))
             return
@@ -687,6 +694,10 @@ final class ChatViewModel {
         guard !isStreaming, isSceneActive, isViewVisible,
               let env, let store, let conversation,
               let base = env.activeProfile?.baseURL else { return }
+        // A commit from the just-finished turn may still be landing; reading
+        // before it does would mistake the not-yet-completed row for a
+        // resumable turn and stream it a second time.
+        await commitTask?.value
         guard let detail = try? await store.conversationDetail(id: conversation.id) else { return }
 
         // Restore an unanswered interactive prompt from the active tool-call batch.
@@ -1092,31 +1103,20 @@ final class ChatViewModel {
             if let pendingID {
                 pendingAssistantPreviewMessageID = pendingID
                 if shouldAutoSpeak { env?.speak(committed, messageID: pendingID) }
-                Task { [weak self] in
-                    do {
-                        try await store.updateMessage(
-                            id: pendingID,
-                            content: committed,
-                            reasoning: committedReasoning,
-                            isComplete: true,
-                            createdAt: .now
-                        )
-                        await self?.cacheServerImages(messageID: pendingID, content: committed)
-                        try await store.updateConversation(
-                            id: conversation.id, title: nil, modelID: nil, updatedAt: .now
-                        )
-                        if shouldNotifyWhenCommitted {
-                            await self?.notifications.scheduleBackgroundCompletion(
-                                conversationID: conversation.id
-                            )
-                        } else {
-                            await self?.maybeGenerateTitle()
-                        }
-                        self?.endBackgroundStreamingTask()
-                    } catch {
-                        self?.handleAssistantCommitFailure(messageID: pendingID, error: error)
-                        self?.endBackgroundStreamingTask()
-                    }
+                commitAssistantMessage(
+                    store: store,
+                    conversationID: conversation.id,
+                    messageID: pendingID,
+                    content: committed,
+                    notifyInBackground: shouldNotifyWhenCommitted
+                ) {
+                    try await store.updateMessage(
+                        id: pendingID,
+                        content: committed,
+                        reasoning: committedReasoning,
+                        isComplete: true,
+                        createdAt: .now
+                    )
                 }
             } else {
                 let assistant = Message(
@@ -1126,25 +1126,14 @@ final class ChatViewModel {
                 )
                 pendingAssistantPreviewMessageID = assistant.id
                 if shouldAutoSpeak { env?.speak(committed, messageID: assistant.id) }
-                Task { [weak self] in
-                    do {
-                        try await store.insertMessage(assistant, attachments: [])
-                        await self?.cacheServerImages(messageID: assistant.id, content: committed)
-                        try await store.updateConversation(
-                            id: conversation.id, title: nil, modelID: nil, updatedAt: .now
-                        )
-                        if shouldNotifyWhenCommitted {
-                            await self?.notifications.scheduleBackgroundCompletion(
-                                conversationID: conversation.id
-                            )
-                        } else {
-                            await self?.maybeGenerateTitle()
-                        }
-                        self?.endBackgroundStreamingTask()
-                    } catch {
-                        self?.handleAssistantCommitFailure(messageID: assistant.id, error: error)
-                        self?.endBackgroundStreamingTask()
-                    }
+                commitAssistantMessage(
+                    store: store,
+                    conversationID: conversation.id,
+                    messageID: assistant.id,
+                    content: committed,
+                    notifyInBackground: shouldNotifyWhenCommitted
+                ) {
+                    try await store.insertMessage(assistant, attachments: [])
                 }
             }
         } else {
@@ -1160,6 +1149,46 @@ final class ChatViewModel {
 
         if let error, error != .cancelled {
             errorMessage = error.userMessage
+        }
+    }
+
+    /// Commit the finished assistant message. The row write itself is tracked
+    /// as `commitTask` so the next turn's history read can await it — without
+    /// also waiting on the network-bound follow-ups (image caching, title
+    /// generation), which run after the row lands.
+    private func commitAssistantMessage(
+        store: ChatStore,
+        conversationID: UUID,
+        messageID: UUID,
+        content: String,
+        notifyInBackground: Bool,
+        write: @escaping @Sendable () async throws -> Void
+    ) {
+        let rowCommit = Task { [weak self] () -> Bool in
+            do {
+                try await write()
+                return true
+            } catch {
+                self?.handleAssistantCommitFailure(messageID: messageID, error: error)
+                self?.endBackgroundStreamingTask()
+                return false
+            }
+        }
+        commitTask = Task { _ = await rowCommit.value }
+        Task { [weak self] in
+            guard await rowCommit.value else { return }
+            await self?.cacheServerImages(messageID: messageID, content: content)
+            try? await store.updateConversation(
+                id: conversationID, title: nil, modelID: nil, updatedAt: .now
+            )
+            if notifyInBackground {
+                await self?.notifications.scheduleBackgroundCompletion(
+                    conversationID: conversationID
+                )
+            } else {
+                await self?.maybeGenerateTitle()
+            }
+            self?.endBackgroundStreamingTask()
         }
     }
 
