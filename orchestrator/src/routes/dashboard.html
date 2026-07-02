@@ -184,9 +184,12 @@ function render(d) {
     host += `<div class="stat" style="margin-top:8px"><div class="v">${g.utilization_pct}%<span style="font-size:13px">${temp}</span> <span style="font-size:13px;color:var(--dim)">· ${fmtBytes(g.memory_used_bytes)} / ${fmtBytes(g.memory_total_bytes)}</span></div><div class="k">${esc(g.name)}</div><div class="bar"><i style="width:${(100*g.memory_used_bytes/g.memory_total_bytes).toFixed(0)}%"></i></div></div>`;
   }
   if (d.disk) {
-    const dUsed = d.disk.total_bytes - d.disk.available_bytes;
     const freePct = 100 * d.disk.available_bytes / d.disk.total_bytes;
-    host += `<div class="stat" style="margin-top:8px"><div class="v ${freePct < 5 ? "err" : freePct < 15 ? "warn" : ""}">${fmtBytes(d.disk.available_bytes)} <span style="font-size:13px;color:var(--dim)">free of ${fmtBytes(d.disk.total_bytes)}</span></div><div class="k">disk${d.image_store ? " (image store)" : ""}</div><div class="bar"><i style="width:${(100*dUsed/d.disk.total_bytes).toFixed(0)}%"></i></div></div>`;
+    const freeCls = freePct < 5 ? "err" : freePct < 15 ? "warn" : "";
+    const freeColor = freeCls ? `var(--${freeCls})` : "var(--dim)";
+    host += d.image_store
+      ? `<div class="stat" style="margin-top:8px"><div class="v">${fmtBytes(d.image_store.bytes)} <span style="font-size:13px;color:${freeColor}">· ${fmtBytes(d.disk.available_bytes)} free</span></div><div class="k">image store · ${fmtN(d.image_store.files)} file${d.image_store.files === 1 ? "" : "s"}</div></div>`
+      : `<div class="stat" style="margin-top:8px"><div class="v ${freeCls}">${fmtBytes(d.disk.available_bytes)} <span style="font-size:13px;color:var(--dim)">free</span></div><div class="k">disk</div></div>`;
   }
   $("host").innerHTML = host || '<div class="empty">unavailable</div>';
 
@@ -195,8 +198,7 @@ function render(d) {
     stat("detached", d.registry.detached_running, d.registry.detached_running > 0 ? "warn" : "") +
     stat("replayable", d.registry.buffered_terminal) +
     stat("disconnects", fmtN(d.sse_disconnects)) +
-    stat("401s", fmtN(d.http_unauthorized), d.http_unauthorized > 0 ? "warn" : "") +
-    (d.image_store ? stat(`image cache · ${fmtN(d.image_store.files)} file${d.image_store.files === 1 ? "" : "s"}`, fmtBytes(d.image_store.bytes)) : "");
+    stat("401s", fmtN(d.http_unauthorized), d.http_unauthorized > 0 ? "warn" : "");
 
   updateModelPicker(h);
   $("models").innerHTML = h && h.models.length ? modelTable(h.models) : '<div class="empty">no history yet</div>';
