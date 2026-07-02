@@ -1245,7 +1245,15 @@ final class ChatViewModel {
         let title = Self.sanitizedTitle(raw)
         guard !title.isEmpty else { return }
         // Title only — don't bump updatedAt, so naming doesn't reorder the list.
-        try? await store.updateConversation(id: conversation.id, title: title, modelID: nil, updatedAt: nil)
+        guard (try? await store.updateConversation(
+            id: conversation.id, title: title, modelID: nil, updatedAt: nil
+        )) != nil else { return }
+        // Keep the in-memory draft in sync: the next send re-persists
+        // conversation.title, and the stale first-message snippet would clobber
+        // the generated title in the drawer.
+        if self.conversation?.id == conversation.id {
+            self.conversation?.title = title
+        }
     }
 
     private static let titlePrompt =

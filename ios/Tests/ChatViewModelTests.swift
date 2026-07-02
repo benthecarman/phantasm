@@ -52,6 +52,34 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(client.requests.count, 2, "reply stream plus title-generation side query")
     }
 
+    func testSecondSendKeepsGeneratedTitle() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        client.enqueue(events: [.token("first reply"), .done])
+        client.enqueue(events: [.token("Better Chat"), .done]) // title side-query
+        vm.send("hello there")
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.conversation.title == "Better Chat"
+        }
+
+        // A later send re-persists the VM's conversation metadata; it must not
+        // revert the generated title to the first-message snippet.
+        client.enqueue(events: [.token("second reply"), .done])
+        vm.send("and another thing")
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.messages.last?.message.content == "second reply"
+                && detail?.messages.last?.message.isComplete == true
+        }
+        let detail = try await self.detail(store, conversation.id)
+        XCTAssertEqual(detail.conversation.title, "Better Chat")
+    }
+
     func testStopBeforeTokensDeletesPendingAssistantRow() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
