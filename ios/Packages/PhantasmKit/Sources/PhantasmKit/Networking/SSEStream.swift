@@ -282,12 +282,20 @@ public struct ChatClient: ChatClienting {
                     let (bytes, response) = try await session.bytes(for: urlReq)
                     if let http = response as? HTTPURLResponse,
                        let err = AppError.fromStatus(http.statusCode) {
-                        throw err
+                        throw await Self.enriched(err, status: http.statusCode, body: bytes)
                     }
 
+                    var sawEvent = false
                     for try await event in chatEventStream(lines: sseLines(bytes)) {
                         try Task.checkCancellation()
+                        sawEvent = true
                         continuation.yield(event)
+                    }
+                    // A 200 whose body parses to zero events (a backend that
+                    // ignored stream:true and returned plain JSON) is a failure,
+                    // not an empty success.
+                    guard sawEvent else {
+                        throw AppError.modelError("the backend sent no stream events")
                     }
                     continuation.finish()
                 } catch is CancellationError {
@@ -299,6 +307,28 @@ public struct ChatClient: ChatClienting {
             // Aborting the SSE connection on cancel (FR-A9).
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Pull the OpenAI `error.message` out of a non-2xx body so e.g. a 400
+    /// "context length exceeded" surfaces its detail, not just "HTTP 400".
+    /// Auth/not-found keep their taxonomy (they drive distinct UI).
+    private static func enriched(
+        _ error: AppError, status: Int, body: URLSession.AsyncBytes
+    ) async -> AppError {
+        guard case .modelError = error else { return error }
+        var data = Data()
+        do {
+            for try await byte in body {
+                data.append(byte)
+                if data.count > 64 * 1024 { break }
+            }
+        } catch {
+            return error
+        }
+        guard let envelope = try? Wire.decoder().decode(StreamErrorEnvelope.self, from: data),
+              let message = envelope.error.message
+        else { return error }
+        return .modelError("HTTP \(status): \(message)")
     }
 
     /// Tell the orchestrator to cancel a resumable turn (the Stop button). The

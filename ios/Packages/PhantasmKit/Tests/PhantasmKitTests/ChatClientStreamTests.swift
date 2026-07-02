@@ -10,13 +10,14 @@ final class ChatClientStreamTests: XCTestCase {
         // Whole SSE body, captured from the live orchestrator.
         nonisolated(unsafe) static var body = ""
         nonisolated(unsafe) static var contentType = "text/event-stream"
+        nonisolated(unsafe) static var status = 200
 
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
         override func startLoading() {
             let http = HTTPURLResponse(
                 url: request.url!,
-                statusCode: 200,
+                statusCode: Self.status,
                 httpVersion: nil,
                 headerFields: ["Content-Type": Self.contentType]
             )!
@@ -31,6 +32,13 @@ final class ChatClientStreamTests: XCTestCase {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [SSEProtocol.self]
         return URLSession(configuration: config)
+    }
+
+    override func setUp() {
+        super.setUp()
+        SSEProtocol.body = ""
+        SSEProtocol.contentType = "text/event-stream"
+        SSEProtocol.status = 200
     }
 
     func testStreamsRealOrchestratorBytes() async throws {
@@ -55,5 +63,41 @@ final class ChatClientStreamTests: XCTestCase {
 
         let text = events.compactMap { if case .token(let t) = $0 { return t } else { return nil } }.joined()
         XCTAssertEqual(text, "Hello!", "expected the content tokens to stream through; got events: \(events)")
+    }
+
+    func testErrorBodyDetailSurfacesOnBadStatus() async throws {
+        // A 400's OpenAI error body must reach the user, not just "HTTP 400".
+        SSEProtocol.status = 400
+        SSEProtocol.contentType = "application/json"
+        SSEProtocol.body = #"{"error":{"message":"context length exceeded","type":"invalid_request_error"}}"#
+
+        let req = ChatRequest(model: "m", messages: [WireMessage(role: "user", content: "hi")])
+        let stream = ChatClient(session: session())
+            .stream(req, base: URL(string: "https://backend.example")!, token: "k")
+        do {
+            _ = try await collect(stream)
+            XCTFail("expected the 400 to throw")
+        } catch let error as AppError {
+            XCTAssertEqual(error, .modelError("HTTP 400: context length exceeded"))
+        }
+    }
+
+    func testZeroEventOkResponseIsAnError() async throws {
+        // A backend that ignores stream:true and returns plain JSON must fail
+        // the turn, not complete "successfully" with an empty message.
+        SSEProtocol.contentType = "application/json"
+        SSEProtocol.body = #"{"choices":[{"message":{"content":"hi"}}]}"#
+
+        let req = ChatRequest(model: "m", messages: [WireMessage(role: "user", content: "hi")])
+        let stream = ChatClient(session: session())
+            .stream(req, base: URL(string: "https://backend.example")!, token: "k")
+        do {
+            _ = try await collect(stream)
+            XCTFail("expected the empty stream to throw")
+        } catch let error as AppError {
+            guard case .modelError = error else {
+                return XCTFail("expected modelError, got \(error)")
+            }
+        }
     }
 }
