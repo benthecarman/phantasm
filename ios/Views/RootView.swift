@@ -18,6 +18,7 @@ struct RootView: View {
     @State private var initialChatID: UUID?
     @State private var showSettings = false
     @State private var showOnboarding = false
+    @State private var showStorageWarning = false
     @State private var isDrawerOpen = false
     @State private var chatViewModels = ChatViewModelCache()
     /// Live drag translation while the user is swiping the drawer.
@@ -61,7 +62,16 @@ struct RootView: View {
                 closeDrawer()
             }
         }
+        .alert("Chat history unavailable", isPresented: $showStorageWarning) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(
+                "The message store could not be opened (the disk may be full). "
+                    + "You can still chat, but this session's messages won't be saved."
+            )
+        }
         .task {
+            if env.databaseOpenFailed { showStorageWarning = true }
             if shouldShowOnboarding {
                 showOnboarding = true
                 return

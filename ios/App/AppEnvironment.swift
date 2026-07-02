@@ -12,6 +12,10 @@ final class AppEnvironment {
     /// against `database.reader`; writes go through the `store` protocol.
     let database: AppDatabase
     var store: ChatStore { database }
+    /// True when the on-disk store failed to open (disk full, corruption) and
+    /// this session is running on a throwaway in-memory store. Chat still
+    /// works; the UI warns that history won't be saved.
+    let databaseOpenFailed: Bool
     let profileStore = ProfileStore()
     let modelPreferenceStore = ModelPreferenceStore()
     let voicePreferenceStore = VoicePreferenceStore()
@@ -64,7 +68,20 @@ final class AppEnvironment {
 
     init() {
         // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
-        database = try! AppDatabase.makeShared()
+        // But a failure (full disk, corruption) must not crash at launch: fall
+        // back to an in-memory store so the app still opens and can warn.
+        do {
+            database = try AppDatabase.makeShared()
+            databaseOpenFailed = false
+        } catch {
+            guard let fallback = try? AppDatabase.empty() else {
+                // No I/O involved — if even an in-memory store can't open,
+                // there is genuinely nothing to run on.
+                fatalError("could not open any message store: \(error)")
+            }
+            database = fallback
+            databaseOpenFailed = true
+        }
         speechSynthesizer = SpeechSynthesizer(voicePrefs: voicePreferenceStore)
         dictationController = DictationController()
         // Wire the app-hosted device tool providers into the registry so forwarded
