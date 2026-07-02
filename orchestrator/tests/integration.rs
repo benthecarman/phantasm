@@ -1055,6 +1055,68 @@ async fn resumable_turn_resumes_from_last_event_id() {
     );
 }
 
+/// A resumable turn that ended in an upstream error logs only the Error event;
+/// its WARNING/finish/[DONE] tail is synthesized per-stream. A client that
+/// resumes with `Last-Event-ID` pointing at the Error event must still get a
+/// terminating tail, not an empty stream that ends without finish or [DONE].
+#[tokio::test]
+async fn resumed_stream_past_error_still_terminates() {
+    let openai = spawn(mock_openai_compatible_erroring()).await;
+    let base = spawn_orchestrator_with_kind(&openai, UpstreamKind::OpenAICompatible).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": "m",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+
+    // First connection: the turn errors; the stream carries the warning tail.
+    let first = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("Idempotency-Key", "turn-err")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(first.contains("WARNING:"), "error surfaced in-stream");
+
+    // Resume from the Error event's id (the only logged event, id 0): the tail
+    // must be re-synthesized so the resumed stream terminates.
+    let resumed = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .header("Idempotency-Key", "turn-err")
+        .header("Last-Event-ID", "0")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        resumed.contains("WARNING:"),
+        "resumed stream re-synthesizes the warning tail: {resumed}"
+    );
+    let finish = resumed
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .any(|d| {
+            d != "[DONE]"
+                && serde_json::from_str::<serde_json::Value>(d)
+                    .is_ok_and(|v| v["choices"][0]["finish_reason"] == "stop")
+        });
+    assert!(finish, "resumed stream carries a finish chunk: {resumed}");
+    assert!(
+        resumed.lines().any(|l| l == "data: [DONE]"),
+        "resumed stream terminates with [DONE]: {resumed}"
+    );
+}
+
 /// `POST /v1/chat/cancel` drops a buffered turn, so a later reconnect with the
 /// same key starts fresh (re-runs upstream) rather than replaying. An unknown id
 /// is a no-op `204`.

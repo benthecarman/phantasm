@@ -134,6 +134,13 @@ impl ActiveTurn {
         (log.events[from..].to_vec(), log.done)
     }
 
+    /// Clone the most recent logged event, if any. Lets a responder that has
+    /// consumed the whole log (e.g. resuming past the terminal event via
+    /// `Last-Event-ID`) still see how the turn ended.
+    pub fn last_event(&self) -> Option<TurnEvent> {
+        self.inner.lock().unwrap().events.last().cloned()
+    }
+
     /// A receiver that fires when more events are available (or the turn ends).
     pub fn subscribe(&self) -> watch::Receiver<usize> {
         self.len_tx.subscribe()

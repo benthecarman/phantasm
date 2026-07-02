@@ -375,6 +375,19 @@ fn attach_response(
                 }
             }
             if done {
+                // The WARNING token / finish / [DONE] tail after an Error is
+                // synthesized here, never logged — so a client resuming with
+                // `Last-Event-ID` at or past the Error event's id would get
+                // `role_open` and then nothing: no finish, no [DONE]. Whenever
+                // the log ends in an Error we didn't just replay (the match
+                // above returns when it does), re-synthesize that tail so the
+                // resumed stream still terminates properly.
+                if let Some(TurnEvent::Error(e)) = active.last_event() {
+                    yield factory.token(&format!("\n\nWARNING: {e}"));
+                    yield factory.finish("stop");
+                    yield done_event();
+                    return;
+                }
                 // Terminal without an explicit Done/Error event (e.g. a turn
                 // cancelled mid-flight): just end the stream, matching the legacy
                 // channel-closed-without-Done behavior.
