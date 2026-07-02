@@ -7,7 +7,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
 packages:
   PhantasmKit:
@@ -44,6 +44,7 @@ targets:
         CFBundleDisplayName: Phantasm
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        ITSAppUsesNonExemptEncryption: false
         UILaunchScreen: {}
         NSPhotoLibraryAddUsageDescription: "Phantasm saves generated images to your photo library when you choose to save them."
         NSPhotoLibraryUsageDescription: "Phantasm lets you choose photos from your library to attach to a message."
