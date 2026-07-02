@@ -107,7 +107,7 @@ pub async fn chat_completions(
     if stream {
         stream_response(model_name, rx, cancel, state.continuations.clone())
     } else {
-        collect_response(model_name, rx, state.continuations.clone()).await
+        collect_response(model_name, rx, cancel, state.continuations.clone()).await
     }
 }
 
@@ -510,8 +510,14 @@ fn stream_response(
 async fn collect_response(
     model: String,
     mut rx: mpsc::Receiver<TurnEvent>,
+    cancel: CancellationToken,
     continuations: ContinuationCache,
 ) -> Response {
+    // Axum drops this handler future when the client disconnects; the guard
+    // then fires the turn's token so the whole tool-resolution loop doesn't run
+    // to completion for a client that will never read the result (FR-O8 for the
+    // legacy non-streaming path). Disarmed once we have a response to return.
+    let guard = cancel.drop_guard();
     let mut content = String::new();
     let mut reason = "stop".to_string();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -540,6 +546,10 @@ async fn collect_response(
             }
         }
     }
+
+    // The turn produced a result while we were still attached; don't cancel it
+    // on the way out.
+    let _ = guard.disarm();
 
     // App-hosted tool calls => standard `tool_calls` message with null content.
     let message = if tool_calls.is_empty() {
@@ -648,6 +658,43 @@ mod tests {
         let messages = vec![user_attached(400)];
         let err = validate_image_limits(&messages, 16, 100).unwrap_err();
         assert!(matches!(err, AppError::PayloadTooLarge(_)));
+    }
+
+    #[tokio::test]
+    async fn dropped_nonstreaming_response_cancels_the_turn() {
+        // Axum drops the handler future when a legacy client disconnects; the
+        // drop-guard must fire the turn's token so tool resolution doesn't run
+        // to completion for nobody.
+        let cancel = CancellationToken::new();
+        let (tx, rx) = mpsc::channel::<TurnEvent>(1);
+        let fut = collect_response("m".into(), rx, cancel.clone(), ContinuationCache::new());
+        let handle = tokio::spawn(fut);
+        tokio::task::yield_now().await;
+        handle.abort(); // stands in for axum dropping the future on disconnect
+        let _ = handle.await;
+        assert!(
+            cancel.is_cancelled(),
+            "dropping the response future must cancel the turn"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn completed_nonstreaming_response_does_not_cancel() {
+        let cancel = CancellationToken::new();
+        let (tx, rx) = mpsc::channel::<TurnEvent>(4);
+        tx.send(TurnEvent::Token("hi".into())).await.unwrap();
+        tx.send(TurnEvent::Done {
+            reason: "stop".into(),
+        })
+        .await
+        .unwrap();
+        let _resp =
+            collect_response("m".into(), rx, cancel.clone(), ContinuationCache::new()).await;
+        assert!(
+            !cancel.is_cancelled(),
+            "a normally completed response must not fire the token"
+        );
     }
 
     #[test]
