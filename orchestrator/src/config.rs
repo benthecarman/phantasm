@@ -96,6 +96,10 @@ pub struct Config {
     pub default_model: String,
     /// Models advertised in /v1/capabilities. Empty => probe the upstream at startup.
     pub models: Vec<String>,
+    /// Whether the flat/legacy default upstream was explicitly configured by
+    /// env. If false and `UPSTREAMS` is non-empty, named upstreams define the
+    /// full routing order without an implicit Ollama default inserted first.
+    pub default_upstream_configured: bool,
     pub max_tool_iters: u8,
     pub upstream_concurrency: usize,
     /// Extra named upstreams (`UPSTREAMS=vllm,...` + `UPSTREAM_<NAME>_*` vars)
@@ -335,6 +339,7 @@ impl Config {
             env_or_alias("UPSTREAM_DEFAULT_MODEL", "OLLAMA_DEFAULT_MODEL", "llama3.1");
         let models = csv_alias("UPSTREAM_MODELS", "OLLAMA_MODELS");
         let extra_upstreams = parse_extra_upstreams()?;
+        let default_upstream_configured = default_upstream_env_present();
 
         let web_search_enabled = env_bool("TOOL_WEB_SEARCH", false);
         let brave_base = parse_url("BRAVE_BASE_URL", "https://api.search.brave.com")?;
@@ -357,6 +362,7 @@ impl Config {
             upstream_thinking_hint,
             default_model,
             models,
+            default_upstream_configured,
             extra_upstreams,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
             upstream_concurrency: env_parse_alias(
@@ -492,22 +498,26 @@ impl Config {
         })
     }
 
-    /// Every configured upstream, in routing-priority order: the default one
-    /// (the flat `upstream_*` fields, named `"default"`) first, then the extra
-    /// named upstreams in `UPSTREAMS` declaration order. The global
-    /// `UPSTREAM_MODELS` pin applies to the default upstream, keeping its
-    /// single-upstream meaning unchanged.
+    /// Every configured upstream, in routing-priority order. If flat/legacy
+    /// default upstream env vars are set, that default comes first and named
+    /// `UPSTREAMS` entries follow. If only named upstreams are configured, their
+    /// declaration order is the full routing order. With no `UPSTREAMS`, the
+    /// implicit Ollama default preserves the original single-upstream behavior.
     pub fn upstream_specs(&self) -> Vec<UpstreamSpec> {
-        let mut specs = Vec::with_capacity(1 + self.extra_upstreams.len());
-        specs.push(UpstreamSpec {
-            name: "default".into(),
-            kind: self.upstream_kind,
-            base: self.upstream_base.clone(),
-            api_key: self.upstream_api_key.clone(),
-            thinking_hint: self.upstream_thinking_hint,
-            models: self.models.clone(),
-            concurrency: None,
-        });
+        let include_default = self.default_upstream_configured || self.extra_upstreams.is_empty();
+        let mut specs =
+            Vec::with_capacity(self.extra_upstreams.len() + usize::from(include_default));
+        if include_default {
+            specs.push(UpstreamSpec {
+                name: "default".into(),
+                kind: self.upstream_kind,
+                base: self.upstream_base.clone(),
+                api_key: self.upstream_api_key.clone(),
+                thinking_hint: self.upstream_thinking_hint,
+                models: self.models.clone(),
+                concurrency: None,
+            });
+        }
         specs.extend(self.extra_upstreams.iter().cloned());
         specs
     }
@@ -803,6 +813,27 @@ fn parse_opt_url(key: &str) -> Result<Option<Url>> {
     }
 }
 
+fn default_upstream_env_present() -> bool {
+    const KEYS: &[&str] = &[
+        "UPSTREAM_KIND",
+        "UPSTREAM_BASE_URL",
+        "UPSTREAM_API_KEY",
+        "UPSTREAM_THINKING_HINT",
+        "UPSTREAM_DEFAULT_MODEL",
+        "UPSTREAM_MODELS",
+        "UPSTREAM_MAX_CONCURRENCY",
+        "OLLAMA_BASE_URL",
+        "OLLAMA_DEFAULT_MODEL",
+        "OLLAMA_MODELS",
+        "OLLAMA_MAX_CONCURRENCY",
+    ];
+    KEYS.iter().any(|key| {
+        std::env::var(key)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
 #[cfg(test)]
 pub mod tests_support {
     use super::*;
@@ -820,6 +851,7 @@ pub mod tests_support {
             upstream_thinking_hint: true,
             default_model: "m".into(),
             models: vec![],
+            default_upstream_configured: true,
             extra_upstreams: vec![],
             max_tool_iters: 5,
             upstream_concurrency: 4,
@@ -1127,6 +1159,36 @@ mod tests {
         assert_eq!(specs[0].name, "default");
         assert_eq!(specs[0].models, ["small"]);
         assert_eq!(specs[1].name, "vllm");
+    }
+
+    #[test]
+    fn upstream_specs_named_only_do_not_inject_implicit_default() {
+        let mut cfg = crate::config::tests_support::minimal();
+        cfg.default_upstream_configured = false;
+        cfg.extra_upstreams = vec![
+            super::UpstreamSpec {
+                name: "vllm".into(),
+                kind: Some(UpstreamKind::OpenAICompatible),
+                base: "http://localhost:18000".parse().unwrap(),
+                api_key: None,
+                thinking_hint: true,
+                models: vec!["big".into()],
+                concurrency: None,
+            },
+            super::UpstreamSpec {
+                name: "ollama".into(),
+                kind: Some(UpstreamKind::NativeOllama),
+                base: "http://localhost:11434".parse().unwrap(),
+                api_key: None,
+                thinking_hint: true,
+                models: vec!["small".into()],
+                concurrency: None,
+            },
+        ];
+        let specs = cfg.upstream_specs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "vllm");
+        assert_eq!(specs[1].name, "ollama");
     }
 
     #[test]

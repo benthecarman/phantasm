@@ -335,6 +335,7 @@ fn test_config(upstream_base: &str) -> Config {
         upstream_thinking_hint: true,
         default_model: "m".into(),
         models: vec!["m".into()],
+        default_upstream_configured: true,
         extra_upstreams: vec![],
         max_tool_iters: 5,
         upstream_concurrency: 4,
