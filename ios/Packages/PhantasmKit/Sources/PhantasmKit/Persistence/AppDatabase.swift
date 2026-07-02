@@ -282,9 +282,7 @@ extension AppDatabase: ChatStore {
             let now = Date()
             // Truncate everything after the edited message (cascades to
             // attachments + fires the FTS triggers), then update it in place.
-            try Message
-                .filter(Col.conversationId == message.conversationId)
-                .filter(Col.createdAt > message.createdAt)
+            try Self.messagesAfter(db, message, inclusive: false)
                 .deleteAll(db)
             message.content = newContent
             message.updatedAt = now
@@ -303,9 +301,7 @@ extension AppDatabase: ChatStore {
             let now = Date()
             // Delete this message and everything after it (cascades to attachments
             // + fires the FTS triggers).
-            try Message
-                .filter(Col.conversationId == message.conversationId)
-                .filter(Col.createdAt >= message.createdAt)
+            try Self.messagesAfter(db, message, inclusive: true)
                 .deleteAll(db)
             if var convo = try Conversation.fetchOne(db, key: message.conversationId) {
                 convo.updatedAt = now
@@ -320,9 +316,7 @@ extension AppDatabase: ChatStore {
             let now = Date()
             // Keep this message; delete everything after it (cascades to
             // attachments + fires the FTS triggers).
-            try Message
-                .filter(Col.conversationId == message.conversationId)
-                .filter(Col.createdAt > message.createdAt)
+            try Self.messagesAfter(db, message, inclusive: false)
                 .deleteAll(db)
             if var convo = try Conversation.fetchOne(db, key: message.conversationId) {
                 convo.updatedAt = now
@@ -362,6 +356,25 @@ extension AppDatabase: ChatStore {
         try await dbWriter.read { db in try Self.conversationDetail(db, id: id) }
     }
 
+    /// Messages at or after `message` in its conversation, in (createdAt, rowid)
+    /// order. rowid breaks same-millisecond ties (burst inserts from the tool
+    /// flow), so truncation never deletes/keeps the wrong sibling.
+    private static func messagesAfter(
+        _ db: Database, _ message: Message, inclusive: Bool
+    ) throws -> QueryInterfaceRequest<Message> {
+        let anchorRowid = try Message
+            .filter(key: message.id)
+            .select(Column.rowID, as: Int64.self)
+            .fetchOne(db) ?? Int64.max
+        let tiebreaker = inclusive ? Column.rowID >= anchorRowid : Column.rowID > anchorRowid
+        return Message
+            .filter(Col.conversationId == message.conversationId)
+            .filter(
+                Col.createdAt > message.createdAt
+                    || (Col.createdAt == message.createdAt && tiebreaker)
+            )
+    }
+
     public func searchConversations(matching query: String) async throws -> [ConversationSearchResult] {
         try await dbWriter.read { db in try Self.search(db, matching: query) }
     }
@@ -384,14 +397,19 @@ public extension AppDatabase {
     /// A conversation's messages in chronological order, each with its ordered
     /// attachments. Empty when the conversation is missing or tombstoned.
     static func messages(_ db: Database, conversationId: UUID) throws -> [ChatMessage] {
+        // rowid breaks createdAt ties: the auto-resolved tool flow inserts an
+        // assistant tool_calls row and its tool result back-to-back, and Date
+        // storage is millisecond-precision — an unspecified tie order could emit
+        // the tool result before its tool_calls row in the wire history, which
+        // strict OpenAI backends reject.
         let messages = try Message
             .filter(Col.conversationId == conversationId)
-            .order(Col.createdAt)
+            .order(Col.createdAt, Column.rowID)
             .fetchAll(db)
         let messageIDs = messages.map(\.id)
         let attachments = try Attachment
             .filter(messageIDs.contains(Column("messageId")))
-            .order(Col.createdAt)
+            .order(Col.createdAt, Column.rowID)
             .fetchAll(db)
         let grouped = Dictionary(grouping: attachments, by: \.messageId)
         return messages.map { ChatMessage(message: $0, attachments: grouped[$0.id] ?? []) }

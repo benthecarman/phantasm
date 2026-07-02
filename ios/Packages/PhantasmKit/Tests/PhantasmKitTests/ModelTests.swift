@@ -659,6 +659,52 @@ final class PersistenceTests: XCTestCase {
         ])
     }
 
+    func testSameTimestampMessagesKeepInsertionOrder() async throws {
+        // The auto-resolved tool flow inserts sibling rows back-to-back and Date
+        // storage is millisecond-precision, so createdAt ties are realistic.
+        // rowid must break the tie: a tool result emitted before its tool_calls
+        // row would make strict backends reject the whole conversation.
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let contents = ["one", "two", "three", "four"]
+        for content in contents {
+            try await store.insertMessage(
+                Message(conversationId: convo.id, role: "assistant", content: content,
+                        createdAt: t0, isComplete: true),
+                attachments: []
+            )
+        }
+
+        let detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.messages.map(\.message.content), contents)
+    }
+
+    func testTruncationAtTimestampTieUsesInsertionOrder() async throws {
+        let store = try AppDatabase.empty()
+        let convo = Conversation(title: "T")
+        try await store.insertConversation(convo)
+        let a = Message(conversationId: convo.id, role: "assistant", content: "a",
+                        createdAt: t0, isComplete: true)
+        let b = Message(conversationId: convo.id, role: "tool", content: "b",
+                        createdAt: t0, isComplete: true)
+        let c = Message(conversationId: convo.id, role: "assistant", content: "c",
+                        createdAt: t0, isComplete: true)
+        for message in [a, b, c] {
+            try await store.insertMessage(message, attachments: [])
+        }
+
+        // Keep `b` and its same-timestamp predecessor; drop only what followed.
+        try await store.deleteMessagesAfter(id: b.id)
+        var detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.messages.map(\.message.content), ["a", "b"])
+
+        // Delete `b` and everything after it, keeping the earlier sibling.
+        try await store.deleteMessagesFrom(id: b.id)
+        detail = try await store.conversationDetail(id: convo.id)
+        XCTAssertEqual(detail?.messages.map(\.message.content), ["a"])
+    }
+
     func testPendingAssistantMessageCompletesInPlace() async throws {
         let store = try AppDatabase.empty()
         let convo = Conversation(title: "T")
