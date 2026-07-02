@@ -23,10 +23,12 @@ struct PhantasmApp: App {
 
     var body: some Scene {
         WindowGroup {
+            // No capability probe here: AppEnvironment.init already refreshes
+            // on construction — probing again from `.task` doubled the
+            // cold-start network chatter for nothing.
             RootView()
                 .environment(env)
                 .environment(notificationRouter)
-                .task { await env.refreshCapabilities() }
         }
         // Reactive reads (@Query) observe the SQLite store; writes go through
         // `env.store`, so a read-only context is all the Views need here.
