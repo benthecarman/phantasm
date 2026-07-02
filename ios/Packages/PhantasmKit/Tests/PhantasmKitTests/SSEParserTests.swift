@@ -71,6 +71,18 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(events, [.token("hi"), .done])
     }
 
+    func testFinishChunkWithoutDeltaEndsStream() async throws {
+        // Some compat servers emit the finish chunk with no delta key at all.
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}",
+            "",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}",
+            "",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        XCTAssertEqual(events, [.token("hi"), .done])
+    }
+
     func testJunkChunkIsTolerated() async throws {
         // A malformed data line must not break the stream (FR-A8 robustness).
         let lines = [

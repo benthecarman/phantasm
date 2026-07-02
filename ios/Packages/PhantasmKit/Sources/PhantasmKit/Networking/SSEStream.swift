@@ -106,14 +106,14 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                 } else if let status = chunk.xStatus {
                     continuation.yield(.status(status))
                 }
-                if let reasoning = chunk.choices.first?.delta.reasoningText,
+                if let reasoning = chunk.choices.first?.delta?.reasoningText,
                    !reasoning.isEmpty {
                     continuation.yield(.reasoning(reasoning))
                 }
-                if let content = chunk.choices.first?.delta.content, !content.isEmpty {
+                if let content = chunk.choices.first?.delta?.content, !content.isEmpty {
                     continuation.yield(.token(content))
                 }
-                for (offset, call) in (chunk.choices.first?.delta.toolCalls ?? []).enumerated() {
+                for (offset, call) in (chunk.choices.first?.delta?.toolCalls ?? []).enumerated() {
                     let key = call.index ?? offset
                     mergeToolCall(call, into: &toolCalls, key: key)
                 }

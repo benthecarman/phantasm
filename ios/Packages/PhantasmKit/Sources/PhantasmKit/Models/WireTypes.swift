@@ -281,7 +281,9 @@ public struct ChatChunk: Decodable, Sendable {
             /// to the app). Absent on ordinary content/reasoning chunks.
             public let toolCalls: [WireToolCall]?
         }
-        public let delta: Delta
+        /// Optional: some compat servers emit a bare finish chunk with no
+        /// `delta` key at all (`{"index":0,"finish_reason":"stop"}`).
+        public let delta: Delta?
         public let finishReason: String?
     }
     public let choices: [Choice]
