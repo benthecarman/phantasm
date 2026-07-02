@@ -82,7 +82,10 @@ pub async fn chat_completions(
         let spill = state.images.clone().filter(|s| !s.has_public_base());
         let (active, is_new) = state.turns.get_or_create(&key);
         if is_new {
-            let rx = spawn_turn(&state, req, active.cancel.clone()).await;
+            // A resumable turn's token is only ever fired by the explicit cancel
+            // endpoint or the abandoned-turn watchdog — never by a disconnect —
+            // so a cancel here is always HARD (nobody will read the buffer).
+            let rx = spawn_turn(&state, req, active.cancel.clone(), true).await;
             spawn_pump(
                 rx,
                 active.clone(),
@@ -97,9 +100,10 @@ pub async fn chat_completions(
     }
 
     // Legacy / standard-client path: the turn is bound to this connection and
-    // cancelled on disconnect via the SSE drop-guard (see `stream_response`).
+    // cancelled on disconnect via the SSE drop-guard (see `stream_response`) —
+    // a SOFT cancel (the client went away; salvage work may still be useful).
     let cancel = CancellationToken::new();
-    let rx = spawn_turn(&state, req, cancel.clone()).await;
+    let rx = spawn_turn(&state, req, cancel.clone(), false).await;
     if stream {
         stream_response(model_name, rx, cancel, state.continuations.clone())
     } else {
@@ -158,11 +162,14 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// Prepare the messages (incl. intra-turn continuation splicing) and spawn the
 /// turn task, returning the channel its `TurnEvent`s arrive on. The turn owns
-/// clones of everything it needs and runs detached on the provided `cancel`.
+/// clones of everything it needs and runs detached on the provided `cancel`;
+/// `hard_cancel` tells it what a fired token means (see
+/// [`crate::orchestrator::run_turn`]).
 async fn spawn_turn(
     state: &AppState,
     req: ChatRequest,
     cancel: CancellationToken,
+    hard_cancel: bool,
 ) -> mpsc::Receiver<TurnEvent> {
     use crate::orchestrator::tools::{ToolExecutor, ToolRegistry};
 
@@ -253,6 +260,7 @@ async fn spawn_turn(
             images,
             tx,
             cancel,
+            hard_cancel,
         )
         .await;
         tracing::info!(

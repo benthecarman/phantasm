@@ -83,6 +83,14 @@ struct Finding {
 
 /// Drive a full Deep Research turn. `messages` is the full conversation history
 /// (XR-2); `base_model` is the upstream model the preset runs underneath.
+///
+/// `hard_cancel` distinguishes what a fired `cancel` means (see
+/// [`crate::orchestrator::run_turn`]): on a *hard* cancel (explicit cancel
+/// endpoint / abandoned-turn watchdog) nobody can ever read the output, so the
+/// best-effort salvage phases — per-sub-agent compression and the partial
+/// synthesis — are skipped instead of burning more upstream calls. A soft
+/// disconnect keeps them, so gathered findings still become a streamable
+/// partial answer.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_research<B, T>(
     cfg: Arc<Config>,
@@ -95,6 +103,7 @@ pub async fn run_research<B, T>(
     options: Map<String, Value>,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
+    hard_cancel: bool,
 ) where
     B: ChatBackend,
     T: ToolExecutor,
@@ -179,6 +188,7 @@ pub async fn run_research<B, T>(
                     options_ref,
                     sub_q,
                     cancel_ref,
+                    hard_cancel,
                 )
                 .await
             }
@@ -210,7 +220,15 @@ pub async fn run_research<B, T>(
     // over the findings already gathered (don't drop them). We run it under a
     // fresh, uncancelled token so the write actually completes; otherwise use
     // the live token so a later disconnect still aborts.
+    //
+    // Except on a HARD cancel: the turn is already gone from the registry, so
+    // nothing can ever read a synthesized answer — stop here rather than run a
+    // full synthesis stream for nobody.
     let cancelled_mid = cancel.is_cancelled();
+    if cancelled_mid && hard_cancel {
+        tracing::info!("research hard-cancelled; skipping synthesis");
+        return;
+    }
     let fresh = CancellationToken::new();
     let synth_cancel = if cancelled_mid { &fresh } else { &cancel };
     synthesize(
@@ -266,6 +284,7 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
     options: &Map<String, Value>,
     sub_question: String,
     cancel: &CancellationToken,
+    hard_cancel: bool,
 ) -> Finding {
     // ISOLATION: a fresh context containing ONLY this sub-agent's system prompt
     // and its sub-question. No sibling findings, no brief, no raw pages from
@@ -332,6 +351,16 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
     // findings to work with rather than dropping the run entirely. It uses a
     // fresh, uncancelled token for the permit acquire so a mid-run cancel can't
     // strand the gathered work unwritten; the call itself stays cheap.
+    //
+    // A HARD cancel is different: the turn's buffer is unreachable and the
+    // synthesis it would feed is skipped anyway, so spend nothing more.
+    if hard_cancel && cancel.is_cancelled() {
+        return Finding {
+            sub_question,
+            text: String::new(),
+            sources: Vec::new(),
+        };
+    }
     let mut compress_msgs = msgs;
     compress_msgs.push(ChatMessage::system(preset.compress_prompt));
     let compress_cancel = CancellationToken::new();
@@ -769,6 +798,9 @@ mod tests {
         /// waits on `resume` so a test can deterministically cancel *between*
         /// research and synthesis.
         gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        /// Like `gate` but for the sub-agent stage, so a test can cancel
+        /// *during* research (before any compression call happens).
+        subagent_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl Engine {
@@ -780,6 +812,7 @@ mod tests {
                 seen: Arc::new(Mutex::new(vec![])),
                 subagent_should_search: Arc::new(Mutex::new(true)),
                 gate: None,
+                subagent_gate: None,
             }
         }
 
@@ -848,6 +881,10 @@ mod tests {
                 return Ok(ass("DRAFT [1] [2] [9]"));
             }
             if sys.contains(SUBAGENT_MARK) {
+                if let Some((reached, resume)) = &self.subagent_gate {
+                    reached.notify_one();
+                    resume.notified().await;
+                }
                 // First sub-agent turn searches once; subsequent turns answer.
                 let mut flag = self.subagent_should_search.lock().unwrap();
                 if *flag {
@@ -976,6 +1013,7 @@ mod tests {
             Map::new(),
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let _ = drain(rx).await;
@@ -1015,6 +1053,7 @@ mod tests {
             Map::new(),
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let _ = drain(rx).await;
@@ -1055,6 +1094,7 @@ mod tests {
             Map::new(),
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let _ = drain(rx).await;
@@ -1134,6 +1174,7 @@ mod tests {
             Map::new(),
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1216,6 +1257,7 @@ mod tests {
                 &Map::new(),
                 "q".into(),
                 &CancellationToken::new(),
+                false,
             ),
         )
         .await
@@ -1264,6 +1306,7 @@ mod tests {
                 Map::new(),
                 tx,
                 cancel_for_task,
+                false,
             )
             .await;
         });
@@ -1286,5 +1329,72 @@ mod tests {
             "expected a partial-synthesis heartbeat"
         );
         assert_eq!(tokens(&events), "SYNTH ANSWER");
+    }
+
+    #[tokio::test]
+    async fn hard_cancel_skips_compression_and_partial_synthesis() {
+        // An explicit cancel (cancel endpoint / watchdog) removes the turn from
+        // the registry before firing the token — nobody can ever read the
+        // buffered result. The engine must not spend further upstream calls:
+        // no compression, no partial synthesis.
+        let plan = r#"{"brief":"B","sub_questions":["q1"]}"#;
+        let mut backend = Engine::new(plan, r#"{"finding":"f","sources":[]}"#, "FINAL");
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        backend.subagent_gate = Some((reached.clone(), resume.clone()));
+        let probe = backend.clone(); // shares `seen` with the moved copy
+        let tools = RawPageTool {
+            executed: Arc::new(Mutex::new(vec![])),
+        };
+        let (tx, rx) = mpsc::channel(256);
+        let cancel = CancellationToken::new();
+
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            run_research(
+                cfg(),
+                backend,
+                tools,
+                Arc::new(Semaphore::new(4)),
+                quick(),
+                "m".into(),
+                history("q"),
+                Map::new(),
+                tx,
+                cancel_for_task,
+                true, // hard cancel semantics (resumable turn)
+            )
+            .await;
+        });
+
+        // Cancel while the (only) sub-agent is mid-turn, before it ever gets to
+        // compress its transcript.
+        reached.notified().await;
+        cancel.cancel();
+        resume.notify_one();
+
+        let events = drain(rx).await;
+        handle.await.unwrap();
+
+        let seen = probe.seen.lock().unwrap();
+        assert!(
+            !seen
+                .iter()
+                .any(|m| Engine::system_text(m).contains(COMPRESS_MARK)),
+            "hard cancel must skip the compression call"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|m| Engine::system_text(m).contains(SYNTH_MARK)),
+            "hard cancel must skip synthesis entirely"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Status(s) if s.contains("synthesizing"))),
+            "no synthesis heartbeat after a hard cancel"
+        );
+        assert!(tokens(&events).is_empty(), "no answer is streamed");
     }
 }

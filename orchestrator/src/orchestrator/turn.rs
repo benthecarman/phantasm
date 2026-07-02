@@ -85,6 +85,12 @@ fn schema_name(schema: &Value) -> Option<String> {
         .map(String::from)
 }
 
+/// `hard_cancel` says what a fired `cancel` *means* for this turn: `true` when
+/// the only firers are the explicit cancel endpoint or the abandoned-turn
+/// watchdog (a resumable turn — no client will ever read further output, so
+/// best-effort salvage work is pure waste), `false` when it is a soft client
+/// disconnect (a legacy connection-bound turn). Research uses this to skip
+/// compression and partial synthesis on a hard cancel.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn<B, T>(
     cfg: Arc<Config>,
@@ -100,6 +106,7 @@ pub async fn run_turn<B, T>(
     images: Option<crate::images::BlobStore>,
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
+    hard_cancel: bool,
 ) where
     B: ChatBackend,
     T: ToolExecutor,
@@ -148,7 +155,17 @@ pub async fn run_turn<B, T>(
     if let Some(p) = preset {
         drop(_permit);
         crate::orchestrator::research::run_research(
-            cfg, backend, tools, sem, p, model, messages, options, tx, cancel,
+            cfg,
+            backend,
+            tools,
+            sem,
+            p,
+            model,
+            messages,
+            options,
+            tx,
+            cancel,
+            hard_cancel,
         )
         .await;
         return;
@@ -918,6 +935,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -954,6 +972,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1000,6 +1019,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1049,6 +1069,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let _ = drain(rx).await;
@@ -1094,6 +1115,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1132,6 +1154,7 @@ mod tests {
             None,
             tx,
             cancel,
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1223,6 +1246,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1268,6 +1292,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1312,6 +1337,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1365,6 +1391,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1404,6 +1431,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1507,6 +1535,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
@@ -1549,6 +1578,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let _ = drain(rx).await;
@@ -1603,6 +1633,7 @@ mod tests {
             None,
             tx,
             CancellationToken::new(),
+            false,
         )
         .await;
         let events = drain(rx).await;
