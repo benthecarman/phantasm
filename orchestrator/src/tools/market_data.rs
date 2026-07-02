@@ -126,10 +126,7 @@ async fn alpha_query(
     http: &reqwest::Client,
     params: &[(&str, &str)],
 ) -> Result<Value, String> {
-    let url = cfg
-        .alpha_vantage_base
-        .join("/query")
-        .map_err(|e| e.to_string())?;
+    let url = http_util::join_base(&cfg.alpha_vantage_base, "/query");
     // Via the shared helper: per-request deadline, capped body, and errors
     // rendered without the URL (the `apikey` rides the query string).
     let v: Value = http_util::get_json(

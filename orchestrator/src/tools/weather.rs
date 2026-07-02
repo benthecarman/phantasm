@@ -76,10 +76,7 @@ async fn weather(
 ) -> Result<String, String> {
     let place = resolve_place(cfg, http, args).await?;
     let days = args.forecast_days.unwrap_or(3).clamp(1, 7).to_string();
-    let url = cfg
-        .open_meteo_base
-        .join("/v1/forecast")
-        .map_err(|e| e.to_string())?;
+    let url = http_util::join_base(&cfg.open_meteo_base, "/v1/forecast");
     let resp: ForecastResponse = http_util::get_json(
         http.get(url)
         .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
@@ -131,10 +128,7 @@ async fn resolve_place(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or("provide either location or latitude+longitude")?;
-            let url = cfg
-                .open_meteo_geocoding_base
-                .join("/v1/search")
-                .map_err(|e| e.to_string())?;
+            let url = http_util::join_base(&cfg.open_meteo_geocoding_base, "/v1/search");
             let geo: GeocodeResponse = http_util::get_json(
                 http.get(url)
                     .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)

@@ -98,10 +98,7 @@ async fn search_repositories(
 ) -> Result<String, String> {
     let query = required(&args.query, "query")?;
     let limit = args.limit.unwrap_or(5).clamp(1, 10).to_string();
-    let url = cfg
-        .github_base
-        .join("/search/repositories")
-        .map_err(|e| e.to_string())?;
+    let url = http_util::join_base(&cfg.github_base, "/search/repositories");
     let resp: RepoSearchResponse = http_util::get_json(
         github_get(cfg, http, url).query(&[("q", query), ("per_page", &limit)]),
     )
@@ -116,10 +113,7 @@ async fn search_code(
 ) -> Result<String, String> {
     let query = required(&args.query, "query")?;
     let limit = args.limit.unwrap_or(5).clamp(1, 10).to_string();
-    let url = cfg
-        .github_base
-        .join("/search/code")
-        .map_err(|e| e.to_string())?;
+    let url = http_util::join_base(&cfg.github_base, "/search/code");
     let resp: CodeSearchResponse = http_util::get_json(
         github_get(cfg, http, url).query(&[("q", query), ("per_page", &limit)]),
     )
@@ -169,12 +163,15 @@ fn github_get(cfg: &Config, http: &reqwest::Client, url: Url) -> reqwest::Reques
 }
 
 fn repo_content_url(base: &Url, owner: &str, repo: &str, path: &str) -> Result<Url, String> {
-    let mut url = base.join("/").map_err(|e| e.to_string())?;
+    // Push segments onto the base's existing path (preserving any prefix like
+    // a GHE /api/v3), rather than resetting to the origin with `join("/")`.
+    let mut url = base.clone();
     {
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| "GitHub base URL cannot be a base".to_string())?;
         segments
+            .pop_if_empty()
             .push("repos")
             .push(owner)
             .push(repo)
@@ -298,5 +295,18 @@ mod tests {
             url.as_str(),
             "https://api.github.com/repos/openai/codex/contents/a%20path/file.rs"
         );
+    }
+
+    #[test]
+    fn content_url_preserves_base_path_prefix() {
+        // A GitHub Enterprise base keeps its /api/v3 prefix, trailing slash or not.
+        for base in ["https://ghe.corp/api/v3", "https://ghe.corp/api/v3/"] {
+            let base = Url::parse(base).unwrap();
+            let url = repo_content_url(&base, "o", "r", "src/main.rs").unwrap();
+            assert_eq!(
+                url.as_str(),
+                "https://ghe.corp/api/v3/repos/o/r/contents/src/main.rs"
+            );
+        }
     }
 }

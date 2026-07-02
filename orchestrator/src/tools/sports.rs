@@ -220,10 +220,10 @@ async fn scoreboard(
     args: &SportsArgs,
 ) -> Result<String, String> {
     let (sport, league) = args.league.path();
-    let url = cfg
-        .espn_base
-        .join(&format!("/apis/site/v2/sports/{sport}/{league}/scoreboard"))
-        .map_err(|e| e.to_string())?;
+    let url = http_util::join_base(
+        &cfg.espn_base,
+        &format!("/apis/site/v2/sports/{sport}/{league}/scoreboard"),
+    );
 
     let mut req = http
         .get(url)

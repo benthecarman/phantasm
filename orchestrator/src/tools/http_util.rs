@@ -16,6 +16,23 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
+use url::Url;
+
+/// Join `path` onto `base`, **appending** to any path prefix the base carries.
+///
+/// `Url::join("/x")` resolves an absolute path against the origin, silently
+/// erasing a configured base path — `https://ghe.corp/api/v3` + `/search/code`
+/// came out as `https://ghe.corp/search/code`. Every tool builds its endpoint
+/// URLs through this instead. A trailing slash on the base is tolerated;
+/// `path` is treated as segments to append whether or not it has a leading
+/// slash.
+pub fn join_base(base: &Url, path: &str) -> Url {
+    let mut url = base.clone();
+    let prefix = base.path().trim_end_matches('/');
+    let suffix = path.trim_start_matches('/');
+    url.set_path(&format!("{prefix}/{suffix}"));
+    url
+}
 
 /// Default total per-request deadline for JSON API calls (connect, TLS,
 /// headers, and the whole body).
@@ -129,6 +146,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("503"), "{err}");
+    }
+
+    #[test]
+    fn join_base_appends_to_a_path_prefix() {
+        // The GHE-style case Url::join used to break: the /api/v3 prefix must
+        // survive, with or without a trailing slash on the base.
+        let base: Url = "https://ghe.corp/api/v3".parse().unwrap();
+        assert_eq!(
+            join_base(&base, "/search/code").as_str(),
+            "https://ghe.corp/api/v3/search/code"
+        );
+        let slash: Url = "https://ghe.corp/api/v3/".parse().unwrap();
+        assert_eq!(
+            join_base(&slash, "/search/code").as_str(),
+            "https://ghe.corp/api/v3/search/code"
+        );
+    }
+
+    #[test]
+    fn join_base_works_from_a_bare_origin() {
+        let base: Url = "https://api.github.com".parse().unwrap();
+        assert_eq!(
+            join_base(&base, "/search/code").as_str(),
+            "https://api.github.com/search/code"
+        );
+        assert_eq!(
+            join_base(&base, "history/abc123").as_str(),
+            "https://api.github.com/history/abc123"
+        );
     }
 
     #[tokio::test]

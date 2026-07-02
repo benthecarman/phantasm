@@ -289,10 +289,7 @@ async fn overpass(
     http: &reqwest::Client,
     query: &str,
 ) -> Result<Vec<OverpassElement>, String> {
-    let url = cfg
-        .overpass_base
-        .join("/api/interpreter")
-        .map_err(|e| e.to_string())?;
+    let url = http_util::join_base(&cfg.overpass_base, "/api/interpreter");
     let resp: OverpassResponse = http_util::get_json(
         http.post(url)
             .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)
@@ -424,10 +421,7 @@ async fn nominatim_search(
     limit: u8,
 ) -> Result<Vec<PlaceResult>, String> {
     let limit = limit.clamp(1, 10).to_string();
-    let url = cfg
-        .nominatim_base
-        .join("/search")
-        .map_err(|e| e.to_string())?;
+    let url = http_util::join_base(&cfg.nominatim_base, "/search");
     let mut req = http
         .get(url)
         .header(reqwest::header::USER_AGENT, &cfg.tool_user_agent)

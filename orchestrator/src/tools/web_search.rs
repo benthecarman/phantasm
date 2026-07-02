@@ -191,10 +191,7 @@ async fn do_search(
         .unwrap_or(cfg.search_max_results)
         .clamp(1, 20);
 
-    let url = cfg
-        .brave_base
-        .join("/res/v1/web/search")
-        .map_err(|e| e.to_string())?;
+    let url = crate::tools::http_util::join_base(&cfg.brave_base, "/res/v1/web/search");
 
     let resp = http
         .get(url)

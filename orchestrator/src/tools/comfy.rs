@@ -25,6 +25,7 @@ use url::Url;
 
 use crate::config::{Config, NodeInput};
 use crate::orchestrator::TurnEvent;
+use crate::tools::http_util;
 
 // The progress phases surfaced to the app as `x_status`, in order. `DOWNLOADING`
 // is emitted twice — first as an indeterminate `Status`, then as the label on the
@@ -61,9 +62,7 @@ static WS_DELIVERY: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_n
 async fn ws_image_delivery(cfg: &Config, http: &reqwest::Client) -> bool {
     *WS_DELIVERY
         .get_or_init(|| async {
-            let Ok(url) = cfg.comfy_base.join("/object_info/SaveImageWebsocket") else {
-                return false;
-            };
+            let url = http_util::join_base(&cfg.comfy_base, "/object_info/SaveImageWebsocket");
             // `/object_info/<node>` returns `{ "<node>": {…schema…} }` when the
             // node exists, an empty object otherwise.
             let supported = match http.get(url).send().await {
@@ -97,17 +96,16 @@ async fn interrupt_comfy(
     executing: bool,
 ) {
     if executing {
-        if let Ok(url) = comfy_base.join("/interrupt") {
-            let _ = http.post(url).send().await;
-        }
-    }
-    if let Ok(url) = comfy_base.join("/queue") {
         let _ = http
-            .post(url)
-            .json(&serde_json::json!({ "delete": [prompt_id] }))
+            .post(http_util::join_base(comfy_base, "/interrupt"))
             .send()
             .await;
     }
+    let _ = http
+        .post(http_util::join_base(comfy_base, "/queue"))
+        .json(&serde_json::json!({ "delete": [prompt_id] }))
+        .send()
+        .await;
     tracing::info!(prompt_id, executing, "interrupted ComfyUI generation");
 }
 
@@ -180,10 +178,7 @@ pub async fn upload_temp_image(
     bytes: Vec<u8>,
     filename: &str,
 ) -> Result<String, String> {
-    let url = cfg
-        .comfy_base
-        .join("/upload/image")
-        .map_err(|e| e.to_string())?;
+    let url = http_util::join_base(&cfg.comfy_base, "/upload/image");
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(filename.to_string())
         .mime_str("image/png")
@@ -251,7 +246,7 @@ pub async fn run_workflow(
     };
 
     // Submit the workflow.
-    let prompt_url = cfg.comfy_base.join("/prompt").map_err(|e| e.to_string())?;
+    let prompt_url = http_util::join_base(&cfg.comfy_base, "/prompt");
     let submit = serde_json::json!({ "prompt": workflow, "client_id": client_id });
     let resp = http
         .post(prompt_url)
@@ -540,14 +535,11 @@ async fn fetch_image(
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<(Vec<u8>, String), String> {
     let history_at = Instant::now();
-    let hist_url = cfg
-        .comfy_base
-        .join(&format!("/history/{prompt_id}"))
-        .map_err(|e| e.to_string())?;
+    let hist_url = http_util::join_base(&cfg.comfy_base, &format!("/history/{prompt_id}"));
     // Deadlined + capped via the shared helper. History entries carry node
     // outputs and metadata for the whole prompt, so allow well beyond the
     // default JSON cap — still bounded.
-    let hist: Value = crate::tools::http_util::send_json(
+    let hist: Value = http_util::send_json(
         http.get(hist_url),
         Duration::from_secs(cfg.comfy_timeout_s),
         HISTORY_BODY_CAP,
@@ -559,7 +551,7 @@ async fn fetch_image(
     let history_ms = history_at.elapsed().as_millis();
 
     let download_at = Instant::now();
-    let view_url = cfg.comfy_base.join("/view").map_err(|e| e.to_string())?;
+    let view_url = http_util::join_base(&cfg.comfy_base, "/view");
     let resp = http
         .get(view_url)
         .query(&[
@@ -652,19 +644,21 @@ fn find_first_image(history: &Value, prompt_id: &str) -> Option<ImageRef> {
     None
 }
 
+/// The progress WebSocket URL: the configured base (any path prefix included)
+/// with `/ws` appended, the scheme switched to ws/wss, and the client id as
+/// the query. Rebuilding from host+port alone dropped a reverse-proxy path
+/// prefix on the base URL.
 fn ws_url(cfg: &Config, client_id: &str) -> Result<String, String> {
+    let mut url = http_util::join_base(&cfg.comfy_base, "/ws");
     let scheme = if cfg.comfy_base.scheme() == "https" {
         "wss"
     } else {
         "ws"
     };
-    let host = cfg.comfy_base.host_str().ok_or("ComfyUI URL has no host")?;
-    let port = cfg
-        .comfy_base
-        .port_or_known_default()
-        .map(|p| format!(":{p}"))
-        .unwrap_or_default();
-    Ok(format!("{scheme}://{host}{port}/ws?clientId={client_id}"))
+    url.set_scheme(scheme)
+        .map_err(|_| format!("cannot derive a websocket URL from {}", cfg.comfy_base))?;
+    url.set_query(Some(&format!("clientId={client_id}")));
+    Ok(url.into())
 }
 
 #[cfg(test)]
@@ -908,5 +902,13 @@ mod tests {
         let cfg = crate::config::tests_support::minimal();
         let url = ws_url(&cfg, "abc").unwrap();
         assert_eq!(url, "ws://localhost:8188/ws?clientId=abc");
+    }
+
+    #[test]
+    fn ws_url_preserves_base_path_prefix() {
+        let mut cfg = crate::config::tests_support::minimal();
+        cfg.comfy_base = "https://gpu.example/comfy".parse().unwrap();
+        let url = ws_url(&cfg, "abc").unwrap();
+        assert_eq!(url, "wss://gpu.example/comfy/ws?clientId=abc");
     }
 }
