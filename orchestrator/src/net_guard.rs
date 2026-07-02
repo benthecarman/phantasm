@@ -77,7 +77,10 @@ pub async fn resolve_allowed(host: &str, port: u16) -> Result<SocketAddr, String
 
 /// Whether an IP must not be fetched from — the SSRF blocklist. Conservative:
 /// covers loopback, private, link-local, CGNAT-shared, multicast, unspecified,
-/// documentation/reserved ranges, and IPv4-mapped IPv6 (re-checked as v4).
+/// documentation/reserved ranges, and the IPv6 forms that embed an IPv4
+/// address (IPv4-mapped `::ffff:0:0/96`, NAT64 `64:ff9b::/96`, and the
+/// deprecated IPv4-compatible `::/96`) — each re-checked as the embedded v4,
+/// so `64:ff9b::7f00:1` can't smuggle a loopback target past the screen.
 pub fn ip_is_disallowed(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4_disallowed(v4),
@@ -85,7 +88,18 @@ pub fn ip_is_disallowed(ip: IpAddr) -> bool {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return v4_disallowed(mapped);
             }
-            let seg0 = v6.segments()[0];
+            let seg = v6.segments();
+            // NAT64 well-known prefix 64:ff9b::/96: the last 32 bits are the
+            // real IPv4 target, so screen that.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return v4_disallowed(embedded_v4(v6));
+            }
+            // Deprecated IPv4-compatible ::/96 (also covers `::` and `::1`,
+            // whose embedded 0.0.0.0/0.0.0.1 fail the v4 screen).
+            if seg[..6] == [0; 6] {
+                return v4_disallowed(embedded_v4(v6));
+            }
+            let seg0 = seg[0];
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -93,6 +107,13 @@ pub fn ip_is_disallowed(ip: IpAddr) -> bool {
                 || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
         }
     }
+}
+
+/// The IPv4 address carried in the low 32 bits of an IPv6 address (used by the
+/// mapped/NAT64/IPv4-compatible embedding formats).
+fn embedded_v4(v6: std::net::Ipv6Addr) -> Ipv4Addr {
+    let o = v6.octets();
+    Ipv4Addr::new(o[12], o[13], o[14], o[15])
 }
 
 fn v4_disallowed(v4: Ipv4Addr) -> bool {
@@ -137,6 +158,40 @@ mod tests {
             assert!(
                 !ip_is_disallowed(ok.parse().unwrap()),
                 "{ok} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn nat64_embedded_internal_v4_is_blocked() {
+        // 64:ff9b::/96 carries the real IPv4 target in the low 32 bits; an
+        // embedded internal address must be screened like the bare v4.
+        for bad in [
+            "64:ff9b::7f00:1",    // 127.0.0.1
+            "64:ff9b::a00:1",     // 10.0.0.1
+            "64:ff9b::c0a8:101",  // 192.168.1.1
+            "64:ff9b::a9fe:a9fe", // 169.254.169.254 (metadata)
+        ] {
+            assert!(
+                ip_is_disallowed(bad.parse().unwrap()),
+                "{bad} should be blocked"
+            );
+        }
+        // A NAT64 address embedding a public v4 stays reachable.
+        assert!(!ip_is_disallowed("64:ff9b::808:808".parse().unwrap())); // 8.8.8.8
+    }
+
+    #[test]
+    fn ipv4_compatible_embedded_internal_v4_is_blocked() {
+        // Deprecated ::/96 embedding: same screen as the embedded v4.
+        for bad in [
+            "::7f00:1",   // 127.0.0.1
+            "::a00:1",    // 10.0.0.1
+            "::c0a8:101", // 192.168.1.1
+        ] {
+            assert!(
+                ip_is_disallowed(bad.parse().unwrap()),
+                "{bad} should be blocked"
             );
         }
     }
