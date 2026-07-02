@@ -137,6 +137,57 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isStreaming)
     }
 
+    func testRecoverContinuationInterruptedAfterToolBatch() async throws {
+        // A turn that continued past an app-tool batch and was interrupted
+        // (backgrounded, killed) leaves: user, assistant tool_calls, tool
+        // result, incomplete assistant. Recovery must resume it — the guard
+        // used to require the row before the pending one to be a user message,
+        // so these turns were orphaned and their answers silently lost.
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation(modelID: "m")
+        try await store.insertConversation(conversation)
+        let t0 = Date(timeIntervalSinceNow: -10)
+        try await store.insertMessage(
+            Message(conversationId: conversation.id, role: "user", content: "what time?",
+                    createdAt: t0, isComplete: true),
+            attachments: []
+        )
+        let calls = [WireToolCall(
+            index: 0, id: "time_call",
+            function: .init(name: ToolName.currentTime, arguments: "{}")
+        )]
+        let json = try XCTUnwrap(String(data: Wire.encoder().encode(calls), encoding: .utf8))
+        try await store.insertMessage(
+            Message(conversationId: conversation.id, role: "assistant", content: "",
+                    createdAt: t0.addingTimeInterval(1), isComplete: true, toolCalls: json),
+            attachments: []
+        )
+        try await store.insertMessage(
+            Message(conversationId: conversation.id, role: "tool", content: "12:00",
+                    createdAt: t0.addingTimeInterval(2), isComplete: true,
+                    toolCallId: "time_call", name: ToolName.currentTime),
+            attachments: []
+        )
+        try await store.insertMessage(
+            Message(conversationId: conversation.id, role: "assistant", content: "",
+                    createdAt: t0.addingTimeInterval(3), isComplete: false),
+            attachments: []
+        )
+        client.enqueue(events: [.token("It is noon."), .done])
+
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        vm.setViewVisible(true)
+
+        try await waitUntil {
+            let detail = try await self.detail(store, conversation.id)
+            return detail.messages.last?.message.content == "It is noon."
+                && detail.messages.last?.message.isComplete == true
+        }
+        XCTAssertFalse(vm.isStreaming)
+    }
+
     func testAppToolBatchParksForPromptThenContinuesAfterAnswer() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()

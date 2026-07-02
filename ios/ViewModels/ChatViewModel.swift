@@ -695,9 +695,11 @@ final class ChatViewModel {
         guard let pending = detail.messages.last,
               pending.message.role == "assistant",
               !pending.message.isComplete else { return }
-        let previous = detail.messages.dropLast().last
-        guard previous?.message.role == "user",
-              previous?.message.isComplete == true else { return }
+        // A resumable turn follows either the user's message (a plain turn) or a
+        // completed tool-result row (the continuation after an app-tool batch).
+        let previous = detail.messages.dropLast().last?.message
+        guard let previous, previous.isComplete,
+              previous.role == "user" || previous.role == "tool" else { return }
         guard let model = env.backendMode.resolvedChatModel(
             conversationModel: detail.conversation.modelID,
             defaultModel: env.preferredModel
@@ -840,6 +842,9 @@ final class ChatViewModel {
                 self?.finish(error: AppError.from(error))
                 return
             }
+            // Restamp so the pending row sorts after the tool result just
+            // inserted (the async tool work above ran past the turn start).
+            self?.streamingStartedAt = .now
             guard await self?.insertPendingAssistantMessage(
                 conversationId: conversation.id,
                 store: store
@@ -935,7 +940,13 @@ final class ChatViewModel {
                 return
             }
 
-            // Every call resolved on-device: continue the turn.
+            // Every call resolved on-device: continue the turn. Restamp the turn
+            // clock first: the tool results above were inserted with a later
+            // createdAt than the original turn start, and a pending row stamped
+            // with the old start would sort before them — breaking ordering and
+            // making the recovery guard unable to ever match an interrupted
+            // continuation.
+            self?.streamingStartedAt = .now
             guard await self?.insertPendingAssistantMessage(
                 conversationId: conversationId, store: store
             ) != nil else { return }
