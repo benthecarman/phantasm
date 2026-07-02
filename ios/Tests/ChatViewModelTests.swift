@@ -52,6 +52,76 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(client.requests.count, 2, "reply stream plus title-generation side query")
     }
 
+    func testTitleGenerationRetriesWithoutReasoningEffortWhenDisabledRequestFails() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        env.backendMode = .full(.init(
+            version: "0.1",
+            modelEntries: [.init(id: "m")]
+        ))
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        client.enqueue(events: [.token("answer"), .done])
+        client.enqueue(events: [], error: AppError.unreachable)
+        client.enqueue(events: [.token("Fallback Title"), .done])
+
+        vm.send("hello")
+
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.conversation.title == "Fallback Title"
+        }
+
+        XCTAssertEqual(client.requests.count, 3)
+        XCTAssertEqual(client.requests[1].reasoningEffort, ReasoningEffort.disabled)
+        XCTAssertNil(client.requests[2].reasoningEffort)
+    }
+
+    func testTitleGenerationIgnoresReasoningEventsAndThinkBlocks() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        client.enqueue(events: [.token("answer"), .done])
+        client.enqueue(events: [
+            .reasoning("hidden plan"),
+            .token("<think>also hidden</think>\nTitle: Useful Chat"),
+            .done,
+        ])
+
+        vm.send("hello")
+
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.conversation.title == "Useful Chat"
+        }
+    }
+
+    func testTitleGenerationStripsLeakedThinkBlocksFromHistory() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        client.enqueue(events: [.token("<think>secret plan</think>Visible answer"), .done])
+        client.enqueue(events: [.token("Visible Title"), .done])
+
+        vm.send("hello")
+
+        try await waitUntil {
+            client.requests.count == 2
+        }
+
+        let titleHistory = client.requests[1].messages.map(\.content.plainText).joined(separator: "\n")
+        XCTAssertFalse(titleHistory.contains("secret plan"))
+        XCTAssertTrue(titleHistory.contains("Visible answer"))
+    }
+
     func testSecondSendKeepsGeneratedTitle() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()

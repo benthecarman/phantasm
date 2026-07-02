@@ -1273,7 +1273,7 @@ final class ChatViewModel {
               let detail = try? await store.conversationDetail(id: conversation.id) else { return }
         let assistantReplies = detail.messages.filter { $0.message.role == "assistant" }.count
         guard assistantReplies == 1 else { return }
-        await generateTitle(history: detail.wireHistory())
+        await generateTitle(history: Self.titleHistory(from: detail.wireHistory()))
     }
 
     /// Side-query the model for a short conversation title. Failures leave the
@@ -1289,14 +1289,28 @@ final class ChatViewModel {
         let client: any ChatClienting = env.backendMode.usesOllamaNativeChat
             ? env.ollamaStreamingClient
             : env.chatStreamingClient
-        let request = ChatRequest(
-            model: model,
-            messages: history + [WireMessage(role: "user", content: Self.titlePrompt)],
-            stream: true,
-            reasoningEffort: env.disabledReasoningEffortForCurrentBackend()
-        )
+        let disabledReasoningEffort = env.disabledReasoningEffortForCurrentBackend()
+        let titleMessages = history + [WireMessage(role: "user", content: Self.titlePrompt)]
 
-        guard let raw = try? await client.complete(request, base: base, token: token) else { return }
+        func complete(reasoningEffort: String?) async throws -> String {
+            let request = ChatRequest(
+                model: model,
+                messages: titleMessages,
+                stream: true,
+                reasoningEffort: reasoningEffort
+            )
+            return try await client.complete(request, base: base, token: token)
+        }
+
+        let raw: String
+        do {
+            raw = try await complete(reasoningEffort: disabledReasoningEffort)
+        } catch {
+            guard disabledReasoningEffort != nil,
+                  let retried = try? await complete(reasoningEffort: nil)
+            else { return }
+            raw = retried
+        }
         let title = Self.sanitizedTitle(raw)
         guard !title.isEmpty else { return }
         // Title only — don't bump updatedAt, so naming doesn't reorder the list.
@@ -1315,10 +1329,20 @@ final class ChatViewModel {
         "Write a short, descriptive title (3-6 words) for this conversation. "
         + "Reply with only the title text — no quotes, no punctuation, no preamble."
 
+    private static func titleHistory(from history: [WireMessage]) -> [WireMessage] {
+        history.map { message in
+            var sanitized = WireMessage(role: message.role, content: message.content.strippingThinkingBlocks())
+            sanitized.toolCalls = message.toolCalls
+            sanitized.toolCallId = message.toolCallId
+            sanitized.name = message.name
+            return sanitized
+        }
+    }
+
     /// Clean up a raw model title: strip quotes/markdown, drop a "Title:" prefix,
     /// collapse to one line, and cap the length.
     static func sanitizedTitle(_ raw: String) -> String {
-        var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var t = raw.strippingThinkingBlocks().trimmingCharacters(in: .whitespacesAndNewlines)
         if let firstLine = t.split(whereSeparator: \.isNewline).first {
             t = String(firstLine).trimmingCharacters(in: .whitespaces)
         }
@@ -1327,5 +1351,35 @@ final class ChatViewModel {
         }
         t = t.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`*.# "))
         return String(t.prefix(60))
+    }
+}
+
+private extension WireContent {
+    func strippingThinkingBlocks() -> WireContent {
+        switch self {
+        case .text(let text):
+            return .text(text.strippingThinkingBlocks())
+        case .parts(let parts):
+            return .parts(parts.map { part in
+                if case .text(let text) = part {
+                    return .text(text.strippingThinkingBlocks())
+                }
+                return part
+            })
+        }
+    }
+}
+
+private extension String {
+    func strippingThinkingBlocks() -> String {
+        var stripped = replacingOccurrences(
+            of: #"(?is)<think\b[^>]*>.*?</think>"#,
+            with: "",
+            options: .regularExpression
+        )
+        if let range = stripped.range(of: "<think", options: .caseInsensitive) {
+            stripped = String(stripped[..<range.lowerBound])
+        }
+        return stripped
     }
 }
