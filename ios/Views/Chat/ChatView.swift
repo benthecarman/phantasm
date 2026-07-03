@@ -96,10 +96,13 @@ struct ChatView: View {
         env.supportsThinking(currentModelID)
     }
 
-    /// Whether this backend exposes the app's Thinking control at all.
+    /// Whether this backend exposes the app's Thinking control at all. Unknown
+    /// endpoint support hides the row; explicit unsupported renders disabled.
     private var showsThinkingToggle: Bool {
-        if case .full = env.backendMode { return true }
-        return false
+        switch env.thinkingSupport(for: currentModelID) {
+        case .supported, .unsupported: return true
+        case .unknown: return false
+        }
     }
 
     /// Token estimate for the current history, recomputed only when `messages`

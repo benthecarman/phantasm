@@ -15,7 +15,7 @@ protocol ChatViewModelEnvironment: AnyObject {
 
     func supportsTools(_ model: String?) -> Bool
     func thinkingEnabled(for model: String?) -> Bool
-    func disabledReasoningEffortForCurrentBackend() -> String?
+    func reasoningEffort(for model: String?) -> String?
     func setDefaultLocationEnabled(_ enabled: Bool)
     func requestLocationAuthorizationWhenInUse()
     func setDefaultHealthEnabled(_ enabled: Bool)

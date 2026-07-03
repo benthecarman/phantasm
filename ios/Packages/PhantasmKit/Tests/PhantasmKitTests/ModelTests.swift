@@ -69,11 +69,11 @@ final class CapabilityDecodeTests: XCTestCase {
         )
     }
 
-    func testManifestWithPartialModelCapabilitiesStaysOptimistic() throws {
+    func testManifestWithPartialModelCapabilitiesStaysOptimisticExceptThinking() throws {
         // An orchestrator that omits individual capability fields (older build,
         // future rename) must not fail the manifest decode — that used to
-        // silently degrade the whole backend to plain chat. Missing fields stay
-        // optimistic (spec §2.1); present fields are honored.
+        // silently degrade the whole backend to plain chat. Missing operational
+        // fields stay optimistic (spec §2.1); Thinking requires an explicit true.
         let json = """
         {"version":"0.3.0",
          "models":[{"id":"m","capabilities":{"completion":true,"vision":false,"tools":true}}],
@@ -83,7 +83,8 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(caps.models, ["m"])
         XCTAssertEqual(caps.visionModelIDs, [])
         XCTAssertEqual(caps.toolModelIDs, ["m"])
-        XCTAssertEqual(caps.modelEntries.first?.capabilities?.thinking, true)
+        XCTAssertEqual(caps.thinkingModelIDs, [])
+        XCTAssertEqual(caps.modelEntries.first?.capabilities?.thinking, false)
     }
 
     func testManifestWithoutModelCapabilitiesIsUnknown() throws {
@@ -91,6 +92,7 @@ final class CapabilityDecodeTests: XCTestCase {
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertNil(caps.visionModelIDs)
         XCTAssertNil(caps.toolModelIDs)
+        XCTAssertNil(caps.thinkingModelIDs)
     }
 
     // MARK: - Per-chat tool selection (standard OpenAI tools/tool_choice)

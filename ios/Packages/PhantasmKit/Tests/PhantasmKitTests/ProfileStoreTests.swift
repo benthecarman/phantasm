@@ -61,7 +61,7 @@ final class ModelPreferenceStoreTests: XCTestCase {
         store = ModelPreferenceStore(defaults: defaults)
     }
 
-    func testThinkingPreferenceDefaultsOffAndIsPerProfileAndModel() {
+    func testThinkingPreferenceStoresExplicitValuesPerProfileAndModel() {
         let a = UUID(), b = UUID()
 
         XCTAssertFalse(store.thinkingEnabled(for: "qwen3", profileID: a))

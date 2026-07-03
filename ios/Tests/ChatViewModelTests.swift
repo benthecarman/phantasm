@@ -52,13 +52,26 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(client.requests.count, 2, "reply stream plus title-generation side query")
     }
 
-    func testTitleGenerationRetriesWithoutReasoningEffortWhenDisabledRequestFails() async throws {
+    func testTitleGenerationRetriesWithoutReasoningEffortWhenReasoningRequestFails() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
         let env = FakeChatEnvironment(client: client)
         env.backendMode = .full(.init(
             version: "0.1",
-            modelEntries: [.init(id: "m")]
+            modelEntries: [
+                .init(
+                    id: "m",
+                    capabilities: .init(
+                        completion: true,
+                        vision: false,
+                        audio: false,
+                        tools: true,
+                        insert: false,
+                        thinking: true,
+                        embedding: false
+                    )
+                )
+            ]
         ))
         let conversation = Conversation()
         let vm = makeViewModel(env: env, store: store, conversation: conversation)
@@ -75,7 +88,7 @@ final class ChatViewModelTests: XCTestCase {
         }
 
         XCTAssertEqual(client.requests.count, 3)
-        XCTAssertEqual(client.requests[1].reasoningEffort, ReasoningEffort.disabled)
+        XCTAssertEqual(client.requests[1].reasoningEffort, ReasoningEffort.enabledDefault)
         XCTAssertNil(client.requests[2].reasoningEffort)
     }
 
@@ -642,13 +655,14 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
         return backendMode.capabilities?.toolModelIDs?.contains(model) ?? true
     }
 
-    func thinkingEnabled(for model: String?) -> Bool { false }
+    func thinkingEnabled(for model: String?) -> Bool {
+        guard let model else { return false }
+        return backendMode.capabilities?.thinkingModelIDs?.contains(model) == true
+    }
 
-    func disabledReasoningEffortForCurrentBackend() -> String? {
-        switch backendMode {
-        case .full: return ReasoningEffort.disabled
-        case .ollamaNative, .plainChatOnly: return nil
-        }
+    func reasoningEffort(for model: String?) -> String? {
+        guard thinkingEnabled(for: model) else { return nil }
+        return ReasoningEffort.enabledDefault
     }
 
     func setDefaultLocationEnabled(_ enabled: Bool) {

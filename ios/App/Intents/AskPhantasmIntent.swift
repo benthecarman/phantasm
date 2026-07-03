@@ -77,10 +77,10 @@ enum AskService {
         config.timeoutIntervalForResource = 30
         let session = URLSession(configuration: config)
 
-        // Probe the backend mode. This resolves the model robustly AND lets us
-        // suppress thinking tokens (`reasoning_effort: "none"`) exactly the way the
-        // in-app turn does — the main reason a bare headless turn felt much slower:
-        // a thinking model was generating (hidden) reasoning we then waited through.
+        // Probe the backend mode. This resolves the model robustly and lets us
+        // suppress thinking tokens only when the endpoint explicitly says the
+        // selected model can think. Unknown support omits `reasoning_effort` so
+        // stricter backends do not reject a guessed value.
         let mode = (try? await CapabilitiesClient(session: session).resolve(base: base, token: token).get())
             ?? .plainChatOnly(models: [])
         guard let model = mode.resolvedChatModel(
@@ -92,7 +92,7 @@ enum AskService {
             model: model,
             messages: [WireMessage(role: "user", content: question)],
             stream: true,
-            reasoningEffort: disabledReasoningEffort(for: mode)
+            reasoningEffort: disabledReasoningEffort(for: model, mode: mode)
         )
 
         let client = ChatClient(session: session)
@@ -102,13 +102,13 @@ enum AskService {
         return answer
     }
 
-    /// `"none"` only for Phantasm/orchestrator backends. Plain OpenAI-compatible
-    /// and native Ollama backends do not participate in the app's Thinking toggle.
-    private static func disabledReasoningEffort(for mode: BackendMode) -> String? {
-        switch mode {
-        case .full: return ReasoningEffort.disabled
-        case .ollamaNative, .plainChatOnly: return nil
-        }
+    /// `"none"` only for models the Phantasm/orchestrator manifest explicitly
+    /// advertises as thinking-capable. Plain OpenAI-compatible/native Ollama
+    /// backends and unknown per-model support omit the field.
+    private static func disabledReasoningEffort(for model: String, mode: BackendMode) -> String? {
+        guard case .full(let caps) = mode,
+              caps.thinkingModelIDs?.contains(model) == true else { return nil }
+        return ReasoningEffort.disabled
     }
 }
 

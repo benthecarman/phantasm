@@ -644,10 +644,7 @@ final class ChatViewModel {
             model: wireModel,
             messages: detail.wireHistory(),
             stream: true,
-            reasoningEffort: detail.conversation.reasoningEffort(
-                thinkingEnabled: env.thinkingEnabled(for: model),
-                disabledEffort: env.disabledReasoningEffortForCurrentBackend()
-            ),
+            reasoningEffort: env.reasoningEffort(for: model),
             enabledTools: detail.conversation.requestedToolNames(
                 supporting: env.backendMode.capabilities?.toolSelectors
             ),
@@ -1365,7 +1362,7 @@ final class ChatViewModel {
         let client: any ChatClienting = env.backendMode.usesOllamaNativeChat
             ? env.ollamaStreamingClient
             : env.chatStreamingClient
-        let disabledReasoningEffort = env.disabledReasoningEffortForCurrentBackend()
+        let reasoningEffort = env.reasoningEffort(for: model)
         let titleMessages = history + [WireMessage(role: "user", content: Self.titlePrompt)]
 
         func complete(reasoningEffort: String?) async throws -> String {
@@ -1380,9 +1377,9 @@ final class ChatViewModel {
 
         let raw: String
         do {
-            raw = try await complete(reasoningEffort: disabledReasoningEffort)
+            raw = try await complete(reasoningEffort: reasoningEffort)
         } catch {
-            guard disabledReasoningEffort != nil,
+            guard reasoningEffort != nil,
                   let retried = try? await complete(reasoningEffort: nil)
             else { return }
             raw = retried

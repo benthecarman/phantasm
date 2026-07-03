@@ -65,6 +65,12 @@ final class AppEnvironment {
     private var thinkingPreferences: [String: [String: Bool]]
     private var capabilityRefreshGeneration = 0
 
+    enum ThinkingSupport {
+        case supported
+        case unsupported
+        case unknown
+    }
+
     init() {
         // Schema is tiny; opening the SQLite store + migrations is fast (NFR-A5).
         // But a failure (full disk, corruption) must not crash at launch: fall
@@ -294,18 +300,24 @@ final class AppEnvironment {
     }
 
     /// Whether `model` can produce reasoning/thinking output through the Phantasm
-    /// orchestrator. Plain OpenAI-compatible and native Ollama backends do not
-    /// expose the app's Thinking toggle.
+    /// orchestrator. The endpoint must explicitly advertise the model as thinking
+    /// capable; plain OpenAI-compatible/native Ollama backends and older manifests
+    /// without per-model thinking data do not expose the app's Thinking toggle.
     func supportsThinking(_ model: String?) -> Bool {
-        guard case .full = backendMode else { return false }
-        guard let thinkingModels else { return true }
-        guard let model else { return false }
-        return thinkingModels.contains(model)
+        thinkingSupport(for: model) == .supported
     }
 
-    /// The effective Thinking setting for `model`: the stored preference, but
-    /// only when the model actually supports reasoning. A model that can't think
-    /// reports `false` regardless of the saved toggle, so we never send
+    func thinkingSupport(for model: String?) -> ThinkingSupport {
+        guard case .full = backendMode else { return .unsupported }
+        guard let thinkingModels else { return .unknown }
+        guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else { return .unknown }
+        return thinkingModels.contains(model) ? .supported : .unsupported
+    }
+
+    /// The effective Thinking setting for `model`: the stored preference, defaulting
+    /// on only when the model actually supports reasoning. A model that can't
+    /// think reports `false` regardless of the saved toggle, so we never send
     /// `reasoning_effort` to a backend that would ignore (or reject) it. The
     /// preference itself is left intact for when a thinking-capable model is
     /// reselected.
@@ -314,14 +326,12 @@ final class AppEnvironment {
               let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               supportsThinking(model) else { return false }
-        return thinkingPreferences[profileID.uuidString]?[model] ?? false
+        return thinkingPreferences[profileID.uuidString]?[model] ?? true
     }
 
-    func disabledReasoningEffortForCurrentBackend() -> String? {
-        switch backendMode {
-        case .full: return ReasoningEffort.disabled
-        case .ollamaNative, .plainChatOnly: return nil
-        }
+    func reasoningEffort(for model: String?) -> String? {
+        guard thinkingSupport(for: model) == .supported else { return nil }
+        return thinkingEnabled(for: model) ? ReasoningEffort.enabledDefault : ReasoningEffort.disabled
     }
 
     func setThinkingEnabled(_ enabled: Bool, for model: String?) {
