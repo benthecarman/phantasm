@@ -18,8 +18,21 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.phantasm.app.pairing</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>phantasm</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>Phantasm shares calendar events with the AI model only when you turn on the Calendar tool for a chat. Event creation also requires your confirmation before anything is added.</string>
 	<key>NSCalendarsUsageDescription</key>
@@ -27,7 +40,7 @@
 	<key>NSCalendarsWriteOnlyAccessUsageDescription</key>
 	<string>Phantasm can add calendar events only when you turn on the Calendar tool for a chat and confirm the event details.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Phantasm uses the camera so you can take a photo to attach to a message.</string>
+	<string>Phantasm uses the camera so you can take a photo to attach to a message, and to scan a backend pairing QR code.</string>
 	<key>NSHealthShareUsageDescription</key>
 	<string>Phantasm shares your Apple Health data with the AI model only when you turn on the Health tool for a chat and the model asks for it. Access is read-only.</string>
 	<key>NSHealthUpdateUsageDescription</key>

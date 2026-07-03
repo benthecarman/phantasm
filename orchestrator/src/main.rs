@@ -11,8 +11,37 @@ use phantasm_orchestrator::{
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
+const USAGE: &str = "usage: phantasm-orchestrator            start the server\n       \
+                     phantasm-orchestrator pair [URL] print a pairing QR (docs/qr-pairing.md)";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Subcommand dispatch before any config/server work: `pair` must run with
+    // partial env (docs/qr-pairing.md), so it can't go through Config::from_env.
+    // The bare invocation stays the server.
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("pair") => {
+            let url = args.next();
+            // A silently dropped extra argument would mint a QR the operator
+            // didn't ask for (e.g. a mis-quoted `pair https://h token`).
+            if let Some(extra) = args.next() {
+                anyhow::bail!("unexpected extra argument `{extra}`\n{USAGE}");
+            }
+            return phantasm_orchestrator::pairing::run(url);
+        }
+        Some("help" | "--help" | "-h") => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Some("--version" | "-V") => {
+            println!("phantasm-orchestrator {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(other) => anyhow::bail!("unknown argument `{other}`\n{USAGE}"),
+        None => {}
+    }
+
     let cfg = Config::from_env().context("loading configuration from environment")?;
     init_tracing(cfg.log_format);
     // Logged here, not in `Config::from_env`: that runs before `init_tracing`,

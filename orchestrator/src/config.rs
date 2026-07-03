@@ -316,14 +316,8 @@ impl Config {
         // `Config::auth_disabled` — `from_env` runs before tracing is
         // initialized, so a warning emitted here would vanish into the
         // pre-init no-op subscriber.
-        let auth_token = std::env::var("PHANTASM_AUTH_TOKEN")
-            .ok()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
-        let metrics_token = std::env::var("PHANTASM_METRICS_TOKEN")
-            .ok()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
+        let auth_token = env_nonempty("PHANTASM_AUTH_TOKEN");
+        let metrics_token = env_nonempty("PHANTASM_METRICS_TOKEN");
 
         let upstream_kind = parse_upstream_kind()?;
         let upstream_base = parse_url_alias(
@@ -622,6 +616,18 @@ impl Config {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Read an env var, trim it, and drop it when unset or empty. `pub(crate)`
+/// because the `pair` subcommand reads `PHANTASM_AUTH_TOKEN` (and its URL
+/// vars) outside `Config::from_env`; sharing the reader keeps the two from
+/// drifting — a `pair` QR embedding a token the server reads differently is
+/// the worst failure mode for a pairing tool.
+pub(crate) fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn env_or_alias(primary: &str, legacy: &str, default: &str) -> String {

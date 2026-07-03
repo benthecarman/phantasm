@@ -55,6 +55,24 @@ public struct BackendProfile: Identifiable, Codable, Sendable, Hashable {
         }
         return s
     }
+
+    /// Canonical form for *equivalence checks only* (never stored or displayed):
+    /// `normalizedBaseURLString` plus lowercased scheme/host and default-port
+    /// elision. Needed because producers normalize differently — the
+    /// orchestrator's `pair` URL serializer lowercases hosts and drops `:443`,
+    /// so a scanned "https://host.example" must match a hand-typed
+    /// "https://Host.Example:443" when pairing dedups by backend (FR-A12).
+    public static func canonicalBaseURLString(_ raw: String) -> String {
+        let normalized = normalizedBaseURLString(raw)
+        guard var components = URLComponents(string: normalized) else { return normalized }
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
+        if (components.scheme == "https" && components.port == 443)
+            || (components.scheme == "http" && components.port == 80) {
+            components.port = nil
+        }
+        return components.string ?? normalized
+    }
 }
 
 /// Persists the profile list + active selection in `UserDefaults` (small,

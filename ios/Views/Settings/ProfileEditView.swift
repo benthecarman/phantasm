@@ -2,12 +2,18 @@ import PhantasmKit
 import SwiftUI
 
 /// Add/edit a backend profile with a "Test connection" check that validates
-/// reachability + auth and reports the resolved mode (FR-A1, FR-A2).
+/// reachability + auth and reports the resolved mode (FR-A1, FR-A2). Also the
+/// landing screen for a scanned/deep-linked pairing URI (FR-A12): `pairing`
+/// prefills the connection fields, and nothing is stored until the user
+/// reviews and taps Save — that explicit save is the confirmation step
+/// docs/qr-pairing.md requires before trusting a scanned backend.
 struct ProfileEditView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
 
     private let existing: BackendProfile?
+    private let pairing: PairingPayload?
+    private let onSaved: () -> Void
 
     @State private var name: String
     @State private var urlString: String
@@ -19,15 +25,28 @@ struct ProfileEditView: View {
     @State private var revealToken = false
     @State private var models: [String] = []
     @State private var loadingModels = false
+    @State private var showPairingQR = false
 
-    init(profile: BackendProfile?) {
+    /// `pairing` overrides the connection fields with the scanned payload;
+    /// pass the matched existing profile too (see
+    /// `PairingPayload.matchingProfile`) so a re-pair edits in place — its
+    /// default model and auto-warm are kept, and a payload without a token
+    /// inherits the saved one via the Keychain prefill instead of blanking it.
+    init(
+        profile: BackendProfile?,
+        pairing: PairingPayload? = nil,
+        onSaved: @escaping () -> Void = {}
+    ) {
         self.existing = profile
-        _name = State(initialValue: profile?.name ?? "")
-        _urlString = State(initialValue: profile?.baseURLString ?? "https://")
+        self.pairing = pairing
+        self.onSaved = onSaved
+        _name = State(initialValue: pairing.map(\.displayName) ?? profile?.name ?? "")
+        _urlString = State(initialValue: pairing?.baseURLString ?? profile?.baseURLString ?? "https://")
         _defaultModel = State(initialValue: profile?.defaultModel ?? "")
         _autoWarm = State(initialValue: profile?.autoWarm ?? false)
-        // Pre-fill the token from the Keychain when editing.
-        _token = State(initialValue: "")
+        // Pre-fill the token from the Keychain when editing (see onAppear);
+        // a pairing token wins over the stored one.
+        _token = State(initialValue: pairing?.token ?? "")
     }
 
     enum TestResult: Equatable {
@@ -67,7 +86,11 @@ struct ProfileEditView: View {
                 } header: {
                     Text("Connection")
                 } footer: {
-                    Text("Leave the token blank for a backend that doesn't require auth (e.g. local Ollama or an orchestrator with auth disabled).")
+                    if pairing != nil {
+                        Text("Filled in from the pairing code. Phantasm will send your chats to this backend — review the address and only save a server that's yours or one you trust.")
+                    } else {
+                        Text("Leave the token blank for a backend that doesn't require auth (e.g. local Ollama or an orchestrator with auth disabled).")
+                    }
                 }
 
                 Section {
@@ -121,8 +144,24 @@ struct ProfileEditView: View {
                         }
                     }
                 }
+
+                if existing != nil && pairing == nil {
+                    Section {
+                        Button {
+                            Haptics.selection()
+                            showPairingQR = true
+                        } label: {
+                            Label("Show Pairing QR Code", systemImage: "qrcode")
+                        }
+                        .disabled(!isValid)
+                    } footer: {
+                        Text("Pair another device by scanning this backend's connection — including its token — with that device's camera.")
+                    }
+                }
             }
-            .navigationTitle(existing == nil ? "Add Backend" : "Edit Backend")
+            .navigationTitle(
+                pairing != nil ? "Pair Backend" : (existing == nil ? "Add Backend" : "Edit Backend")
+            )
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -138,6 +177,16 @@ struct ProfileEditView: View {
                 if canLoadModels {
                     Task { await loadModels() }
                 }
+            }
+            .sheet(isPresented: $showPairingQR) {
+                // Live field values, so what's shared is what's on screen —
+                // including an edited-but-unsaved token.
+                let trimmedName = name.trimmingCharacters(in: .whitespaces)
+                PairingQRView(payload: PairingPayload(
+                    baseURLString: BackendProfile.normalizedBaseURLString(urlString),
+                    token: normalizedToken.isEmpty ? nil : normalizedToken,
+                    name: trimmedName.isEmpty ? nil : trimmedName
+                ))
             }
         }
     }
@@ -195,8 +244,16 @@ struct ProfileEditView: View {
         )
         let token = normalizedToken
         env.upsert(profile, token: token.isEmpty ? nil : token)
+        // A pairing is an explicit "use this backend"; manual adds keep the
+        // current selection. upsert already activates (and refreshes) when
+        // nothing was active or this is the active profile, so only an actual
+        // switch needs setActive — skipping otherwise avoids a double probe.
+        if pairing != nil, env.activeProfileID != profile.id {
+            env.setActive(profile.id)
+        }
         Haptics.notify(.success)
         dismiss()
+        onSaved()
     }
 
     private func clearStaleDefaultModel() {

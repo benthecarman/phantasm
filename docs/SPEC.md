@@ -231,6 +231,24 @@ standard OpenAI; a client that ignores it gets the legacy behavior. See
   `TURN_ABANDON_GRACE_S` is cancelled by a watchdog (the force-killed-app
   backstop). All three are server config.
 
+### 2.2d Pairing URI (optional, additive)
+
+A backend connection is fully described by URL + token (§1), so pairing a
+device is a transport problem: move those strings onto the phone without
+typing. The shared convention is a URI that doubles as QR payload and deep
+link — see [`qr-pairing.md`](qr-pairing.md) for the design:
+
+```
+phantasm://pair?v=1&url=<base URL>&token=<bearer>&name=<label>
+```
+
+`v` and `url` are required (`v` ≠ `1` ⇒ reject; unknown params ignored);
+`token` and `name` are optional, so the format covers unauthenticated
+backends like bare Ollama. It is producer-agnostic — the orchestrator, the
+app itself (sharing an existing profile to a second device), or a shell
+one-liner can mint one; no HTTP surface is added. The URI embeds the bearer
+token and MUST be handled as the credential it is (never logged, per NFR-O7).
+
 ### 2.3 Tools: server-side (invisible) and app-hosted (forwarded)
 
 Most tool execution happens entirely on the **orchestrator ↔ Ollama** hop using
@@ -402,8 +420,12 @@ listing (FR-O6), bearer auth → 401 (FR-O7), cancellation — on disconnect for
 plain turn, or via `POST /v1/chat/cancel` for a resumable turn that survives
 disconnect (FR-O8, §2.2c), optional self-contained tools for web fetch, current
 time, calculator, unit conversion, weather, places/geocoding, market data,
-GitHub reads, OCR, and sandboxed code execution (`code_exec`, §2.3) (FR-O9).
-Local docs/filesystem tools and other side-effecting tools are out of scope.
+GitHub reads, OCR, and sandboxed code execution (`code_exec`, §2.3) (FR-O9),
+a `pair` subcommand printing the §2.2d pairing URI as a terminal QR — one
+line after install, URL from the argument or `PAIR_URL`/`PUBLIC_BASE_URL`,
+never emitted from the running service (FR-O10,
+[`qr-pairing.md`](qr-pairing.md)). Local docs/filesystem tools and
+other side-effecting tools are out of scope.
 
 **Non-functional:** co-location over localhost/LAN (NFR-O1), async concurrency
 with a configurable upstream generation limit (NFR-O2), low plain-chat latency
@@ -421,7 +443,11 @@ inline image display + save/share (FR-A7), `x_status` progress UI (FR-A8),
 cancellation — Stop calls `POST /v1/chat/cancel` for a resumable turn (FR-A9,
 §2.2c), resumable turns so a generation survives backgrounding: the app keys each
 turn with `Idempotency-Key` and reconnects to replay it on foreground (FR-A11),
-connection handling distinguishing unreachable/auth/model errors (FR-A10).
+connection handling distinguishing unreachable/auth/model errors (FR-A10),
+QR pairing — scan or deep-link a §2.2d pairing URI into a backend profile
+behind an explicit confirmation showing the target host, and render a pairing
+QR for an existing profile to pair a second device (FR-A12,
+[`qr-pairing.md`](qr-pairing.md)).
 
 **Non-functional:** iOS 18+ (NFR-A1), token in Keychain (NFR-A2), local SwiftData
 persistence (NFR-A3), smooth streaming off the main thread (NFR-A4), fast cold
@@ -476,3 +502,8 @@ MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel
   server-hosted image URLs when the deployment configures a store + public base
   (server-side choice, no client opt-in; see §2.2b).
 - Ship one default ComfyUI workflow, overridable via config.
+- Pairing rides a `phantasm://pair` URI (§2.2d) carrying the static token
+  directly — no token issuance, no `/v1/pair` endpoint, no new HTTP surface.
+  A one-time-code exchange was considered and deferred: it would require the
+  server to mint and store credentials, breaking the env-only/stateless model
+  for marginal gain at single-user scale (see `qr-pairing.md`).

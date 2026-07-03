@@ -14,6 +14,9 @@ struct SettingsView: View {
     @State private var editing: BackendProfile?
     @State private var isCreating = false
     @State private var isConfirmingDeleteAll = false
+    /// Scanner → confirmation as one sheet (FR-A12), so the hand-off between
+    /// the two stages can't race a second presentation.
+    @State private var pairingRoute: PairingSheetRoute?
 
     var body: some View {
         NavigationStack {
@@ -73,6 +76,14 @@ struct SettingsView: View {
                     } label: {
                         Label("Add Backend", systemImage: "plus")
                     }
+                    Button {
+                        Haptics.selection()
+                        pairingRoute = .scan
+                    } label: {
+                        Label("Pair via QR Code", systemImage: "qrcode.viewfinder")
+                    }
+                } footer: {
+                    Text("Running the Phantasm orchestrator? `phantasm-orchestrator pair` prints a code to scan.")
                 }
 
                 Section {
@@ -115,6 +126,9 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $isCreating) {
                 ProfileEditView(profile: nil)
+            }
+            .sheet(item: $pairingRoute) { _ in
+                PairingFlowSheet(route: $pairingRoute)
             }
             .alert(
                 "Confirm",

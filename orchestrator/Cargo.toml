@@ -45,6 +45,11 @@ tempfile = "3"
 # Durable metrics history for the dashboard (`metrics_store`). `bundled`
 # compiles SQLite in, so deployments need no system libsqlite.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Terminal QR for the `pair` subcommand (docs/qr-pairing.md). Pure Rust; the
+# `image` feature is off — we only render to unicode half-blocks. The
+# percent-encoding crate is already in the tree via `url`.
+qrcode = { version = "0.14", default-features = false }
+percent-encoding = "2"
 
 # systemd readiness/`Type=notify` integration. Pure-Rust (no libsystemd link),
 # unix-only; a no-op unless `$NOTIFY_SOCKET` is set, so dev/Docker are unaffected.

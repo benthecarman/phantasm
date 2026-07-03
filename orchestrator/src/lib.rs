@@ -15,6 +15,7 @@ pub mod net_guard;
 pub mod ollama;
 pub mod openai;
 pub mod orchestrator;
+pub mod pairing;
 pub mod routes;
 pub mod state;
 pub mod tools;

@@ -19,6 +19,10 @@ struct RootView: View {
     @State private var showSettings = false
     @State private var showOnboarding = false
     @State private var showStorageWarning = false
+    /// A `phantasm://pair` deep link awaiting the user's confirmation (FR-A12) —
+    /// from the system Camera, or a tapped link in Messages/Mail.
+    @State private var pairingRoute: PairingSheetRoute?
+    @State private var pairingError: String?
     @State private var isDrawerOpen = false
     @State private var chatViewModels = ChatViewModelCache()
     /// Live drag translation while the user is swiping the drawer.
@@ -49,6 +53,25 @@ struct RootView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsView(onHistoryCleared: { startNewChat() })
+        }
+        .onOpenURL { handlePairingURL($0) }
+        .sheet(item: $pairingRoute) { _ in
+            PairingFlowSheet(route: $pairingRoute) {
+                // Pairing during first-run replaces the onboarding backend
+                // form; the saved profile is already active, so go chat.
+                if showOnboarding {
+                    showOnboarding = false
+                    startNewChat()
+                }
+            }
+        }
+        .alert("Can't Pair", isPresented: Binding(
+            get: { pairingError != nil },
+            set: { if !$0 { pairingError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(pairingError ?? "")
         }
         .onChange(of: scenePhase) { _, phase in
             chatViewModels.setSceneActive(phase == .active)
@@ -91,6 +114,23 @@ struct RootView: View {
 
     private var shouldShowOnboarding: Bool {
         env.profiles.isEmpty
+    }
+
+    /// Route a deep-linked URL into the pairing confirmation. A URL that isn't
+    /// a pairing URI is ignored silently — no other deep links exist today, so
+    /// a stray open shouldn't alert.
+    private func handlePairingURL(_ url: URL) {
+        do {
+            let payload = try PairingURI.parse(url)
+            // Only one sheet can be presented from this hierarchy: with
+            // Settings up, the confirmation would be dropped or deferred with
+            // no feedback. Dismiss it first so the link visibly lands.
+            showSettings = false
+            pairingRoute = .confirm(payload)
+        } catch let error as PairingURI.ParseError where error != .notPairingURI {
+            showSettings = false
+            pairingError = error.userMessage
+        } catch {}
     }
 
     private var edgeOpenArea: some View {

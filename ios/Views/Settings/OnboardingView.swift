@@ -21,6 +21,9 @@ struct OnboardingView: View {
     @State private var locationEnabled = false
     @State private var healthEnabled = false
     @State private var calendarEnabled = false
+    /// Scanner → confirmation as one sheet (FR-A12). A confirmed pairing saves
+    /// + activates the profile itself, replacing this form's save.
+    @State private var pairingRoute: PairingSheetRoute?
 
     enum Step {
         case backend
@@ -44,11 +47,28 @@ struct OnboardingView: View {
             }
             .navigationTitle(step == .backend ? "Set Up Phantasm" : "Choose Tools")
             .navigationBarTitleDisplayMode(.inline)
+            .sheet(item: $pairingRoute) { _ in
+                PairingFlowSheet(route: $pairingRoute) {
+                    // Profile saved + active; skip the manual form.
+                    step = .tools
+                }
+            }
         }
     }
 
     private var backendForm: some View {
         Form {
+            Section {
+                Button {
+                    Haptics.selection()
+                    pairingRoute = .scan
+                } label: {
+                    Label("Scan Pairing Code", systemImage: "qrcode.viewfinder")
+                }
+            } footer: {
+                Text("Running the Phantasm orchestrator? `phantasm-orchestrator pair` prints a code to scan — no typing. Or fill in the connection below.")
+            }
+
             Section {
                 TextField("Name", text: $name)
                 TextField("Base URL", text: $urlString)
