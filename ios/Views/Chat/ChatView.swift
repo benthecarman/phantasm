@@ -96,6 +96,10 @@ struct ChatView: View {
         env.supportsThinking(currentModelID)
     }
 
+    private var reasoningEfforts: [String] {
+        env.reasoningEfforts(for: currentModelID)
+    }
+
     /// Whether this backend exposes the app's Thinking control at all. Unknown
     /// endpoint support hides the row; explicit unsupported renders disabled.
     private var showsThinkingToggle: Bool {
@@ -211,9 +215,14 @@ struct ChatView: View {
                         get: { vm.modeID },
                         set: { vm.setModeID($0) }
                     ),
+                    reasoningEfforts: reasoningEfforts,
                     thinkingEnabled: Binding(
                         get: { env.thinkingEnabled(for: currentModelID) },
                         set: { env.setThinkingEnabled($0, for: currentModelID) }
+                    ),
+                    selectedReasoningEffort: Binding(
+                        get: { env.selectedReasoningEffort(for: currentModelID) },
+                        set: { env.setSelectedReasoningEffort($0, for: currentModelID) }
                     ),
                     onSend: send,
                     onStop: {
@@ -599,7 +608,9 @@ struct ComposerView: View {
     let availableModes: [Capabilities.Mode]
     /// The per-message research mode selection (nil = ordinary turn).
     let modeID: Binding<String?>
+    let reasoningEfforts: [String]
     let thinkingEnabled: Binding<Bool>
+    let selectedReasoningEffort: Binding<String>
     let onSend: () -> Void
     let onStop: () -> Void
 
@@ -726,7 +737,9 @@ struct ComposerView: View {
                 calendarEnabled: calendarEnabled,
                 availableModes: availableModes,
                 modeID: modeID,
-                thinkingEnabled: thinkingEnabled
+                reasoningEfforts: reasoningEfforts,
+                thinkingEnabled: thinkingEnabled,
+                selectedReasoningEffort: selectedReasoningEffort
             )
         }
         .sheet(isPresented: $showModelPicker) {

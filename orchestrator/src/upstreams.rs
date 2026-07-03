@@ -36,31 +36,38 @@ pub struct UpstreamEntry {
     /// Bounds simultaneous in-flight generations on THIS upstream (NFR-O2).
     pub sem: Arc<Semaphore>,
     pub max_concurrency: usize,
+    /// Optional per-model reasoning effort values advertised for models served
+    /// by this upstream. Empty means unknown/not advertised.
+    pub reasoning_efforts: Vec<String>,
     /// Config-pinned models; non-empty => authoritative, never re-probed.
     pinned_models: Vec<String>,
     /// Last probed model list (startup detection, then capability refreshes).
     probed_models: RwLock<Vec<String>>,
 }
 
+pub struct UpstreamEntryInit {
+    pub name: String,
+    pub kind: UpstreamKind,
+    pub base: Url,
+    pub backend: UpstreamChatBackend,
+    pub max_concurrency: usize,
+    pub reasoning_efforts: Vec<String>,
+    pub pinned_models: Vec<String>,
+    pub probed_models: Vec<String>,
+}
+
 impl UpstreamEntry {
-    pub fn new(
-        name: String,
-        kind: UpstreamKind,
-        base: Url,
-        backend: UpstreamChatBackend,
-        max_concurrency: usize,
-        pinned_models: Vec<String>,
-        probed_models: Vec<String>,
-    ) -> Self {
+    pub fn new(init: UpstreamEntryInit) -> Self {
         UpstreamEntry {
-            name,
-            kind,
-            base,
-            backend,
-            sem: Arc::new(Semaphore::new(max_concurrency)),
-            max_concurrency,
-            pinned_models,
-            probed_models: RwLock::new(probed_models),
+            name: init.name,
+            kind: init.kind,
+            base: init.base,
+            backend: init.backend,
+            sem: Arc::new(Semaphore::new(init.max_concurrency)),
+            max_concurrency: init.max_concurrency,
+            reasoning_efforts: init.reasoning_efforts,
+            pinned_models: init.pinned_models,
+            probed_models: RwLock::new(init.probed_models),
         }
     }
 
@@ -174,15 +181,16 @@ mod tests {
             reqwest::Client::new(),
             base.clone(),
         ));
-        UpstreamEntry::new(
-            name.into(),
-            UpstreamKind::NativeOllama,
+        UpstreamEntry::new(UpstreamEntryInit {
+            name: name.into(),
+            kind: UpstreamKind::NativeOllama,
             base,
             backend,
-            4,
-            pinned.iter().map(|s| s.to_string()).collect(),
-            probed.iter().map(|s| s.to_string()).collect(),
-        )
+            max_concurrency: 4,
+            reasoning_efforts: vec![],
+            pinned_models: pinned.iter().map(|s| s.to_string()).collect(),
+            probed_models: probed.iter().map(|s| s.to_string()).collect(),
+        })
     }
 
     #[test]

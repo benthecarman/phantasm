@@ -58,6 +58,10 @@ pub struct UpstreamSpec {
     pub base: Url,
     pub api_key: Option<String>,
     pub thinking_hint: bool,
+    /// Optional OpenAI-compatible reasoning effort values to advertise for this
+    /// upstream's models. Native Ollama is intentionally excluded: `/api/show`
+    /// reports only thinking support, not a trustworthy per-model levels list.
+    pub reasoning_efforts: Vec<String>,
     /// Models this upstream serves. Non-empty => pinned: advertised and routed
     /// as-is, never probed. Empty => probed from the upstream.
     pub models: Vec<String>,
@@ -93,6 +97,11 @@ pub struct Config {
     /// OpenAI-compatible upstream (vLLM/llama.cpp templates honor it). Disable
     /// for a strict `/v1` server that rejects unknown body fields. Default on.
     pub upstream_thinking_hint: bool,
+    /// Optional reasoning effort values advertised for the default
+    /// OpenAI-compatible upstream. Ignored after auto-detection if the default
+    /// upstream is native Ollama; rejected when UPSTREAM_KIND explicitly names
+    /// native Ollama.
+    pub upstream_reasoning_efforts: Vec<String>,
     pub default_model: String,
     /// Models advertised in /v1/capabilities. Empty => probe the upstream at startup.
     pub models: Vec<String>,
@@ -329,6 +338,8 @@ impl Config {
             .ok()
             .filter(|s| !s.trim().is_empty());
         let upstream_thinking_hint = env_bool("UPSTREAM_THINKING_HINT", true);
+        let upstream_reasoning_efforts =
+            parse_reasoning_efforts("UPSTREAM_REASONING_EFFORTS", upstream_kind, "UPSTREAM_KIND")?;
         let default_model =
             env_or_alias("UPSTREAM_DEFAULT_MODEL", "OLLAMA_DEFAULT_MODEL", "llama3.1");
         let models = csv_alias("UPSTREAM_MODELS", "OLLAMA_MODELS");
@@ -354,6 +365,7 @@ impl Config {
             upstream_base,
             upstream_api_key,
             upstream_thinking_hint,
+            upstream_reasoning_efforts,
             default_model,
             models,
             default_upstream_configured,
@@ -508,6 +520,7 @@ impl Config {
                 base: self.upstream_base.clone(),
                 api_key: self.upstream_api_key.clone(),
                 thinking_hint: self.upstream_thinking_hint,
+                reasoning_efforts: self.upstream_reasoning_efforts.clone(),
                 models: self.models.clone(),
                 concurrency: None,
             });
@@ -739,6 +752,24 @@ fn parse_upstream_kind_key(key: &str) -> Result<Option<UpstreamKind>> {
     }
 }
 
+fn parse_reasoning_efforts(
+    key: &str,
+    kind: Option<UpstreamKind>,
+    kind_key: &str,
+) -> Result<Vec<String>> {
+    let efforts = csv(key);
+    if efforts.is_empty() {
+        return Ok(efforts);
+    }
+    if kind == Some(UpstreamKind::NativeOllama) {
+        anyhow::bail!(
+            "{key} is only supported for OpenAI-compatible upstreams; remove it or set \
+             {kind_key}=openai_compatible/vllm"
+        );
+    }
+    Ok(efforts)
+}
+
 /// Parse the extra named upstreams: `UPSTREAMS` is a CSV of names, each
 /// configured via `UPSTREAM_<NAME>_*` vars (name uppercased, `-` => `_`).
 /// A declared name missing its `BASE_URL` is a hard startup error — a silently
@@ -776,13 +807,20 @@ fn parse_extra_upstreams() -> Result<Vec<UpstreamSpec>> {
             })?;
         let base = Url::parse(raw_base.trim())
             .with_context(|| format!("{base_key} must be a valid URL (got {raw_base:?})"))?;
+        let kind_key = format!("{prefix}_KIND");
+        let kind = parse_upstream_kind_key(&kind_key)?;
         specs.push(UpstreamSpec {
-            kind: parse_upstream_kind_key(&format!("{prefix}_KIND"))?,
+            kind,
             base,
             api_key: std::env::var(format!("{prefix}_API_KEY"))
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             thinking_hint: env_bool(&format!("{prefix}_THINKING_HINT"), true),
+            reasoning_efforts: parse_reasoning_efforts(
+                &format!("{prefix}_REASONING_EFFORTS"),
+                kind,
+                &kind_key,
+            )?,
             models: csv(&format!("{prefix}_MODELS")),
             concurrency: parse_opt_usize(&format!("{prefix}_MAX_CONCURRENCY"))?.map(|n| n.max(1)),
             name,
@@ -855,6 +893,7 @@ pub mod tests_support {
             upstream_base: "http://localhost:11434".parse().unwrap(),
             upstream_api_key: None,
             upstream_thinking_hint: true,
+            upstream_reasoning_efforts: vec![],
             default_model: "m".into(),
             models: vec![],
             default_upstream_configured: true,
@@ -957,7 +996,7 @@ pub mod tests_support {
 mod tests {
     use super::{
         csv_alias, env_node, env_or_alias, env_parse_alias, parse_extra_upstreams,
-        parse_upstream_kind, parse_url_alias, NodeInput,
+        parse_reasoning_efforts, parse_upstream_kind, parse_url_alias, NodeInput,
     };
     use crate::ollama::UpstreamKind;
     use std::sync::{Mutex, OnceLock};
@@ -1022,6 +1061,31 @@ mod tests {
             err.contains(KEY) && err.contains("25.noise_seed"),
             "unexpected error: {err}"
         );
+
+        std::env::remove_var(KEY);
+    }
+
+    #[test]
+    fn reasoning_efforts_are_openai_compatible_metadata() {
+        let _guard = env_lock();
+        const KEY: &str = "UPSTREAM_REASONING_EFFORTS";
+
+        std::env::remove_var(KEY);
+        assert!(parse_reasoning_efforts(KEY, None, "UPSTREAM_KIND")
+            .unwrap()
+            .is_empty());
+
+        std::env::set_var(KEY, "none, low, medium, high");
+        assert_eq!(
+            parse_reasoning_efforts(KEY, Some(UpstreamKind::OpenAICompatible), "UPSTREAM_KIND")
+                .unwrap(),
+            ["none", "low", "medium", "high"]
+        );
+
+        let err = parse_reasoning_efforts(KEY, Some(UpstreamKind::NativeOllama), "UPSTREAM_KIND")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(KEY), "got: {err}");
 
         std::env::remove_var(KEY);
     }
@@ -1099,6 +1163,7 @@ mod tests {
             "UPSTREAM_VLLM_MODELS",
             "UPSTREAM_VLLM_MAX_CONCURRENCY",
             "UPSTREAM_VLLM_THINKING_HINT",
+            "UPSTREAM_VLLM_REASONING_EFFORTS",
         ];
         for key in keys {
             std::env::remove_var(key);
@@ -1119,6 +1184,7 @@ mod tests {
         std::env::set_var("UPSTREAM_VLLM_MODELS", "qwen3-32b, qwen3-32b-awq");
         std::env::set_var("UPSTREAM_VLLM_MAX_CONCURRENCY", "2");
         std::env::set_var("UPSTREAM_VLLM_THINKING_HINT", "false");
+        std::env::set_var("UPSTREAM_VLLM_REASONING_EFFORTS", "none, low, medium, high");
         let specs = parse_extra_upstreams().unwrap();
         assert_eq!(specs.len(), 1);
         let spec = &specs[0];
@@ -1129,6 +1195,17 @@ mod tests {
         assert_eq!(spec.models, ["qwen3-32b", "qwen3-32b-awq"]);
         assert_eq!(spec.concurrency, Some(2));
         assert!(!spec.thinking_hint);
+        assert_eq!(spec.reasoning_efforts, ["none", "low", "medium", "high"]);
+
+        // Reasoning effort lists are explicit OpenAI-compatible metadata, not
+        // allowed on native Ollama where the upstream does not expose levels.
+        std::env::set_var("UPSTREAM_VLLM_KIND", "ollama");
+        let err = parse_extra_upstreams().unwrap_err().to_string();
+        assert!(
+            err.contains("UPSTREAM_VLLM_REASONING_EFFORTS"),
+            "got: {err}"
+        );
+        std::env::set_var("UPSTREAM_VLLM_KIND", "vllm");
 
         // Reserved / duplicate names are rejected.
         std::env::set_var("UPSTREAMS", "default");
@@ -1157,6 +1234,7 @@ mod tests {
             base: "http://localhost:8000".parse().unwrap(),
             api_key: None,
             thinking_hint: true,
+            reasoning_efforts: vec!["low".into(), "high".into()],
             models: vec!["big".into()],
             concurrency: None,
         }];
@@ -1178,6 +1256,7 @@ mod tests {
                 base: "http://localhost:18000".parse().unwrap(),
                 api_key: None,
                 thinking_hint: true,
+                reasoning_efforts: vec![],
                 models: vec!["big".into()],
                 concurrency: None,
             },
@@ -1187,6 +1266,7 @@ mod tests {
                 base: "http://localhost:11434".parse().unwrap(),
                 api_key: None,
                 thinking_hint: true,
+                reasoning_efforts: vec![],
                 models: vec!["small".into()],
                 concurrency: None,
             },

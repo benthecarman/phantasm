@@ -30,7 +30,7 @@ use tracing::warn;
 use crate::config::{Config, UpstreamSpec};
 use crate::ollama::{UpstreamChatBackend, UpstreamKind};
 use crate::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo, ToolSelector};
-use crate::upstreams::{UpstreamEntry, UpstreamSet};
+use crate::upstreams::{UpstreamEntry, UpstreamEntryInit, UpstreamSet};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -65,15 +65,19 @@ fn entry_from_spec(
     backend: UpstreamChatBackend,
     probed_models: Vec<String>,
 ) -> UpstreamEntry {
-    UpstreamEntry::new(
-        spec.name.clone(),
+    UpstreamEntry::new(UpstreamEntryInit {
+        name: spec.name.clone(),
         kind,
-        spec.base.clone(),
+        base: spec.base.clone(),
         backend,
-        spec.concurrency.unwrap_or(cfg.upstream_concurrency).max(1),
-        spec.models.clone(),
+        max_concurrency: spec.concurrency.unwrap_or(cfg.upstream_concurrency).max(1),
+        reasoning_efforts: match kind {
+            UpstreamKind::NativeOllama => Vec::new(),
+            UpstreamKind::OpenAICompatible => spec.reasoning_efforts.clone(),
+        },
+        pinned_models: spec.models.clone(),
         probed_models,
-    )
+    })
 }
 
 /// Detect which upstream chat API one configured host exposes.
@@ -167,17 +171,22 @@ pub async fn probe_capabilities(
                 UpstreamKind::NativeOllama => detect_model_metadata(&entry.backend, ids).await,
                 UpstreamKind::OpenAICompatible => vec![(None, None); ids.len()],
             };
-            ids.iter().cloned().zip(metadata).collect::<Vec<_>>()
+            (entry, ids.iter().cloned().zip(metadata).collect::<Vec<_>>())
         },
     ))
     .await;
     let models: Vec<ModelInfo> = per_entry
         .into_iter()
-        .flatten()
-        .map(|(id, (capabilities, context_length))| ModelInfo {
-            id,
-            capabilities,
-            context_length,
+        .flat_map(|(entry, models)| {
+            models
+                .into_iter()
+                .map(|(id, (capabilities, context_length))| ModelInfo {
+                    id,
+                    capabilities,
+                    context_length,
+                    reasoning_efforts: entry.reasoning_efforts.clone(),
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
     if models.is_empty() {
@@ -332,7 +341,7 @@ fn tool_selector_id(tool: &str) -> Option<&'static str> {
 
 /// Probe each model's `/api/show` metadata once (concurrent, best-effort, short
 /// timeout). Capability field names mirror the upstream names (e.g.
-/// `"completion"`, `"vision"`, `"tools"`, `"thinking"`).
+/// `"completion"`, `"vision"`, `"tools"`).
 async fn detect_model_metadata(
     upstream: &UpstreamChatBackend,
     models: &[String],

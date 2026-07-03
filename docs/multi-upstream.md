@@ -48,6 +48,7 @@ startup loudly rather than silently dropping the backend.
 | `UPSTREAM_<NAME>_API_KEY` | *(none)* | Bearer token for OpenAI-compatible backends. |
 | `UPSTREAM_<NAME>_MAX_CONCURRENCY` | global `UPSTREAM_MAX_CONCURRENCY` | Cap on simultaneous generations on this backend. |
 | `UPSTREAM_<NAME>_THINKING_HINT` | `true` | Send the Qwen-style `enable_thinking` hint (OpenAI-compatible backends only). Set `false` for strict `/v1` servers. |
+| `UPSTREAM_<NAME>_REASONING_EFFORTS` | *(none)* | CSV of reasoning effort values to advertise for this OpenAI-compatible upstream's models, e.g. `none,low,medium,high`. Rejected when the upstream kind is explicitly native Ollama. |
 
 Two things change meaning slightly in multi-upstream mode:
 

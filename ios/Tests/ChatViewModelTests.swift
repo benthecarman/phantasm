@@ -67,9 +67,9 @@ final class ChatViewModelTests: XCTestCase {
                         audio: false,
                         tools: true,
                         insert: false,
-                        thinking: true,
                         embedding: false
-                    )
+                    ),
+                    reasoningEfforts: [ReasoningEffort.disabled, ReasoningEffort.enabledDefault]
                 )
             ]
         ))
@@ -572,7 +572,6 @@ final class ChatViewModelTests: XCTestCase {
                         audio: false,
                         tools: true,
                         insert: false,
-                        thinking: false,
                         embedding: false
                     )
                 )
@@ -657,7 +656,7 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
 
     func thinkingEnabled(for model: String?) -> Bool {
         guard let model else { return false }
-        return backendMode.capabilities?.thinkingModelIDs?.contains(model) == true
+        return backendMode.capabilities?.reasoningEffortModelIDs?.contains(model) == true
     }
 
     func reasoningEffort(for model: String?) -> String? {

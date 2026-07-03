@@ -7,11 +7,12 @@ final class CapabilityDecodeTests: XCTestCase {
         {"version":"0.3.0",
          "models":[
            {"id":"llama3.1","context_length":8192,
-            "capabilities":{"completion":true,"vision":false,"audio":false,"tools":false,"insert":false,"thinking":false,"embedding":false}},
+            "capabilities":{"completion":true,"vision":false,"audio":false,"tools":false,"insert":false,"embedding":false}},
            {"id":"qwen2.5:14b","context_length":32768,
-            "capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":true,"embedding":false}},
+            "reasoning_efforts":["none","low","medium","high"],
+            "capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"embedding":false}},
            {"id":"nomic-embed-text:latest",
-            "capabilities":{"completion":false,"vision":false,"audio":false,"tools":false,"insert":false,"thinking":false,"embedding":true}}
+            "capabilities":{"completion":false,"vision":false,"audio":false,"tools":false,"insert":false,"embedding":true}}
          ],
          "tool_selectors":[
            {"id":"web_search","label":"Web search","tools":["web_search","weather"]},
@@ -21,6 +22,16 @@ final class CapabilityDecodeTests: XCTestCase {
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertEqual(caps.models, ["llama3.1", "qwen2.5:14b"])
         XCTAssertEqual(caps.modelEntries.first?.contextLength, 8192)
+        XCTAssertEqual(caps.modelEntries[0].reasoningEffortAvailability, .unknown)
+        XCTAssertEqual(
+            caps.modelEntries[1].reasoningEffortAvailability,
+            .known(["none", "low", "medium", "high"])
+        )
+        XCTAssertEqual(caps.reasoningEffortsByID["llama3.1"], .unknown)
+        XCTAssertEqual(
+            caps.reasoningEffortsByID["qwen2.5:14b"],
+            .known(["none", "low", "medium", "high"])
+        )
         XCTAssertTrue(caps.hasToolSelector(ToolSelectorName.webSearch))
         XCTAssertTrue(caps.hasToolSelector(ToolSelectorName.utilities))
         XCTAssertFalse(caps.hasToolSelector(ToolSelectorName.imageGeneration))
@@ -35,8 +46,8 @@ final class CapabilityDecodeTests: XCTestCase {
         let json = """
         {"version":"0.3.0",
          "models":[
-           {"id":"llava","capabilities":{"completion":true,"vision":true,"audio":true,"tools":false,"insert":false,"thinking":false,"embedding":false}},
-           {"id":"qwen","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":true,"thinking":true,"embedding":false}}
+           {"id":"llava","capabilities":{"completion":true,"vision":true,"audio":true,"tools":false,"insert":false,"embedding":false}},
+           {"id":"qwen","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":true,"embedding":false}}
          ],
          "tool_selectors":[]}
         """
@@ -47,10 +58,26 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(caps.modelEntries.last?.capabilities?.insert, true)
     }
 
+    func testReasoningEffortsDistinguishUnknownFromKnownEmpty() throws {
+        let json = """
+        {"version":"0.3.0",
+         "models":[
+           {"id":"unknown"},
+           {"id":"known-empty","reasoning_efforts":[]},
+           {"id":"known-levels","reasoning_efforts":["low","medium"]}
+         ],
+         "tool_selectors":[]}
+        """
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+        XCTAssertEqual(caps.reasoningEffortsByID["unknown"], .unknown)
+        XCTAssertEqual(caps.reasoningEffortsByID["known-empty"], .known([]))
+        XCTAssertEqual(caps.reasoningEffortsByID["known-levels"], .known(["low", "medium"]))
+    }
+
     func testConnectionTestMessageCoversBackendModes() throws {
         let json = """
         {"version":"0.3.0",
-         "models":[{"id":"qwen","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":false,"embedding":false}}],
+         "models":[{"id":"qwen","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"embedding":false}}],
          "tool_selectors":[{"id":"web_search","label":"Web search","tools":["web_search"]}]}
         """
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
@@ -69,11 +96,11 @@ final class CapabilityDecodeTests: XCTestCase {
         )
     }
 
-    func testManifestWithPartialModelCapabilitiesStaysOptimisticExceptThinking() throws {
+    func testManifestWithPartialModelCapabilitiesStaysOptimistic() throws {
         // An orchestrator that omits individual capability fields (older build,
         // future rename) must not fail the manifest decode — that used to
-        // silently degrade the whole backend to plain chat. Missing operational
-        // fields stay optimistic (spec §2.1); Thinking requires an explicit true.
+        // silently degrade the whole backend to plain chat. Missing capability
+        // fields stay optimistic (spec §2.1).
         let json = """
         {"version":"0.3.0",
          "models":[{"id":"m","capabilities":{"completion":true,"vision":false,"tools":true}}],
@@ -83,8 +110,7 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(caps.models, ["m"])
         XCTAssertEqual(caps.visionModelIDs, [])
         XCTAssertEqual(caps.toolModelIDs, ["m"])
-        XCTAssertEqual(caps.thinkingModelIDs, [])
-        XCTAssertEqual(caps.modelEntries.first?.capabilities?.thinking, false)
+        XCTAssertNil(caps.reasoningEffortModelIDs)
     }
 
     func testManifestWithoutModelCapabilitiesIsUnknown() throws {
@@ -92,7 +118,7 @@ final class CapabilityDecodeTests: XCTestCase {
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertNil(caps.visionModelIDs)
         XCTAssertNil(caps.toolModelIDs)
-        XCTAssertNil(caps.thinkingModelIDs)
+        XCTAssertNil(caps.reasoningEffortModelIDs)
     }
 
     // MARK: - Per-chat tool selection (standard OpenAI tools/tool_choice)
@@ -165,7 +191,7 @@ final class CapabilityDecodeTests: XCTestCase {
     func testManifestDecodesModes() throws {
         let json = """
         {"version":"0.3.0",
-         "models":[{"id":"qwen2.5:14b","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":false,"embedding":false}}],
+         "models":[{"id":"qwen2.5:14b","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"embedding":false}}],
          "tool_selectors":[
            {"id":"web_search","label":"Web search","tools":["web_search"]},
            {"id":"image_generation","label":"Images","tools":["image_generation"]}
@@ -192,7 +218,7 @@ final class CapabilityDecodeTests: XCTestCase {
         // web_search available, image_generation not.
         let json = """
         {"version":"0.3.0",
-         "models":[{"id":"m","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"thinking":false,"embedding":false}}],
+         "models":[{"id":"m","capabilities":{"completion":true,"vision":false,"audio":false,"tools":true,"insert":false,"embedding":false}}],
          "tool_selectors":[{"id":"web_search","label":"Web search","tools":["web_search"]}],
          "modes":[
            {"id":"deep-research","label":"Deep Research","required_tools":["web_search"]},

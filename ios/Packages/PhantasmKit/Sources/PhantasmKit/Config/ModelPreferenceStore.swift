@@ -5,6 +5,7 @@ import Foundation
 public final class ModelPreferenceStore: @unchecked Sendable {
     private let defaults: UserDefaults
     private let thinkingKey = "phantasm.modelThinking"
+    private let reasoningEffortKey = "phantasm.modelReasoningEffort"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -16,6 +17,14 @@ public final class ModelPreferenceStore: @unchecked Sendable {
 
     public func saveThinkingPreferences(_ preferences: [String: [String: Bool]]) {
         defaults.set(preferences, forKey: thinkingKey)
+    }
+
+    public func loadReasoningEffortPreferences() -> [String: [String: String]] {
+        defaults.dictionary(forKey: reasoningEffortKey) as? [String: [String: String]] ?? [:]
+    }
+
+    public func saveReasoningEffortPreferences(_ preferences: [String: [String: String]]) {
+        defaults.set(preferences, forKey: reasoningEffortKey)
     }
 
     public func thinkingEnabled(for model: String, profileID: UUID) -> Bool {
@@ -34,5 +43,9 @@ public final class ModelPreferenceStore: @unchecked Sendable {
         var preferences = loadThinkingPreferences()
         preferences[profileID.uuidString] = nil
         saveThinkingPreferences(preferences)
+
+        var effortPreferences = loadReasoningEffortPreferences()
+        effortPreferences[profileID.uuidString] = nil
+        saveReasoningEffortPreferences(effortPreferences)
     }
 }

@@ -56,13 +56,18 @@ final class AppEnvironment {
     /// undetectable for this backend, so tools are allowed optimistically. The
     /// server tools also require the backend to advertise them (`backendMode`).
     var toolModels: Set<String>?
-    /// Models known to support reasoning/thinking on a Phantasm backend.
-    var thinkingModels: Set<String>?
+    /// Per-model reasoning effort availability on a Phantasm backend. Missing
+    /// `reasoning_efforts` for one model must not hide controls for another
+    /// model that did advertise options.
+    var reasoningEffortsByModel: [String: Capabilities.Model.ReasoningEffortAvailability]?
     /// Per-model context window sizes, when the backend reports them. Empty/missing
     /// for a model ⇒ the picker omits the size badge and no overflow warning shows.
     var contextLengths: [String: Int]?
     /// Observable cache over persisted per-profile, per-model Thinking preferences.
     private var thinkingPreferences: [String: [String: Bool]]
+    /// Observable cache over explicit per-profile, per-model reasoning effort
+    /// choices for models with more than an on/off Thinking control.
+    private var reasoningEffortPreferences: [String: [String: String]]
     private var capabilityRefreshGeneration = 0
 
     enum ThinkingSupport {
@@ -96,6 +101,7 @@ final class AppEnvironment {
         AppToolRegistry.configureCalendar(provider: calendarProvider)
         profiles = profileStore.load()
         thinkingPreferences = modelPreferenceStore.loadThinkingPreferences()
+        reasoningEffortPreferences = modelPreferenceStore.loadReasoningEffortPreferences()
         // Keychain tokens outlive an app uninstall but the UserDefaults profile
         // list does not, so a reinstall can strand tokens with no owning
         // profile. Reconcile the two on launch.
@@ -208,7 +214,7 @@ final class AppEnvironment {
             backendMode = .plainChatOnly(models: [])
             visionModels = nil
             toolModels = nil
-            thinkingModels = nil
+            reasoningEffortsByModel = nil
             contextLengths = nil
             isProbing = false
             return
@@ -231,7 +237,7 @@ final class AppEnvironment {
         guard isCurrentCapabilityRefresh(generation, profileID: profileID) else { return }
         visionModels = modelCapabilities.vision
         toolModels = modelCapabilities.tools
-        thinkingModels = modelCapabilities.thinking
+        reasoningEffortsByModel = modelCapabilities.reasoningEfforts
         contextLengths = modelCapabilities.contextLengths
         warmActiveModel(base: base, token: token)
     }
@@ -261,7 +267,7 @@ final class AppEnvironment {
     ) async -> (
         vision: Set<String>?,
         tools: Set<String>?,
-        thinking: Set<String>?,
+        reasoningEfforts: [String: Capabilities.Model.ReasoningEffortAvailability]?,
         contextLengths: [String: Int]?
     ) {
         switch mode {
@@ -269,7 +275,7 @@ final class AppEnvironment {
             return (
                 caps.visionModelIDs,
                 caps.toolModelIDs,
-                caps.thinkingModelIDs,
+                caps.reasoningEffortsByID,
                 caps.contextLengthByID
             )
         case .ollamaNative(let models):
@@ -300,19 +306,32 @@ final class AppEnvironment {
     }
 
     /// Whether `model` can produce reasoning/thinking output through the Phantasm
-    /// orchestrator. The endpoint must explicitly advertise the model as thinking
-    /// capable; plain OpenAI-compatible/native Ollama backends and older manifests
-    /// without per-model thinking data do not expose the app's Thinking toggle.
+    /// orchestrator. The endpoint must explicitly advertise a non-empty
+    /// `reasoning_efforts` list; plain OpenAI-compatible/native Ollama backends
+    /// and older manifests without per-model effort data do not expose the app's
+    /// Thinking toggle.
     func supportsThinking(_ model: String?) -> Bool {
         thinkingSupport(for: model) == .supported
     }
 
+    func reasoningEfforts(for model: String?) -> [String] {
+        guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty,
+              case .known(let efforts) = reasoningEffortsByModel?[model] else { return [] }
+        return efforts
+    }
+
     func thinkingSupport(for model: String?) -> ThinkingSupport {
         guard case .full = backendMode else { return .unsupported }
-        guard let thinkingModels else { return .unknown }
         guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty else { return .unknown }
-        return thinkingModels.contains(model) ? .supported : .unsupported
+        guard let availability = reasoningEffortsByModel?[model] else { return .unknown }
+        switch availability {
+        case .unknown:
+            return .unknown
+        case .known(let efforts):
+            return efforts.isEmpty ? .unsupported : .supported
+        }
     }
 
     /// The effective Thinking setting for `model`: the stored preference, defaulting
@@ -331,7 +350,13 @@ final class AppEnvironment {
 
     func reasoningEffort(for model: String?) -> String? {
         guard thinkingSupport(for: model) == .supported else { return nil }
-        return thinkingEnabled(for: model) ? ReasoningEffort.enabledDefault : ReasoningEffort.disabled
+        let efforts = reasoningEfforts(for: model)
+        guard efforts.count > 2 else {
+            return thinkingEnabled(for: model)
+                ? preferredEnabledReasoningEffort(from: efforts)
+                : disabledReasoningEffort(from: efforts)
+        }
+        return selectedReasoningEffort(for: model)
     }
 
     func setThinkingEnabled(_ enabled: Bool, for model: String?) {
@@ -342,6 +367,45 @@ final class AppEnvironment {
         byModel[model] = enabled
         thinkingPreferences[profileID.uuidString] = byModel
         modelPreferenceStore.saveThinkingPreferences(thinkingPreferences)
+    }
+
+    func selectedReasoningEffort(for model: String?) -> String {
+        let efforts = reasoningEfforts(for: model)
+        guard let profileID = activeProfileID,
+              let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else { return preferredEnabledReasoningEffort(from: efforts) }
+        if let stored = reasoningEffortPreferences[profileID.uuidString]?[model],
+           efforts.contains(stored) {
+            return stored
+        }
+        return defaultReasoningEffort(from: efforts)
+    }
+
+    func setSelectedReasoningEffort(_ effort: String, for model: String?) {
+        let efforts = reasoningEfforts(for: model)
+        guard efforts.contains(effort),
+              let profileID = activeProfileID,
+              let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty else { return }
+        var byModel = reasoningEffortPreferences[profileID.uuidString] ?? [:]
+        byModel[model] = effort
+        reasoningEffortPreferences[profileID.uuidString] = byModel
+        modelPreferenceStore.saveReasoningEffortPreferences(reasoningEffortPreferences)
+    }
+
+    private func disabledReasoningEffort(from efforts: [String]) -> String? {
+        efforts.first { $0.caseInsensitiveCompare(ReasoningEffort.disabled) == .orderedSame }
+    }
+
+    private func preferredEnabledReasoningEffort(from efforts: [String]) -> String {
+        if efforts.contains(ReasoningEffort.enabledDefault) { return ReasoningEffort.enabledDefault }
+        return efforts.first {
+            $0.caseInsensitiveCompare(ReasoningEffort.disabled) != .orderedSame
+        } ?? ReasoningEffort.enabledDefault
+    }
+
+    private func defaultReasoningEffort(from efforts: [String]) -> String {
+        preferredEnabledReasoningEffort(from: efforts)
     }
 
     /// Kick off a best-effort preload of the model new chats will use, so the

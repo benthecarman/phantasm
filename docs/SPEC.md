@@ -43,20 +43,19 @@ image generation on top of plain inference.
         "audio": false,
         "tools": false,
         "insert": false,
-        "thinking": false,
         "embedding": false
       }
     },
     {
       "id": "qwen2.5:14b",
       "context_length": 32768,
+      "reasoning_efforts": ["none", "low", "medium", "high"],
       "capabilities": {
         "completion": true,
         "vision": false,
         "audio": false,
         "tools": true,
         "insert": true,
-        "thinking": true,
         "embedding": false
       }
     },
@@ -68,7 +67,6 @@ image generation on top of plain inference.
         "audio": false,
         "tools": false,
         "insert": false,
-        "thinking": false,
         "embedding": true
       }
     }
@@ -137,9 +135,13 @@ app treats omitted capabilities as unknown and allows them optimistically. When
 present, capability field names mirror upstream Ollama names: `completion` gates
 chat model selection, `vision` gates image attachments, `audio` reports audio
 input support, `tools` gates all server and app-hosted tool affordances, `insert`
-reports fill-in-the-middle support, `thinking` reports model reasoning support,
-and `embedding` identifies embedding-only models. `context_length` is model
+reports fill-in-the-middle support, and `embedding` identifies embedding-only
+models. `context_length` is model
 metadata, not a capability, so it lives beside `capabilities`.
+`reasoning_efforts`, when present, reports model reasoning support and lists
+the configured effort values the app may offer for that model. Native Ollama
+does not advertise this field because `/api/show` does not provide a
+trustworthy per-model list of accepted levels.
 
 Each `tool_selectors[]` entry names one app-facing UI bucket. When a bucket is
 enabled, the app sends the concrete server-side schema names listed in that

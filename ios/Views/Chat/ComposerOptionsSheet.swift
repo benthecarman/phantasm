@@ -42,8 +42,12 @@ struct ComposerOptionsSheet: View {
     /// The per-message research mode selection (nil = ordinary turn). Selecting a
     /// mode reaches the wire only as a `<base>:<mode>` model-id suffix at send time.
     let modeID: Binding<String?>
+    /// Advertised `reasoning_efforts` for the selected model.
+    let reasoningEfforts: [String]
     /// Whether the backend should be allowed to emit thinking/reasoning deltas.
     let thinkingEnabled: Binding<Bool>
+    /// Explicit effort selection for models that expose more than on/off.
+    let selectedReasoningEffort: Binding<String>
 
     @Environment(\.dismiss) private var dismiss
     @State private var photoItems: [PhotosPickerItem] = []
@@ -83,13 +87,7 @@ struct ComposerOptionsSheet: View {
 
                 if showsThinkingToggle {
                     Section("Response") {
-                        optionRow(
-                            "Thinking",
-                            systemImage: "brain.head.profile",
-                            available: modelSupportsThinking,
-                            disabledReason: "This model can't think",
-                            isOn: thinkingEnabled
-                        )
+                        reasoningEffortRow
                     }
                 }
 
@@ -301,30 +299,65 @@ struct ComposerOptionsSheet: View {
         .disabled(!available)
     }
 
-    /// A response toggle. When the model can't drive the feature it renders
-    /// disabled + pinned off, captioned with the reason — same treatment as
-    /// `toolRow`, so an unusable toggle stays discoverable instead of vanishing.
-    private func optionRow(
-        _ title: String,
-        systemImage: String,
-        available: Bool,
-        disabledReason: String,
-        isOn: Binding<Bool>
-    ) -> some View {
+    /// Response reasoning control. Two advertised efforts render as the existing
+    /// on/off Thinking toggle; larger effort lists render as a menu picker.
+    @ViewBuilder
+    private var reasoningEffortRow: some View {
+        if reasoningEfforts.count > 2 {
+            reasoningEffortPickerRow
+        } else {
+            reasoningToggleRow
+        }
+    }
+
+    private var reasoningToggleRow: some View {
         HStack(spacing: 12) {
-            icon(systemImage, tint: available ? .accentColor : .secondary)
-            Toggle(isOn: available ? feedbackBinding(isOn) : .constant(false)) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(title)
-                        .foregroundStyle(available ? Color.primary : Color.secondary)
-                    if !available {
-                        Text(disabledReason)
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
+            icon("brain.head.profile", tint: modelSupportsThinking ? .accentColor : .secondary)
+            Toggle(isOn: modelSupportsThinking ? feedbackBinding(thinkingEnabled) : .constant(false)) {
+                reasoningLabel(
+                    title: "Thinking",
+                    available: modelSupportsThinking,
+                    disabledReason: "This model can't think"
+                )
+            }
+            .disabled(!modelSupportsThinking)
+        }
+    }
+
+    private var reasoningEffortPickerRow: some View {
+        HStack(spacing: 12) {
+            icon("brain.head.profile", tint: modelSupportsThinking ? .accentColor : .secondary)
+            reasoningLabel(
+                title: "Thinking",
+                available: modelSupportsThinking,
+                disabledReason: "This model can't think"
+            )
+            Spacer()
+            Picker("Thinking", selection: effortSelection) {
+                ForEach(reasoningEfforts, id: \.self) { effort in
+                    Text(Self.reasoningEffortLabel(effort))
+                        .tag(effort)
                 }
             }
-            .disabled(!available)
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .disabled(!modelSupportsThinking)
+        }
+    }
+
+    private func reasoningLabel(
+        title: String,
+        available: Bool,
+        disabledReason: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+                .foregroundStyle(available ? Color.primary : Color.secondary)
+            if !available {
+                Text(disabledReason)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
         }
     }
 
@@ -353,6 +386,33 @@ struct ComposerOptionsSheet: View {
                 binding.wrappedValue = newValue
             }
         )
+    }
+
+    private var effortSelection: Binding<String> {
+        Binding(
+            get: {
+                reasoningEfforts.contains(selectedReasoningEffort.wrappedValue)
+                    ? selectedReasoningEffort.wrappedValue
+                    : reasoningEfforts.first ?? ReasoningEffort.enabledDefault
+            },
+            set: { newValue in
+                if selectedReasoningEffort.wrappedValue != newValue { Haptics.selection() }
+                selectedReasoningEffort.wrappedValue = newValue
+            }
+        )
+    }
+
+    static func reasoningEffortLabel(_ effort: String) -> String {
+        switch effort.lowercased() {
+        case "none": return "Off"
+        case "low": return "Low"
+        case "medium": return "Medium"
+        case "high": return "High"
+        default:
+            return effort
+                .replacingOccurrences(of: "_", with: " ")
+                .capitalized
+        }
     }
 
     // MARK: Loading

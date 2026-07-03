@@ -103,11 +103,12 @@ enum AskService {
     }
 
     /// `"none"` only for models the Phantasm/orchestrator manifest explicitly
-    /// advertises as thinking-capable. Plain OpenAI-compatible/native Ollama
-    /// backends and unknown per-model support omit the field.
+    /// advertises with reasoning effort options. Plain OpenAI-compatible/native
+    /// Ollama backends and unknown per-model support omit the field.
     private static func disabledReasoningEffort(for model: String, mode: BackendMode) -> String? {
         guard case .full(let caps) = mode,
-              caps.thinkingModelIDs?.contains(model) == true else { return nil }
+              case .known(let efforts) = caps.reasoningEffortsByID[model],
+              !efforts.isEmpty else { return nil }
         return ReasoningEffort.disabled
     }
 }

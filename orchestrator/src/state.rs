@@ -191,6 +191,11 @@ pub struct ModelInfo {
     /// Model context window in tokens, when the upstream reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u64>,
+    /// Optional OpenAI-compatible reasoning effort values this model accepts,
+    /// when configured for its upstream. Native Ollama does not advertise this:
+    /// `/api/show` reports thinking support only, not the accepted levels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -200,7 +205,6 @@ pub struct ModelCapabilities {
     pub audio: bool,
     pub tools: bool,
     pub insert: bool,
-    pub thinking: bool,
     pub embedding: bool,
 }
 
@@ -212,7 +216,6 @@ impl ModelCapabilities {
             audio: has_capability(names, "audio"),
             tools: has_capability(names, "tools"),
             insert: has_capability(names, "insert"),
-            thinking: has_capability(names, "thinking"),
             embedding: has_capability(names, "embedding"),
         }
     }

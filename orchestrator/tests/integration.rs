@@ -11,7 +11,7 @@ use axum::Router;
 use phantasm_orchestrator::config::{Config, LogFormat};
 use phantasm_orchestrator::ollama::{UpstreamChatBackend, UpstreamKind};
 use phantasm_orchestrator::state::{CapabilitySnapshot, ModelCapabilities, ModelInfo};
-use phantasm_orchestrator::upstreams::{UpstreamEntry, UpstreamSet};
+use phantasm_orchestrator::upstreams::{UpstreamEntry, UpstreamEntryInit, UpstreamSet};
 use phantasm_orchestrator::{probe_capabilities, routes};
 use tokio::sync::Mutex;
 
@@ -409,6 +409,7 @@ fn test_config(upstream_base: &str) -> Config {
         upstream_base: upstream_base.parse().unwrap(),
         upstream_api_key: None,
         upstream_thinking_hint: true,
+        upstream_reasoning_efforts: vec![],
         default_model: "m".into(),
         models: vec!["m".into()],
         default_upstream_configured: true,
@@ -517,10 +518,10 @@ fn test_capabilities() -> CapabilitySnapshot {
                 audio: false,
                 tools: false,
                 insert: false,
-                thinking: false,
                 embedding: false,
             }),
             context_length: Some(4096),
+            reasoning_efforts: vec![],
         }],
         tool_selectors: vec![],
         modes: vec![],
@@ -986,15 +987,16 @@ async fn capability_refresh_uses_fixed_backend_kind() {
     let http = reqwest::Client::new();
     let spec = &cfg.upstream_specs()[0];
     let native = UpstreamChatBackend::from_spec(UpstreamKind::NativeOllama, http.clone(), spec);
-    let upstreams = UpstreamSet::new(vec![UpstreamEntry::new(
-        spec.name.clone(),
-        UpstreamKind::NativeOllama,
-        spec.base.clone(),
-        native,
-        4,
-        vec![],
-        vec![],
-    )]);
+    let upstreams = UpstreamSet::new(vec![UpstreamEntry::new(UpstreamEntryInit {
+        name: spec.name.clone(),
+        kind: UpstreamKind::NativeOllama,
+        base: spec.base.clone(),
+        backend: native,
+        max_concurrency: 4,
+        reasoning_efforts: vec![],
+        pinned_models: vec![],
+        probed_models: vec![],
+    })]);
 
     let capabilities = probe_capabilities(&cfg, &http, &upstreams, false).await;
 
@@ -1053,6 +1055,7 @@ async fn multiple_upstreams_union_models_and_route_by_model() {
         base: vllm.parse().unwrap(),
         api_key: None,
         thinking_hint: true,
+        reasoning_efforts: vec!["none".into(), "low".into(), "medium".into(), "high".into()],
         models: vec![], // probed from its /v1/models
         concurrency: Some(2),
     }];
@@ -1087,6 +1090,23 @@ async fn multiple_upstreams_union_models_and_route_by_model() {
     assert!(
         ids.contains(&"big"),
         "extra upstream's model advertised: {ids:?}"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/v1/capabilities"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let caps: serde_json::Value = resp.json().await.unwrap();
+    let models = caps["models"].as_array().unwrap();
+    let native_model = models.iter().find(|m| m["id"] == "m").unwrap();
+    let vllm_model = models.iter().find(|m| m["id"] == "big").unwrap();
+    assert_eq!(native_model.get("reasoning_efforts"), None);
+    assert_eq!(
+        vllm_model["reasoning_efforts"],
+        serde_json::json!(["none", "low", "medium", "high"])
     );
 
     let chat = |model: &'static str| {
@@ -1910,7 +1930,6 @@ async fn capabilities_requires_auth_and_reports_models() {
     assert_eq!(v["models"][0]["capabilities"]["audio"], false);
     assert_eq!(v["models"][0]["capabilities"]["tools"], false);
     assert_eq!(v["models"][0]["capabilities"]["insert"], false);
-    assert_eq!(v["models"][0]["capabilities"]["thinking"], false);
     assert_eq!(v["models"][0]["capabilities"]["embedding"], false);
     assert_eq!(v["models"][0]["context_length"], 4096);
     assert_eq!(v["tool_selectors"], serde_json::json!([]));

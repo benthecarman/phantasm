@@ -307,14 +307,33 @@ public extension ChatChunk.Choice.Delta {
 /// The capabilities manifest (spec §2.1).
 public struct Capabilities: Decodable, Sendable, Equatable {
     public struct Model: Decodable, Sendable, Equatable, Identifiable {
+        public enum ReasoningEffortAvailability: Sendable, Equatable {
+            case unknown
+            case known([String])
+        }
+
         public let id: String
         public let capabilities: ModelCapabilities?
         public let contextLength: Int?
+        /// Optional per-model reasoning effort values advertised by the
+        /// orchestrator. `nil` means unknown/not advertised; `[]` means the
+        /// backend explicitly advertised no selectable levels.
+        public let reasoningEfforts: [String]?
 
-        public init(id: String, capabilities: ModelCapabilities? = nil, contextLength: Int? = nil) {
+        public var reasoningEffortAvailability: ReasoningEffortAvailability {
+            reasoningEfforts.map(ReasoningEffortAvailability.known) ?? .unknown
+        }
+
+        public init(
+            id: String,
+            capabilities: ModelCapabilities? = nil,
+            contextLength: Int? = nil,
+            reasoningEfforts: [String]? = nil
+        ) {
             self.id = id
             self.capabilities = capabilities
             self.contextLength = contextLength
+            self.reasoningEfforts = reasoningEfforts
         }
     }
 
@@ -324,27 +343,23 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         public let audio: Bool
         public let tools: Bool
         public let insert: Bool
-        public let thinking: Bool
         public let embedding: Bool
 
         private enum CodingKeys: String, CodingKey {
-            case completion, vision, audio, tools, insert, thinking, embedding
+            case completion, vision, audio, tools, insert, embedding
         }
 
         public init(from decoder: Decoder) throws {
             // Spec §2.1: unknown operational capabilities stay optimistic. An
             // orchestrator version that omits an individual field (older build,
             // renamed key) must not fail the whole manifest decode — that would
-            // silently degrade the backend to plain chat. Thinking is different:
-            // the app only exposes/defaults it on when the endpoint explicitly
-            // advertises support.
+            // silently degrade the backend to plain chat.
             let container = try decoder.container(keyedBy: CodingKeys.self)
             completion = try container.decodeIfPresent(Bool.self, forKey: .completion) ?? true
             vision = try container.decodeIfPresent(Bool.self, forKey: .vision) ?? true
             audio = try container.decodeIfPresent(Bool.self, forKey: .audio) ?? true
             tools = try container.decodeIfPresent(Bool.self, forKey: .tools) ?? true
             insert = try container.decodeIfPresent(Bool.self, forKey: .insert) ?? true
-            thinking = try container.decodeIfPresent(Bool.self, forKey: .thinking) ?? false
             embedding = try container.decodeIfPresent(Bool.self, forKey: .embedding) ?? true
         }
 
@@ -354,7 +369,6 @@ public struct Capabilities: Decodable, Sendable, Equatable {
             audio: Bool,
             tools: Bool,
             insert: Bool,
-            thinking: Bool,
             embedding: Bool
         ) {
             self.completion = completion
@@ -362,7 +376,6 @@ public struct Capabilities: Decodable, Sendable, Equatable {
             self.audio = audio
             self.tools = tools
             self.insert = insert
-            self.thinking = thinking
             self.embedding = embedding
         }
     }
@@ -430,11 +443,6 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         supportedModels(where: \.tools)
     }
 
-    /// `nil` means reasoning support is unknown for this backend.
-    public var thinkingModelIDs: Set<String>? {
-        supportedModels(where: \.thinking)
-    }
-
     /// Per-model context window sizes, for the models that report one. Models
     /// without a reported window are simply absent from the map.
     public var contextLengthByID: [String: Int] {
@@ -443,6 +451,29 @@ public struct Capabilities: Decodable, Sendable, Equatable {
             if let length = model.contextLength { map[model.id] = length }
         }
         return map
+    }
+
+    /// Per-model reasoning effort availability. Missing `reasoning_efforts` is
+    /// represented as `.unknown`; an empty advertised list stays `.known([])`.
+    public var reasoningEffortsByID: [String: Model.ReasoningEffortAvailability] {
+        Dictionary(uniqueKeysWithValues: modelEntries.map {
+            ($0.id, $0.reasoningEffortAvailability)
+        })
+    }
+
+    /// `nil` means reasoning effort support is unknown for at least one model.
+    /// A present set contains models with a non-empty advertised effort list.
+    public var reasoningEffortModelIDs: Set<String>? {
+        var supported = Set<String>()
+        for model in modelEntries {
+            switch model.reasoningEffortAvailability {
+            case .unknown:
+                return nil
+            case .known(let efforts):
+                if !efforts.isEmpty { supported.insert(model.id) }
+            }
+        }
+        return supported
     }
 
     public init(
