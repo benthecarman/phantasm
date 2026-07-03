@@ -12,10 +12,10 @@ struct ComposerOptionsSheet: View {
     @Binding var attachments: [PendingAttachment]
     /// Whether the selected model can accept images (vision). Gates camera + photos.
     let allowsImageAttachments: Bool
-    /// Whether the backend advertises each server tool (spec §2.1). A tool is
-    /// only usable when the backend advertises it *and* the model can drive tools
-    /// (`modelSupportsTools`). Unusable tools are shown disabled + off with the
-    /// reason (server vs. model) rather than hidden.
+    /// Whether the backend advertises each server tool (spec §2.1). Most tools
+    /// also require the model to drive function calls (`modelSupportsTools`);
+    /// image generation is server-resolved and stays available for every model
+    /// when the backend advertises it.
     let supportsWebSearch: Bool
     let supportsImageGeneration: Bool
     /// Whether the backend forwards app-hosted tools (i.e. it's an orchestrator).
@@ -102,6 +102,7 @@ struct ComposerOptionsSheet: View {
                         "Image generation",
                         systemImage: "wand.and.stars",
                         backendSupports: supportsImageGeneration,
+                        requiresModelTools: false,
                         isOn: imageGenerationEnabled
                     )
                     toolRow(
@@ -205,19 +206,20 @@ struct ComposerOptionsSheet: View {
         .disabled(!enabled)
     }
 
-    /// A server-tool toggle. A tool needs both the backend to advertise it and a
-    /// model that can drive tools; when either is missing it renders disabled +
-    /// pinned off, captioned with whichever side is the blocker.
+    /// A server-tool toggle. Most tools need both the backend to advertise them
+    /// and a model that can drive tools; image generation opts out because the
+    /// server-side tool loop can resolve it for any selected model.
     private func toolRow(
         _ title: String,
         systemImage: String,
         backendSupports: Bool,
+        requiresModelTools: Bool = true,
         isOn: Binding<Bool>
     ) -> some View {
-        let available = backendSupports && modelSupportsTools
+        let available = backendSupports && (!requiresModelTools || modelSupportsTools)
         let reason: String? =
             !backendSupports ? "Not supported by this server"
-            : !modelSupportsTools ? "This model can't use tools"
+            : requiresModelTools && !modelSupportsTools ? "This model can't use tools"
             : nil
         return HStack(spacing: 12) {
             icon(systemImage, tint: available ? .accentColor : .secondary)
