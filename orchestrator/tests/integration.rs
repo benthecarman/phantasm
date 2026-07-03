@@ -62,7 +62,9 @@ fn mock_ollama_app_tool_call() -> Router {
             post(|body: axum::extract::Json<serde_json::Value>| async move {
                 let streaming = body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
                 if streaming {
-                    "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"unused\"},\"done\":true,\"done_reason\":\"stop\"}\n"
+                    "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
+                       {\"function\":{\"name\":\"ask_user_input\",\"arguments\":{\"questions\":[{\"question\":\"Pick one\",\"options\":[\"A\",\"B\"],\"type\":\"single_select\"}]}}}\
+                     ]},\"done\":true,\"done_reason\":\"tool_calls\"}\n"
                 } else {
                     "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
                        {\"function\":{\"name\":\"ask_user_input\",\"arguments\":{\"questions\":[{\"question\":\"Pick one\",\"options\":[\"A\",\"B\"],\"type\":\"single_select\"}]}}}\
@@ -124,7 +126,12 @@ fn mock_ollama_mixed_tools(requests: RecordedRequests) -> Router {
                         .as_array()
                         .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
                     requests.lock().await.push(body.0.clone());
-                    if streaming {
+                    if streaming && !resumed && body.0.get("tools").is_some() {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
+                           {\"function\":{\"name\":\"calculator\",\"arguments\":{\"expression\":\"1+1\"}}},\
+                           {\"function\":{\"name\":\"ask_user\",\"arguments\":{\"question\":\"which?\"}}}\
+                         ]},\"done\":true,\"done_reason\":\"tool_calls\"}\n"
+                    } else if streaming {
                         "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n\
                          {\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\"}\n"
                     } else if resumed {
@@ -161,7 +168,11 @@ fn mock_ollama_code_exec(requests: RecordedRequests) -> Router {
                         .as_array()
                         .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
                     requests.lock().await.push(body.0.clone());
-                    if streaming {
+                    if streaming && !resumed && body.0.get("tools").is_some() {
+                        "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
+                           {\"function\":{\"name\":\"code_exec\",\"arguments\":{\"language\":\"python\",\"code\":\"print(1)\"}}}\
+                         ]},\"done\":true,\"done_reason\":\"tool_calls\"}\n"
+                    } else if streaming {
                         "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n\
                          {\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\"}\n"
                     } else if resumed {
@@ -270,9 +281,9 @@ fn mock_openai_compatible_strict_stream_options(requests: RecordedRequests) -> R
 }
 
 /// A mock OpenAI-compatible backend for vLLM/llama.cpp-style server tool use.
-/// The first non-streaming call returns a standard OpenAI `tool_calls` message.
-/// After the orchestrator appends a `tool` role result, the final streaming pass
-/// emits "Hello world".
+/// The first streaming tool-resolution call returns a standard OpenAI
+/// `tool_calls` message. After the orchestrator appends a `tool` role result,
+/// the next streaming tool-resolution call emits "Hello world".
 fn mock_openai_compatible_tool_call(requests: RecordedRequests) -> Router {
     Router::new()
         .route(
@@ -287,14 +298,16 @@ fn mock_openai_compatible_tool_call(requests: RecordedRequests) -> Router {
                         .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"));
                     requests.lock().await.push(body.0.clone());
                     if streaming {
-                        if body.0.get("tools").is_some() {
-                            return (StatusCode::BAD_REQUEST, "final stream must not include tools")
-                                .into_response();
-                        }
-                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
-                                    data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
-                                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
-                                    data: [DONE]\n\n";
+                        let body = if resumed {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                             data: [DONE]\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_calc\",\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"calculator\",\"arguments\":\"{\\\"expression\\\":\\\"1+1\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                             data: [DONE]\n\n"
+                        };
                         ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
                     } else if resumed {
                         let tool_messages = body.0["messages"]
@@ -351,6 +364,38 @@ fn mock_openai_compatible_tool_call(requests: RecordedRequests) -> Router {
         .route(
             "/v1/models",
             get(|| async { axum::Json(serde_json::json!({"data":[{"id":"m"}]})) }),
+        )
+}
+
+/// OpenAI-compatible backend that accepts tools on a streaming request but
+/// decides no tool is needed and streams the final answer immediately. This is
+/// the vLLM fast path: the orchestrator must not re-issue a second final stream.
+fn mock_openai_compatible_streaming_tools_no_call(requests: RecordedRequests) -> Router {
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: axum::extract::Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    requests.lock().await.push(body.0.clone());
+                    let streaming = body.0.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !streaming || body.0.get("tools").is_none() {
+                        return (StatusCode::BAD_REQUEST, "expected streaming tools request")
+                            .into_response();
+                    }
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
+                                data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
+                                data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                                data: [DONE]\n\n";
+                    ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async {
+                axum::Json(serde_json::json!({"data":[{"id":"m","object":"model"}]}))
+            }),
         )
 }
 
@@ -1581,9 +1626,8 @@ async fn openai_compatible_upstream_runs_server_tool_loop() {
     let resolution = requests
         .iter()
         .find(|r| r["tools"].as_array().is_some_and(|tools| !tools.is_empty()))
-        .expect(
-            "expected the non-streaming OpenAI-compatible tool-resolution call to include tools",
-        );
+        .expect("expected the streaming OpenAI-compatible tool-resolution call to include tools");
+    assert_eq!(resolution["stream"], true);
     assert_eq!(
         resolution["tool_choice"], "required",
         "expected downstream tool_choice to be forwarded during tool resolution"
@@ -1615,9 +1659,15 @@ async fn openai_compatible_upstream_runs_server_tool_loop() {
     assert!(
         requests
             .iter()
-            .filter(|r| r["stream"].as_bool() == Some(true))
-            .all(|r| r.get("tools").is_none() && r.get("tool_choice").is_none()),
-        "expected final OpenAI-compatible stream requests to omit tools and tool_choice"
+            .filter(|r| {
+                r["stream"].as_bool() == Some(true)
+                    && r["messages"]
+                        .as_array()
+                        .is_some_and(|ms| ms.iter().any(|m| m["role"] == "tool"))
+            })
+            .all(|r| r["tools"].as_array().is_some_and(|tools| !tools.is_empty())
+                && r.get("tool_choice").is_none()),
+        "expected post-tool OpenAI-compatible resolution streams to keep tools but omit tool_choice"
     );
     assert!(
         requests
@@ -1627,6 +1677,60 @@ async fn openai_compatible_upstream_runs_server_tool_loop() {
                 .is_some_and(|ms| { ms.iter().any(|m| m["role"] == "tool") }))
             .all(|r| r.get("tool_choice").is_none()),
         "expected resumed post-tool OpenAI-compatible calls to omit tool_choice"
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_streaming_tools_no_call_does_not_reissue_final_stream() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let openai = spawn(mock_openai_compatible_streaming_tools_no_call(
+        requests.clone(),
+    ))
+    .await;
+    let base =
+        spawn_orchestrator_with_calculator_kind(&openai, UpstreamKind::OpenAICompatible).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "say hello"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    let mut content = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(data).unwrap();
+        if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(c);
+        }
+    }
+    assert_eq!(content, "Hello world");
+
+    let requests = requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "streaming tool-resolution content should be relayed directly"
+    );
+    assert_eq!(requests[0]["stream"], true);
+    assert!(
+        requests[0]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "expected the single upstream request to carry offered tools"
     );
 }
 

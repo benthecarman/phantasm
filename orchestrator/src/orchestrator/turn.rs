@@ -1,11 +1,11 @@
 //! The heart of the orchestrator: the server-side tool loop (FR-O3).
 //!
-//! Two-phase model:
-//!   * **Tool resolution** — non-streaming `chat_once` calls. While the model
-//!     keeps requesting tools we execute them and feed results back, capped at
-//!     `max_tool_iters`.
-//!   * **Final answer** — once the model stops calling tools we re-issue the
-//!     resolved messages as a *streaming* call and relay tokens to the app.
+//! Streaming model:
+//!   * Plain turns go straight to the final-answer stream.
+//!   * Tool turns use streaming tool-resolution calls. While the model keeps
+//!     requesting tools we execute them and feed results back, capped at
+//!     `max_tool_iters`. Once the model streams answer text, it is relayed
+//!     directly to the app.
 //!
 //! Plain turns (no tools configured) skip straight to the streaming phase, which
 //! is the low-overhead passthrough path (NFR-O3).
@@ -264,166 +264,144 @@ pub async fn run_turn<B, T>(
         if let Some(choice) = forced_tool_choice.take() {
             tool_options.insert("tool_choice".into(), choice);
         }
-        let resp = tokio::select! {
-            r = backend.chat_once(&model, vision.as_deref().unwrap_or(&messages), &schemas, &tool_options) => r,
-            _ = cancel.cancelled() => return,
-        };
 
-        let resp = match resp {
-            Ok(m) => m,
-            Err(e) => {
-                // Surface upstream failures server-side too — otherwise they only
-                // ride to the client as a TurnEvent::Error and vanish from logs.
-                tracing::error!(iter, model = %model, error = %e, "tool-resolution chat_once failed");
-                let _ = tx.send(TurnEvent::Error(e.to_string())).await;
-                return;
-            }
-        };
+        let streamed = stream_tool_resolution(
+            &backend,
+            &model,
+            vision.as_deref().unwrap_or(&messages),
+            &schemas,
+            &tool_options,
+            &appends,
+            &tx,
+            &cancel,
+        )
+        .await;
 
-        match resp.tool_calls.clone().filter(|c| !c.is_empty()) {
-            None => {
-                // Model produced a final answer — re-issue as a stream for live tokens.
-                tracing::debug!(iter, "model produced final answer; streaming");
+        let calls = match streamed {
+            StreamToolResolution::FinalAnswer => {
                 model_stats
                     .resolution_phase
                     .observe_duration(resolution_started.elapsed());
-                let streaming_started = std::time::Instant::now();
-                stream_final(
-                    &backend,
-                    &model,
-                    vision.as_deref().unwrap_or(&messages),
-                    &options,
-                    appends,
-                    &tx,
-                    &cancel,
-                )
-                .await;
-                model_stats
-                    .streaming_phase
-                    .observe_duration(streaming_started.elapsed());
                 return;
             }
-            Some(calls) => {
-                // Tool names are identifiers, not message content — safe to log.
-                let requested: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
-                tracing::info!(
-                    iter,
-                    count = calls.len(),
-                    tools = ?requested,
-                    "model requested tool calls"
-                );
-                // App-hosted tool calls are handed back to the app to execute;
-                // the turn ends here so the app can run them and resume next
-                // request. Normally that's stateless (XR-2): the app re-sends its
-                // own complete history. But when the model issues server calls in
-                // the *same* response, dropping them would lose that work — so we
-                // honor every call: run the server ones now and stash the full
-                // history (with their results) server-side as `held`, keyed off
-                // the forwarded app call. The continuation request resumes from it
-                // and the server tools stay invisible to the app.
-                let mut calls = calls;
-                for c in &mut calls {
-                    // Normalize ids so the held assistant message, the forwarded
-                    // app calls (the cache key), and the app's echoed
-                    // `tool_call_id` all agree.
-                    c.id = Some(ensure_call_id(c));
-                }
-                let (app_calls, server_calls): (Vec<ToolCall>, Vec<ToolCall>) = calls
-                    .iter()
-                    .cloned()
-                    .partition(|c| app_names.contains(&c.function.name));
-                if !app_calls.is_empty() {
-                    let held = if server_calls.is_empty() {
-                        None
-                    } else {
-                        // Hold the assistant message (carrying *every* call) plus a
-                        // `tool` result per executed server call, atop the history
-                        // so far — exactly what resuming the loop needs.
-                        let mut resp = resp;
-                        resp.tool_calls = Some(calls.clone());
-                        messages.push(resp);
-                        let Some(outcomes) =
-                            execute_calls(&tools, &server_calls, &server_names, &ctx, &tx, &cancel)
-                                .await
-                        else {
-                            return;
-                        };
-                        for outcome in outcomes {
-                            messages.push(held_result_message(outcome));
-                        }
-                        Some(std::mem::take(&mut messages))
-                    };
-                    let forwarded: Vec<&str> =
-                        app_calls.iter().map(|c| c.function.name.as_str()).collect();
-                    let server_ran: Vec<&str> = server_calls
-                        .iter()
-                        .map(|c| c.function.name.as_str())
-                        .collect();
-                    tracing::info!(
-                        app = ?forwarded,
-                        server = ?server_ran,
-                        held = held.is_some(),
-                        "forwarding app-hosted tool calls; co-occurring server calls executed inline"
-                    );
-                    // Content queued for the final answer (e.g. an image a server
-                    // tool generated in an EARLIER iteration) would be silently
-                    // dropped by ending the turn here — while the model's context
-                    // already claims the user saw it. Flush it to the stream
-                    // before the tool_calls chunk so the app renders it.
-                    if !appends.is_empty() {
-                        let _ = tx.send(TurnEvent::Token(appends.join("\n\n"))).await;
-                    }
-                    let _ = tx
-                        .send(TurnEvent::ToolCalls {
-                            app: app_calls,
-                            held,
-                        })
-                        .await;
-                    let _ = tx
-                        .send(TurnEvent::Done {
-                            reason: "tool_calls".into(),
-                        })
-                        .await;
-                    return;
-                }
+            StreamToolResolution::ToolCalls(calls) => calls,
+        };
 
-                // Keep the pushed assistant message's ids in sync with the
-                // normalized `calls` used for execution: a compat upstream may
-                // omit ids, and history where `tool` results echo minted ids the
-                // assistant `tool_calls` message lacks gets a 400 from strict
-                // servers on the very next call.
-                let mut resp = resp;
-                resp.tool_calls = Some(calls.clone());
-                // Mirror into the vision projection (when active) so the next
-                // upstream call sees the same continuation. These messages carry
-                // no images, so the clone is cheap and needs no downscaling.
-                push_vision(&mut vision, &resp);
-                messages.push(resp); // assistant message carrying the tool_calls
-                let Some(outcomes) =
-                    execute_calls(&tools, &calls, &server_names, &ctx, &tx, &cancel).await
-                else {
-                    return;
-                };
-                for outcome in outcomes {
-                    push_vision(&mut vision, &outcome.message);
-                    messages.push(outcome.message);
-                    if let Some(extra) = outcome.append_to_answer {
-                        // A generated/edited image becomes the most recent image
-                        // in the conversation, so a later tool in this same turn
-                        // (e.g. image_edit right after image_generation) can act
-                        // on it. The image rides only the streamed answer, never
-                        // the message history latest_input_images() scans — and in
-                        // URL-delivery mode it's a `/v1/files/<id>/content` ref, not bytes
-                        // — so resolve it into the turn context directly.
-                        ctx.input_images.extend(
-                            resolve_images(
-                                &MessageContent::Text(extra.clone()),
-                                ctx.images.as_ref(),
-                            )
-                            .await,
-                        );
-                        appends.push(extra);
+        {
+            // Tool names are identifiers, not message content — safe to log.
+            let requested: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+            tracing::info!(
+                iter,
+                count = calls.len(),
+                tools = ?requested,
+                "model requested tool calls"
+            );
+            // App-hosted tool calls are handed back to the app to execute;
+            // the turn ends here so the app can run them and resume next
+            // request. Normally that's stateless (XR-2): the app re-sends its
+            // own complete history. But when the model issues server calls in
+            // the *same* response, dropping them would lose that work — so we
+            // honor every call: run the server ones now and stash the full
+            // history (with their results) server-side as `held`, keyed off
+            // the forwarded app call. The continuation request resumes from it
+            // and the server tools stay invisible to the app.
+            let mut calls = calls;
+            for c in &mut calls {
+                // Normalize ids so the held assistant message, the forwarded
+                // app calls (the cache key), and the app's echoed
+                // `tool_call_id` all agree.
+                c.id = Some(ensure_call_id(c));
+            }
+            let (app_calls, server_calls): (Vec<ToolCall>, Vec<ToolCall>) = calls
+                .iter()
+                .cloned()
+                .partition(|c| app_names.contains(&c.function.name));
+            if !app_calls.is_empty() {
+                let held = if server_calls.is_empty() {
+                    None
+                } else {
+                    // Hold the assistant message (carrying *every* call) plus a
+                    // `tool` result per executed server call, atop the history
+                    // so far — exactly what resuming the loop needs.
+                    let resp = assistant_tool_calls_message(calls.clone());
+                    messages.push(resp);
+                    let Some(outcomes) =
+                        execute_calls(&tools, &server_calls, &server_names, &ctx, &tx, &cancel)
+                            .await
+                    else {
+                        return;
+                    };
+                    for outcome in outcomes {
+                        messages.push(held_result_message(outcome));
                     }
+                    Some(std::mem::take(&mut messages))
+                };
+                let forwarded: Vec<&str> =
+                    app_calls.iter().map(|c| c.function.name.as_str()).collect();
+                let server_ran: Vec<&str> = server_calls
+                    .iter()
+                    .map(|c| c.function.name.as_str())
+                    .collect();
+                tracing::info!(
+                    app = ?forwarded,
+                    server = ?server_ran,
+                    held = held.is_some(),
+                    "forwarding app-hosted tool calls; co-occurring server calls executed inline"
+                );
+                // Content queued for the final answer (e.g. an image a server
+                // tool generated in an EARLIER iteration) would be silently
+                // dropped by ending the turn here — while the model's context
+                // already claims the user saw it. Flush it to the stream
+                // before the tool_calls chunk so the app renders it.
+                if !appends.is_empty() {
+                    let _ = tx.send(TurnEvent::Token(appends.join("\n\n"))).await;
+                }
+                let _ = tx
+                    .send(TurnEvent::ToolCalls {
+                        app: app_calls,
+                        held,
+                    })
+                    .await;
+                let _ = tx
+                    .send(TurnEvent::Done {
+                        reason: "tool_calls".into(),
+                    })
+                    .await;
+                return;
+            }
+
+            // Keep the pushed assistant message's ids in sync with the
+            // normalized `calls` used for execution: a compat upstream may
+            // omit ids, and history where `tool` results echo minted ids the
+            // assistant `tool_calls` message lacks gets a 400 from strict
+            // servers on the very next call.
+            let resp = assistant_tool_calls_message(calls.clone());
+            // Mirror into the vision projection (when active) so the next
+            // upstream call sees the same continuation. These messages carry
+            // no images, so the clone is cheap and needs no downscaling.
+            push_vision(&mut vision, &resp);
+            messages.push(resp); // assistant message carrying the tool_calls
+            let Some(outcomes) =
+                execute_calls(&tools, &calls, &server_names, &ctx, &tx, &cancel).await
+            else {
+                return;
+            };
+            for outcome in outcomes {
+                push_vision(&mut vision, &outcome.message);
+                messages.push(outcome.message);
+                if let Some(extra) = outcome.append_to_answer {
+                    // A generated/edited image becomes the most recent image
+                    // in the conversation, so a later tool in this same turn
+                    // (e.g. image_edit right after image_generation) can act
+                    // on it. The image rides only the streamed answer, never
+                    // the message history latest_input_images() scans — and in
+                    // URL-delivery mode it's a `/v1/files/<id>/content` ref, not bytes
+                    // — so resolve it into the turn context directly.
+                    ctx.input_images.extend(
+                        resolve_images(&MessageContent::Text(extra.clone()), ctx.images.as_ref())
+                            .await,
+                    );
+                    appends.push(extra);
                 }
             }
         }
@@ -453,6 +431,114 @@ pub async fn run_turn<B, T>(
     model_stats
         .streaming_phase
         .observe_duration(streaming_started.elapsed());
+}
+
+enum StreamToolResolution {
+    FinalAnswer,
+    ToolCalls(Vec<ToolCall>),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_tool_resolution<B: ChatBackend>(
+    backend: &B,
+    model: &str,
+    messages: &[ChatMessage],
+    schemas: &[Value],
+    options: &Map<String, Value>,
+    appends: &[String],
+    tx: &mpsc::Sender<TurnEvent>,
+    cancel: &CancellationToken,
+) -> StreamToolResolution {
+    if cancel.is_cancelled() {
+        return StreamToolResolution::FinalAnswer;
+    }
+    let stream = tokio::select! {
+        s = backend.chat_stream_tools(model, messages, schemas, options) => s,
+        _ = cancel.cancelled() => return StreamToolResolution::FinalAnswer,
+    };
+    let Some(mut stream) = (match stream {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::error!(
+                model = %model,
+                error = %e,
+                "opening required tool-resolution stream failed"
+            );
+            let _ = tx.send(TurnEvent::Error(e.to_string())).await;
+            return StreamToolResolution::FinalAnswer;
+        }
+    }) else {
+        tracing::error!(model = %model, "backend does not support required streaming tool resolution");
+        let _ = tx
+            .send(TurnEvent::Error(
+                "backend does not support streaming tool resolution".into(),
+            ))
+            .await;
+        return StreamToolResolution::FinalAnswer;
+    };
+
+    let mut reason = "stop".to_string();
+    loop {
+        let next = tokio::select! {
+            n = stream.next() => n,
+            _ = cancel.cancelled() => return StreamToolResolution::FinalAnswer,
+        };
+        match next {
+            Some(Ok(delta)) => {
+                if !delta.reasoning.is_empty()
+                    && tx
+                        .send(TurnEvent::Reasoning(delta.reasoning))
+                        .await
+                        .is_err()
+                {
+                    return StreamToolResolution::FinalAnswer;
+                }
+                if !delta.content.is_empty()
+                    && tx.send(TurnEvent::Token(delta.content)).await.is_err()
+                {
+                    return StreamToolResolution::FinalAnswer;
+                }
+                if let Some(calls) = delta.tool_calls.filter(|calls| !calls.is_empty()) {
+                    return StreamToolResolution::ToolCalls(calls);
+                }
+                if let Some(r) = delta.done_reason.clone() {
+                    reason = r;
+                }
+                if delta.done {
+                    break;
+                }
+            }
+            Some(Err(e)) => {
+                tracing::error!(model = %model, error = %e, "tool-resolution stream errored mid-flight");
+                let _ = tx.send(TurnEvent::Error(e.to_string())).await;
+                return StreamToolResolution::FinalAnswer;
+            }
+            None => break,
+        }
+    }
+
+    for extra in appends {
+        if tx
+            .send(TurnEvent::Token(format!("\n\n{extra}")))
+            .await
+            .is_err()
+        {
+            return StreamToolResolution::FinalAnswer;
+        }
+    }
+
+    let _ = tx.send(TurnEvent::Done { reason }).await;
+    StreamToolResolution::FinalAnswer
+}
+
+fn assistant_tool_calls_message(calls: Vec<ToolCall>) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: Some(calls),
+        tool_call_id: None,
+        name: None,
+    }
 }
 
 /// Execute a batch of tool calls concurrently, returning outcomes in call
@@ -687,7 +773,7 @@ async fn stream_relay_inner<B: ChatBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ollama::{DeltaStream, StreamDelta};
+    use crate::ollama::{DeltaStream, StreamDelta, ToolDeltaStream, ToolStreamDelta};
     use crate::openai::types::{ContentPart, FunctionCall, MessageContent, RawArguments, ToolCall};
     use crate::orchestrator::tools::ToolOutcome;
     use std::sync::Mutex;
@@ -696,11 +782,11 @@ mod tests {
 
     #[derive(Clone)]
     struct ScriptedBackend {
-        // Each chat_once call pops the next scripted assistant message.
+        // Each tool-resolution call pops the next scripted assistant message.
         once: Arc<Mutex<Vec<ChatMessage>>>,
         once_calls: Arc<Mutex<usize>>,
         final_tokens: Arc<Vec<String>>,
-        // Messages seen by the most recent chat_once call (for assertions).
+        // Messages seen by the most recent tool-resolution call (for assertions).
         seen: Arc<Mutex<Vec<ChatMessage>>>,
     }
 
@@ -864,6 +950,57 @@ mod tests {
             };
             Ok(Box::pin(s))
         }
+
+        async fn chat_stream_tools(
+            &self,
+            _model: &str,
+            messages: &[ChatMessage],
+            _tools: &[Value],
+            _options: &Map<String, Value>,
+        ) -> Result<Option<ToolDeltaStream>, crate::error::AppError> {
+            *self.once_calls.lock().unwrap() += 1;
+            *self.seen.lock().unwrap() = messages.to_vec();
+            let next = {
+                let mut q = self.once.lock().unwrap();
+                if q.is_empty() {
+                    assistant("done")
+                } else {
+                    q.remove(0)
+                }
+            };
+            let tokens = self.final_tokens.clone();
+            let s = async_stream::stream! {
+                if let Some(calls) = next.tool_calls.clone().filter(|calls| !calls.is_empty()) {
+                    yield Ok(ToolStreamDelta::new("", "", Some(calls), true, Some("tool_calls".into())));
+                } else {
+                    let emitted = if tokens.is_empty() {
+                        match next.content {
+                            Some(MessageContent::Text(text)) => {
+                                yield Ok(ToolStreamDelta::new(text, "", None, true, Some("stop".into())));
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        for (i, t) in tokens.iter().enumerate() {
+                            let last = i + 1 == tokens.len();
+                            yield Ok(ToolStreamDelta::new(
+                                t.clone(),
+                                "",
+                                None,
+                                last,
+                                if last { Some("stop".into()) } else { None },
+                            ));
+                        }
+                        true
+                    };
+                    if !emitted {
+                        yield Ok(ToolStreamDelta::new("", "", None, true, Some("stop".into())));
+                    }
+                }
+            };
+            Ok(Some(Box::pin(s)))
+        }
     }
 
     // ---- scripted tool executor ----
@@ -1013,7 +1150,7 @@ mod tests {
         assert_eq!(
             *backend.once_calls.lock().unwrap(),
             0,
-            "fast path skips chat_once"
+            "fast path skips tool resolution"
         );
         assert!(matches!(events.last(), Some(TurnEvent::Done { .. })));
     }
@@ -1051,7 +1188,7 @@ mod tests {
             executed.lock().unwrap().as_slice(),
             &["web_search".to_string()]
         );
-        // chat_once called twice: once -> tool_call, twice -> no tools (final)
+        // Tool resolution runs twice: first for the call, then for the final answer.
         assert_eq!(*backend.once_calls.lock().unwrap(), 2);
         assert_eq!(collect_text(&events), "answer");
     }
@@ -1091,7 +1228,7 @@ mod tests {
         .await;
         let _ = drain(rx).await;
 
-        // Inspect the history the SECOND chat_once saw: assistant tool_calls
+        // Inspect the history the second tool-resolution call saw: assistant tool_calls
         // ids must exist and match the tool result's tool_call_id.
         let seen = backend.seen.lock().unwrap().clone();
         let assistant = seen
@@ -1204,7 +1341,7 @@ mod tests {
         )
         .await;
         let _ = drain(rx).await;
-        // Exactly `max_tool_iters` chat_once calls, then a stream.
+        // Exactly `max_tool_iters` tool-resolution calls, then a forced final stream.
         assert_eq!(*backend.once_calls.lock().unwrap(), 3);
         assert_eq!(executed.lock().unwrap().len(), 3);
     }
@@ -1212,11 +1349,11 @@ mod tests {
     #[tokio::test]
     async fn research_preset_delegates_to_engine_and_streams() {
         // A resolved research preset must DELEGATE to research::run_research,
-        // not run the plain tool loop. The scripted backend's chat_once is used
-        // for plan/sub-agent/compress/draft/verify; chat_stream is only reached
-        // for the (non-verify) streaming synthesis, so a verify preset emits its
-        // final answer as a Token (here the compress/verify echo "done"). The
-        // key assertion is that we got a non-empty answer through the engine.
+        // not run the plain tool loop. Research still uses scripted
+        // non-streaming calls for plan/sub-agent/compress/draft/verify;
+        // chat_stream is only reached for streaming synthesis, so a verify
+        // preset emits its final answer as a Token. The key assertion is that
+        // we got a non-empty answer through the engine.
         let infinite = std::iter::repeat_with(|| assistant_calling("web_search"))
             .take(100)
             .collect::<Vec<_>>();
@@ -1630,7 +1767,7 @@ mod tests {
     }
 
     /// The text content of the first `tool`-role message the backend saw on its
-    /// most recent `chat_once`, if any.
+    /// most recent model call, if any.
     fn seen_tool_result(backend: &ScriptedBackend) -> Option<String> {
         backend
             .seen
@@ -1786,7 +1923,7 @@ mod tests {
     async fn empty_tool_selection_takes_plain_fast_path() {
         // Tools are configured, but the client opted out (an empty `tools`
         // selection / `tool_choice: "none"`) — the turn must skip tool
-        // resolution entirely (no chat_once) and just stream.
+        // resolution entirely and just stream.
         let backend =
             ScriptedBackend::new(vec![assistant_calling("web_search")], vec!["hi".into()]);
         let tools = ScriptedTools {

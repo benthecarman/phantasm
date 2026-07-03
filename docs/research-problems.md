@@ -19,9 +19,9 @@ from an ordinary turn:
 4. Raises the tool-loop cap from `MAX_TOOL_ITERS` (5) to `MAX_RESEARCH_ITERS`
    (default **6**, config.rs:141).
 
-Otherwise it reuses the **exact same machinery** as a normal turn: one model, one
-linear non-streaming `chat_once` loop, one growing message list, then a single
-streaming synthesis call. That reuse is the root of most problems below.
+Unlike the ordinary streaming turn loop, this path still behaves like one model,
+one linear planning/tool loop, one growing message list, then a single streaming
+synthesis call. That reuse is the root of most problems below.
 
 ## 1. It isn't actually "research" — it's a longer prompt on the normal loop
 
@@ -36,7 +36,7 @@ iteration cap.
 
 ## 2. Sequential and tiny — no parallelism, 6-round ceiling
 
-- Every round is strictly sequential: `chat_once` → execute one tool → `chat_once`
+- Every round is strictly sequential: model call → execute one tool → model call
   again (turn.rs:165-197). Sub-questions that are independent **cannot** be
   searched concurrently.
 - `MAX_RESEARCH_ITERS` defaults to **6** (config.rs:141). Real deep research runs

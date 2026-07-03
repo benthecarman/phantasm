@@ -500,7 +500,8 @@ pub fn dashboard_history(
             avg_tokens_per_sec: tps,
         });
     }
-    out.models.sort_by(|a, b| b.turns.cmp(&a.turns));
+    out.models
+        .sort_by_key(|model| std::cmp::Reverse(model.turns));
 
     // Time series: merge the three tables' buckets.
     let mut buckets: BTreeMap<i64, SeriesPoint> = BTreeMap::new();

@@ -50,18 +50,18 @@ fails). `core.hooksPath` is local config, so each clone must run this once.
 ## Architecture — things that aren't obvious from the code
 
 - **Upstream Ollama uses the native `/api/chat` (NDJSON), not the OpenAI-compat
-  endpoint.** The OpenAI-compat one silently drops `tool_calls` when streaming.
-  The orchestrator still presents OpenAI *downstream* to the app.
+  endpoint.** Native Ollama exposes model metadata and native message fields
+  directly; the orchestrator still presents OpenAI *downstream* to the app.
 - **Multiple upstreams route by model id** (`orchestrator/src/upstreams.rs`,
   [docs/multi-upstream.md](docs/multi-upstream.md)): the flat `UPSTREAM_*` vars
   define the default upstream; `UPSTREAMS=name,...` + `UPSTREAM_<NAME>_*` add
   more (e.g. Ollama for small models + vLLM for a big one). Each upstream has
   its own concurrency semaphore; unclaimed models fall back to the default
   upstream. The app can't tell — capabilities/models advertise the union.
-- **Two-phase turn** (`orchestrator/src/orchestrator/turn.rs`): tool resolution
-  runs non-streaming `chat_once` in a loop (capped at `MAX_TOOL_ITERS`); once the
-  model stops calling tools, the final answer is re-issued as a streaming call.
-  Plain turns (no tools) skip straight to streaming — the low-overhead path.
+- **Streaming turn loop** (`orchestrator/src/orchestrator/turn.rs`): tool
+  resolution uses streaming upstream calls and relays final-answer tokens from
+  that stream directly. Backends used for streaming chat must support streamed
+  tool calls; plain turns (no tools) skip straight to final-answer streaming.
 - **Tools are invisible to the app.** It's a plain OpenAI SSE client. Progress
   rides the additive `x_status` SSE field; generated images are embedded as
   base64-data-URI markdown in the assistant message. Any new custom SSE field

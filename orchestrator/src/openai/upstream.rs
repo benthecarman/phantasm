@@ -10,13 +10,16 @@ use futures_util::{Stream, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 use url::Url;
 
 use crate::error::AppError;
-use crate::ollama::{ChatBackend, DeltaStream, StreamDelta};
-use crate::openai::types::{requested_thinking, ChatMessage, MessageContent};
+use crate::ollama::{ChatBackend, DeltaStream, StreamDelta, ToolDeltaStream, ToolStreamDelta};
+use crate::openai::types::{
+    requested_thinking, ChatMessage, FunctionCall, MessageContent, RawArguments, ToolCall,
+};
 
 #[derive(Clone)]
 pub struct OpenAICompatibleClient {
@@ -139,10 +142,9 @@ async fn list_models_response(req: reqwest::RequestBuilder) -> Result<Vec<String
 
 /// Serialize the history into the request `messages` array. We serialize each
 /// message from a borrow rather than cloning the whole slice first — histories
-/// carry multi-MB inline base64 images and the two-phase tool loop re-issues the
-/// upstream call several times per turn, so a per-call clone is pure waste (the
-/// Ollama path avoids it the same way). Only tool-role messages are copied, to
-/// drop their `name`: OpenAI-compatible tool results are matched by
+/// can carry multi-MB inline base64 images, so a per-call clone is pure waste
+/// (the Ollama path avoids it the same way). Only tool-role messages are copied,
+/// to drop their `name`: OpenAI-compatible tool results are matched by
 /// `tool_call_id`, and `name` (kept internally for Ollama's native `tool_name`)
 /// may be rejected by strict /v1 servers. Those messages are small.
 fn messages_value(messages: &[ChatMessage]) -> Value {
@@ -269,6 +271,51 @@ impl ChatBackend for OpenAICompatibleClient {
                 .map(|metrics| (metrics, model.to_string())),
         )))
     }
+
+    async fn chat_stream_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        options: &Map<String, Value>,
+    ) -> Result<Option<ToolDeltaStream>, AppError> {
+        let mut request =
+            Self::build_request(model, messages, tools, options, true, self.thinking_hint);
+        let mut resp = self
+            .authed_post(&self.chat_url())
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
+        if is_stream_options_rejection(resp.status()) {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                model = %model,
+                %status,
+                detail = %detail,
+                "OpenAI-compatible upstream rejected streaming usage; retrying without stream_options"
+            );
+            if let Value::Object(body) = &mut request {
+                body.remove("stream_options");
+            }
+            resp = self
+                .authed_post(&self.chat_url())
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
+        }
+        Ok(Some(Box::pin(sse_bytes_to_tool_deltas(
+            resp.bytes_stream(),
+            None,
+        ))))
+    }
 }
 
 fn is_stream_options_rejection(status: reqwest::StatusCode) -> bool {
@@ -344,6 +391,97 @@ where
     }
 }
 
+fn sse_bytes_to_tool_deltas<S>(
+    mut bytes: S,
+    metrics: Option<(Arc<crate::metrics::Metrics>, String)>,
+) -> impl Stream<Item = Result<ToolStreamDelta, AppError>>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    try_stream! {
+        let mut buf = BytesMut::new();
+        let mut think_tags = ThinkTagNormalizer::default();
+        let mut tool_calls = ToolCallAccumulator::default();
+        let started_at = Instant::now();
+        let mut recorded_usage = false;
+        let mut pending_done_reason: Option<String> = None;
+        'read: while let Some(next) = bytes.next().await {
+            let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = buf.split_to(pos + 1);
+                let Some(payload) = sse_data_payload(line.as_ref()) else {
+                    continue;
+                };
+                if payload == b"[DONE]" {
+                    if metrics.is_some() {
+                        yield ToolStreamDelta::new("", "", None, true, pending_done_reason.take());
+                    }
+                    break 'read;
+                }
+                let value: Value = serde_json::from_slice(payload)
+                    .map_err(|e| AppError::UpstreamError(format!("bad SSE data line: {e}")))?;
+                if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
+                    continue;
+                }
+                tool_calls.absorb_chunk(&value);
+                let mut delta = delta_from_openai_chunk(&value);
+                if metrics.is_some() && delta.done {
+                    pending_done_reason = delta.done_reason.clone();
+                    delta.done = false;
+                }
+                let normalized = think_tags.normalize(delta);
+                if !normalized.content.is_empty() || !normalized.reasoning.is_empty() {
+                    yield ToolStreamDelta::new(
+                        normalized.content,
+                        normalized.reasoning,
+                        None,
+                        false,
+                        None,
+                    );
+                }
+                if normalized.done {
+                    let calls = tool_calls.finish()?;
+                    yield ToolStreamDelta::new(
+                        "",
+                        "",
+                        calls,
+                        true,
+                        normalized.done_reason,
+                    );
+                    break 'read;
+                }
+            }
+        }
+
+        if let Some(payload) = sse_data_payload(buf.as_ref()) {
+            if payload != b"[DONE]" {
+                if let Ok(value) = serde_json::from_slice::<Value>(payload) {
+                    if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
+                        return;
+                    }
+                    tool_calls.absorb_chunk(&value);
+                    let normalized = think_tags.normalize(delta_from_openai_chunk(&value));
+                    if !normalized.content.is_empty() || !normalized.reasoning.is_empty() {
+                        yield ToolStreamDelta::new(
+                            normalized.content,
+                            normalized.reasoning,
+                            None,
+                            false,
+                            None,
+                        );
+                    }
+                    if normalized.done {
+                        let calls = tool_calls.finish()?;
+                        yield ToolStreamDelta::new("", "", calls, true, normalized.done_reason);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn record_stream_usage(
     metrics: &Option<(Arc<crate::metrics::Metrics>, String)>,
     value: &Value,
@@ -383,6 +521,90 @@ fn sse_data_payload(line: &[u8]) -> Option<&[u8]> {
         return None;
     }
     line.strip_prefix(b"data:").map(<[u8]>::trim_ascii)
+}
+
+#[derive(Default)]
+struct ToolCallAccumulator {
+    calls: BTreeMap<u32, PartialToolCall>,
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    kind: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+impl ToolCallAccumulator {
+    fn absorb_chunk(&mut self, value: &Value) {
+        let Some(chunks) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("tool_calls"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+
+        for chunk in chunks {
+            let index = chunk
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0);
+            let call = self.calls.entry(index).or_default();
+            if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+                if !id.is_empty() {
+                    call.id = Some(id.to_string());
+                }
+            }
+            if let Some(kind) = chunk.get("type").and_then(Value::as_str) {
+                if !kind.is_empty() {
+                    call.kind = Some(kind.to_string());
+                }
+            }
+            if let Some(function) = chunk.get("function").and_then(Value::as_object) {
+                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                    call.name.push_str(name);
+                }
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    call.arguments.push_str(arguments);
+                }
+            }
+        }
+    }
+
+    fn finish(&self) -> Result<Option<Vec<ToolCall>>, AppError> {
+        if self.calls.is_empty() {
+            return Ok(None);
+        }
+        self.calls
+            .values()
+            .map(|call| {
+                if call.name.trim().is_empty() {
+                    return Err(AppError::UpstreamError(
+                        "streamed tool call missing function name".into(),
+                    ));
+                }
+                Ok(ToolCall {
+                    id: call.id.clone(),
+                    kind: call.kind.clone().unwrap_or_else(|| "function".into()),
+                    function: FunctionCall {
+                        name: call.name.clone(),
+                        arguments: RawArguments::Str(if call.arguments.trim().is_empty() {
+                            "{}".into()
+                        } else {
+                            call.arguments.clone()
+                        }),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
 }
 
 fn delta_from_openai_chunk(chunk: &Value) -> StreamDelta {

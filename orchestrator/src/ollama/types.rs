@@ -1,8 +1,7 @@
 //! Ollama *native* `/api/chat` wire types.
 //!
-//! We use the native API rather than Ollama's OpenAI-compat endpoint because
-//! the latter silently drops `tool_calls` when `stream:true`. The native API
-//! has reliable streaming + tool calling. Conversions to/from our OpenAI
+//! We use the native API for Ollama upstreams because it exposes model metadata
+//! and native message fields directly. Conversions to/from our OpenAI
 //! `ChatMessage` live here so the rest of the codebase speaks one dialect.
 
 use std::collections::HashMap;

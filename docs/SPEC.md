@@ -466,10 +466,10 @@ MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel
   `/v1/capabilities`. Resumable turns (§2.2c) add only *transport* surface —
   the `Idempotency-Key`/`Last-Event-ID` headers, SSE `id:`, and a
   `POST /v1/chat/cancel` endpoint — leaving request/response bodies standard.
-- Upstream native Ollama via **`/api/chat`** when available (Ollama
-  OpenAI-compat drops streamed tool_calls), with explicit or auto-detected
-  OpenAI-compatible `/v1` support for non-Ollama model hosts such as vLLM and
-  llama.cpp. `UPSTREAM_KIND` may force `native_ollama` or
+- Upstream native Ollama via **`/api/chat`** when available, with explicit or
+  auto-detected OpenAI-compatible `/v1` support for non-Ollama model hosts such
+  as vLLM and llama.cpp. Streaming chat turns require the selected upstream to
+  support streamed tool calls. `UPSTREAM_KIND` may force `native_ollama` or
   `openai_compatible`/`vllm`/`llama_cpp`; unset/`auto` probes native Ollama
   first, then `/v1/models`.
 - Image return format: inline base64 data-URI markdown by default; absolute

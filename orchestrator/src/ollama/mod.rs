@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use crate::config::UpstreamSpec;
 use crate::error::AppError;
 use crate::ollama::types::ModelMetadata;
-use crate::openai::types::ChatMessage;
+use crate::openai::types::{ChatMessage, ToolCall};
 use crate::openai::OpenAICompatibleClient;
 
 /// One delta from a streaming final-answer pass.
@@ -44,12 +44,45 @@ impl StreamDelta {
 /// A boxed stream of final-answer deltas (the streaming chat result).
 pub type DeltaStream = std::pin::Pin<Box<dyn Stream<Item = Result<StreamDelta, AppError>> + Send>>;
 
+/// One delta from a streaming tool-resolution pass. OpenAI-compatible upstreams
+/// can stream either final-answer content or a terminal tool-call batch.
+#[derive(Debug, Clone)]
+pub struct ToolStreamDelta {
+    pub content: String,
+    pub reasoning: String,
+    pub tool_calls: Option<Vec<ToolCall>>,
+    pub done: bool,
+    pub done_reason: Option<String>,
+}
+
+impl ToolStreamDelta {
+    pub fn new(
+        content: impl Into<String>,
+        reasoning: impl Into<String>,
+        tool_calls: Option<Vec<ToolCall>>,
+        done: bool,
+        done_reason: Option<String>,
+    ) -> Self {
+        ToolStreamDelta {
+            content: content.into(),
+            reasoning: reasoning.into(),
+            tool_calls,
+            done,
+            done_reason,
+        }
+    }
+}
+
+pub type ToolDeltaStream =
+    std::pin::Pin<Box<dyn Stream<Item = Result<ToolStreamDelta, AppError>> + Send>>;
+
 /// The model backend the orchestrator talks to. Abstracted as a trait so the
 /// tool loop can be unit-tested against a scripted in-memory backend with no
 /// network (see `orchestrator::loop` tests).
 pub trait ChatBackend: Send + Sync + Clone + 'static {
-    /// Non-streaming chat used during tool resolution. Returns the assistant
-    /// message (which may carry `tool_calls`).
+    /// Non-streaming chat used for non-streaming downstream requests and
+    /// research-internal planning calls. Streaming turns do not use this for
+    /// tool resolution.
     fn chat_once(
         &self,
         model: &str,
@@ -65,6 +98,19 @@ pub trait ChatBackend: Send + Sync + Clone + 'static {
         messages: &[ChatMessage],
         options: &Map<String, Value>,
     ) -> impl std::future::Future<Output = Result<DeltaStream, AppError>> + Send;
+
+    /// Streaming tool-resolution pass. Streaming chat turns require this; a
+    /// backend returning `Ok(None)` fails the turn rather than taking a hidden
+    /// non-streaming fallback.
+    fn chat_stream_tools(
+        &self,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[Value],
+        _options: &Map<String, Value>,
+    ) -> impl std::future::Future<Output = Result<Option<ToolDeltaStream>, AppError>> + Send {
+        async { Ok(None) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +213,27 @@ impl ChatBackend for UpstreamChatBackend {
             }
             UpstreamChatBackend::OpenAICompatible(client) => {
                 client.chat_stream(model, messages, options).await
+            }
+        }
+    }
+
+    async fn chat_stream_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        options: &Map<String, Value>,
+    ) -> Result<Option<ToolDeltaStream>, AppError> {
+        match self {
+            UpstreamChatBackend::NativeOllama(client) => {
+                client
+                    .chat_stream_tools(model, messages, tools, options)
+                    .await
+            }
+            UpstreamChatBackend::OpenAICompatible(client) => {
+                client
+                    .chat_stream_tools(model, messages, tools, options)
+                    .await
             }
         }
     }

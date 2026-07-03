@@ -9,9 +9,9 @@ use url::Url;
 use super::types::{
     ModelMetadata, OllamaChatChunk, OllamaChatRequest, OllamaMessage, ShowResponse, TagsResponse,
 };
-use super::{ChatBackend, DeltaStream, StreamDelta};
+use super::{ChatBackend, DeltaStream, StreamDelta, ToolDeltaStream, ToolStreamDelta};
 use crate::error::AppError;
-use crate::openai::types::ChatMessage;
+use crate::openai::types::{ChatMessage, ToolCall};
 
 /// Explicit residency hint for the opt-in warm preload path.
 const WARM_KEEP_ALIVE: &str = "30m";
@@ -217,6 +217,38 @@ impl ChatBackend for OllamaClient {
         let stream = ndjson_to_deltas(resp.bytes_stream(), usage_recorder(&self.metrics, model));
         Ok(Box::pin(stream))
     }
+
+    async fn chat_stream_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        options: &Map<String, Value>,
+    ) -> Result<Option<ToolDeltaStream>, AppError> {
+        let url = self.endpoint("/api/chat")?;
+        let body = self.build_request(model, messages, tools, options, true, None);
+        tracing::debug!(
+            model = %model,
+            messages = messages.len(),
+            tools = tools.len(),
+            "upstream chat_stream_tools (/api/chat, streaming)"
+        );
+        let resp = self.http.post(url).json(&body).send().await.map_err(|e| {
+            tracing::warn!(model = %model, error = %e, "Ollama unreachable (chat_stream_tools)");
+            AppError::UpstreamUnreachable(e.to_string())
+        })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(model = %model, %status, "Ollama returned error status (chat_stream_tools)");
+            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
+        }
+
+        let stream =
+            ndjson_to_tool_deltas(resp.bytes_stream(), usage_recorder(&self.metrics, model));
+        Ok(Some(Box::pin(stream)))
+    }
 }
 
 /// A metrics handle bound to the model of one request, for recording the
@@ -284,6 +316,54 @@ where
     }
 }
 
+/// Turn native Ollama streaming-with-tools NDJSON into tool-resolution deltas.
+/// Ollama may emit parallel tool calls across multiple chunks, so hold calls
+/// until the stream finishes and then emit one complete batch.
+fn ndjson_to_tool_deltas<S>(
+    mut bytes: S,
+    usage: UsageRecorder,
+) -> impl Stream<Item = Result<ToolStreamDelta, AppError>>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    try_stream! {
+        let mut buf = BytesMut::new();
+        let mut pending_tool_calls = Vec::<ToolCall>::new();
+        while let Some(next) = bytes.next().await {
+            let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
+            buf.extend_from_slice(&chunk);
+
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = buf.split_to(pos + 1);
+                let trimmed = line.as_ref();
+                if trimmed.iter().all(|b| b.is_ascii_whitespace()) {
+                    continue;
+                }
+                let parsed: OllamaChatChunk = serde_json::from_slice(trimmed)
+                    .map_err(|e| AppError::UpstreamError(format!("bad NDJSON line: {e}")))?;
+                record_chunk_usage(&usage, &parsed);
+                if let Some(delta) = tool_delta_from(parsed, &mut pending_tool_calls) {
+                    yield delta;
+                }
+            }
+        }
+
+        let rest = buf.as_ref();
+        if !rest.iter().all(|b| b.is_ascii_whitespace()) {
+            if let Ok(parsed) = serde_json::from_slice::<OllamaChatChunk>(rest) {
+                record_chunk_usage(&usage, &parsed);
+                if let Some(delta) = tool_delta_from(parsed, &mut pending_tool_calls) {
+                    yield delta;
+                }
+            }
+        }
+
+        if !pending_tool_calls.is_empty() {
+            yield ToolStreamDelta::new("", "", Some(std::mem::take(&mut pending_tool_calls)), true, Some("tool_calls".into()));
+        }
+    }
+}
+
 fn delta_from(chunk: OllamaChatChunk) -> StreamDelta {
     let message = chunk.message.unwrap_or_default();
     StreamDelta::new(
@@ -292,6 +372,46 @@ fn delta_from(chunk: OllamaChatChunk) -> StreamDelta {
         chunk.done,
         chunk.done_reason,
     )
+}
+
+fn tool_delta_from(
+    chunk: OllamaChatChunk,
+    pending_tool_calls: &mut Vec<ToolCall>,
+) -> Option<ToolStreamDelta> {
+    let message = chunk.message.unwrap_or_default();
+    if let Some(mut calls) = message.clone().into_openai().tool_calls {
+        pending_tool_calls.append(&mut calls);
+    }
+
+    if chunk.done {
+        let content = message.content.unwrap_or_default();
+        let reasoning = message.thinking.unwrap_or_default();
+        return Some(ToolStreamDelta::new(
+            if pending_tool_calls.is_empty() {
+                content
+            } else {
+                String::new()
+            },
+            if pending_tool_calls.is_empty() {
+                reasoning
+            } else {
+                String::new()
+            },
+            (!pending_tool_calls.is_empty()).then(|| std::mem::take(pending_tool_calls)),
+            true,
+            chunk.done_reason,
+        ));
+    }
+
+    if pending_tool_calls.is_empty() {
+        let content = message.content.unwrap_or_default();
+        let reasoning = message.thinking.unwrap_or_default();
+        if !content.is_empty() || !reasoning.is_empty() {
+            return Some(ToolStreamDelta::new(content, reasoning, None, false, None));
+        }
+    }
+
+    None
 }
 
 /// Read the requested thinking control and strip the reasoning keys so they are
@@ -306,9 +426,9 @@ fn extract_thinking_control(options: &mut Map<String, Value>) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_thinking_control, ndjson_to_deltas, OllamaClient};
+    use super::{extract_thinking_control, ndjson_to_deltas, ndjson_to_tool_deltas, OllamaClient};
     use crate::error::AppError;
-    use crate::ollama::StreamDelta;
+    use crate::ollama::{StreamDelta, ToolStreamDelta};
     use bytes::Bytes;
     use futures_util::{stream, StreamExt};
     use serde_json::{json, Map, Value};
@@ -318,6 +438,14 @@ mod tests {
 
     async fn collect(chunks: Vec<reqwest::Result<Bytes>>) -> Vec<Result<StreamDelta, AppError>> {
         ndjson_to_deltas(stream::iter(chunks), None).collect().await
+    }
+
+    async fn collect_tool_deltas(
+        chunks: Vec<reqwest::Result<Bytes>>,
+    ) -> Vec<Result<ToolStreamDelta, AppError>> {
+        ndjson_to_tool_deltas(stream::iter(chunks), None)
+            .collect()
+            .await
     }
 
     #[tokio::test]
@@ -407,6 +535,47 @@ mod tests {
         // 30 tokens / 1.5s = 20 tok/s.
         assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
         assert_eq!(stats.model_load.snapshot().count, 1);
+    }
+
+    #[tokio::test]
+    async fn ndjson_tool_stream_accumulates_parallel_calls() {
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"name\":\"first\",\"arguments\":{\"x\":1}}}]},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"name\":\"second\",\"arguments\":{\"y\":2}}}]},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+        ))];
+
+        let deltas: Vec<ToolStreamDelta> = collect_tool_deltas(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(deltas.len(), 1);
+        let calls = deltas[0].tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "first");
+        assert_eq!(calls[1].function.name, "second");
+        assert!(deltas[0].done);
+    }
+
+    #[tokio::test]
+    async fn ndjson_tool_stream_keeps_terminal_content() {
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+        ))];
+
+        let deltas: Vec<ToolStreamDelta> = collect_tool_deltas(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].content, "Hello");
+        assert_eq!(deltas[1].content, " world");
+        assert!(deltas[1].done);
     }
 
     #[tokio::test]

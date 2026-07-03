@@ -101,8 +101,8 @@ Verified on Linux: `cargo test` (121 pass), `cargo clippy --all-targets`,
 |------|--------|
 | `orchestrator/src/openai/types.rs` | `ToolSpecFunction` now also deserializes `description` + `parameters`. New `ChatRequest::app_tools() -> Vec<Value>` rebuilds OpenAI envelopes for schema-bearing entries (`[]` when `tool_choice:"none"`). Added `RawArguments::to_json_string()`. Added serialize-only `DeltaToolCall`/`DeltaFunctionCall` + `Delta.tool_calls` field + `Delta::tool_calls(...)` ctor. |
 | `orchestrator/src/orchestrator/mod.rs` | New `TurnEvent::ToolCalls(Vec<ToolCall>)`. |
-| `orchestrator/src/orchestrator/turn.rs` | `run_turn` takes a new `app_tools: Vec<Value>` param. Merges app tools after `select_schemas` with **server-wins** collision handling (`schema_name` helper builds the `app_names` set). In the tool-resolution loop, if the model calls any app tool it sends `TurnEvent::ToolCalls(app_calls)` + `Done{reason:"tool_calls"}` and returns **without** executing (co-occurring server calls are dropped that turn; the model re-issues them next turn). |
-| `orchestrator/src/openai/sse.rs` | `ChunkFactory::tool_calls(&[ToolCall])` emits the delta chunk; `ensure_call_id` mints an id when absent (shared with the non-streaming path). |
+| `orchestrator/src/orchestrator/turn.rs` | `run_turn` takes a new `app_tools: Vec<Value>` param. Merges app tools after `select_schemas` with **server-wins** collision handling (`schema_name` helper builds the `app_names` set). In the streaming tool-resolution loop, if the model calls any app tool it sends `TurnEvent::ToolCalls(app_calls)` + `Done{reason:"tool_calls"}` and returns. Co-occurring server calls are executed first and held in a short-lived server-side continuation keyed by the forwarded app `tool_call_id`. |
+| `orchestrator/src/openai/sse.rs` | `ChunkFactory::tool_calls(&[ToolCall])` emits the delta chunk; `ensure_call_id` mints an id when absent. |
 | `orchestrator/src/routes/chat.rs` | Computes `req.app_tools()`, passes into `run_turn`. `stream_response` maps `TurnEvent::ToolCalls` → `factory.tool_calls`. `collect_response` (non-streaming) emits `tool_calls` with `content:null` + `finish_reason:"tool_calls"` via `wire_tool_calls`. |
 | `docs/SPEC.md` | §2.2/§2.3 rewritten: app-hosted vs server tools, forwarding, collision rule, pairing rule. |
 
@@ -111,7 +111,7 @@ through Ollama's native API both ways, so no message-type changes were needed.
 
 **Tests added** (in `turn.rs`, `types.rs`, `sse.rs`): app-tool extraction,
 collision (server wins → executed not forwarded), forwarding (emits ToolCalls +
-Done, never executes, one `chat_once`), mixed app+server call, SSE shape
+Done, never executes app-hosted tools), mixed app+server call, SSE shape
 (arguments is a string), `to_json_string`, `ensure_call_id`.
 
 ---
