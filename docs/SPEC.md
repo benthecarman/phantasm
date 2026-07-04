@@ -480,7 +480,8 @@ passthrough). 3. Tool loop + web search. 4. Image generation. 5. Polish
 
 User accounts, subscription billing, cross-device cloud sync, managed
 remote-access relay, and anything running on developer-hosted infrastructure.
-MVP assumes the user reaches their own backend (home wifi, VPN/Tailscale, tunnel).
+MVP assumes the user reaches their own backend using a server URL that is
+already reachable from their device.
 
 ## 8. Resolved decisions
 

@@ -152,7 +152,7 @@ up (it reads the same env the service does, so it emits the same token).
   `Config::from_env` (upstream vars etc.), so it works right after install
   before the deployment is fully wired. Missing URL ⇒ exit non-zero with one
   line naming the arg/vars. No LAN-IP guessing: the address the *phone* can
-  reach (Tailscale name, LAN IP, tunnel hostname) is deployment knowledge the
+  reach (LAN IP, DNS name, or hosted hostname) is deployment knowledge the
   server can't reliably infer, and a QR that encodes the wrong host is worse
   than no QR. Unset token ⇒ emit a token-less URI (auth-disabled deployment)
   with a warning mirroring the server's own auth-disabled warning.
@@ -204,9 +204,8 @@ gains nothing.
   apps.
 - **QR on the dashboard**: rejected above (metrics/chat token separation).
 - **mDNS/Bonjour discovery** instead of QR: discovers the URL but not the
-  token, only works on the same LAN segment (excludes Tailscale/tunnel
-  deployments — the common remote case), and adds a discovery surface. QR
-  carries both halves and is transport-independent.
+  token, only works on the same LAN segment, and adds a discovery surface.
+  QR carries both halves and is transport-independent.
 
 ## Test plan
 

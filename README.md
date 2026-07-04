@@ -41,4 +41,4 @@ markdown/image rendering, and `x_status` progress.
 
 Out of scope for MVP (deferred premium layer): user accounts, billing, cloud
 sync, and managed remote-access relay. You reach your own backend yourself
-(home wifi, VPN/Tailscale, or your own tunnel).
+using a server URL that is already reachable from your device.
