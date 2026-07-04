@@ -21,6 +21,7 @@ pub mod state;
 pub mod tools;
 pub mod turn_registry;
 pub mod upstreams;
+pub(crate) mod xml_tools;
 
 use std::sync::Arc;
 use std::time::Duration;

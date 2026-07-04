@@ -1,11 +1,15 @@
 //! Fallback parser for XML-style tool calls emitted as plain text.
 //!
-//! Some models served by Ollama (notably the qwen3-coder family) stop using
-//! the native structured `tool_calls` field once offered many tools (~6+) and
-//! instead write the calls into the assistant text as
+//! Some models (notably the qwen3-coder family) stop using the structured
+//! `tool_calls` field once offered many tools (~6+) and instead write the
+//! calls into the assistant text as
 //! `<function=name><parameter=key>value</parameter>…</function>`. Without a
 //! fallback that XML would stream to the app as visible answer text and no
-//! tool would ever run.
+//! tool would ever run. Shared by both upstream kinds: native Ollama always
+//! needs it; an OpenAI-compatible host may parse tool calls server-side
+//! (vLLM's `--tool-call-parser`), so there it is the safety net for parser
+//! misses — and the only guard on the post-tools final pass, where no `tools`
+//! are sent and such parsers don't engage.
 //!
 //! [`XmlToolScan`] sits in the streaming tool-resolution path: it lets normal
 //! text through token-by-token (holding back only a trailing partial marker),
@@ -24,9 +28,13 @@
 //! the marker is specific enough that misfires need the model to reproduce a
 //! complete, valid block verbatim.
 
+use futures_util::StreamExt;
 use serde_json::Value;
 
-use crate::openai::types::{mint_call_id, FunctionCall, RawArguments, ToolCall};
+use crate::ollama::DeltaStream;
+use crate::openai::types::{
+    mint_call_id, ChatMessage, FunctionCall, MessageContent, RawArguments, ToolCall,
+};
 
 /// The opening tag prefix whose presence flips the scanner into XML mode.
 pub(crate) const XML_MARKER: &str = "<function=";
@@ -210,6 +218,72 @@ fn strip_wrapping_newlines(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// Non-streaming counterpart of the streaming scan: when a message carries no
+/// structured tool calls but wrote `<function=…>` blocks into its text, lift
+/// them into `tool_calls` (keeping any prose before the first block as
+/// content). Callers gate this on tools having been offered — without tools,
+/// XML-looking content is quoted material, not a call attempt.
+pub(crate) fn apply_xml_tool_fallback(mut message: ChatMessage) -> ChatMessage {
+    if message.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
+        return message;
+    }
+    let Some(MessageContent::Text(text)) = &message.content else {
+        return message;
+    };
+    let Some(marker) = text.find(XML_MARKER) else {
+        return message;
+    };
+    let calls = parse_xml_tool_calls(text);
+    if calls.is_empty() {
+        return message;
+    }
+    let prefix = text[..marker].trim().to_string();
+    message.content = (!prefix.is_empty()).then_some(MessageContent::Text(prefix));
+    message.tool_calls = Some(calls);
+    message
+}
+
+/// Adapt a final-answer delta stream for the post-tools pass: prose relays
+/// live (partial markers held back), and structurally complete call blocks
+/// are excised at stream end — including on truncated streams. Lets a backend
+/// implement `chat_stream_after_tools` by wrapping its plain `chat_stream`.
+pub(crate) fn excise_call_attempts(inner: DeltaStream) -> DeltaStream {
+    Box::pin(async_stream::try_stream! {
+        let mut inner = inner;
+        let mut scan = XmlToolScan::default();
+        while let Some(delta) = inner.next().await {
+            let mut delta = delta?;
+            let mut released = scan.push(&delta.content);
+            if delta.done {
+                released.push_str(&drain_excised(&mut scan));
+            }
+            delta.content = released;
+            if !delta.content.is_empty() || !delta.reasoning.is_empty() || delta.done {
+                yield delta;
+            }
+        }
+        // Truncated stream (no done delta): a complete block still must not
+        // leak as visible XML.
+        let text = drain_excised(&mut scan);
+        if !text.is_empty() {
+            yield crate::ollama::StreamDelta::new(text, "", false, None);
+        }
+    })
+}
+
+/// The scan's withheld text with complete call blocks excised (logged).
+pub(crate) fn drain_excised(scan: &mut XmlToolScan) -> String {
+    let raw = std::mem::take(scan).into_raw();
+    let (cleaned, excised) = excise_call_blocks(&raw);
+    if excised > 0 {
+        tracing::warn!(
+            excised,
+            "model emitted tool-call block(s) in the post-tools final answer; excised"
+        );
+    }
+    cleaned
+}
+
 fn is_plausible_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -299,6 +373,49 @@ mod tests {
         let (cleaned, removed) = excise_call_blocks("a </tool_call> in prose");
         assert_eq!(removed, 0);
         assert_eq!(cleaned, "a </tool_call> in prose");
+    }
+
+    fn delta_stream(deltas: Vec<crate::ollama::StreamDelta>) -> DeltaStream {
+        Box::pin(futures_util::stream::iter(deltas.into_iter().map(Ok)))
+    }
+
+    async fn collect_contents(stream: DeltaStream) -> String {
+        use futures_util::StreamExt;
+        stream
+            .map(|d| d.unwrap().content)
+            .collect::<Vec<_>>()
+            .await
+            .concat()
+    }
+
+    #[tokio::test]
+    async fn excise_adapter_strips_call_attempts_and_keeps_prose() {
+        use crate::ollama::StreamDelta;
+        let inner = delta_stream(vec![
+            StreamDelta::new("Trying once more.\n<function=weather>\n", "", false, None),
+            StreamDelta::new(
+                "</function>\nThe answer is 42.",
+                "",
+                true,
+                Some("stop".into()),
+            ),
+        ]);
+        let out = collect_contents(excise_call_attempts(inner)).await;
+        assert_eq!(out, "Trying once more.\n\nThe answer is 42.");
+    }
+
+    #[tokio::test]
+    async fn excise_adapter_covers_truncated_streams() {
+        use crate::ollama::StreamDelta;
+        // No done delta: the withheld block still must not leak.
+        let inner = delta_stream(vec![StreamDelta::new(
+            "<function=weather>\n</function>",
+            "",
+            false,
+            None,
+        )]);
+        let out = collect_contents(excise_call_attempts(inner)).await;
+        assert_eq!(out, "");
     }
 
     #[test]

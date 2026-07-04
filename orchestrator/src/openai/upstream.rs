@@ -20,6 +20,7 @@ use crate::ollama::{ChatBackend, DeltaStream, StreamDelta, ToolDeltaStream, Tool
 use crate::openai::types::{
     requested_thinking, ChatMessage, FunctionCall, MessageContent, RawArguments, ToolCall,
 };
+use crate::xml_tools::{self, XmlToolScan};
 
 #[derive(Clone)]
 pub struct OpenAICompatibleClient {
@@ -216,14 +217,23 @@ impl ChatBackend for OpenAICompatibleClient {
             );
         }
 
-        response
+        let message = response
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
             .and_then(|choice| choice.get("message"))
             .map(chat_message_from_openai)
             .transpose()?
-            .ok_or_else(|| AppError::UpstreamError("missing chat completion message".into()))
+            .ok_or_else(|| AppError::UpstreamError("missing chat completion message".into()))?;
+        // Safety net behind any server-side tool parser (vLLM's
+        // --tool-call-parser): a call the server failed to structure falls
+        // through as XML text — lift it. Gated on tools being offered; without
+        // them, XML-looking content is quoted material.
+        Ok(if tools.is_empty() {
+            message
+        } else {
+            xml_tools::apply_xml_tool_fallback(message)
+        })
     }
 
     async fn chat_stream(
@@ -270,6 +280,20 @@ impl ChatBackend for OpenAICompatibleClient {
                 .clone()
                 .map(|metrics| (metrics, model.to_string())),
         )))
+    }
+
+    async fn chat_stream_after_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &Map<String, Value>,
+    ) -> Result<DeltaStream, AppError> {
+        // No `tools` in this request, so a server-side tool parser will not
+        // engage — any `<function=…>` block the model still emits would relay
+        // to the app as answer text without this.
+        Ok(xml_tools::excise_call_attempts(
+            self.chat_stream(model, messages, options).await?,
+        ))
     }
 
     async fn chat_stream_tools(
@@ -402,6 +426,8 @@ where
         let mut buf = BytesMut::new();
         let mut think_tags = ThinkTagNormalizer::default();
         let mut tool_calls = ToolCallAccumulator::default();
+        let mut scan = XmlToolScan::default();
+        let mut terminal_seen = false;
         let started_at = Instant::now();
         let mut recorded_usage = false;
         let mut pending_done_reason: Option<String> = None;
@@ -417,6 +443,7 @@ where
                 if payload == b"[DONE]" {
                     if metrics.is_some() {
                         yield ToolStreamDelta::new("", "", None, true, pending_done_reason.take());
+                        terminal_seen = true;
                     }
                     break 'read;
                 }
@@ -432,9 +459,14 @@ where
                     delta.done = false;
                 }
                 let normalized = think_tags.normalize(delta);
-                if !normalized.content.is_empty() || !normalized.reasoning.is_empty() {
+                // XML fallback scan: prose relays live, a candidate
+                // `<function=…>` block is withheld and resolved at `done`.
+                // Behind a server-side tool parser this stays inert — parsed
+                // calls arrive structured and the content carries no XML.
+                let released = scan.push(&normalized.content);
+                if !released.is_empty() || !normalized.reasoning.is_empty() {
                     yield ToolStreamDelta::new(
-                        normalized.content,
+                        released,
                         normalized.reasoning,
                         None,
                         false,
@@ -442,14 +474,8 @@ where
                     );
                 }
                 if normalized.done {
-                    let calls = tool_calls.finish()?;
-                    yield ToolStreamDelta::new(
-                        "",
-                        "",
-                        calls,
-                        true,
-                        normalized.done_reason,
-                    );
+                    yield finish_tool_stream(&tool_calls, &mut scan, normalized.done_reason)?;
+                    terminal_seen = true;
                     break 'read;
                 }
             }
@@ -463,9 +489,10 @@ where
                     }
                     tool_calls.absorb_chunk(&value);
                     let normalized = think_tags.normalize(delta_from_openai_chunk(&value));
-                    if !normalized.content.is_empty() || !normalized.reasoning.is_empty() {
+                    let released = scan.push(&normalized.content);
+                    if !released.is_empty() || !normalized.reasoning.is_empty() {
                         yield ToolStreamDelta::new(
-                            normalized.content,
+                            released,
                             normalized.reasoning,
                             None,
                             false,
@@ -473,13 +500,48 @@ where
                         );
                     }
                     if normalized.done {
-                        let calls = tool_calls.finish()?;
-                        yield ToolStreamDelta::new("", "", calls, true, normalized.done_reason);
+                        yield finish_tool_stream(&tool_calls, &mut scan, normalized.done_reason)?;
+                        terminal_seen = true;
                     }
                 }
             }
         }
+
+        // Stream ended without a terminal chunk: resolve whatever was
+        // withheld or accumulated, so a buffered XML block (or an already
+        // streamed native batch) is neither lost nor leaked.
+        if !terminal_seen {
+            let delta = finish_tool_stream(&tool_calls, &mut scan, None)?;
+            if delta.tool_calls.is_some() || !delta.content.is_empty() {
+                yield delta;
+            }
+        }
     }
+}
+
+/// Terminal delta for a tool-resolution stream: structured calls win (any
+/// scanned XML is discarded like other content), otherwise a complete XML
+/// block parsed from the withheld text becomes the batch, otherwise any
+/// withheld text flushes back as content on the terminal delta.
+fn finish_tool_stream(
+    tool_calls: &ToolCallAccumulator,
+    scan: &mut XmlToolScan,
+    done_reason: Option<String>,
+) -> Result<ToolStreamDelta, AppError> {
+    let end = std::mem::take(scan).finish();
+    if let Some(calls) = tool_calls.finish()? {
+        return Ok(ToolStreamDelta::new("", "", Some(calls), true, done_reason));
+    }
+    if !end.calls.is_empty() {
+        return Ok(ToolStreamDelta::new(
+            "",
+            "",
+            Some(end.calls),
+            true,
+            Some("tool_calls".into()),
+        ));
+    }
+    Ok(ToolStreamDelta::new(end.raw, "", None, true, done_reason))
 }
 
 fn record_stream_usage(
@@ -831,6 +893,114 @@ mod tests {
         assert!(!deltas[0].done);
         assert!(deltas[1].done);
         assert_eq!(deltas[1].done_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn sse_tool_stream_parses_xml_fallback_when_parser_misses() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        // A server-side tool parser missed: the call arrives as XML text with
+        // no structured tool_calls. Prose streams; the block becomes the batch.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"On it.\\n<function=weather>\\n<parameter=location>Berlin</parameter>\\n\"},\"finish_reason\":null}]}\n\n\
+              data: {\"choices\":[{\"delta\":{\"content\":\"</function>\"},\"finish_reason\":null}]}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<ToolStreamDelta> = sse_bytes_to_tool_deltas(stream::iter(chunks), None)
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+
+        let streamed: String = deltas.iter().map(|d| d.content.as_str()).collect();
+        assert_eq!(streamed, "On it.\n", "XML never reaches the app");
+        let last = deltas.last().expect("terminal delta");
+        assert!(last.done);
+        let calls = last.tool_calls.as_ref().expect("xml calls parsed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "weather");
+    }
+
+    #[tokio::test]
+    async fn sse_tool_stream_prefers_structured_calls_over_xml_text() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"<function=wrong>\\n</function>\"},\"finish_reason\":null}]}\n\n\
+              data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"right\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<ToolStreamDelta> = sse_bytes_to_tool_deltas(stream::iter(chunks), None)
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+
+        let last = deltas.last().expect("terminal delta");
+        let calls = last.tool_calls.as_ref().expect("structured calls win");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "right");
+    }
+
+    #[tokio::test]
+    async fn sse_tool_stream_flushes_unparseable_xml_as_content() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"<function=weather>never closed\"},\"finish_reason\":null}]}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<ToolStreamDelta> = sse_bytes_to_tool_deltas(stream::iter(chunks), None)
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+
+        let streamed: String = deltas.iter().map(|d| d.content.as_str()).collect();
+        assert_eq!(streamed, "<function=weather>never closed");
+        assert!(deltas.last().unwrap().tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_once_xml_fallback_gated_on_tools() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": "Example:\n<function=time>\n</function>"
+                }}]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenAICompatibleClient::new(
+            reqwest::Client::new(),
+            &Url::parse(&server.uri()).expect("mock server URL"),
+            None,
+            true,
+        );
+
+        // No tools: quoted material passes through untouched.
+        let message = client.chat_once("m", &[], &[], &Map::new()).await.unwrap();
+        assert!(message.tool_calls.is_none());
+
+        // Tools offered: the fallback lifts the block.
+        let tools = vec![json!({"type": "function", "function": {"name": "time"}})];
+        let message = client
+            .chat_once("m", &[], &tools, &Map::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            message.tool_calls.as_ref().unwrap()[0].function.name,
+            "time"
+        );
     }
 
     #[tokio::test]

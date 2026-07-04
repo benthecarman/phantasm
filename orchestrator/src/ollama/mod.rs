@@ -1,6 +1,5 @@
 pub mod client;
 pub mod types;
-mod xml_tools;
 
 pub use client::OllamaClient;
 

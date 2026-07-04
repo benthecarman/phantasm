@@ -11,10 +11,10 @@ use url::Url;
 use super::types::{
     ModelMetadata, OllamaChatChunk, OllamaChatRequest, OllamaMessage, ShowResponse, TagsResponse,
 };
-use super::xml_tools::{excise_call_blocks, parse_xml_tool_calls, XmlToolScan, XML_MARKER};
 use super::{ChatBackend, DeltaStream, StreamDelta, ToolDeltaStream, ToolStreamDelta};
 use crate::error::AppError;
-use crate::openai::types::{ChatMessage, MessageContent, ToolCall};
+use crate::openai::types::{ChatMessage, ToolCall};
+use crate::xml_tools::{apply_xml_tool_fallback, drain_excised, XmlToolScan};
 
 /// Explicit residency hint for the opt-in warm preload path.
 const WARM_KEEP_ALIVE: &str = "30m";
@@ -647,21 +647,6 @@ struct PostToolsAssembler {
     scan: XmlToolScan,
 }
 
-impl PostToolsAssembler {
-    /// The withheld text with complete call blocks excised.
-    fn drain_scan(&mut self) -> String {
-        let raw = std::mem::take(&mut self.scan).into_raw();
-        let (cleaned, excised) = excise_call_blocks(&raw);
-        if excised > 0 {
-            tracing::warn!(
-                excised,
-                "model emitted tool-call block(s) in the post-tools final answer; excised"
-            );
-        }
-        cleaned
-    }
-}
-
 impl ChunkAssembler for PostToolsAssembler {
     type Delta = StreamDelta;
 
@@ -672,7 +657,7 @@ impl ChunkAssembler for PostToolsAssembler {
         let mut released = self.scan.push(&content);
 
         if chunk.done {
-            released.push_str(&self.drain_scan());
+            released.push_str(&drain_excised(&mut self.scan));
             return Some(StreamDelta::new(
                 released,
                 reasoning,
@@ -691,7 +676,7 @@ impl ChunkAssembler for PostToolsAssembler {
         // Same excision on a truncated stream — a complete block must not
         // leak just because the `done` chunk never arrived. (After a done
         // chunk the scan was already drained, so this yields nothing.)
-        let text = self.drain_scan();
+        let text = drain_excised(&mut self.scan);
         (!text.is_empty()).then(|| StreamDelta::new(text, "", false, None))
     }
 }
@@ -791,30 +776,6 @@ impl ChunkAssembler for ToolDeltaAssembler {
         }
         (!end.raw.is_empty()).then(|| ToolStreamDelta::new(end.raw, "", None, false, None))
     }
-}
-
-/// Non-streaming counterpart of the assembler's XML fallback: when the model
-/// produced no structured tool calls but wrote `<function=…>` blocks into its
-/// text, lift them into `tool_calls` (keeping any prose before the first
-/// block as content). See [`super::xml_tools`].
-fn apply_xml_tool_fallback(mut message: ChatMessage) -> ChatMessage {
-    if message.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
-        return message;
-    }
-    let Some(MessageContent::Text(text)) = &message.content else {
-        return message;
-    };
-    let Some(marker) = text.find(XML_MARKER) else {
-        return message;
-    };
-    let calls = parse_xml_tool_calls(text);
-    if calls.is_empty() {
-        return message;
-    }
-    let prefix = text[..marker].trim().to_string();
-    message.content = (!prefix.is_empty()).then_some(MessageContent::Text(prefix));
-    message.tool_calls = Some(calls);
-    message
 }
 
 /// Translate the OpenAI output-length cap to the native option. Standard
