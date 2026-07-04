@@ -11,9 +11,10 @@ use url::Url;
 use super::types::{
     ModelMetadata, OllamaChatChunk, OllamaChatRequest, OllamaMessage, ShowResponse, TagsResponse,
 };
+use super::xml_tools::{excise_call_blocks, parse_xml_tool_calls, XmlToolScan, XML_MARKER};
 use super::{ChatBackend, DeltaStream, StreamDelta, ToolDeltaStream, ToolStreamDelta};
 use crate::error::AppError;
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::types::{ChatMessage, MessageContent, ToolCall};
 
 /// Explicit residency hint for the opt-in warm preload path.
 const WARM_KEEP_ALIVE: &str = "30m";
@@ -230,6 +231,36 @@ impl OllamaClient {
         }
     }
 
+    /// Shared final-answer streaming path: same request either way, the
+    /// `assembler` decides delta policy (verbatim vs post-tools XML excision)
+    /// and `context` labels logs.
+    async fn stream_chat<A>(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &Map<String, Value>,
+        context: &'static str,
+        assembler: A,
+    ) -> Result<DeltaStream, AppError>
+    where
+        A: ChunkAssembler<Delta = StreamDelta> + Send + 'static,
+    {
+        let options = self.prepare_options(model, options).await;
+        let body = self.build_request(model, messages, &[], options, true, None);
+        tracing::debug!(
+            model = %model,
+            messages = messages.len(),
+            context,
+            "upstream final-answer stream (/api/chat, streaming)"
+        );
+        let resp = self.post_chat(&body, context).await?;
+        Ok(Box::pin(ndjson_stream(
+            resp.bytes_stream(),
+            usage_recorder(&self.metrics, model),
+            assembler,
+        )))
+    }
+
     pub fn set_metrics(&mut self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
         self.metrics = Some(metrics);
     }
@@ -394,12 +425,6 @@ impl OllamaClient {
         Ok(show.into())
     }
 
-    /// Declared capabilities of a model via `/api/show` (e.g. `"vision"`,
-    /// `"tools"`). Used by focused tests and older internal callers.
-    pub async fn model_capabilities(&self, model: &str) -> Result<Vec<String>, AppError> {
-        Ok(self.model_metadata(model).await?.capabilities)
-    }
-
     /// Best-effort model preload used only by `POST /v1/warm`. Loads with the
     /// same `num_ctx` real chats will use — a differing value would make the
     /// first chat reload the model, defeating the warm.
@@ -438,7 +463,16 @@ impl ChatBackend for OllamaClient {
             .await
             .map_err(|e| AppError::UpstreamError(e.to_string()))?;
         record_chunk_usage(&usage_recorder(&self.metrics, model), &chunk);
-        Ok(chunk.message.unwrap_or_default().into_openai())
+        let message = chunk.message.unwrap_or_default().into_openai();
+        // Only engage the XML fallback when tools were actually offered:
+        // no-tools callers (research plan/compress/verify) read the text
+        // only, and XML-looking content there is quoted material, not a
+        // call attempt — rewriting it would silently truncate their input.
+        Ok(if tools.is_empty() {
+            message
+        } else {
+            apply_xml_tool_fallback(message)
+        })
     }
 
     async fn chat_stream(
@@ -447,17 +481,24 @@ impl ChatBackend for OllamaClient {
         messages: &[ChatMessage],
         options: &Map<String, Value>,
     ) -> Result<DeltaStream, AppError> {
-        let options = self.prepare_options(model, options).await;
-        let body = self.build_request(model, messages, &[], options, true, None);
-        tracing::debug!(
-            model = %model,
-            messages = messages.len(),
-            "upstream chat_stream (/api/chat, streaming)"
-        );
-        let resp = self.post_chat(&body, "chat_stream").await?;
+        self.stream_chat(model, messages, options, "chat_stream", VerbatimAssembler)
+            .await
+    }
 
-        let stream = ndjson_to_deltas(resp.bytes_stream(), usage_recorder(&self.metrics, model));
-        Ok(Box::pin(stream))
+    async fn chat_stream_after_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &Map<String, Value>,
+    ) -> Result<DeltaStream, AppError> {
+        self.stream_chat(
+            model,
+            messages,
+            options,
+            "chat_stream_after_tools",
+            PostToolsAssembler::default(),
+        )
+        .await
     }
 
     async fn chat_stream_tools(
@@ -477,8 +518,11 @@ impl ChatBackend for OllamaClient {
         );
         let resp = self.post_chat(&body, "chat_stream_tools").await?;
 
-        let stream =
-            ndjson_to_tool_deltas(resp.bytes_stream(), usage_recorder(&self.metrics, model));
+        let stream = ndjson_stream(
+            resp.bytes_stream(),
+            usage_recorder(&self.metrics, model),
+            ToolDeltaAssembler::default(),
+        );
         Ok(Some(Box::pin(stream)))
     }
 }
@@ -508,14 +552,26 @@ fn record_chunk_usage(recorder: &UsageRecorder, chunk: &OllamaChatChunk) {
     }
 }
 
-/// Turn a stream of raw byte chunks (NDJSON) into a stream of `StreamDelta`s,
+/// One NDJSON response's chunk-to-delta assembly policy. The framing
+/// (line buffering, parse, usage recording) is shared by `ndjson_stream`;
+/// what differs per pass is only how chunks become deltas.
+trait ChunkAssembler {
+    type Delta;
+    fn push_chunk(&mut self, chunk: OllamaChatChunk) -> Option<Self::Delta>;
+    /// Flush after the byte stream ends without a `done` chunk (defensive).
+    fn finish(self) -> Option<Self::Delta>;
+}
+
+/// Turn a stream of raw byte chunks (NDJSON) into deltas via `assembler`,
 /// buffering partial lines across chunk boundaries.
-fn ndjson_to_deltas<S>(
+fn ndjson_stream<S, A>(
     mut bytes: S,
     usage: UsageRecorder,
-) -> impl Stream<Item = Result<StreamDelta, AppError>>
+    mut assembler: A,
+) -> impl Stream<Item = Result<A::Delta, AppError>>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+    A: ChunkAssembler,
 {
     try_stream! {
         let mut buf = BytesMut::new();
@@ -523,7 +579,7 @@ where
             let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
             buf.extend_from_slice(&chunk);
 
-            // Emit one delta per complete `\n`-terminated JSON line.
+            // Emit per complete `\n`-terminated JSON line.
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let line = buf.split_to(pos + 1);
                 let trimmed = line.as_ref();
@@ -533,7 +589,9 @@ where
                 let parsed: OllamaChatChunk = serde_json::from_slice(trimmed)
                     .map_err(|e| AppError::UpstreamError(format!("bad NDJSON line: {e}")))?;
                 record_chunk_usage(&usage, &parsed);
-                yield delta_from(parsed);
+                if let Some(delta) = assembler.push_chunk(parsed) {
+                    yield delta;
+                }
             }
         }
 
@@ -542,108 +600,221 @@ where
         if !rest.iter().all(|b| b.is_ascii_whitespace()) {
             if let Ok(parsed) = serde_json::from_slice::<OllamaChatChunk>(rest) {
                 record_chunk_usage(&usage, &parsed);
-                yield delta_from(parsed);
-            }
-        }
-    }
-}
-
-/// Turn native Ollama streaming-with-tools NDJSON into tool-resolution deltas.
-/// Ollama may emit parallel tool calls across multiple chunks, so hold calls
-/// until the stream finishes and then emit one complete batch.
-fn ndjson_to_tool_deltas<S>(
-    mut bytes: S,
-    usage: UsageRecorder,
-) -> impl Stream<Item = Result<ToolStreamDelta, AppError>>
-where
-    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
-{
-    try_stream! {
-        let mut buf = BytesMut::new();
-        let mut pending_tool_calls = Vec::<ToolCall>::new();
-        while let Some(next) = bytes.next().await {
-            let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
-            buf.extend_from_slice(&chunk);
-
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line = buf.split_to(pos + 1);
-                let trimmed = line.as_ref();
-                if trimmed.iter().all(|b| b.is_ascii_whitespace()) {
-                    continue;
-                }
-                let parsed: OllamaChatChunk = serde_json::from_slice(trimmed)
-                    .map_err(|e| AppError::UpstreamError(format!("bad NDJSON line: {e}")))?;
-                record_chunk_usage(&usage, &parsed);
-                if let Some(delta) = tool_delta_from(parsed, &mut pending_tool_calls) {
+                if let Some(delta) = assembler.push_chunk(parsed) {
                     yield delta;
                 }
             }
         }
 
-        let rest = buf.as_ref();
-        if !rest.iter().all(|b| b.is_ascii_whitespace()) {
-            if let Ok(parsed) = serde_json::from_slice::<OllamaChatChunk>(rest) {
-                record_chunk_usage(&usage, &parsed);
-                if let Some(delta) = tool_delta_from(parsed, &mut pending_tool_calls) {
-                    yield delta;
-                }
-            }
-        }
-
-        if !pending_tool_calls.is_empty() {
-            yield ToolStreamDelta::new("", "", Some(std::mem::take(&mut pending_tool_calls)), true, Some("tool_calls".into()));
+        if let Some(delta) = assembler.finish() {
+            yield delta;
         }
     }
 }
 
-fn delta_from(chunk: OllamaChatChunk) -> StreamDelta {
-    let message = chunk.message.unwrap_or_default();
-    StreamDelta::new(
-        message.content.unwrap_or_default(),
-        message.thinking.unwrap_or_default(),
-        chunk.done,
-        chunk.done_reason,
-    )
-}
+/// Plain final-answer pass: every chunk relays verbatim. Used by
+/// `chat_stream` — no tools were involved in the turn, so `<function=…>`
+/// text can only be quoted material and must pass through untouched.
+struct VerbatimAssembler;
 
-fn tool_delta_from(
-    chunk: OllamaChatChunk,
-    pending_tool_calls: &mut Vec<ToolCall>,
-) -> Option<ToolStreamDelta> {
-    let message = chunk.message.unwrap_or_default();
-    if let Some(mut calls) = message.clone().into_openai().tool_calls {
-        pending_tool_calls.append(&mut calls);
-    }
+impl ChunkAssembler for VerbatimAssembler {
+    type Delta = StreamDelta;
 
-    if chunk.done {
-        let content = message.content.unwrap_or_default();
-        let reasoning = message.thinking.unwrap_or_default();
-        return Some(ToolStreamDelta::new(
-            if pending_tool_calls.is_empty() {
-                content
-            } else {
-                String::new()
-            },
-            if pending_tool_calls.is_empty() {
-                reasoning
-            } else {
-                String::new()
-            },
-            (!pending_tool_calls.is_empty()).then(|| std::mem::take(pending_tool_calls)),
-            true,
+    fn push_chunk(&mut self, chunk: OllamaChatChunk) -> Option<StreamDelta> {
+        let message = chunk.message.unwrap_or_default();
+        Some(StreamDelta::new(
+            message.content.unwrap_or_default(),
+            message.thinking.unwrap_or_default(),
+            chunk.done,
             chunk.done_reason,
-        ));
+        ))
     }
 
-    if pending_tool_calls.is_empty() {
+    fn finish(self) -> Option<StreamDelta> {
+        None
+    }
+}
+
+/// Post-tools final-answer pass (`chat_stream_after_tools`): the model was
+/// being offered tools until this call, so any `<function=…>` block it emits
+/// now is a real call attempt that can no longer be executed — raw XML must
+/// not reach the app. The scan withholds candidate blocks and, at stream end,
+/// structurally complete blocks are excised while ALL surrounding prose
+/// (before, between, after) is kept. Deterministic — the caller supplied the
+/// after-tools signal, so no quoted-vs-attempt heuristic is needed.
+#[derive(Default)]
+struct PostToolsAssembler {
+    scan: XmlToolScan,
+}
+
+impl PostToolsAssembler {
+    /// The withheld text with complete call blocks excised.
+    fn drain_scan(&mut self) -> String {
+        let raw = std::mem::take(&mut self.scan).into_raw();
+        let (cleaned, excised) = excise_call_blocks(&raw);
+        if excised > 0 {
+            tracing::warn!(
+                excised,
+                "model emitted tool-call block(s) in the post-tools final answer; excised"
+            );
+        }
+        cleaned
+    }
+}
+
+impl ChunkAssembler for PostToolsAssembler {
+    type Delta = StreamDelta;
+
+    fn push_chunk(&mut self, chunk: OllamaChatChunk) -> Option<StreamDelta> {
+        let message = chunk.message.unwrap_or_default();
         let content = message.content.unwrap_or_default();
         let reasoning = message.thinking.unwrap_or_default();
-        if !content.is_empty() || !reasoning.is_empty() {
-            return Some(ToolStreamDelta::new(content, reasoning, None, false, None));
+        let mut released = self.scan.push(&content);
+
+        if chunk.done {
+            released.push_str(&self.drain_scan());
+            return Some(StreamDelta::new(
+                released,
+                reasoning,
+                true,
+                chunk.done_reason,
+            ));
         }
+
+        if !released.is_empty() || !reasoning.is_empty() {
+            return Some(StreamDelta::new(released, reasoning, false, None));
+        }
+        None
     }
 
-    None
+    fn finish(mut self) -> Option<StreamDelta> {
+        // Same excision on a truncated stream — a complete block must not
+        // leak just because the `done` chunk never arrived. (After a done
+        // chunk the scan was already drained, so this yields nothing.)
+        let text = self.drain_scan();
+        (!text.is_empty()).then(|| StreamDelta::new(text, "", false, None))
+    }
+}
+
+/// Assembles tool-resolution deltas from native chunks. Holds native tool
+/// calls until the stream finishes (Ollama may spread parallel calls over
+/// several chunks) and runs the XML fallback scan over the text so a model
+/// that wrote its calls as `<function=…>` text (see [`super::xml_tools`])
+/// still resolves tools instead of leaking XML to the app. Native structured
+/// calls win: once any arrive, scanned text is discarded like other content.
+#[derive(Default)]
+struct ToolDeltaAssembler {
+    pending_tool_calls: Vec<ToolCall>,
+    scan: XmlToolScan,
+}
+
+impl ToolDeltaAssembler {
+    /// The terminal delta carrying the accumulated native tool-call batch.
+    fn native_batch(&mut self, done_reason: Option<String>) -> ToolStreamDelta {
+        ToolStreamDelta::new(
+            "",
+            "",
+            Some(std::mem::take(&mut self.pending_tool_calls)),
+            true,
+            done_reason,
+        )
+    }
+}
+
+impl ChunkAssembler for ToolDeltaAssembler {
+    type Delta = ToolStreamDelta;
+
+    fn push_chunk(&mut self, chunk: OllamaChatChunk) -> Option<ToolStreamDelta> {
+        let mut message = chunk.message.unwrap_or_default();
+        if let Some(calls) = message.tool_calls.take() {
+            self.pending_tool_calls.extend(
+                calls
+                    .into_iter()
+                    .map(super::types::OllamaToolCall::into_openai),
+            );
+        }
+        let content = message.content.unwrap_or_default();
+        let reasoning = message.thinking.unwrap_or_default();
+
+        if chunk.done {
+            if !self.pending_tool_calls.is_empty() {
+                // Native calls win outright; drop any scanned XML so the
+                // post-stream finish() can't replay it as a second batch.
+                self.scan = XmlToolScan::default();
+                return Some(self.native_batch(chunk.done_reason));
+            }
+            let mut released = self.scan.push(&content);
+            let end = std::mem::take(&mut self.scan).finish();
+            if !end.calls.is_empty() {
+                return Some(ToolStreamDelta::new(
+                    released,
+                    reasoning,
+                    Some(end.calls),
+                    true,
+                    Some("tool_calls".into()),
+                ));
+            }
+            released.push_str(&end.raw);
+            return Some(ToolStreamDelta::new(
+                released,
+                reasoning,
+                None,
+                true,
+                chunk.done_reason,
+            ));
+        }
+
+        if !self.pending_tool_calls.is_empty() {
+            return None;
+        }
+        let released = self.scan.push(&content);
+        if !released.is_empty() || !reasoning.is_empty() {
+            return Some(ToolStreamDelta::new(released, reasoning, None, false, None));
+        }
+        None
+    }
+
+    /// Flush after the byte stream ends without a `done` chunk (defensive).
+    fn finish(mut self) -> Option<ToolStreamDelta> {
+        if !self.pending_tool_calls.is_empty() {
+            return Some(self.native_batch(Some("tool_calls".into())));
+        }
+        let end = self.scan.finish();
+        if !end.calls.is_empty() {
+            return Some(ToolStreamDelta::new(
+                "",
+                "",
+                Some(end.calls),
+                true,
+                Some("tool_calls".into()),
+            ));
+        }
+        (!end.raw.is_empty()).then(|| ToolStreamDelta::new(end.raw, "", None, false, None))
+    }
+}
+
+/// Non-streaming counterpart of the assembler's XML fallback: when the model
+/// produced no structured tool calls but wrote `<function=…>` blocks into its
+/// text, lift them into `tool_calls` (keeping any prose before the first
+/// block as content). See [`super::xml_tools`].
+fn apply_xml_tool_fallback(mut message: ChatMessage) -> ChatMessage {
+    if message.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
+        return message;
+    }
+    let Some(MessageContent::Text(text)) = &message.content else {
+        return message;
+    };
+    let Some(marker) = text.find(XML_MARKER) else {
+        return message;
+    };
+    let calls = parse_xml_tool_calls(text);
+    if calls.is_empty() {
+        return message;
+    }
+    let prefix = text[..marker].trim().to_string();
+    message.content = (!prefix.is_empty()).then_some(MessageContent::Text(prefix));
+    message.tool_calls = Some(calls);
+    message
 }
 
 /// Translate the OpenAI output-length cap to the native option. Standard
@@ -672,7 +843,10 @@ fn extract_thinking_control(options: &mut Map<String, Value>) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_thinking_control, ndjson_to_deltas, ndjson_to_tool_deltas, OllamaClient};
+    use super::{
+        extract_thinking_control, ndjson_stream, OllamaClient, PostToolsAssembler,
+        ToolDeltaAssembler, VerbatimAssembler,
+    };
     use crate::error::AppError;
     use crate::ollama::{StreamDelta, ToolStreamDelta};
     use bytes::Bytes;
@@ -683,13 +857,23 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn collect(chunks: Vec<reqwest::Result<Bytes>>) -> Vec<Result<StreamDelta, AppError>> {
-        ndjson_to_deltas(stream::iter(chunks), None).collect().await
+        ndjson_stream(stream::iter(chunks), None, VerbatimAssembler)
+            .collect()
+            .await
+    }
+
+    async fn collect_after_tools(
+        chunks: Vec<reqwest::Result<Bytes>>,
+    ) -> Vec<Result<StreamDelta, AppError>> {
+        ndjson_stream(stream::iter(chunks), None, PostToolsAssembler::default())
+            .collect()
+            .await
     }
 
     async fn collect_tool_deltas(
         chunks: Vec<reqwest::Result<Bytes>>,
     ) -> Vec<Result<ToolStreamDelta, AppError>> {
-        ndjson_to_tool_deltas(stream::iter(chunks), None)
+        ndjson_stream(stream::iter(chunks), None, ToolDeltaAssembler::default())
             .collect()
             .await
     }
@@ -767,13 +951,16 @@ mod tests {
               {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\
                \"prompt_eval_count\":10,\"eval_count\":30,\"eval_duration\":1500000000,\"load_duration\":2000000000}\n",
         ))];
-        let deltas: Vec<StreamDelta> =
-            ndjson_to_deltas(stream::iter(chunks), Some((metrics.clone(), "m1".into())))
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .map(|r| r.unwrap())
-                .collect();
+        let deltas: Vec<StreamDelta> = ndjson_stream(
+            stream::iter(chunks),
+            Some((metrics.clone(), "m1".into())),
+            VerbatimAssembler,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
         assert_eq!(deltas.len(), 2);
         let stats = metrics.model("m1");
         assert_eq!(stats.prompt_tokens.get(), 10);
@@ -825,6 +1012,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ndjson_tool_stream_parses_xml_tool_calls_and_streams_prefix() {
+        // qwen3-coder style: prose, then the call as XML text, no native
+        // tool_calls field. The prose must stream; the XML must not.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"Let me check.\\n\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"<function=weather>\\n<parameter=location>Ber\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"lin</parameter>\\n</function>\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+        ))];
+
+        let deltas: Vec<ToolStreamDelta> = collect_tool_deltas(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let streamed: String = deltas.iter().map(|d| d.content.as_str()).collect();
+        assert_eq!(streamed, "Let me check.\n", "XML never reaches the app");
+
+        let last = deltas.last().expect("final delta");
+        assert!(last.done);
+        let calls = last.tool_calls.as_ref().expect("xml calls parsed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "weather");
+        assert!(calls[0].id.as_deref().unwrap().starts_with("call_"));
+    }
+
+    #[tokio::test]
+    async fn ndjson_tool_stream_prefers_native_calls_over_xml_text() {
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"<function=wrong>\\n</function>\",\"tool_calls\":[{\"function\":{\"name\":\"right\",\"arguments\":{}}}]},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+        ))];
+
+        let deltas: Vec<ToolStreamDelta> = collect_tool_deltas(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(deltas.len(), 1);
+        let calls = deltas[0].tool_calls.as_ref().expect("native calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "right");
+    }
+
+    #[tokio::test]
+    async fn ndjson_tool_stream_flushes_unparseable_xml_as_content() {
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"<function=weather>never closed\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+        ))];
+
+        let deltas: Vec<ToolStreamDelta> = collect_tool_deltas(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let last = deltas.last().expect("final delta");
+        assert!(last.done);
+        assert!(last.tool_calls.is_none());
+        let streamed: String = deltas.iter().map(|d| d.content.as_str()).collect();
+        assert_eq!(streamed, "<function=weather>never closed");
+    }
+
+    #[test]
+    fn chat_once_xml_fallback_lifts_calls_and_keeps_prefix() {
+        use crate::openai::types::ChatMessage;
+        let message = ChatMessage {
+            role: "assistant".into(),
+            content: Some(crate::openai::types::MessageContent::Text(
+                "On it.\n<function=time>\n</function>".into(),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let out = super::apply_xml_tool_fallback(message);
+        assert_eq!(out.tool_calls.as_ref().unwrap()[0].function.name, "time");
+        assert!(
+            matches!(&out.content, Some(crate::openai::types::MessageContent::Text(t)) if t == "On it."),
+        );
+
+        // Plain text passes through untouched.
+        let plain = ChatMessage {
+            role: "assistant".into(),
+            content: Some(crate::openai::types::MessageContent::Text("hi".into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let out = super::apply_xml_tool_fallback(plain);
+        assert!(out.tool_calls.is_none());
+    }
+
+    #[tokio::test]
     async fn ndjson_surfaces_malformed_line_as_error() {
         let chunks = vec![Ok(Bytes::from_static(b"{not json}\n"))];
         let first = collect(chunks).await.into_iter().next().expect("one item");
@@ -841,10 +1125,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = OllamaClient::new(
-            reqwest::Client::new(),
-            Url::parse(&server.uri()).expect("mock server URL"),
-        );
+        let client = test_client(&server);
 
         let err = client
             .model_metadata("missing")
@@ -861,180 +1142,6 @@ mod tests {
             }
             other => panic!("expected UpstreamError, got {other:?}"),
         }
-    }
-
-    fn chat_response() -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"role": "assistant", "content": "hi"},
-            "done": true,
-        }))
-    }
-
-    /// Client pointed at the mock server. Layer setters on the binding when a
-    /// test needs num_ctx injection or retries.
-    fn test_client(server: &MockServer) -> OllamaClient {
-        OllamaClient::new(
-            reqwest::Client::new(),
-            Url::parse(&server.uri()).expect("mock server URL"),
-        )
-    }
-
-    fn fast_retry() -> super::RetryPolicy {
-        super::RetryPolicy {
-            max_retries: 3,
-            network_max_retries: 2,
-            initial: std::time::Duration::from_millis(1),
-            multiplier: 1.0,
-            cap: std::time::Duration::from_millis(1),
-        }
-    }
-
-    #[tokio::test]
-    async fn chat_once_retries_500_until_the_model_is_loaded() {
-        let server = MockServer::start().await;
-        // Two load-window 500s, then success — first-mounted match wins until
-        // its budget is spent.
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("model is loading"))
-            .up_to_n_times(2)
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(chat_response())
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let mut client = test_client(&server);
-        client.set_retry_policy(fast_retry());
-
-        let message = crate::ollama::ChatBackend::chat_once(&client, "big", &[], &[], &Map::new())
-            .await
-            .expect("succeeds after transient 500s");
-        assert!(matches!(
-            message.content,
-            Some(crate::openai::types::MessageContent::Text(t)) if t == "hi"
-        ));
-    }
-
-    #[tokio::test]
-    async fn five_xx_budget_is_independent_of_the_network_budget() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("loading"))
-            .up_to_n_times(2)
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(chat_response())
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let mut client = test_client(&server);
-        // Zero network budget: two 500s must still be retried on the 5xx
-        // budget (per-class counters, not one shared count).
-        client.set_retry_policy(super::RetryPolicy {
-            network_max_retries: 0,
-            ..fast_retry()
-        });
-
-        crate::ollama::ChatBackend::chat_once(&client, "big", &[], &[], &Map::new())
-            .await
-            .expect("5xx retries unaffected by the network budget");
-    }
-
-    #[tokio::test]
-    async fn chat_once_gives_up_when_retries_are_exhausted() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("still broken"))
-            .expect(4) // initial attempt + max_retries(3)
-            .mount(&server)
-            .await;
-
-        let mut client = test_client(&server);
-        client.set_retry_policy(fast_retry());
-
-        let err = crate::ollama::ChatBackend::chat_once(&client, "big", &[], &[], &Map::new())
-            .await
-            .expect_err("permanent 500 eventually surfaces");
-        assert!(matches!(err, AppError::UpstreamError(m) if m.contains("still broken")));
-    }
-
-    #[tokio::test]
-    async fn chat_once_does_not_retry_client_errors() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("model not found"))
-            .expect(1) // a 4xx must never be retried
-            .mount(&server)
-            .await;
-
-        let mut client = test_client(&server);
-        client.set_retry_policy(fast_retry());
-
-        let err = crate::ollama::ChatBackend::chat_once(&client, "m", &[], &[], &Map::new())
-            .await
-            .expect_err("404 is a real error");
-        assert!(matches!(err, AppError::UpstreamError(m) if m.contains("model not found")));
-    }
-
-    #[tokio::test]
-    async fn warm_model_does_not_retry() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("loading"))
-            .expect(1) // warm is fast best-effort: exactly one attempt
-            .mount(&server)
-            .await;
-        let mut client = test_client(&server);
-        client.set_retry_policy(fast_retry());
-
-        client.warm_model("big").await.expect_err("fails fast");
-    }
-
-    #[tokio::test]
-    async fn permanent_500_bodies_are_not_retried() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(
-                ResponseTemplate::new(500)
-                    .set_body_string("model requires more system memory (32 GiB)"),
-            )
-            .expect(1) // deterministic failure: retrying can never succeed
-            .mount(&server)
-            .await;
-        let mut client = test_client(&server);
-        client.set_retry_policy(fast_retry());
-
-        let err = crate::ollama::ChatBackend::chat_once(&client, "big", &[], &[], &Map::new())
-            .await
-            .expect_err("permanent 500 surfaces immediately");
-        assert!(matches!(err, AppError::UpstreamError(m) if m.contains("more system memory")));
-    }
-
-    #[test]
-    fn retry_policy_backoff_is_exponential_and_capped() {
-        let policy = super::RetryPolicy::default();
-        assert_eq!(policy.delay(1), std::time::Duration::from_millis(2000));
-        assert_eq!(policy.delay(2), std::time::Duration::from_millis(3000));
-        assert_eq!(policy.delay(3), std::time::Duration::from_millis(4500));
-        assert_eq!(
-            policy.delay(20),
-            std::time::Duration::from_secs(15),
-            "capped"
-        );
     }
 
     #[test]
@@ -1085,6 +1192,22 @@ mod tests {
             "capabilities": ["completion"],
             "model_info": model_info,
         }))
+    }
+
+    fn chat_response() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "message": {"role": "assistant", "content": "hi"},
+            "done": true,
+        }))
+    }
+
+    /// Client pointed at the mock server. Layer setters on the binding when a
+    /// test needs num_ctx injection or retries.
+    fn test_client(server: &MockServer) -> OllamaClient {
+        OllamaClient::new(
+            reqwest::Client::new(),
+            Url::parse(&server.uri()).expect("mock server URL"),
+        )
     }
 
     async fn chat_bodies(server: &MockServer) -> Vec<Value> {
@@ -1203,6 +1326,220 @@ mod tests {
         }
     }
 
+    fn fast_retry() -> super::RetryPolicy {
+        super::RetryPolicy {
+            max_retries: 3,
+            network_max_retries: 2,
+            initial: std::time::Duration::from_millis(1),
+            multiplier: 1.0,
+            cap: std::time::Duration::from_millis(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn ndjson_tool_stream_native_calls_discard_buffered_xml() {
+        // XML buffered by the scan, then native tool_calls, then done: the
+        // native batch wins and the stale XML must NOT replay as a second
+        // done delta from the post-stream flush.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"<function=wrong>\\n</function>\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"name\":\"right\",\"arguments\":{}}}]},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+        ))];
+
+        let deltas: Vec<ToolStreamDelta> = collect_tool_deltas(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(deltas.len(), 1, "exactly one final delta: {deltas:?}");
+        let calls = deltas[0].tool_calls.as_ref().expect("native calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "right");
+    }
+
+    #[tokio::test]
+    async fn post_tools_stream_excises_call_attempt_but_keeps_surrounding_prose() {
+        // Forced final after the tool budget: the block is a call attempt and
+        // is excised; prose before AND after it survives.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"Trying once more.\\n<function=weather>\\n<parameter=location>Berlin</parameter>\\n</function>\\nThe answer is 42.\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+        ))];
+        let deltas: Vec<StreamDelta> = collect_after_tools(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let streamed: String = deltas.iter().map(|d| d.content.as_str()).collect();
+        assert_eq!(streamed, "Trying once more.\n\nThe answer is 42.");
+        assert!(deltas.last().unwrap().done);
+    }
+
+    #[tokio::test]
+    async fn post_tools_stream_excises_on_truncated_stream_too() {
+        // Stream dies before the done chunk: the buffered block still must
+        // not leak as visible XML.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"<function=weather>\\n</function>\"},\"done\":false}\n",
+        ))];
+        let deltas: Vec<StreamDelta> = collect_after_tools(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let streamed: String = deltas.iter().map(|d| d.content.as_str()).collect();
+        assert_eq!(streamed, "", "no raw XML on truncated streams");
+    }
+
+    #[tokio::test]
+    async fn plain_final_answer_stream_relays_xml_verbatim() {
+        // chat_stream = no tools were ever offered: XML can only be quoted
+        // material and passes through untouched.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"<function=weather>\\n</function>\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+        ))];
+        let deltas: Vec<StreamDelta> = collect(chunks)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(deltas[0].content, "<function=weather>\n</function>");
+    }
+
+    #[tokio::test]
+    async fn chat_once_skips_xml_fallback_when_no_tools_offered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "Example:\n<function=time>\n</function>"},
+                "done": true,
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+
+        // No tools offered (research plan/compress/verify): text is quoted
+        // material and must pass through untouched.
+        let message = crate::ollama::ChatBackend::chat_once(&client, "m", &[], &[], &Map::new())
+            .await
+            .expect("chat");
+        assert!(message.tool_calls.is_none());
+        assert!(matches!(
+            &message.content,
+            Some(crate::openai::types::MessageContent::Text(t)) if t.contains("<function=time>")
+        ));
+
+        // Tools offered: the fallback engages.
+        let tools = vec![json!({"type": "function", "function": {"name": "time"}})];
+        let message = crate::ollama::ChatBackend::chat_once(&client, "m", &[], &tools, &Map::new())
+            .await
+            .expect("chat");
+        assert_eq!(
+            message.tool_calls.as_ref().unwrap()[0].function.name,
+            "time"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_model_does_not_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("loading"))
+            .expect(1) // warm is fast best-effort: exactly one attempt
+            .mount(&server)
+            .await;
+        let mut client = test_client(&server);
+        client.set_retry_policy(fast_retry());
+
+        client.warm_model("big").await.expect_err("fails fast");
+    }
+
+    #[tokio::test]
+    async fn permanent_500_bodies_are_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("model requires more system memory (32 GiB)"),
+            )
+            .expect(1) // deterministic failure: retrying can never succeed
+            .mount(&server)
+            .await;
+        let mut client = test_client(&server);
+        client.set_retry_policy(fast_retry());
+
+        let err = crate::ollama::ChatBackend::chat_once(&client, "big", &[], &[], &Map::new())
+            .await
+            .expect_err("permanent 500 surfaces immediately");
+        assert!(matches!(err, AppError::UpstreamError(m) if m.contains("more system memory")));
+    }
+
+    #[tokio::test]
+    async fn chat_once_retries_500_until_the_model_is_loaded() {
+        let server = MockServer::start().await;
+        // Two load-window 500s, then success — first-mounted match wins until
+        // its budget is spent.
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("model is loading"))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(chat_response())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        client.set_retry_policy(fast_retry());
+
+        let message = crate::ollama::ChatBackend::chat_once(&client, "big", &[], &[], &Map::new())
+            .await
+            .expect("succeeds after transient 500s");
+        assert!(matches!(
+            message.content,
+            Some(crate::openai::types::MessageContent::Text(t)) if t == "hi"
+        ));
+    }
+
+    #[tokio::test]
+    async fn five_xx_budget_is_independent_of_the_network_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("loading"))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(chat_response())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        // Zero network budget: two 500s must still be retried on the 5xx
+        // budget (per-class counters, not one shared count).
+        client.set_retry_policy(super::RetryPolicy {
+            network_max_retries: 0,
+            ..fast_retry()
+        });
+
+        crate::ollama::ChatBackend::chat_once(&client, "big", &[], &[], &Map::new())
+            .await
+            .expect("5xx retries unaffected by the network budget");
+    }
+
     #[tokio::test]
     async fn failed_ctx_probe_is_retried_after_the_cooldown() {
         let server = MockServer::start().await;
@@ -1274,6 +1611,57 @@ mod tests {
             .expect("chat");
 
         assert_eq!(chat_bodies(&server).await[0]["options"]["num_ctx"], 32_768);
+    }
+
+    #[tokio::test]
+    async fn chat_once_gives_up_when_retries_are_exhausted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("still broken"))
+            .expect(4) // initial attempt + max_retries(3)
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        client.set_retry_policy(fast_retry());
+
+        let err = crate::ollama::ChatBackend::chat_once(&client, "big", &[], &[], &Map::new())
+            .await
+            .expect_err("permanent 500 eventually surfaces");
+        assert!(matches!(err, AppError::UpstreamError(m) if m.contains("still broken")));
+    }
+
+    #[tokio::test]
+    async fn chat_once_does_not_retry_client_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("model not found"))
+            .expect(1) // a 4xx must never be retried
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        client.set_retry_policy(fast_retry());
+
+        let err = crate::ollama::ChatBackend::chat_once(&client, "m", &[], &[], &Map::new())
+            .await
+            .expect_err("404 is a real error");
+        assert!(matches!(err, AppError::UpstreamError(m) if m.contains("model not found")));
+    }
+
+    #[test]
+    fn retry_policy_backoff_is_exponential_and_capped() {
+        let policy = super::RetryPolicy::default();
+        assert_eq!(policy.delay(1), std::time::Duration::from_millis(2000));
+        assert_eq!(policy.delay(2), std::time::Duration::from_millis(3000));
+        assert_eq!(policy.delay(3), std::time::Duration::from_millis(4500));
+        assert_eq!(
+            policy.delay(20),
+            std::time::Duration::from_secs(15),
+            "capped"
+        );
     }
 
     #[test]

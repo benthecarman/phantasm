@@ -224,6 +224,7 @@ pub async fn run_turn<B, T>(
             vision.as_deref().unwrap_or(&messages),
             &options,
             Vec::new(),
+            false, // plain turn: no tools were ever offered
             &tx,
             &cancel,
         )
@@ -424,6 +425,7 @@ pub async fn run_turn<B, T>(
         vision.as_deref().unwrap_or(&messages),
         &options,
         appends,
+        true, // forced final after the tool budget: excise call-attempt XML
         &tx,
         &cancel,
     )
@@ -665,20 +667,6 @@ async fn latest_input_images(
     Vec::new()
 }
 
-/// Issue a streaming call (without tools) and relay tokens, then append any
-/// deferred content (e.g. generated images) and finish.
-async fn stream_final<B: ChatBackend>(
-    backend: &B,
-    model: &str,
-    messages: &[ChatMessage],
-    options: &Map<String, Value>,
-    appends: Vec<String>,
-    tx: &mpsc::Sender<TurnEvent>,
-    cancel: &CancellationToken,
-) {
-    stream_relay_inner(backend, model, messages, options, appends, tx, cancel).await;
-}
-
 /// Stream a final-answer call and relay its tokens/reasoning, ending with a
 /// `Done` event — the reusable streaming relay shared by the plain turn path and
 /// the research synthesis stage (which appends nothing). Public to the crate so
@@ -691,15 +679,32 @@ pub(crate) async fn stream_relay<B: ChatBackend>(
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) {
-    stream_relay_inner(backend, model, messages, options, Vec::new(), tx, cancel).await;
+    stream_final(
+        backend,
+        model,
+        messages,
+        options,
+        Vec::new(),
+        false,
+        tx,
+        cancel,
+    )
+    .await;
 }
 
-async fn stream_relay_inner<B: ChatBackend>(
+/// Issue a streaming call (without tools) and relay tokens, then append any
+/// deferred content (e.g. generated images) and finish. `after_tools` marks
+/// the forced final answer once the tool budget is exhausted — the backend
+/// then excises text-formatted tool-call blocks (they are call attempts, not
+/// answer text); plain no-tools turns relay verbatim.
+#[allow(clippy::too_many_arguments)]
+async fn stream_final<B: ChatBackend>(
     backend: &B,
     model: &str,
     messages: &[ChatMessage],
     options: &Map<String, Value>,
     appends: Vec<String>,
+    after_tools: bool,
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) {
@@ -707,7 +712,13 @@ async fn stream_relay_inner<B: ChatBackend>(
         return;
     }
     let stream = tokio::select! {
-        s = backend.chat_stream(model, messages, options) => s,
+        s = async {
+            if after_tools {
+                backend.chat_stream_after_tools(model, messages, options).await
+            } else {
+                backend.chat_stream(model, messages, options).await
+            }
+        } => s,
         _ = cancel.cancelled() => return,
     };
 

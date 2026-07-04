@@ -583,6 +583,14 @@ fn default_tool_type() -> String {
     "function".to_string()
 }
 
+/// Mint a synthetic tool-call id in the OpenAI style. Used wherever an
+/// upstream supplies calls without ids (native Ollama, XML fallback, SSE
+/// deltas missing them) so downstream correlation always has one, in one
+/// consistent format.
+pub(crate) fn mint_call_id() -> String {
+    format!("call_{}", uuid::Uuid::new_v4().simple())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,

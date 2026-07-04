@@ -1,5 +1,6 @@
 pub mod client;
 pub mod types;
+mod xml_tools;
 
 pub use client::OllamaClient;
 
@@ -98,6 +99,21 @@ pub trait ChatBackend: Send + Sync + Clone + 'static {
         messages: &[ChatMessage],
         options: &Map<String, Value>,
     ) -> impl std::future::Future<Output = Result<DeltaStream, AppError>> + Send;
+
+    /// Streaming final answer for a turn that just exhausted its tool budget.
+    /// Same call shape as [`Self::chat_stream`], but the model was being
+    /// offered tools until this very call, so backends that can should excise
+    /// text-formatted tool-call blocks (see `ollama::xml_tools`) instead of
+    /// relaying them as answer text — they are call attempts that can no
+    /// longer be executed. Default: plain `chat_stream` (verbatim relay).
+    fn chat_stream_after_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &Map<String, Value>,
+    ) -> impl std::future::Future<Output = Result<DeltaStream, AppError>> + Send {
+        self.chat_stream(model, messages, options)
+    }
 
     /// Streaming tool-resolution pass. Streaming chat turns require this; a
     /// backend returning `Ok(None)` fails the turn rather than taking a hidden
@@ -213,6 +229,26 @@ impl ChatBackend for UpstreamChatBackend {
             UpstreamChatBackend::NativeOllama(client) => {
                 client.chat_stream(model, messages, options).await
             }
+            UpstreamChatBackend::OpenAICompatible(client) => {
+                client.chat_stream(model, messages, options).await
+            }
+        }
+    }
+
+    async fn chat_stream_after_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &Map<String, Value>,
+    ) -> Result<DeltaStream, AppError> {
+        match self {
+            UpstreamChatBackend::NativeOllama(client) => {
+                client
+                    .chat_stream_after_tools(model, messages, options)
+                    .await
+            }
+            // No XML fallback for OpenAI-compatible upstreams yet — verbatim,
+            // matching their chat_stream (tracked as a separate port).
             UpstreamChatBackend::OpenAICompatible(client) => {
                 client.chat_stream(model, messages, options).await
             }

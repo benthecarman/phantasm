@@ -170,7 +170,7 @@ pub fn done_event() -> Event {
 pub fn ensure_call_id(call: &ToolCall) -> String {
     call.id
         .clone()
-        .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()))
+        .unwrap_or_else(crate::openai::types::mint_call_id)
 }
 
 fn to_event(chunk: &ChatChunk) -> Event {

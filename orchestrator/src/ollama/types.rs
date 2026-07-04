@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::openai::types::{ChatMessage, FunctionCall, MessageContent, RawArguments, ToolCall};
+use crate::openai::types::{
+    mint_call_id, ChatMessage, FunctionCall, MessageContent, RawArguments, ToolCall,
+};
 
 #[derive(Debug, Serialize)]
 pub struct OllamaChatRequest {
@@ -139,6 +141,21 @@ pub struct TagModel {
 
 // ---- conversions ----
 
+impl OllamaToolCall {
+    /// Convert to the OpenAI dialect, minting a synthetic call id (the native
+    /// API doesn't supply one).
+    pub fn into_openai(self) -> ToolCall {
+        ToolCall {
+            id: Some(mint_call_id()),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: self.function.name,
+                arguments: RawArguments::Obj(self.function.arguments),
+            },
+        }
+    }
+}
+
 impl OllamaMessage {
     /// Convert our OpenAI-dialect message to the native shape. Multimodal
     /// content parts are split: text is concatenated into `content`, image
@@ -185,19 +202,9 @@ impl OllamaMessage {
     /// Convert a native assistant message back to our OpenAI dialect, minting a
     /// synthetic call id (the native API doesn't supply one).
     pub fn into_openai(self) -> ChatMessage {
-        let tool_calls = self.tool_calls.map(|calls| {
-            calls
-                .into_iter()
-                .map(|c| ToolCall {
-                    id: Some(format!("call_{}", uuid::Uuid::new_v4().simple())),
-                    kind: "function".into(),
-                    function: FunctionCall {
-                        name: c.function.name,
-                        arguments: RawArguments::Obj(c.function.arguments),
-                    },
-                })
-                .collect::<Vec<_>>()
-        });
+        let tool_calls = self
+            .tool_calls
+            .map(|calls| calls.into_iter().map(OllamaToolCall::into_openai).collect());
         ChatMessage {
             role: if self.role.is_empty() {
                 "assistant".into()
