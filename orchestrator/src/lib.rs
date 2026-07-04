@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod history;
 pub mod host_stats;
 pub mod image_norm;
 pub mod images;
