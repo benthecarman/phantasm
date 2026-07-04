@@ -980,6 +980,78 @@ async fn native_capabilities_omit_metadata_when_show_errors() {
     assert_eq!(capabilities.models[0].context_length, None);
 }
 
+/// A mock Ollama whose one model declares a context length far above any
+/// reasonable num_ctx cap.
+fn mock_ollama_big_context() -> Router {
+    Router::new()
+        .route(
+            "/api/tags",
+            get(|| async { axum::Json(serde_json::json!({"models":[{"name":"m"}]})) }),
+        )
+        .route(
+            "/api/show",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "capabilities": ["completion"],
+                    "model_info": {"qwen3.context_length": 262144}
+                }))
+            }),
+        )
+}
+
+#[tokio::test]
+async fn native_capabilities_advertise_num_ctx_capped_context_length() {
+    let ollama = spawn(mock_ollama_big_context()).await;
+    let mut cfg = test_config(&ollama);
+    cfg.models = vec![];
+    cfg.upstream_num_ctx_cap = 32_768;
+    let http = reqwest::Client::new();
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &http).await;
+
+    let capabilities = probe_capabilities(&cfg, &http, &upstreams, true).await;
+
+    assert_eq!(capabilities.models.len(), 1);
+    assert_eq!(
+        capabilities.models[0].context_length,
+        Some(32_768),
+        "advertised context length is the served window: min(declared, cap)"
+    );
+}
+
+#[tokio::test]
+async fn native_capabilities_advertise_declared_context_length_when_injection_disabled() {
+    let ollama = spawn(mock_ollama_big_context()).await;
+    let mut cfg = test_config(&ollama);
+    cfg.models = vec![];
+    // test_config disables injection (cap 0): the declared value is the
+    // best-known bound and must pass through unclamped.
+    let http = reqwest::Client::new();
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &http).await;
+
+    let capabilities = probe_capabilities(&cfg, &http, &upstreams, true).await;
+
+    assert_eq!(capabilities.models.len(), 1);
+    assert_eq!(capabilities.models[0].context_length, Some(262_144));
+}
+
+#[tokio::test]
+async fn openai_capabilities_omit_context_length_when_not_advertised() {
+    // `mock_openai_compatible`'s /v1/models carries no max_model_len /
+    // context_length extension — the field must stay unknown, not zero.
+    let openai = spawn(mock_openai_compatible()).await;
+    let mut cfg = test_config(&openai);
+    cfg.models = vec![];
+    let http = reqwest::Client::new();
+    let upstreams = phantasm_orchestrator::detect_upstreams(&cfg, &http).await;
+
+    let capabilities = probe_capabilities(&cfg, &http, &upstreams, true).await;
+
+    assert_eq!(capabilities.models.len(), 1);
+    assert_eq!(capabilities.models[0].id, "m");
+    assert_eq!(capabilities.models[0].context_length, None);
+    assert!(capabilities.models[0].capabilities.is_none());
+}
+
 #[tokio::test]
 async fn capability_refresh_uses_fixed_backend_kind() {
     let openai = spawn(mock_openai_compatible()).await;
@@ -1035,7 +1107,10 @@ fn mock_vllm_big_model() -> Router {
         )
         .route(
             "/v1/models",
-            get(|| async { axum::Json(serde_json::json!({"data":[{"id":"big"}]})) }),
+            get(|| async {
+                // vLLM extends the listing with the served context window.
+                axum::Json(serde_json::json!({"data":[{"id":"big","max_model_len":40960}]}))
+            }),
         )
 }
 
@@ -1109,6 +1184,16 @@ async fn multiple_upstreams_union_models_and_route_by_model() {
     assert_eq!(
         vllm_model["reasoning_efforts"],
         serde_json::json!(["none", "low", "medium", "high"])
+    );
+    assert_eq!(
+        vllm_model["context_length"],
+        serde_json::json!(40960),
+        "vLLM's max_model_len should surface as context_length"
+    );
+    assert_eq!(
+        vllm_model.get("capabilities"),
+        None,
+        "per-model capabilities stay unknown for OpenAI-compatible upstreams"
     );
 
     let chat = |model: &'static str| {

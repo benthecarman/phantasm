@@ -10,7 +10,7 @@ use futures_util::{Stream, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 use url::Url;
@@ -82,7 +82,31 @@ impl OpenAICompatibleClient {
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>, AppError> {
-        list_models_response(self.authed_get(&self.models_url())).await
+        Ok(self
+            .models_data()
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect())
+    }
+
+    /// Per-model context lengths advertised on `/v1/models`, for hosts that
+    /// extend the listing with one — vLLM's `max_model_len`, or a literal
+    /// `context_length` field. Hosts without the extension yield an empty map.
+    pub async fn model_context_lengths(&self) -> Result<HashMap<String, u64>, AppError> {
+        Ok(self
+            .models_data()
+            .await?
+            .into_iter()
+            .filter_map(|m| {
+                let length = m.context_length()?;
+                Some((m.id, length))
+            })
+            .collect())
+    }
+
+    async fn models_data(&self) -> Result<Vec<ModelEntry>, AppError> {
+        models_response(self.authed_get(&self.models_url())).await
     }
 
     fn build_request(
@@ -124,7 +148,7 @@ impl OpenAICompatibleClient {
     }
 }
 
-async fn list_models_response(req: reqwest::RequestBuilder) -> Result<Vec<String>, AppError> {
+async fn models_response(req: reqwest::RequestBuilder) -> Result<Vec<ModelEntry>, AppError> {
     let resp = req
         .send()
         .await
@@ -138,7 +162,7 @@ async fn list_models_response(req: reqwest::RequestBuilder) -> Result<Vec<String
         .json()
         .await
         .map_err(|e| AppError::UpstreamError(e.to_string()))?;
-    Ok(models.data.into_iter().map(|m| m.id).collect())
+    Ok(models.data)
 }
 
 /// Serialize the history into the request `messages` array. We serialize each
@@ -830,6 +854,16 @@ struct ModelsResponse {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     id: String,
+    /// vLLM extends `/v1/models` with the served context window.
+    max_model_len: Option<u64>,
+    /// The same extension under the name other hosts use (e.g. OpenRouter).
+    context_length: Option<u64>,
+}
+
+impl ModelEntry {
+    fn context_length(&self) -> Option<u64> {
+        self.max_model_len.or(self.context_length)
+    }
 }
 
 #[cfg(test)]
@@ -846,6 +880,19 @@ mod tests {
     fn openai_api_base_preserves_existing_v1_path() {
         let base = Url::parse("https://api.example.test/custom/v1/").unwrap();
         assert_eq!(openai_api_base(&base), "https://api.example.test/custom/v1");
+    }
+
+    #[test]
+    fn models_response_parses_context_length_extensions() {
+        let json = r#"{"data":[
+            {"id":"vllm-model","object":"model","max_model_len":40960},
+            {"id":"router-model","context_length":131072},
+            {"id":"plain","object":"model"}
+        ]}"#;
+        let parsed: ModelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.data[0].context_length(), Some(40960));
+        assert_eq!(parsed.data[1].context_length(), Some(131072));
+        assert_eq!(parsed.data[2].context_length(), None);
     }
 
     #[test]

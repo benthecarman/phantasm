@@ -164,13 +164,19 @@ pub async fn probe_capabilities(
 
     // Per-model vision + tool support is only knowable for native Ollama (via
     // `/api/show`). For an OpenAI-compatible upstream we omit model
-    // capabilities so clients can distinguish unknown from known-unsupported.
+    // capabilities so clients can distinguish unknown from known-unsupported;
+    // context length is still probed, since some hosts advertise it on
+    // `/v1/models` (vLLM's `max_model_len`).
     let claimed = upstreams.claimed_models();
     let per_entry = futures_util::future::join_all(upstreams.entries().iter().zip(&claimed).map(
         |(entry, ids)| async move {
-            let metadata = match entry.kind {
-                UpstreamKind::NativeOllama => detect_model_metadata(&entry.backend, ids).await,
-                UpstreamKind::OpenAICompatible => vec![(None, None); ids.len()],
+            let metadata = match &entry.backend {
+                UpstreamChatBackend::NativeOllama(_) => {
+                    detect_model_metadata(&entry.backend, ids).await
+                }
+                UpstreamChatBackend::OpenAICompatible(client) => {
+                    detect_openai_context_lengths(client, ids).await
+                }
             };
             (entry, ids.iter().cloned().zip(metadata).collect::<Vec<_>>())
         },
@@ -356,18 +362,43 @@ async fn detect_model_metadata(
                 // propagates on the next capabilities refresh. Failed probes
                 // are NOT seeded — a boot-window miss must not disable
                 // injection.
-                if let UpstreamChatBackend::NativeOllama(client) = upstream {
-                    client.seed_context_length(model, metadata.context_length);
-                }
+                let context_length = match upstream {
+                    UpstreamChatBackend::NativeOllama(client) => {
+                        client.seed_context_length(model, metadata.context_length);
+                        // Advertise the window actually served — num_ctx
+                        // injection clamps the declared length to the cap —
+                        // so the app budgets against a real number.
+                        client.served_context_length(metadata.context_length)
+                    }
+                    UpstreamChatBackend::OpenAICompatible(_) => metadata.context_length,
+                };
                 (
                     Some(ModelCapabilities::from_names(&metadata.capabilities)),
-                    metadata.context_length,
+                    context_length,
                 )
             }
             _ => (None, None),
         }
     });
     futures_util::future::join_all(checks).await
+}
+
+/// One best-effort `/v1/models` fetch, mapping each model to the context
+/// length the host advertises in the listing (vLLM's `max_model_len`).
+/// Capabilities stay unknown (`None`) — an OpenAI-compatible host exposes no
+/// per-model vision/tool support.
+async fn detect_openai_context_lengths(
+    client: &crate::openai::OpenAICompatibleClient,
+    models: &[String],
+) -> Vec<(Option<ModelCapabilities>, Option<u64>)> {
+    let lengths = match tokio::time::timeout(PROBE_TIMEOUT, client.model_context_lengths()).await {
+        Ok(Ok(lengths)) => lengths,
+        _ => std::collections::HashMap::new(),
+    };
+    models
+        .iter()
+        .map(|model| (None, lengths.get(model).copied()))
+        .collect()
 }
 
 /// Cheap reachability check with a short timeout; failures are non-fatal.

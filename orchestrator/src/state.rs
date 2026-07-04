@@ -188,7 +188,10 @@ pub struct ModelInfo {
     /// unsupported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<ModelCapabilities>,
-    /// Model context window in tokens, when the upstream reports it.
+    /// Model context window in tokens, when the upstream reports it. This is
+    /// the window actually served: for native Ollama the declared length is
+    /// clamped to the upstream's num_ctx cap (when injection is enabled), and
+    /// for OpenAI-compatible hosts it is what `/v1/models` advertises.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u64>,
     /// Optional OpenAI-compatible reasoning effort values this model accepts,

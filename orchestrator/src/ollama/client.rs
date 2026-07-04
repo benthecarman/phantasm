@@ -141,10 +141,40 @@ impl OllamaClient {
     /// doesn't pay its own `/api/show` round-trip — and a model re-pull
     /// propagates on the next capabilities refresh instead of never.
     pub fn seed_context_length(&self, model: &str, context_length: Option<u64>) {
-        self.ctx_len_cache
+        let previous = self
+            .ctx_len_cache
             .write()
             .expect("poisoned")
             .insert(model.to_string(), CtxProbe::Declared(context_length));
+        // Announce a clamp when the declared value first arrives (or a re-pull
+        // changes it) rather than on every TTL refresh: the served window is
+        // quietly smaller than the model card suggests, and the operator
+        // sizing the cap should see that.
+        if matches!(previous, Some(CtxProbe::Declared(prev)) if prev == context_length) {
+            return;
+        }
+        if let Some(declared) = context_length {
+            if self.num_ctx_cap > 0 && declared > self.num_ctx_cap {
+                tracing::info!(
+                    model = %model,
+                    declared,
+                    cap = self.num_ctx_cap,
+                    "declared context length exceeds num_ctx cap; serving the capped window"
+                );
+            }
+        }
+    }
+
+    /// The context window actually served for a declared context length:
+    /// `min(declared, cap)` while num_ctx injection is enabled. With injection
+    /// disabled (`cap == 0`) Ollama's own server default governs and we can't
+    /// see it, so the declared value passes through as the best-known bound.
+    pub fn served_context_length(&self, declared: Option<u64>) -> Option<u64> {
+        let declared = declared?;
+        Some(match self.num_ctx_cap {
+            0 => declared,
+            cap => declared.min(cap),
+        })
     }
 
     #[cfg(test)]
@@ -323,7 +353,7 @@ impl OllamaClient {
                 }
             }
         };
-        declared.map(|len| len.min(self.num_ctx_cap))
+        self.served_context_length(declared)
     }
 
     /// Clone the request options and inject the resolved `num_ctx` (see
@@ -1160,6 +1190,23 @@ mod tests {
             "message": {"role": "assistant", "content": "hi"},
             "done": true,
         }))
+    }
+
+    #[test]
+    fn served_context_length_clamps_to_cap() {
+        let mut client = OllamaClient::new(
+            reqwest::Client::new(),
+            Url::parse("http://localhost:11434").unwrap(),
+        );
+        client.set_num_ctx_cap(32_768);
+        assert_eq!(client.served_context_length(Some(8192)), Some(8192));
+        assert_eq!(client.served_context_length(Some(262_144)), Some(32_768));
+        assert_eq!(client.served_context_length(None), None);
+
+        // Injection disabled: Ollama's own default governs and we can't see
+        // it, so the declared value passes through as the best-known bound.
+        client.set_num_ctx_cap(0);
+        assert_eq!(client.served_context_length(Some(262_144)), Some(262_144));
     }
 
     /// Client pointed at the mock server. Layer setters on the binding when a

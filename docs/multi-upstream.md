@@ -74,6 +74,12 @@ Two things change meaning slightly in multi-upstream mode:
   restart. If an upstream is temporarily unreachable, its last-known list is
   kept rather than dropping its models.
 - Research modes (`…:deep-research`) route by the base model, as you'd expect.
+- Advertised model metadata comes from the serving upstream: native Ollama
+  reports per-model capabilities and context length via `/api/show`, with the
+  context length clamped to the upstream's num_ctx cap so the advertised
+  window is the one actually served; OpenAI-compatible upstreams omit
+  capabilities (unknowable) but report `context_length` when the host extends
+  `/v1/models` with one (vLLM's `max_model_len` — exact by construction).
 
 ## Verifying it works
 
