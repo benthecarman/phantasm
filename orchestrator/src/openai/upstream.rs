@@ -17,6 +17,7 @@ use url::Url;
 
 use crate::error::AppError;
 use crate::ollama::{ChatBackend, DeltaStream, StreamDelta, ToolDeltaStream, ToolStreamDelta};
+use crate::openai::retry::{classify_response, RetryPolicy, Retryable};
 use crate::openai::types::{
     requested_thinking, ChatMessage, FunctionCall, MessageContent, RawArguments, ToolCall,
 };
@@ -37,6 +38,9 @@ pub struct OpenAICompatibleClient {
     /// honor `stream_options.include_usage` report final streaming token counts;
     /// for those we use the observed stream duration as the throughput window.
     metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// Transient-failure retry tuning for chat request initiation (see
+    /// [`RetryPolicy`]).
+    retry: RetryPolicy,
 }
 
 impl OpenAICompatibleClient {
@@ -56,11 +60,18 @@ impl OpenAICompatibleClient {
             api_key,
             thinking_hint,
             metrics: None,
+            retry: RetryPolicy::default(),
         }
     }
 
     pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::Metrics>) {
         self.metrics = Some(metrics);
+    }
+
+    /// Tests shrink the backoff so retry paths run in milliseconds.
+    #[cfg(test)]
+    fn set_retry_policy(&mut self, retry: RetryPolicy) {
+        self.retry = retry;
     }
 
     /// A POST builder carrying the bearer token when one is configured.
@@ -146,6 +157,101 @@ impl OpenAICompatibleClient {
     fn models_url(&self) -> String {
         format!("{}/models", self.api_base)
     }
+
+    /// POST `request` to `/v1/chat/completions`, retrying transient initiation
+    /// failures per [`RetryPolicy`] (retry loop adapted from goose's provider
+    /// layer). Two failure classes never retry: timeouts (the upstream already
+    /// spent the read window generating; re-sending re-runs that work) and
+    /// deterministic 4xx (the identical payload is re-sent every attempt).
+    /// A 429's server-provided `Retry-After` is honored over computed backoff.
+    ///
+    /// Also owns the one-shot `stream_options` fallback: old hosts reject the
+    /// field outright, so the first rejection strips it and re-sends without
+    /// spending retry budget. Bodies go only into the returned error, never
+    /// logs — an upstream error body can echo request fragments (NFR-O7).
+    ///
+    /// Cancellation-safe: the turn loop `select!`s on the caller, so a backoff
+    /// sleep is simply dropped when the client disconnects.
+    async fn post_chat(
+        &self,
+        request: &mut Value,
+        model: &str,
+        context: &'static str,
+    ) -> Result<reqwest::Response, AppError> {
+        let url = self.chat_url();
+        let mut attempt = 0u32;
+        loop {
+            let resp = match self.authed_post(&url).json(&*request).send().await {
+                Ok(resp) => resp,
+                Err(e) if e.is_timeout() => {
+                    tracing::warn!(model = %model, cause = %e, context, "OpenAI-compatible upstream request timed out; not retrying");
+                    return Err(AppError::UpstreamUnreachable(e.to_string()));
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > self.retry.network_max_retries {
+                        tracing::warn!(model = %model, cause = %e, attempts = attempt, context, "OpenAI-compatible upstream unreachable; retries exhausted");
+                        return Err(AppError::UpstreamUnreachable(e.to_string()));
+                    }
+                    let delay = self.retry.delay(attempt);
+                    tracing::warn!(
+                        model = %model,
+                        cause = %e,
+                        attempt,
+                        retry_in_ms = delay.as_millis() as u64,
+                        context,
+                        "OpenAI-compatible upstream unreachable; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+            if resp.status().is_success() {
+                return Ok(resp);
+            }
+            let status = resp.status();
+
+            if is_stream_options_rejection(status) && request.get("stream_options").is_some() {
+                tracing::warn!(
+                    model = %model,
+                    %status,
+                    context,
+                    "OpenAI-compatible upstream rejected streaming usage; retrying without stream_options"
+                );
+                if let Value::Object(body) = &mut *request {
+                    body.remove("stream_options");
+                }
+                continue;
+            }
+
+            let headers = resp.headers().clone();
+            let body = resp.text().await.unwrap_or_default();
+            let (error, retryable) = classify_response(status, &headers, &body);
+            let hint = match retryable {
+                Retryable::Server => None,
+                Retryable::RateLimited(hint) => hint,
+                Retryable::No => {
+                    tracing::warn!(model = %model, %status, context, "OpenAI-compatible upstream returned error status");
+                    return Err(error);
+                }
+            };
+            attempt += 1;
+            if attempt > self.retry.max_retries {
+                tracing::warn!(model = %model, %status, attempts = attempt, context, "OpenAI-compatible upstream failing; retries exhausted");
+                return Err(error);
+            }
+            let delay = self.retry.delay_with_hint(attempt, hint);
+            tracing::warn!(
+                model = %model,
+                %status,
+                attempt,
+                retry_in_ms = delay.as_millis() as u64,
+                context,
+                "transient OpenAI-compatible upstream failure; retrying"
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 async fn models_response(req: reqwest::RequestBuilder) -> Result<Vec<ModelEntry>, AppError> {
@@ -211,19 +317,9 @@ impl ChatBackend for OpenAICompatibleClient {
         tools: &[Value],
         options: &Map<String, Value>,
     ) -> Result<ChatMessage, AppError> {
-        let request =
+        let mut request =
             Self::build_request(model, messages, tools, options, false, self.thinking_hint);
-        let resp = self
-            .authed_post(&self.chat_url())
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
-        }
+        let resp = self.post_chat(&mut request, model, "chat_once").await?;
         let response: Value = resp
             .json()
             .await
@@ -268,36 +364,7 @@ impl ChatBackend for OpenAICompatibleClient {
     ) -> Result<DeltaStream, AppError> {
         let mut request =
             Self::build_request(model, messages, &[], options, true, self.thinking_hint);
-        let mut resp = self
-            .authed_post(&self.chat_url())
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
-        if is_stream_options_rejection(resp.status()) {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                model = %model,
-                %status,
-                detail = %detail,
-                "OpenAI-compatible upstream rejected streaming usage; retrying without stream_options"
-            );
-            if let Value::Object(body) = &mut request {
-                body.remove("stream_options");
-            }
-            resp = self
-                .authed_post(&self.chat_url())
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
-        }
+        let resp = self.post_chat(&mut request, model, "chat_stream").await?;
         Ok(Box::pin(sse_bytes_to_deltas(
             resp.bytes_stream(),
             self.metrics
@@ -329,36 +396,9 @@ impl ChatBackend for OpenAICompatibleClient {
     ) -> Result<Option<ToolDeltaStream>, AppError> {
         let mut request =
             Self::build_request(model, messages, tools, options, true, self.thinking_hint);
-        let mut resp = self
-            .authed_post(&self.chat_url())
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
-        if is_stream_options_rejection(resp.status()) {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                model = %model,
-                %status,
-                detail = %detail,
-                "OpenAI-compatible upstream rejected streaming usage; retrying without stream_options"
-            );
-            if let Value::Object(body) = &mut request {
-                body.remove("stream_options");
-            }
-            resp = self
-                .authed_post(&self.chat_url())
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| AppError::UpstreamUnreachable(e.to_string()))?;
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            return Err(AppError::UpstreamError(format!("{status}: {detail}")));
-        }
+        let resp = self
+            .post_chat(&mut request, model, "chat_stream_tools")
+            .await?;
         Ok(Some(Box::pin(sse_bytes_to_tool_deltas(
             resp.bytes_stream(),
             None,
@@ -1048,6 +1088,183 @@ mod tests {
             message.tool_calls.as_ref().unwrap()[0].function.name,
             "time"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_once_retries_transient_500_until_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Two 500s (a host still coming up), then the mount below answers.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("loading"))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut client = OpenAICompatibleClient::new(
+            reqwest::Client::new(),
+            &Url::parse(&server.uri()).expect("mock server URL"),
+            None,
+            false,
+        );
+        client.set_retry_policy(RetryPolicy::fast());
+
+        let message = client.chat_once("m", &[], &[], &Map::new()).await.unwrap();
+        assert!(matches!(message.content, Some(MessageContent::Text(ref t)) if t == "ok"));
+    }
+
+    #[tokio::test]
+    async fn chat_once_honors_rate_limit_retry_hint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {"message": "slow down", "metadata": {"retry_after_seconds": 0.05}}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut client = OpenAICompatibleClient::new(
+            reqwest::Client::new(),
+            &Url::parse(&server.uri()).expect("mock server URL"),
+            None,
+            false,
+        );
+        client.set_retry_policy(RetryPolicy::fast());
+
+        let started = std::time::Instant::now();
+        let message = client.chat_once("m", &[], &[], &Map::new()).await.unwrap();
+        assert!(matches!(message.content, Some(MessageContent::Text(ref t)) if t == "ok"));
+        // fast() backs off in single-digit milliseconds; only the server's
+        // 50ms hint explains a wait this long.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "server-provided retry delay was not honored"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_once_context_length_400_is_bad_request_and_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": "This model's maximum context length is 8192 tokens"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = OpenAICompatibleClient::new(
+            reqwest::Client::new(),
+            &Url::parse(&server.uri()).expect("mock server URL"),
+            None,
+            false,
+        );
+        client.set_retry_policy(RetryPolicy::fast());
+
+        let error = client
+            .chat_once("m", &[], &[], &Map::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AppError::BadRequest(m) if m.contains("context window exceeded")),
+            "got {error:?}"
+        );
+        // MockServer verifies expect(1) on drop: no retry happened.
+    }
+
+    #[tokio::test]
+    async fn chat_once_auth_failure_is_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = OpenAICompatibleClient::new(
+            reqwest::Client::new(),
+            &Url::parse(&server.uri()).expect("mock server URL"),
+            None,
+            false,
+        );
+        client.set_retry_policy(RetryPolicy::fast());
+
+        let error = client
+            .chat_once("m", &[], &[], &Map::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AppError::UpstreamError(m) if m.contains("authentication")),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_still_strips_rejected_stream_options() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Reject only while stream_options is present — an old host.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"stream_options": {"include_usage": true}}),
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_string("unknown field"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = OpenAICompatibleClient::new(
+            reqwest::Client::new(),
+            &Url::parse(&server.uri()).expect("mock server URL"),
+            None,
+            false,
+        );
+        client.set_retry_policy(RetryPolicy::fast());
+
+        let deltas: Vec<StreamDelta> = client
+            .chat_stream("m", &[], &Map::new())
+            .await
+            .expect("stream opens after stripping stream_options")
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        assert_eq!(deltas[0].content, "hi");
     }
 
     #[tokio::test]
