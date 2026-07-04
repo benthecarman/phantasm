@@ -129,7 +129,9 @@ impl UpstreamChatBackend {
     pub fn from_spec(kind: UpstreamKind, http: reqwest::Client, spec: &UpstreamSpec) -> Self {
         match kind {
             UpstreamKind::NativeOllama => {
-                UpstreamChatBackend::NativeOllama(OllamaClient::new(http, spec.base.clone()))
+                let mut client = OllamaClient::new(http, spec.base.clone());
+                client.set_num_ctx_cap(spec.num_ctx_cap);
+                UpstreamChatBackend::NativeOllama(client)
             }
             UpstreamKind::OpenAICompatible => {
                 UpstreamChatBackend::OpenAICompatible(OpenAICompatibleClient::new(

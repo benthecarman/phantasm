@@ -69,6 +69,12 @@ pub struct UpstreamSpec {
     /// `UPSTREAM_MAX_CONCURRENCY`. Separate hosts get separate semaphores —
     /// the point of a second upstream is usually a second GPU/box.
     pub concurrency: Option<usize>,
+    /// Native-Ollama only: cap on the `num_ctx` injected from the model's
+    /// declared context length (`num_ctx = min(declared, cap)`), so long
+    /// histories aren't silently truncated at Ollama's small server default.
+    /// Bounded because num_ctx sizes the KV-cache allocation — a 256k-context
+    /// model at full size would OOM most GPUs. `0` disables injection.
+    pub num_ctx_cap: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +117,10 @@ pub struct Config {
     pub default_upstream_configured: bool,
     pub max_tool_iters: u8,
     pub upstream_concurrency: usize,
+    /// Default `num_ctx` cap for native-Ollama upstreams
+    /// (`UPSTREAM_NUM_CTX_CAP`, default 32768; `0` disables injection). See
+    /// [`UpstreamSpec::num_ctx_cap`].
+    pub upstream_num_ctx_cap: u64,
     /// Extra named upstreams (`UPSTREAMS=vllm,...` + `UPSTREAM_<NAME>_*` vars)
     /// beyond the default one described by the flat fields above. See
     /// [`Config::upstream_specs`].
@@ -343,7 +353,11 @@ impl Config {
         let default_model =
             env_or_alias("UPSTREAM_DEFAULT_MODEL", "OLLAMA_DEFAULT_MODEL", "llama3.1");
         let models = csv_alias("UPSTREAM_MODELS", "OLLAMA_MODELS");
-        let extra_upstreams = parse_extra_upstreams()?;
+        // Strict (unlike most flat vars): this knob sizes the KV-cache VRAM
+        // allocation, so a typo silently becoming the 32768 default is exactly
+        // the misconfiguration the operator set it to avoid.
+        let upstream_num_ctx_cap = parse_opt_int::<u64>("UPSTREAM_NUM_CTX_CAP")?.unwrap_or(32_768);
+        let extra_upstreams = parse_extra_upstreams(upstream_num_ctx_cap)?;
         let default_upstream_configured = default_upstream_env_present();
 
         let web_search_enabled = env_bool("TOOL_WEB_SEARCH", false);
@@ -371,6 +385,7 @@ impl Config {
             default_upstream_configured,
             extra_upstreams,
             max_tool_iters: env_parse("MAX_TOOL_ITERS", 5),
+            upstream_num_ctx_cap,
             upstream_concurrency: env_parse_alias(
                 "UPSTREAM_MAX_CONCURRENCY",
                 "OLLAMA_MAX_CONCURRENCY",
@@ -523,6 +538,7 @@ impl Config {
                 reasoning_efforts: self.upstream_reasoning_efforts.clone(),
                 models: self.models.clone(),
                 concurrency: None,
+                num_ctx_cap: self.upstream_num_ctx_cap,
             });
         }
         specs.extend(self.extra_upstreams.iter().cloned());
@@ -774,7 +790,9 @@ fn parse_reasoning_efforts(
 /// configured via `UPSTREAM_<NAME>_*` vars (name uppercased, `-` => `_`).
 /// A declared name missing its `BASE_URL` is a hard startup error — a silently
 /// dropped upstream would strand the models meant to route to it.
-fn parse_extra_upstreams() -> Result<Vec<UpstreamSpec>> {
+/// `default_num_ctx_cap` is the flat `UPSTREAM_NUM_CTX_CAP`, used when an
+/// entry has no `UPSTREAM_<NAME>_NUM_CTX_CAP` of its own.
+fn parse_extra_upstreams(default_num_ctx_cap: u64) -> Result<Vec<UpstreamSpec>> {
     let names = csv("UPSTREAMS");
     let mut specs: Vec<UpstreamSpec> = Vec::with_capacity(names.len());
     for raw_name in names {
@@ -822,7 +840,25 @@ fn parse_extra_upstreams() -> Result<Vec<UpstreamSpec>> {
                 &kind_key,
             )?,
             models: csv(&format!("{prefix}_MODELS")),
-            concurrency: parse_opt_usize(&format!("{prefix}_MAX_CONCURRENCY"))?.map(|n| n.max(1)),
+            concurrency: parse_opt_int::<usize>(&format!("{prefix}_MAX_CONCURRENCY"))?
+                .map(|n| n.max(1)),
+            num_ctx_cap: {
+                let cap = parse_opt_int::<u64>(&format!("{prefix}_NUM_CTX_CAP"))?;
+                // num_ctx injection is native-Ollama only; accepting the cap
+                // on an explicitly OpenAI-compatible upstream would silently
+                // drop a VRAM-sizing knob the operator believes is active
+                // (mirrors the REASONING_EFFORTS kind check). `auto` kinds
+                // pass — the value simply goes unused if detection lands on
+                // OpenAI-compatible.
+                if cap.is_some() && kind == Some(UpstreamKind::OpenAICompatible) {
+                    anyhow::bail!(
+                        "{prefix}_NUM_CTX_CAP is set but {kind_key} names an OpenAI-compatible \
+                         backend — num_ctx injection is native-Ollama only, so the cap would \
+                         be silently ignored"
+                    );
+                }
+                cap.unwrap_or(default_num_ctx_cap)
+            },
             name,
         });
     }
@@ -833,13 +869,14 @@ fn parse_extra_upstreams() -> Result<Vec<UpstreamSpec>> {
 /// invalid is a hard startup error rather than a silent fallback (matching the
 /// BASE_URL/KIND handling above — a typo'd value should not quietly run with
 /// the default).
-fn parse_opt_usize(key: &str) -> Result<Option<usize>> {
+fn parse_opt_int<T: std::str::FromStr>(key: &str) -> Result<Option<T>> {
     let Some(raw) = std::env::var(key).ok().filter(|s| !s.trim().is_empty()) else {
         return Ok(None);
     };
     let n = raw
         .trim()
-        .parse::<usize>()
+        .parse::<T>()
+        .ok()
         .with_context(|| format!("{key} must be a non-negative integer (got {raw:?})"))?;
     Ok(Some(n))
 }
@@ -899,6 +936,7 @@ pub mod tests_support {
             default_upstream_configured: true,
             extra_upstreams: vec![],
             max_tool_iters: 5,
+            upstream_num_ctx_cap: 32_768,
             upstream_concurrency: 4,
             turn_result_ttl_s: 24 * 60 * 60,
             turn_registry_max: 128,
@@ -1164,18 +1202,19 @@ mod tests {
             "UPSTREAM_VLLM_MAX_CONCURRENCY",
             "UPSTREAM_VLLM_THINKING_HINT",
             "UPSTREAM_VLLM_REASONING_EFFORTS",
+            "UPSTREAM_VLLM_NUM_CTX_CAP",
         ];
         for key in keys {
             std::env::remove_var(key);
         }
 
         // No UPSTREAMS => no extras (the back-compat single-upstream path).
-        assert!(parse_extra_upstreams().unwrap().is_empty());
+        assert!(parse_extra_upstreams(32_768).unwrap().is_empty());
 
         // A declared upstream without a base URL is a startup error, not a
         // silently dropped backend.
         std::env::set_var("UPSTREAMS", "vllm");
-        let err = parse_extra_upstreams().unwrap_err().to_string();
+        let err = parse_extra_upstreams(32_768).unwrap_err().to_string();
         assert!(err.contains("UPSTREAM_VLLM_BASE_URL"), "got: {err}");
 
         std::env::set_var("UPSTREAM_VLLM_KIND", "vllm");
@@ -1185,7 +1224,7 @@ mod tests {
         std::env::set_var("UPSTREAM_VLLM_MAX_CONCURRENCY", "2");
         std::env::set_var("UPSTREAM_VLLM_THINKING_HINT", "false");
         std::env::set_var("UPSTREAM_VLLM_REASONING_EFFORTS", "none, low, medium, high");
-        let specs = parse_extra_upstreams().unwrap();
+        let specs = parse_extra_upstreams(32_768).unwrap();
         assert_eq!(specs.len(), 1);
         let spec = &specs[0];
         assert_eq!(spec.name, "vllm");
@@ -1194,13 +1233,32 @@ mod tests {
         assert_eq!(spec.api_key.as_deref(), Some("sk-test"));
         assert_eq!(spec.models, ["qwen3-32b", "qwen3-32b-awq"]);
         assert_eq!(spec.concurrency, Some(2));
+        // No per-upstream override => the flat UPSTREAM_NUM_CTX_CAP default.
+        assert_eq!(spec.num_ctx_cap, 32_768);
         assert!(!spec.thinking_hint);
         assert_eq!(spec.reasoning_efforts, ["none", "low", "medium", "high"]);
+
+        // A per-upstream cap on an explicitly OpenAI-compatible upstream is
+        // rejected — num_ctx injection is native-Ollama only, and silently
+        // ignoring a VRAM-sizing knob is the failure the strict parsing
+        // exists to prevent.
+        std::env::set_var("UPSTREAM_VLLM_NUM_CTX_CAP", "8192");
+        let err = parse_extra_upstreams(32_768).unwrap_err().to_string();
+        assert!(err.contains("UPSTREAM_VLLM_NUM_CTX_CAP"), "got: {err}");
+
+        // On a native-Ollama kind it overrides the flat default.
+        std::env::set_var("UPSTREAM_VLLM_KIND", "ollama");
+        std::env::remove_var("UPSTREAM_VLLM_REASONING_EFFORTS");
+        let specs = parse_extra_upstreams(32_768).unwrap();
+        assert_eq!(specs[0].num_ctx_cap, 8192);
+        std::env::set_var("UPSTREAM_VLLM_KIND", "vllm");
+        std::env::remove_var("UPSTREAM_VLLM_NUM_CTX_CAP");
+        std::env::set_var("UPSTREAM_VLLM_REASONING_EFFORTS", "none, low, medium, high");
 
         // Reasoning effort lists are explicit OpenAI-compatible metadata, not
         // allowed on native Ollama where the upstream does not expose levels.
         std::env::set_var("UPSTREAM_VLLM_KIND", "ollama");
-        let err = parse_extra_upstreams().unwrap_err().to_string();
+        let err = parse_extra_upstreams(32_768).unwrap_err().to_string();
         assert!(
             err.contains("UPSTREAM_VLLM_REASONING_EFFORTS"),
             "got: {err}"
@@ -1209,19 +1267,33 @@ mod tests {
 
         // Reserved / duplicate names are rejected.
         std::env::set_var("UPSTREAMS", "default");
-        assert!(parse_extra_upstreams().is_err());
+        assert!(parse_extra_upstreams(32_768).is_err());
         std::env::set_var("UPSTREAMS", "vllm,vllm");
-        assert!(parse_extra_upstreams().is_err());
+        assert!(parse_extra_upstreams(32_768).is_err());
 
         // An unparseable concurrency is a startup error, not a silent default.
         std::env::set_var("UPSTREAMS", "vllm");
         std::env::set_var("UPSTREAM_VLLM_MAX_CONCURRENCY", "two");
-        let err = parse_extra_upstreams().unwrap_err().to_string();
+        let err = parse_extra_upstreams(32_768).unwrap_err().to_string();
         assert!(err.contains("UPSTREAM_VLLM_MAX_CONCURRENCY"), "got: {err}");
 
         for key in keys {
             std::env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn num_ctx_cap_rejects_malformed_values() {
+        let _guard = env_lock();
+        const KEY: &str = "UPSTREAM_NUM_CTX_CAP";
+        // A VRAM-sizing knob must not silently fall back on a typo.
+        std::env::set_var(KEY, "32k");
+        let err = super::parse_opt_int::<u64>(KEY).unwrap_err().to_string();
+        assert!(err.contains(KEY), "got: {err}");
+        std::env::set_var(KEY, "8192");
+        assert_eq!(super::parse_opt_int::<u64>(KEY).unwrap(), Some(8192));
+        std::env::remove_var(KEY);
+        assert_eq!(super::parse_opt_int::<u64>(KEY).unwrap(), None);
     }
 
     #[test]
@@ -1237,6 +1309,7 @@ mod tests {
             reasoning_efforts: vec!["low".into(), "high".into()],
             models: vec!["big".into()],
             concurrency: None,
+            num_ctx_cap: 32_768,
         }];
         let specs = cfg.upstream_specs();
         assert_eq!(specs.len(), 2);
@@ -1259,6 +1332,7 @@ mod tests {
                 reasoning_efforts: vec![],
                 models: vec!["big".into()],
                 concurrency: None,
+                num_ctx_cap: 32_768,
             },
             super::UpstreamSpec {
                 name: "ollama".into(),
@@ -1269,6 +1343,7 @@ mod tests {
                 reasoning_efforts: vec![],
                 models: vec!["small".into()],
                 concurrency: None,
+                num_ctx_cap: 32_768,
             },
         ];
         let specs = cfg.upstream_specs();

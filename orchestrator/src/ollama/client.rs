@@ -18,6 +18,26 @@ use crate::openai::types::{ChatMessage, ToolCall};
 /// Explicit residency hint for the opt-in warm preload path.
 const WARM_KEEP_ALIVE: &str = "30m";
 
+/// Bound on the lazy `/api/show` probe in `resolve_num_ctx` — it precedes a
+/// chat call, so it must never inherit the shared client's 120s read window.
+const METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a FAILED `/api/show` probe suppresses re-probing. A failure must
+/// not be cached forever — the likeliest failure moment is exactly co-hosted
+/// boot (Ollama not yet listening), and a permanent verdict would silently
+/// disable num_ctx injection until restart. A short cooldown keeps a broken
+/// endpoint from taxing every call while letting a booting one recover.
+const CTX_PROBE_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// One model's `/api/show` probe outcome (see `resolve_num_ctx`).
+#[derive(Clone, Copy)]
+enum CtxProbe {
+    /// Definitive: metadata fetched; `None` = it reports no context length.
+    Declared(Option<u64>),
+    /// The probe failed; retry after [`CTX_PROBE_RETRY_COOLDOWN`].
+    FailedAt(std::time::Instant),
+}
+
 /// Cold-start retry for `/api/chat` request *initiation*. While a large model
 /// loads into memory (30–120s), Ollama can answer 500; without retries the
 /// first chat after an idle period fails outright. Failures are classified,
@@ -89,6 +109,15 @@ pub struct OllamaClient {
     /// the `ChatBackend` trait) keeps the trait — and its scripted test
     /// impls — untouched.
     metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    /// Cap on the `num_ctx` injected from the model's declared context length
+    /// (see `resolve_num_ctx`). `0` disables injection entirely.
+    num_ctx_cap: u64,
+    /// Per-model `/api/show` probe outcome, shared across clones (probes,
+    /// warm, chat). Seeded by the capability probing (startup + TTL refresh)
+    /// and filled lazily on first use otherwise; failures carry a cooldown.
+    ctx_len_cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, CtxProbe>>>,
+    /// Failure cooldown, a field only so tests can shrink it.
+    ctx_probe_cooldown: Duration,
     /// Cold-start retry tuning for chat request initiation (see [`RetryPolicy`]).
     retry: RetryPolicy,
 }
@@ -99,8 +128,27 @@ impl OllamaClient {
             http,
             base,
             metrics: None,
+            num_ctx_cap: 0,
+            ctx_len_cache: Default::default(),
+            ctx_probe_cooldown: CTX_PROBE_RETRY_COOLDOWN,
             retry: RetryPolicy::default(),
         }
+    }
+
+    /// Feed a context length probed elsewhere (startup + TTL capability
+    /// probing, see `detect_model_metadata`) so the first chat per model
+    /// doesn't pay its own `/api/show` round-trip — and a model re-pull
+    /// propagates on the next capabilities refresh instead of never.
+    pub fn seed_context_length(&self, model: &str, context_length: Option<u64>) {
+        self.ctx_len_cache
+            .write()
+            .expect("poisoned")
+            .insert(model.to_string(), CtxProbe::Declared(context_length));
+    }
+
+    #[cfg(test)]
+    fn set_ctx_probe_cooldown(&mut self, cooldown: Duration) {
+        self.ctx_probe_cooldown = cooldown;
     }
 
     /// Tests shrink the backoff so retry paths run in milliseconds.
@@ -186,6 +234,81 @@ impl OllamaClient {
         self.metrics = Some(metrics);
     }
 
+    pub fn set_num_ctx_cap(&mut self, cap: u64) {
+        self.num_ctx_cap = cap;
+    }
+
+    /// The `num_ctx` to inject for `model`: `min(declared context length, cap)`.
+    ///
+    /// Ollama sizes its KV cache from its own server default (typically 4096)
+    /// unless a request says otherwise, silently truncating longer histories —
+    /// and per XR-2 the app resends the full history every turn. The declared
+    /// length comes from `/api/show`, fetched once per model and cached, so the
+    /// value is stable across a turn's calls (a changed `num_ctx` would force
+    /// Ollama to reload the model).
+    ///
+    /// `None` (inject nothing, keep Ollama's default) when injection is
+    /// disabled (`cap == 0`), the request already carries a `num_ctx`, the
+    /// metadata doesn't report a context length, or the metadata fetch fails.
+    /// Only a definitive answer is cached permanently; a failed or timed-out
+    /// probe is cached with a cooldown — long enough that a persistently
+    /// failing `/api/show` (a proxy forwarding only `/api/chat`) doesn't tax
+    /// every call, short enough that one refused connection at co-hosted boot
+    /// doesn't silently disable injection until restart.
+    async fn resolve_num_ctx(&self, model: &str, options: &Map<String, Value>) -> Option<u64> {
+        if self.num_ctx_cap == 0 || options.contains_key("num_ctx") {
+            return None;
+        }
+        let cached = self
+            .ctx_len_cache
+            .read()
+            .expect("poisoned")
+            .get(model)
+            .copied();
+        let declared = match cached {
+            Some(CtxProbe::Declared(declared)) => declared,
+            Some(CtxProbe::FailedAt(at)) if at.elapsed() < self.ctx_probe_cooldown => None,
+            _ => {
+                let probe =
+                    tokio::time::timeout(METADATA_PROBE_TIMEOUT, self.model_metadata(model)).await;
+                let outcome = match probe {
+                    Ok(Ok(metadata)) => CtxProbe::Declared(metadata.context_length),
+                    Ok(Err(e)) => {
+                        tracing::warn!(model = %model, error = %e, "num_ctx metadata probe failed; keeping Ollama's default for now");
+                        CtxProbe::FailedAt(std::time::Instant::now())
+                    }
+                    Err(_) => {
+                        tracing::warn!(model = %model, "num_ctx metadata probe timed out; keeping Ollama's default for now");
+                        CtxProbe::FailedAt(std::time::Instant::now())
+                    }
+                };
+                self.ctx_len_cache
+                    .write()
+                    .expect("poisoned")
+                    .insert(model.to_string(), outcome);
+                match outcome {
+                    CtxProbe::Declared(declared) => declared,
+                    CtxProbe::FailedAt(_) => None,
+                }
+            }
+        };
+        declared.map(|len| len.min(self.num_ctx_cap))
+    }
+
+    /// Clone the request options and inject the resolved `num_ctx` (see
+    /// [`Self::resolve_num_ctx`]); the result feeds `build_request`.
+    async fn prepare_options(
+        &self,
+        model: &str,
+        options: &Map<String, Value>,
+    ) -> Map<String, Value> {
+        let mut options = options.clone();
+        if let Some(num_ctx) = self.resolve_num_ctx(model, &options).await {
+            options.insert("num_ctx".into(), num_ctx.into());
+        }
+        options
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, AppError> {
         self.base
             .join(path)
@@ -197,13 +320,13 @@ impl OllamaClient {
         model: &str,
         messages: &[ChatMessage],
         tools: &[Value],
-        options: &Map<String, Value>,
+        mut options: Map<String, Value>,
         stream: bool,
         keep_alive: Option<&str>,
     ) -> OllamaChatRequest {
-        let mut options = options.clone();
         let think = extract_thinking_control(&mut options);
         options.remove("tool_choice");
+        translate_output_cap(&mut options);
         OllamaChatRequest {
             model: model.to_string(),
             messages: messages.iter().map(OllamaMessage::from_openai).collect(),
@@ -277,9 +400,12 @@ impl OllamaClient {
         Ok(self.model_metadata(model).await?.capabilities)
     }
 
-    /// Best-effort model preload used only by `POST /v1/warm`.
+    /// Best-effort model preload used only by `POST /v1/warm`. Loads with the
+    /// same `num_ctx` real chats will use — a differing value would make the
+    /// first chat reload the model, defeating the warm.
     pub async fn warm_model(&self, model: &str) -> Result<(), AppError> {
-        let body = self.build_request(model, &[], &[], &Map::new(), false, Some(WARM_KEEP_ALIVE));
+        let options = self.prepare_options(model, &Map::new()).await;
+        let body = self.build_request(model, &[], &[], options, false, Some(WARM_KEEP_ALIVE));
         // No retries: warm is documented fast best-effort — a down backend
         // must not hold the route (and its semaphore permit) for a backoff
         // window. The load-window 500s retry logic belongs to real chats.
@@ -297,6 +423,7 @@ impl ChatBackend for OllamaClient {
         tools: &[Value],
         options: &Map<String, Value>,
     ) -> Result<ChatMessage, AppError> {
+        let options = self.prepare_options(model, options).await;
         let body = self.build_request(model, messages, tools, options, false, None);
         tracing::debug!(
             model = %model,
@@ -320,6 +447,7 @@ impl ChatBackend for OllamaClient {
         messages: &[ChatMessage],
         options: &Map<String, Value>,
     ) -> Result<DeltaStream, AppError> {
+        let options = self.prepare_options(model, options).await;
         let body = self.build_request(model, messages, &[], options, true, None);
         tracing::debug!(
             model = %model,
@@ -339,6 +467,7 @@ impl ChatBackend for OllamaClient {
         tools: &[Value],
         options: &Map<String, Value>,
     ) -> Result<Option<ToolDeltaStream>, AppError> {
+        let options = self.prepare_options(model, options).await;
         let body = self.build_request(model, messages, tools, options, true, None);
         tracing::debug!(
             model = %model,
@@ -515,6 +644,20 @@ fn tool_delta_from(
     }
 
     None
+}
+
+/// Translate the OpenAI output-length cap to the native option. Standard
+/// clients send `max_tokens` (or `max_completion_tokens` for reasoning
+/// models); `/api/chat` only understands `options.num_predict` and would
+/// silently ignore the OpenAI names. An explicit `num_predict` wins.
+fn translate_output_cap(options: &mut Map<String, Value>) {
+    // Remove BOTH OpenAI names unconditionally — a client may send the pair,
+    // and a leftover would reach /api/chat as an unknown option.
+    let max_completion_tokens = options.remove("max_completion_tokens");
+    let max_tokens = options.remove("max_tokens");
+    if let Some(cap) = max_completion_tokens.or(max_tokens) {
+        options.entry("num_predict").or_insert(cap);
+    }
 }
 
 /// Read the requested thinking control and strip the reasoning keys so they are
@@ -892,6 +1035,245 @@ mod tests {
             std::time::Duration::from_secs(15),
             "capped"
         );
+    }
+
+    #[test]
+    fn build_request_translates_max_tokens_to_num_predict() {
+        let client = OllamaClient::new(
+            reqwest::Client::new(),
+            Url::parse("http://localhost:11434").unwrap(),
+        );
+        let options = Map::from_iter([("max_tokens".into(), json!(4096))]);
+        let req = client.build_request("m", &[], &[], options, true, None);
+        let opts = req.options.expect("options");
+        assert_eq!(opts["num_predict"], 4096);
+        assert!(opts.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn build_request_prefers_max_completion_tokens_and_explicit_num_predict() {
+        let client = OllamaClient::new(
+            reqwest::Client::new(),
+            Url::parse("http://localhost:11434").unwrap(),
+        );
+        // max_completion_tokens (reasoning models) wins over max_tokens, and
+        // BOTH OpenAI names are stripped — a leftover would reach /api/chat
+        // as an unknown option.
+        let options = Map::from_iter([
+            ("max_tokens".into(), json!(4096)),
+            ("max_completion_tokens".into(), json!(1024)),
+        ]);
+        let req = client.build_request("m", &[], &[], options, true, None);
+        let opts = req.options.expect("options");
+        assert_eq!(opts["num_predict"], 1024);
+        assert!(opts.get("max_tokens").is_none());
+        assert!(opts.get("max_completion_tokens").is_none());
+
+        // An explicit native num_predict wins over both.
+        let options = Map::from_iter([
+            ("max_tokens".into(), json!(4096)),
+            ("num_predict".into(), json!(64)),
+        ]);
+        let req = client.build_request("m", &[], &[], options, true, None);
+        let opts = req.options.expect("options");
+        assert_eq!(opts["num_predict"], 64);
+        assert!(opts.get("max_tokens").is_none());
+    }
+
+    fn show_response(model_info: Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "capabilities": ["completion"],
+            "model_info": model_info,
+        }))
+    }
+
+    async fn chat_bodies(server: &MockServer) -> Vec<Value> {
+        server
+            .received_requests()
+            .await
+            .expect("requests recorded")
+            .iter()
+            .filter(|r| r.url.path() == "/api/chat")
+            .map(|r| serde_json::from_slice(&r.body).expect("chat body is JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn chat_once_injects_capped_num_ctx_and_caches_metadata() {
+        let server = MockServer::start().await;
+        // Metadata is fetched once per model, not once per request.
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(show_response(json!({"qwen3.context_length": 40_960})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(chat_response())
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        client.set_num_ctx_cap(32_768);
+        for _ in 0..2 {
+            crate::ollama::ChatBackend::chat_once(&client, "qwen3", &[], &[], &Map::new())
+                .await
+                .expect("chat");
+        }
+
+        for body in chat_bodies(&server).await {
+            assert_eq!(body["options"]["num_ctx"], 32_768, "declared 40960 capped");
+        }
+    }
+
+    #[tokio::test]
+    async fn num_ctx_uses_declared_length_when_below_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(show_response(json!({"tiny.context_length": 8192})))
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        client.set_num_ctx_cap(32_768);
+
+        assert_eq!(
+            client.resolve_num_ctx("tiny", &Map::new()).await,
+            Some(8192)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_supplied_num_ctx_wins_without_a_metadata_fetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(show_response(json!({"qwen3.context_length": 40_960})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(chat_response())
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        client.set_num_ctx_cap(32_768);
+        let options = Map::from_iter([("num_ctx".into(), json!(2048))]);
+        crate::ollama::ChatBackend::chat_once(&client, "qwen3", &[], &[], &options)
+            .await
+            .expect("chat");
+
+        assert_eq!(chat_bodies(&server).await[0]["options"]["num_ctx"], 2048);
+    }
+
+    #[tokio::test]
+    async fn num_ctx_injection_disabled_by_default_and_without_declared_length() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(show_response(json!({"m.embedding_length": 5120})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(chat_response())
+            .mount(&server)
+            .await;
+
+        // Cap unset (0) => no injection and no metadata fetch.
+        let client = test_client(&server);
+        crate::ollama::ChatBackend::chat_once(&client, "m", &[], &[], &Map::new())
+            .await
+            .expect("chat");
+
+        // Cap set but metadata reports no context length => keep Ollama's default.
+        let mut capped = client.clone();
+        capped.set_num_ctx_cap(32_768);
+        crate::ollama::ChatBackend::chat_once(&capped, "m", &[], &[], &Map::new())
+            .await
+            .expect("chat");
+
+        for body in chat_bodies(&server).await {
+            assert!(body.get("options").is_none(), "no options injected: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_ctx_probe_is_retried_after_the_cooldown() {
+        let server = MockServer::start().await;
+        // First /api/show attempt fails; after the (zeroed) cooldown the next
+        // call probes again and succeeds — a boot-window miss must not
+        // disable num_ctx injection until restart.
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("booting"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(show_response(json!({"qwen3.context_length": 40_960})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(chat_response())
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        client.set_num_ctx_cap(32_768);
+        client.set_ctx_probe_cooldown(std::time::Duration::ZERO);
+
+        for _ in 0..2 {
+            crate::ollama::ChatBackend::chat_once(&client, "qwen3", &[], &[], &Map::new())
+                .await
+                .expect("chat");
+        }
+
+        let bodies = chat_bodies(&server).await;
+        assert!(
+            bodies[0].get("options").is_none(),
+            "first chat: probe failed, no injection"
+        );
+        assert_eq!(
+            bodies[1]["options"]["num_ctx"], 32_768,
+            "second chat: cooldown elapsed, probe retried, injection active"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_context_length_skips_the_lazy_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(show_response(json!({"qwen3.context_length": 40_960})))
+            .expect(0) // seeded: the lazy probe must not fire
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(chat_response())
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server);
+        client.set_num_ctx_cap(32_768);
+        client.seed_context_length("qwen3", Some(40_960));
+
+        crate::ollama::ChatBackend::chat_once(&client, "qwen3", &[], &[], &Map::new())
+            .await
+            .expect("chat");
+
+        assert_eq!(chat_bodies(&server).await[0]["options"]["num_ctx"], 32_768);
     }
 
     #[test]

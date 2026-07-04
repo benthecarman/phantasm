@@ -47,6 +47,7 @@ startup loudly rather than silently dropping the backend.
 | `UPSTREAM_<NAME>_MODELS` | *(probed)* | CSV pin of the models this upstream serves. Unset => probed from the backend (`/api/tags` or `/v1/models`). |
 | `UPSTREAM_<NAME>_API_KEY` | *(none)* | Bearer token for OpenAI-compatible backends. |
 | `UPSTREAM_<NAME>_MAX_CONCURRENCY` | global `UPSTREAM_MAX_CONCURRENCY` | Cap on simultaneous generations on this backend. |
+| `UPSTREAM_<NAME>_NUM_CTX_CAP` | global `UPSTREAM_NUM_CTX_CAP` (32768) | Native Ollama only: cap on the `num_ctx` injected from each model's declared context length (`0` disables injection). Size it to this host's VRAM. Rejected when the upstream kind is explicitly OpenAI-compatible (the value would be silently ignored). |
 | `UPSTREAM_<NAME>_THINKING_HINT` | `true` | Send the Qwen-style `enable_thinking` hint (OpenAI-compatible backends only). Set `false` for strict `/v1` servers. |
 | `UPSTREAM_<NAME>_REASONING_EFFORTS` | *(none)* | CSV of reasoning effort values to advertise for this OpenAI-compatible upstream's models, e.g. `none,low,medium,high`. Rejected when the upstream kind is explicitly native Ollama. |
 

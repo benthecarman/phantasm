@@ -348,10 +348,21 @@ async fn detect_model_metadata(
 ) -> Vec<(Option<ModelCapabilities>, Option<u64>)> {
     let checks = models.iter().map(|model| async move {
         match tokio::time::timeout(PROBE_TIMEOUT, upstream.model_metadata(model)).await {
-            Ok(Some(Ok(metadata))) => (
-                Some(ModelCapabilities::from_names(&metadata.capabilities)),
-                metadata.context_length,
-            ),
+            Ok(Some(Ok(metadata))) => {
+                // Success only: hand the declared context length to the
+                // client's num_ctx cache so the first chat per model skips
+                // its own /api/show round-trip, and a model re-pull
+                // propagates on the next capabilities refresh. Failed probes
+                // are NOT seeded — a boot-window miss must not disable
+                // injection.
+                if let UpstreamChatBackend::NativeOllama(client) = upstream {
+                    client.seed_context_length(model, metadata.context_length);
+                }
+                (
+                    Some(ModelCapabilities::from_names(&metadata.capabilities)),
+                    metadata.context_length,
+                )
+            }
             _ => (None, None),
         }
     });

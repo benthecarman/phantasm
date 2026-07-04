@@ -415,6 +415,7 @@ fn test_config(upstream_base: &str) -> Config {
         default_upstream_configured: true,
         extra_upstreams: vec![],
         max_tool_iters: 5,
+        upstream_num_ctx_cap: 0, // tests opt out of num_ctx injection unless they set it
         upstream_concurrency: 4,
         turn_result_ttl_s: 24 * 60 * 60,
         turn_registry_max: 128,
@@ -1058,6 +1059,7 @@ async fn multiple_upstreams_union_models_and_route_by_model() {
         reasoning_efforts: vec!["none".into(), "low".into(), "medium".into(), "high".into()],
         models: vec![], // probed from its /v1/models
         concurrency: Some(2),
+        num_ctx_cap: 0,
     }];
 
     let http = phantasm_orchestrator::build_http_client().unwrap();
