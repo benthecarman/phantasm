@@ -14,7 +14,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "process"] }
 axum = { version = "0.8", features = ["json"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["cors"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
 secrecy = "0.10"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -40,7 +40,6 @@ hmac = "0.12"
 uuid = { version = "1", features = ["v4"] }
 url = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-chrono-tz = "0.10"
 tempfile = "3"
 # Durable metrics history for the dashboard (`metrics_store`). `bundled`
 # compiles SQLite in, so deployments need no system libsqlite.
