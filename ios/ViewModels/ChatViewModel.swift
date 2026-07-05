@@ -709,15 +709,20 @@ final class ChatViewModel {
             // duplicate. The resumable server turn replays in full on reconnect.
             let interruptedInBackground = !sawDone && backgrounded
             let emptyResponse = streamingText.isEmpty
-            if interruptedInBackground || (emptyResponse && backgrounded) {
+            let reasoningOnlyResponse = sawDone && emptyResponse && !streamingReasoning.isEmpty
+            if interruptedInBackground || (emptyResponse && !reasoningOnlyResponse && backgrounded) {
                 suspendedByScene = false
                 finish(error: nil, emptyPendingDisposition: .keepForRecovery)
             } else {
-                finish(
-                    error: emptyResponse
-                        ? .modelError("The stream completed without any assistant text.")
-                        : nil
-                )
+                let completionError: AppError?
+                if reasoningOnlyResponse {
+                    completionError = .modelError("The model produced thinking but no answer.")
+                } else if emptyResponse {
+                    completionError = .modelError("The stream completed without any assistant text.")
+                } else {
+                    completionError = nil
+                }
+                finish(error: completionError)
             }
         } catch {
             finishAfterStreamFailure(error)
@@ -1161,6 +1166,7 @@ final class ChatViewModel {
         // Commit any streamed text as one complete assistant message.
         let committed = streamingText
         let committedReasoning = streamingReasoning
+        let hasAssistantPayload = !committed.isEmpty || !committedReasoning.isEmpty
         let pendingID = pendingAssistantMessageID
         pendingAssistantMessageID = nil
         let shouldKeepPendingForRecovery = pendingID != nil
@@ -1177,7 +1183,7 @@ final class ChatViewModel {
             pendingAssistantPreviewMessageID = nil
             hasAssistantPreview = false
             endBackgroundStreamingTask()
-        } else if let store, let conversation, !committed.isEmpty {
+        } else if let store, let conversation, hasAssistantPayload {
             // The preview stays visible (hasAssistantPreview remains true) until
             // the committed row lands and reconcileAssistantPreview clears it.
             if let pendingID {
@@ -1265,7 +1271,7 @@ final class ChatViewModel {
                 await self?.notifications.scheduleBackgroundCompletion(
                     conversationID: conversationID
                 )
-            } else {
+            } else if !content.isEmpty {
                 await self?.maybeGenerateTitle()
             }
             self?.endBackgroundStreamingTask()

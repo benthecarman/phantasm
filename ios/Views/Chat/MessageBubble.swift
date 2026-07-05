@@ -238,7 +238,11 @@ struct StreamingBubble: View {
                 if !reasoning.isEmpty {
                     // Reasoning is "live" until the answer starts streaming; after
                     // that the trace is complete and the chip settles.
-                    ThinkingDisclosure(text: reasoning, isStreaming: text.isEmpty)
+                    ThinkingDisclosure(
+                        text: reasoning,
+                        isStreaming: text.isEmpty,
+                        allowsTextSelection: false
+                    )
                 }
                 // Show the loader until there's something to render. Gate on an
                 // empty-or-nil status (not just nil) so a blank `x_status` value
@@ -261,6 +265,9 @@ struct ThinkingDisclosure: View {
     let text: String
     /// Whether reasoning tokens are still streaming in — drives the shimmer.
     var isStreaming = false
+    /// Live preview text is rebuilt throughout generation; selectable text makes
+    /// that path significantly heavier, so only committed reasoning enables it.
+    var allowsTextSelection = true
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
@@ -338,11 +345,11 @@ struct ThinkingDisclosure: View {
         }
     }
 
+    @ViewBuilder
     private var reasoningBody: some View {
-        Text(text)
+        let body = Text(text)
             .font(.callout)
             .foregroundStyle(.secondary)
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.leading, 12)
             .overlay(alignment: .leading) {
@@ -352,6 +359,12 @@ struct ThinkingDisclosure: View {
             }
             .padding(.top, 8)
             .padding(.leading, 8)
+
+        if allowsTextSelection {
+            body.textSelection(.enabled)
+        } else {
+            body
+        }
     }
 
     private func startAnimationIfNeeded() {
@@ -373,7 +386,8 @@ struct ThinkingDisclosure: View {
     VStack(alignment: .leading, spacing: 16) {
         ThinkingDisclosure(
             text: "The user is asking about X. Let me consider the trade-offs before answering.",
-            isStreaming: true
+            isStreaming: true,
+            allowsTextSelection: false
         )
         ThinkingDisclosure(
             text: "The user is asking about X. Let me consider the trade-offs before answering."

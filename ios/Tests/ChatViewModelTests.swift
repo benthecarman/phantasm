@@ -249,6 +249,36 @@ final class ChatViewModelTests: XCTestCase {
         }
     }
 
+    func testReasoningOnlyCompletionCommitsReasoningAndSurfacesSpecificError() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        vm.setViewVisible(true)
+
+        client.enqueue(events: [.reasoning("thinking trace"), .done])
+
+        vm.send("think but do not answer")
+
+        try await waitUntil {
+            vm.errorMessage == AppError.modelError("The model produced thinking but no answer.").userMessage
+        }
+        try await waitUntil {
+            guard let detail = try await store.conversationDetail(id: conversation.id),
+                  detail.messages.count == 2 else {
+                return false
+            }
+            let assistant = detail.messages[1].message
+            return assistant.role == "assistant"
+                && assistant.content.isEmpty
+                && assistant.reasoning == "thinking trace"
+                && assistant.isComplete
+        }
+        XCTAssertFalse(vm.isStreaming)
+        XCTAssertEqual(client.requests.count, 1)
+    }
+
     func testRecoverPendingAssistantRowReplaysStreamingInPlace() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
