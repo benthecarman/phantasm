@@ -449,6 +449,9 @@ where
                 }
                 let value: Value = serde_json::from_slice(payload)
                     .map_err(|e| AppError::UpstreamError(format!("bad SSE data line: {e}")))?;
+                if let Some(message) = in_band_error(&value) {
+                    Err(AppError::UpstreamError(message))?;
+                }
                 if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
                     continue;
                 }
@@ -469,6 +472,9 @@ where
         if let Some(payload) = sse_data_payload(buf.as_ref()) {
             if payload != b"[DONE]" {
                 if let Ok(value) = serde_json::from_slice::<Value>(payload) {
+                    if let Some(message) = in_band_error(&value) {
+                        Err(AppError::UpstreamError(message))?;
+                    }
                     if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
                         return;
                     }
@@ -513,6 +519,9 @@ where
                 }
                 let value: Value = serde_json::from_slice(payload)
                     .map_err(|e| AppError::UpstreamError(format!("bad SSE data line: {e}")))?;
+                if let Some(message) = in_band_error(&value) {
+                    Err(AppError::UpstreamError(message))?;
+                }
                 if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
                     continue;
                 }
@@ -548,6 +557,9 @@ where
         if let Some(payload) = sse_data_payload(buf.as_ref()) {
             if payload != b"[DONE]" {
                 if let Ok(value) = serde_json::from_slice::<Value>(payload) {
+                    if let Some(message) = in_band_error(&value) {
+                        Err(AppError::UpstreamError(message))?;
+                    }
                     if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
                         return;
                     }
@@ -639,6 +651,27 @@ fn record_stream_usage(
     true
 }
 
+/// The error message of an in-band error object some compat servers report as
+/// a `data:` chunk on an HTTP 200 stream — OpenAI's `{"error":{...}}` shape or
+/// vLLM's `{"object":"error","message":...}` (e.g. a mid-generation CUDA OOM).
+/// Without this check such a chunk parses as an empty delta and the failure
+/// surfaces only as silent truncation.
+fn in_band_error(value: &Value) -> Option<String> {
+    let message = |v: &Value| {
+        v.get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown upstream error")
+            .to_string()
+    };
+    if let Some(error) = value.get("error").filter(|e| !e.is_null()) {
+        return Some(message(error));
+    }
+    if value.get("object").and_then(Value::as_str) == Some("error") {
+        return Some(message(value));
+    }
+    None
+}
+
 /// The payload of an SSE `data:` line (trimmed), or `None` for a blank
 /// separator, a `:` comment, or any non-`data` field line.
 fn sse_data_payload(line: &[u8]) -> Option<&[u8]> {
@@ -675,12 +708,15 @@ impl ToolCallAccumulator {
             return;
         };
 
-        for chunk in chunks {
+        // Some servers omit `index` even with several calls in one delta
+        // array; falling back to the array position keeps them distinct
+        // (defaulting all to 0 would merge them into one garbled call).
+        for (position, chunk) in chunks.iter().enumerate() {
             let index = chunk
                 .get("index")
                 .and_then(Value::as_u64)
                 .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or(0);
+                .unwrap_or(position as u32);
             let call = self.calls.entry(index).or_default();
             if let Some(id) = chunk.get("id").and_then(Value::as_str) {
                 if !id.is_empty() {
@@ -756,11 +792,17 @@ fn delta_from_openai_chunk(chunk: &Value) -> StreamDelta {
 }
 
 fn reasoning_from_delta(delta: &Value) -> Option<&str> {
-    delta
-        .get("reasoning")
-        .or_else(|| delta.get("reasoning_content"))
-        .or_else(|| delta.get("thinking"))
-        .and_then(Value::as_str)
+    // Checked per key: a router may emit `"reasoning": null` (or "") alongside
+    // the field that actually carries the text, and a merely-present first key
+    // must not shadow the others.
+    ["reasoning", "reasoning_content", "thinking"]
+        .into_iter()
+        .find_map(|key| {
+            delta
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
 }
 
 #[derive(Default)]
@@ -1265,6 +1307,114 @@ mod tests {
             .collect()
             .await;
         assert_eq!(deltas[0].content, "hi");
+    }
+
+    #[tokio::test]
+    async fn sse_stream_surfaces_in_band_error_object() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        // OpenAI-compatible servers can report failures as an in-band error
+        // object on a data line of an HTTP 200 stream; it must fail the
+        // stream, not parse as an empty delta and truncate silently.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"error\":{\"message\":\"Internal server error\",\"type\":\"server_error\",\"code\":500}}\n\ndata: [DONE]\n\n",
+        ))];
+        let mut got = Box::pin(sse_bytes_to_deltas(stream::iter(chunks), None));
+        match got.next().await.expect("one item") {
+            Err(AppError::UpstreamError(message)) => {
+                assert!(message.contains("Internal server error"), "{message}");
+            }
+            other => panic!("expected an upstream error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_tool_stream_surfaces_vllm_style_error_object() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        // vLLM reports mid-stream failures as `{"object":"error",...}` after
+        // content has already flowed.
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n\
+              data: {\"object\":\"error\",\"message\":\"CUDA out of memory\",\"code\":500}\n\n",
+        ))];
+        let mut got = Box::pin(sse_bytes_to_tool_deltas(stream::iter(chunks), None));
+        let first = got.next().await.expect("content delta").unwrap();
+        assert_eq!(first.content, "Hi");
+        match got.next().await.expect("error item") {
+            Err(AppError::UpstreamError(message)) => {
+                assert!(message.contains("CUDA out of memory"), "{message}");
+            }
+            other => panic!("expected an upstream error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_accumulator_defaults_missing_index_to_array_position() {
+        // Some servers emit several complete calls in ONE delta array with no
+        // `index` field; they must not collapse into a single garbled call.
+        let mut acc = ToolCallAccumulator::default();
+        acc.absorb_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+                {"id": "call_b", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}}
+            ]}}]
+        }));
+        let calls = acc.finish().unwrap().expect("two calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id.as_deref(), Some("call_a"));
+        assert_eq!(calls[1].id.as_deref(), Some("call_b"));
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[1].function.name, "get_weather");
+    }
+
+    #[test]
+    fn tool_call_accumulator_reassembles_out_of_order_indices() {
+        // Fragments for index 1 arrive before index 0 exists; the finished
+        // batch comes out index-ordered with argument fragments concatenated.
+        let mut acc = ToolCallAccumulator::default();
+        acc.absorb_chunk(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 1, "id": "call_b", "function": {"name": "weather", "arguments": "{\"city\":"}}
+        ]}}]}));
+        acc.absorb_chunk(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_a", "function": {"name": "time", "arguments": "{}"}}
+        ]}}]}));
+        acc.absorb_chunk(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 1, "function": {"arguments": "\"Tokyo\"}"}}
+        ]}}]}));
+        let calls = acc.finish().unwrap().expect("two calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id.as_deref(), Some("call_a"));
+        assert_eq!(calls[1].id.as_deref(), Some("call_b"));
+        match &calls[1].function.arguments {
+            RawArguments::Str(s) => assert_eq!(s, "{\"city\":\"Tokyo\"}"),
+            other => panic!("expected string arguments, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_reasoning_does_not_shadow_reasoning_content() {
+        // Routers emit `"reasoning": null` (or "") alongside the field that
+        // actually carries the text; the first key must not shadow the others.
+        let chunk = json!({
+            "choices": [{
+                "delta": { "content": "", "reasoning": null, "reasoning_content": "plan" },
+                "finish_reason": null
+            }]
+        });
+        assert_eq!(delta_from_openai_chunk(&chunk).reasoning, "plan");
+
+        let chunk = json!({
+            "choices": [{
+                "delta": { "reasoning": "", "thinking": "deep" },
+                "finish_reason": null
+            }]
+        });
+        assert_eq!(delta_from_openai_chunk(&chunk).reasoning, "deep");
     }
 
     #[tokio::test]

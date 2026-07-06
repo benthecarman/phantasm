@@ -375,6 +375,28 @@ mod tests {
         assert_eq!(cleaned, "a </tool_call> in prose");
     }
 
+    #[test]
+    fn fallback_lifts_calls_and_keeps_prefix_prose() {
+        let message = ChatMessage {
+            role: "assistant".into(),
+            content: Some(MessageContent::Text(
+                "I'll check.\n\n<function=time>\n</function>".into(),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let message = apply_xml_tool_fallback(message);
+        assert_eq!(
+            message.tool_calls.as_ref().unwrap()[0].function.name,
+            "time"
+        );
+        match message.content {
+            Some(MessageContent::Text(text)) => assert_eq!(text, "I'll check."),
+            other => panic!("expected trimmed prefix prose, got {other:?}"),
+        }
+    }
+
     fn delta_stream(deltas: Vec<crate::ollama::StreamDelta>) -> DeltaStream {
         Box::pin(futures_util::stream::iter(deltas.into_iter().map(Ok)))
     }

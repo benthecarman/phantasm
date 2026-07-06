@@ -264,6 +264,20 @@ async fn spawn_turn(
     let log_model = model.clone();
     // Resolved research mode id (if any) for per-turn logging.
     let mode = preset.map(|p| p.id);
+    // Excise history defects a strict upstream would 400 on (see
+    // `crate::history`). After the continuation splice, so the check runs on
+    // the history actually going upstream — a spliced resume is well-formed
+    // by construction and passes through untouched.
+    let repairs = crate::history::repair_history(&mut messages);
+    if !repairs.is_clean() {
+        tracing::warn!(
+            turn_id,
+            orphaned_results = repairs.orphaned_results,
+            unanswered_calls = repairs.unanswered_calls,
+            dropped_messages = repairs.dropped_messages,
+            "repaired malformed client history"
+        );
+    }
     if cfg.log_content {
         tracing::debug!(turn_id, messages = ?messages, "turn content");
     }
