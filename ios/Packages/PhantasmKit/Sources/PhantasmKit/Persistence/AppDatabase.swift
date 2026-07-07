@@ -26,7 +26,29 @@ public final class AppDatabase: Sendable {
         )
         let dir = support.appendingPathComponent("Phantasm", isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        let pool = try DatabasePool(path: dir.appendingPathComponent("phantasm.sqlite").path)
+        return try open(at: dir.appendingPathComponent("phantasm.sqlite"))
+    }
+
+    /// Open (or create) the on-disk store at `url`. Internal so tests can
+    /// exercise the pre-release reset below against a scratch file.
+    static func open(at url: URL) throws -> AppDatabase {
+        let pool = try DatabasePool(path: url.path)
+        // Pre-release schema reset: the incremental migration lineage was
+        // collapsed into the single migration below before the first release.
+        // A store written by an older dev build carries applied identifiers
+        // this migrator has never heard of, and GRDB (correctly) refuses to
+        // migrate such a database. No released build ever produced one, so a
+        // superseded store is dev data: start fresh instead of dooming every
+        // session to the in-memory fallback.
+        if try pool.read({ try migrator.hasBeenSuperseded($0) }) {
+            let fm = FileManager.default
+            try pool.close()
+            try fm.removeItem(at: url)
+            // SQLite side files; usually gone after a clean close.
+            try? fm.removeItem(at: URL(fileURLWithPath: url.path + "-wal"))
+            try? fm.removeItem(at: URL(fileURLWithPath: url.path + "-shm"))
+            return try AppDatabase(DatabasePool(path: url.path))
+        }
         return try AppDatabase(pool)
     }
 
@@ -39,15 +61,36 @@ public final class AppDatabase: Sendable {
 
     private static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
-        migrator.registerMigration("v1") { db in
+        // The full schema in one migration. The incremental lineage this
+        // replaced (v1–v11) predates the first release; no shipped build ever
+        // ran it, and `makeShared` resets any leftover dev store that did
+        // (`hasBeenSuperseded`). Post-release schema changes append new
+        // migrations below this one.
+        migrator.registerMigration("v1_initial_schema") { db in
             try db.create(table: "conversation") { t in
                 t.primaryKey("id", .blob).notNull()
                 t.column("title", .text).notNull()
                 t.column("createdAt", .datetime).notNull()
                 t.column("updatedAt", .datetime).notNull()
+                // Tombstone: deletes keep this slim row (messages are
+                // hard-deleted) so a future cloud-sync layer can propagate
+                // the deletion (SPEC §7).
                 t.column("deletedAt", .datetime)
                 t.column("modelID", .text)
                 t.column("profileID", .blob)
+                // Per-chat tool selection. Server tools default on, matching
+                // a tools-enabled backend out of the box; the device tools
+                // default off — each is privacy-sensitive and triggers a
+                // system permission prompt.
+                t.column("webSearchEnabled", .boolean).notNull().defaults(to: true)
+                t.column("imageGenerationEnabled", .boolean).notNull().defaults(to: true)
+                t.column("locationEnabled", .boolean).notNull().defaults(to: false)
+                t.column("healthEnabled", .boolean).notNull().defaults(to: false)
+                t.column("calendarEnabled", .boolean).notNull().defaults(to: false)
+                // Selected research/turn mode (nil = ordinary turn). Reaches
+                // the wire only as a `<base>:<modeID>` model-id suffix
+                // (redesign §7).
+                t.column("modeID", .text)
             }
             try db.create(table: "message") { t in
                 t.primaryKey("id", .blob).notNull()
@@ -55,9 +98,28 @@ public final class AppDatabase: Sendable {
                     .references("conversation", onDelete: .cascade)
                 t.column("role", .text).notNull()
                 t.column("content", .text).notNull()
+                // Model thinking for an assistant response — separate from
+                // `content` so it's hidden by default and excluded from
+                // future prompts.
+                t.column("reasoning", .text).notNull()
                 t.column("createdAt", .datetime).notNull()
                 t.column("updatedAt", .datetime).notNull()
+                // false while streaming; flipped once the turn finishes.
                 t.column("isComplete", .boolean).notNull()
+                // Client-executed (app-hosted) tools: an assistant message
+                // can carry forwarded calls (JSON `[WireToolCall]`); a
+                // `tool`-role message records the answer to `toolCallId`
+                // from tool `name`. Re-sent in history so the model sees its
+                // own call paired with the result (§2.3).
+                t.column("toolCalls", .text)
+                t.column("toolCallId", .text)
+                t.column("name", .text)
+                // What FTS indexes: `content` with inline base64 image
+                // payloads stripped. Indexing raw content would tokenize
+                // megabytes of base64 into FTS — slow commits, index bloat,
+                // garbage hits. Maintained by the store whenever `content`
+                // changes.
+                t.column("searchText", .text).notNull()
             }
             try db.create(table: "attachment") { t in
                 t.primaryKey("id", .blob).notNull()
@@ -72,159 +134,34 @@ public final class AppDatabase: Sendable {
                 t.column("updatedAt", .datetime).notNull()
             }
 
-            // FTS5 external-content indexes, kept in sync by triggers that GRDB
-            // installs via `synchronize(withTable:)`. unicode61 removes diacritics
-            // by default; searches use prefix patterns for search-as-you-type.
-            try db.create(virtualTable: "message_ft", using: FTS5()) { t in
-                t.synchronize(withTable: "message")
-                t.tokenizer = .unicode61()
-                t.column("content")
-            }
-            try db.create(virtualTable: "conversation_ft", using: FTS5()) { t in
-                t.synchronize(withTable: "conversation")
-                t.tokenizer = .unicode61()
-                t.column("title")
-            }
-        }
-
-        // Per-chat tool selection (web search / image generation). Existing chats
-        // default on, matching the prior always-offered behavior on tool-enabled
-        // backends; the composer's tool selector flips them per chat.
-        migrator.registerMigration("v2_per_chat_tools") { db in
-            try db.alter(table: "conversation") { t in
-                t.add(column: "webSearchEnabled", .boolean).notNull().defaults(to: true)
-                t.add(column: "imageGenerationEnabled", .boolean).notNull().defaults(to: true)
-            }
-        }
-
-        // Per-chat Deep Research mode (x_research). Off by default — it's a
-        // slower, deliberate mode the user opts into per chat.
-        migrator.registerMigration("v3_deep_research") { db in
-            try db.alter(table: "conversation") { t in
-                t.add(column: "deepResearchEnabled", .boolean).notNull().defaults(to: false)
-            }
-        }
-
-        // Per-assistant-message reasoning text. Existing rows migrate to no stored
-        // reasoning; the Thinking toggle itself is stored per model in UserDefaults.
-        migrator.registerMigration("v4_thinking") { db in
-            try db.alter(table: "message") { t in
-                t.add(column: "reasoning", .text).notNull().defaults(to: "")
-            }
-        }
-
-        // Deep Research becomes a selected mode id rather than a bool: research is
-        // now chosen via a mode-suffixed model id (redesign §2/§7), and the mode
-        // table is server-side. Add `modeID` (nil = ordinary turn) and
-        // migrate rows that had `deepResearchEnabled` on to "deep-research". The
-        // old boolean column is left in place (unused) to keep the migration simple.
-        migrator.registerMigration("v5_research_mode") { db in
-            try db.alter(table: "conversation") { t in
-                t.add(column: "modeID", .text)
-            }
-            try db.execute(
-                sql: """
-                    UPDATE conversation
-                    SET modeID = 'deep-research'
-                    WHERE deepResearchEnabled = 1
-                    """
-            )
-        }
-
-        // Client-executed (app-hosted) tools: an assistant message can carry
-        // forwarded tool calls, and a `tool`-role message records the user's
-        // answer. All nil for existing rows (ordinary chat/assistant messages).
-        migrator.registerMigration("v6_client_tools") { db in
-            try db.alter(table: "message") { t in
-                t.add(column: "toolCalls", .text)
-                t.add(column: "toolCallId", .text)
-                t.add(column: "name", .text)
-            }
-        }
-
-        // Per-chat opt-in for the app-hosted location tool. Off by default
-        // (privacy-sensitive, triggers a permission prompt); the composer's tool
-        // selector flips it per chat.
-        migrator.registerMigration("v7_location_tool") { db in
-            try db.alter(table: "conversation") { t in
-                t.add(column: "locationEnabled", .boolean).notNull().defaults(to: false)
-            }
-        }
-
-        // Per-chat opt-in for the app-hosted health tool. Off by default (same
-        // privacy reasoning as location); the composer's tool selector flips it.
-        migrator.registerMigration("v8_health_tool") { db in
-            try db.alter(table: "conversation") { t in
-                t.add(column: "healthEnabled", .boolean).notNull().defaults(to: false)
-            }
-        }
-
-        // Per-chat opt-in for the app-hosted calendar tool. Off by default (same
-        // privacy reasoning as location/health); the composer's tool selector
-        // flips it.
-        migrator.registerMigration("v9_calendar_tool") { db in
-            try db.alter(table: "conversation") { t in
-                t.add(column: "calendarEnabled", .boolean).notNull().defaults(to: false)
-            }
-        }
-
-        // Full-text search moves to a sanitized projection: indexing raw
-        // content tokenized megabytes of inline base64 image payload into FTS
-        // (slow commits, permanent index bloat, garbage hits). `searchText` is
-        // content with data-URI payloads stripped; the FTS index re-points at it.
-        migrator.registerMigration("v10_search_projection") { db in
-            try db.alter(table: "message") { t in
-                t.add(column: "searchText", .text).notNull().defaults(to: "")
-            }
-            // Most rows carry no data URI: copy content wholesale.
-            try db.execute(sql: """
-                UPDATE message SET searchText = content
-                WHERE content NOT LIKE '%](data:image/%'
-                """)
-            // Sanitize the (few) image-bearing rows in Swift.
-            let rows = try Row.fetchAll(db, sql: """
-                SELECT id, content FROM message WHERE content LIKE '%](data:image/%'
-                """)
-            for row in rows {
-                let id: UUID = row["id"]
-                let content: String = row["content"]
-                try db.execute(
-                    sql: "UPDATE message SET searchText = ? WHERE id = ?",
-                    arguments: [Message.searchProjection(content), id]
-                )
-            }
-            // Replace the FTS index (and the sync triggers GRDB installed for
-            // it) with one over the sanitized column. Recreating it re-indexes
-            // from the message table, shedding the base64 already in the index.
-            let triggers = try String.fetchAll(db, sql: """
-                SELECT name FROM sqlite_master
-                WHERE type = 'trigger' AND tbl_name = 'message' AND sql LIKE '%message_ft%'
-                """)
-            for trigger in triggers {
-                try db.execute(sql: "DROP TRIGGER \"\(trigger)\"")
-            }
-            try db.execute(sql: "DROP TABLE message_ft")
-            try db.create(virtualTable: "message_ft", using: FTS5()) { t in
-                t.synchronize(withTable: "message")
-                t.tokenizer = .unicode61()
-                t.column("searchText")
-            }
-        }
-
-        // Semantic search index: one vector per message, produced by the
-        // on-device embedder. `model` names the embedder revision — vectors
-        // from different revisions are never comparable, so a revision bump
-        // makes every row a re-embed candidate. An *empty* vector marks a
-        // message that failed to embed, so the indexer doesn't retry it
-        // forever. Rows cascade-delete with their message; content rewrites
-        // delete the row explicitly so the indexer re-embeds.
-        migrator.registerMigration("v11_message_embedding") { db in
+            // Semantic search index: one vector per message, produced by the
+            // on-device embedder. `model` names the embedder revision —
+            // vectors from different revisions are never comparable, so a
+            // revision bump makes every row a re-embed candidate. An *empty*
+            // vector marks a message that failed to embed, so the indexer
+            // doesn't retry it forever. Rows cascade-delete with their
+            // message; content rewrites delete the row explicitly so the
+            // indexer re-embeds.
             try db.create(table: "message_embedding") { t in
                 t.primaryKey("messageId", .blob).notNull()
                     .references("message", onDelete: .cascade)
                 t.column("model", .text).notNull()
                 t.column("vector", .blob).notNull()
                 t.column("updatedAt", .datetime).notNull()
+            }
+
+            // FTS5 external-content indexes, kept in sync by triggers that GRDB
+            // installs via `synchronize(withTable:)`. unicode61 removes diacritics
+            // by default; searches use prefix patterns for search-as-you-type.
+            try db.create(virtualTable: "message_ft", using: FTS5()) { t in
+                t.synchronize(withTable: "message")
+                t.tokenizer = .unicode61()
+                t.column("searchText")
+            }
+            try db.create(virtualTable: "conversation_ft", using: FTS5()) { t in
+                t.synchronize(withTable: "conversation")
+                t.tokenizer = .unicode61()
+                t.column("title")
             }
         }
         return migrator
