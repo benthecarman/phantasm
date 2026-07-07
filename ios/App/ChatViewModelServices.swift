@@ -24,6 +24,9 @@ protocol ChatViewModelEnvironment: AnyObject {
     func requestCalendarAuthorization()
     func warm(model: String)
     func speak(_ text: String, messageID: UUID)
+    /// Fire-and-forget: bring the semantic search index up to date after a
+    /// turn commits new message rows.
+    func indexSearchEmbeddings()
 }
 
 extension AppEnvironment: ChatViewModelEnvironment {
@@ -57,6 +60,10 @@ extension AppEnvironment: ChatViewModelEnvironment {
 
     func speak(_ text: String, messageID: UUID) {
         speechSynthesizer.speak(text, messageID: messageID)
+    }
+
+    func indexSearchEmbeddings() {
+        Task { [searchIndexer] in await searchIndexer.indexPending() }
     }
 }
 

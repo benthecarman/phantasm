@@ -12,6 +12,12 @@ struct HistoryDrawer: View {
     /// Empty search → all conversations (recent first); non-empty → ranked FTS5
     /// results across titles + message content. Bound to the search field below.
     @Query(ConversationsRequest()) private var results: [ConversationSearchResult]
+    /// Hybrid (keyword ⊕ semantic) results for the settled query. Keyword
+    /// results render instantly via `results`; once the embedding leg resolves
+    /// for the *same* text, the list upgrades in place. Nil (or a stale query)
+    /// falls back to keyword-only — the query mismatch check means a stale
+    /// overlay can never show for text the user has since edited.
+    @State private var hybridOverlay: (query: String, results: [ConversationSearchResult])?
 
     /// The currently displayed conversation (may be an unsaved new chat).
     let selection: Conversation?
@@ -31,6 +37,19 @@ struct HistoryDrawer: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color(.secondarySystemBackground))
+        // Semantic search rides behind the instant FTS5 list: debounce a
+        // keystroke's worth, embed the query on-device, fuse with the keyword
+        // ranking, and swap the upgraded list in if the text hasn't moved.
+        .task(id: $results.searchText.wrappedValue) {
+            let query = $results.searchText.wrappedValue
+            hybridOverlay = nil
+            guard query.trimmingCharacters(in: .whitespacesAndNewlines).count >= 3 else { return }
+            guard (try? await Task.sleep(for: .milliseconds(250))) != nil else { return }
+            guard let fused = await env.searchHistoryHybrid(matching: query),
+                  !Task.isCancelled
+            else { return }
+            hybridOverlay = (query, fused)
+        }
         .overlay(alignment: .trailing) {
             // A hairline on the edge that faces the chat so the drawer reads as a
             // distinct surface instead of bleeding into the content behind it.
@@ -77,6 +96,15 @@ struct HistoryDrawer: View {
         .padding(.bottom, 8)
     }
 
+    /// The hybrid list when it matches the current query, else the reactive
+    /// keyword results (also the live-updating path for the empty query).
+    private var displayedResults: [ConversationSearchResult] {
+        if let hybridOverlay, hybridOverlay.query == $results.searchText.wrappedValue {
+            return hybridOverlay.results
+        }
+        return results
+    }
+
     private var list: some View {
         List {
             if env.activeProfile == nil {
@@ -84,7 +112,7 @@ struct HistoryDrawer: View {
                     Label("Add a backend to start", systemImage: "server.rack")
                 }
             }
-            ForEach(results) { result in
+            ForEach(displayedResults) { result in
                 let isSelected = result.conversation.id == selection?.id
                 VStack(alignment: .leading, spacing: 2) {
                     Text(result.conversation.title).lineLimit(1)
@@ -180,6 +208,9 @@ struct HistoryDrawer: View {
 
     private func deleteConversations(ids: [UUID]) {
         guard !ids.isEmpty else { return }
+        // The reactive keyword list drops the rows on its own; the hybrid
+        // overlay is a snapshot and must not keep showing them.
+        hybridOverlay = nil
         // Stop in-flight turns first: a deleted chat's stream must not keep
         // running (holding the backend) or commit into rows being removed.
         onDeleted(ids)

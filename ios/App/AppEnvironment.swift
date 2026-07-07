@@ -43,6 +43,12 @@ final class AppEnvironment {
     let ollamaChatClient = OllamaNativeChatClient()
     let capabilitiesClient = CapabilitiesClient()
     let warmupClient = WarmupClient()
+    /// On-device semantic embedder (Apple's contextual embedding — OS-provided
+    /// assets, nothing bundled) + the indexer that keeps message vectors in
+    /// step with history. Search degrades to keyword-only whenever embedding
+    /// is unavailable (assets not downloaded yet, unsupported device).
+    let searchEmbedder = ContextualTextEmbedder()
+    let searchIndexer: EmbeddingIndexer
 
     var profiles: [BackendProfile]
     var activeProfileID: UUID?
@@ -94,6 +100,7 @@ final class AppEnvironment {
         }
         speechSynthesizer = SpeechSynthesizer(voicePrefs: voicePreferenceStore)
         dictationController = DictationController()
+        searchIndexer = EmbeddingIndexer(database: database, embedder: searchEmbedder)
         // Wire the app-hosted device tool providers into the registry so forwarded
         // location / health / calendar calls resolve on-device.
         AppToolRegistry.configureLocation(provider: locationProvider)
@@ -110,6 +117,26 @@ final class AppEnvironment {
         // Lazily refresh capabilities for the active backend on launch; the
         // picker is seeded from the cache (see `availableModels`) in the meantime.
         Task { await refreshCapabilities() }
+        // Backfill the semantic index for any history that predates it (or
+        // arrived while embedding assets weren't available). Incremental —
+        // already-embedded messages are skipped.
+        Task { [searchIndexer] in await searchIndexer.indexPending() }
+    }
+
+    /// Hybrid history search: FTS5 keyword hits fused with semantic (embedding)
+    /// hits. Returns nil when the embedder can't run — the caller keeps showing
+    /// the reactive keyword-only results. Very short queries skip the semantic
+    /// leg: prefix fragments embed as noise, and FTS5's prefix matching already
+    /// owns search-as-you-type.
+    func searchHistoryHybrid(matching query: String) async -> [ConversationSearchResult]? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 3 else { return nil }
+        guard let vector = try? await searchEmbedder.embed(String(trimmed.prefix(300))) else {
+            return nil
+        }
+        return try? await database.hybridSearchConversations(
+            matching: trimmed, queryVector: vector, model: searchEmbedder.identifier
+        )
     }
 
     var activeProfile: BackendProfile? {

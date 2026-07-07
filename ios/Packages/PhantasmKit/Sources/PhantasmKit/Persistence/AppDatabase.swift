@@ -210,6 +210,23 @@ public final class AppDatabase: Sendable {
                 t.column("searchText")
             }
         }
+
+        // Semantic search index: one vector per message, produced by the
+        // on-device embedder. `model` names the embedder revision — vectors
+        // from different revisions are never comparable, so a revision bump
+        // makes every row a re-embed candidate. An *empty* vector marks a
+        // message that failed to embed, so the indexer doesn't retry it
+        // forever. Rows cascade-delete with their message; content rewrites
+        // delete the row explicitly so the indexer re-embeds.
+        migrator.registerMigration("v11_message_embedding") { db in
+            try db.create(table: "message_embedding") { t in
+                t.primaryKey("messageId", .blob).notNull()
+                    .references("message", onDelete: .cascade)
+                t.column("model", .text).notNull()
+                t.column("vector", .blob).notNull()
+                t.column("updatedAt", .datetime).notNull()
+            }
+        }
         return migrator
     }
 }
@@ -268,6 +285,7 @@ extension AppDatabase: ChatStore {
             if let createdAt { message.createdAt = createdAt }
             message.updatedAt = Date()
             try message.update(db)
+            try Self.invalidateEmbedding(db, messageId: id)
         }
     }
 
@@ -280,6 +298,7 @@ extension AppDatabase: ChatStore {
             message.isComplete = true
             message.updatedAt = Date()
             try message.update(db)
+            try Self.invalidateEmbedding(db, messageId: id)
         }
     }
 
@@ -334,6 +353,7 @@ extension AppDatabase: ChatStore {
             message.searchText = Message.searchProjection(newContent)
             message.updatedAt = now
             try message.update(db)
+            try Self.invalidateEmbedding(db, messageId: id)
             // Bump the conversation so the edit re-sorts it to the top.
             if var convo = try Conversation.fetchOne(db, key: message.conversationId) {
                 convo.updatedAt = now
@@ -424,6 +444,144 @@ extension AppDatabase: ChatStore {
 
     public func searchConversations(matching query: String) async throws -> [ConversationSearchResult] {
         try await dbWriter.read { db in try Self.search(db, matching: query) }
+    }
+}
+
+// MARK: - Semantic search index
+
+/// A message the semantic index hasn't embedded yet.
+public struct MessageEmbeddingCandidate: Equatable, Sendable {
+    public let id: UUID
+    /// The message's sanitized search projection (same text FTS indexes).
+    public let text: String
+}
+
+/// Embedding storage + the hybrid (keyword ⊕ semantic) search entry point.
+/// Deliberately *not* part of `ChatStore`: vectors are derived, rebuildable
+/// data tied to this storage engine, like the FTS tables. The indexer and the
+/// search UI talk to `AppDatabase` directly (the accepted read-path coupling).
+public extension AppDatabase {
+    /// Completed user/assistant messages with searchable text that have no
+    /// stored vector for `model`, newest first (so a backfill makes recent
+    /// chats semantically searchable soonest).
+    func messagesNeedingEmbedding(model: String, limit: Int) async throws -> [MessageEmbeddingCandidate] {
+        try await dbWriter.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT m.id AS id, m.searchText AS text
+                    FROM message m
+                    LEFT JOIN message_embedding e
+                        ON e.messageId = m.id AND e.model = :model
+                    WHERE e.messageId IS NULL
+                      AND m.isComplete
+                      AND m.role IN ('user', 'assistant')
+                      AND trim(m.searchText) <> ''
+                    ORDER BY m.createdAt DESC
+                    LIMIT :limit
+                    """,
+                arguments: ["model": model, "limit": limit]
+            )
+            return rows.map { MessageEmbeddingCandidate(id: $0["id"], text: $0["text"]) }
+        }
+    }
+
+    /// Upsert one message's vector. An empty vector marks the message as
+    /// unembeddable (never retried, skipped by search). A no-op if the message
+    /// was deleted while the embedder ran.
+    func storeMessageEmbedding(messageId: UUID, model: String, vector: [Float]) async throws {
+        try await dbWriter.write { db in
+            guard try Message.exists(db, key: messageId) else { return }
+            try db.execute(
+                sql: """
+                    INSERT INTO message_embedding (messageId, model, vector, updatedAt)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(messageId) DO UPDATE SET
+                        model = excluded.model,
+                        vector = excluded.vector,
+                        updatedAt = excluded.updatedAt
+                    """,
+                arguments: [messageId, model, VectorCodec.encode(vector), Date()]
+            )
+        }
+    }
+
+    /// Hybrid search: FTS5 keyword results fused (reciprocal-rank) with
+    /// semantic nearest-message results. `queryVector` must come from the
+    /// embedder named by `model`; both lists are computed in one read so they
+    /// see the same snapshot.
+    func hybridSearchConversations(
+        matching query: String, queryVector: [Float], model: String
+    ) async throws -> [ConversationSearchResult] {
+        try await dbWriter.read { db in
+            HybridSearchRanker.fuse(
+                keyword: try Self.search(db, matching: query),
+                semantic: try Self.semanticSearch(db, queryVector: queryVector, model: model)
+            )
+        }
+    }
+
+    /// Drop a message's stored vector after its content is rewritten, so the
+    /// next indexer pass re-embeds the new text.
+    internal static func invalidateEmbedding(_ db: Database, messageId: UUID) throws {
+        try db.execute(
+            sql: "DELETE FROM message_embedding WHERE messageId = ?",
+            arguments: [messageId]
+        )
+    }
+
+    /// Conversations ranked by their best cosine hit against `queryVector`,
+    /// best first, capped at `limit`. Brute-force scan: a personal history is
+    /// thousands of vectors, well under a millisecond of dot products — no
+    /// vector index needed. Snippets come from the best-matching message.
+    internal static func semanticSearch(
+        _ db: Database, queryVector: [Float], model: String, limit: Int = 10
+    ) throws -> [ConversationSearchResult] {
+        guard !queryVector.isEmpty else { return [] }
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT e.vector AS vector, m.conversationId AS cid, m.searchText AS text
+                FROM message_embedding e
+                JOIN message m ON m.id = e.messageId
+                JOIN conversation c ON c.id = m.conversationId
+                WHERE e.model = ? AND c.deletedAt IS NULL AND length(e.vector) > 0
+                """,
+            arguments: [model]
+        )
+        struct BestHit {
+            var score: Float
+            var text: String
+        }
+        var bestByConversation: [UUID: BestHit] = [:]
+        for row in rows {
+            let vector = VectorCodec.decode(row["vector"])
+            guard vector.count == queryVector.count else { continue }
+            let score = VectorCodec.dot(vector, queryVector)
+            let cid: UUID = row["cid"]
+            if let current = bestByConversation[cid], current.score >= score { continue }
+            bestByConversation[cid] = BestHit(score: score, text: row["text"])
+        }
+        let top = bestByConversation.sorted { $0.value.score > $1.value.score }.prefix(limit)
+        guard !top.isEmpty else { return [] }
+        let conversations = try Conversation.filter(keys: top.map(\.key)).fetchAll(db)
+        let byID = Dictionary(uniqueKeysWithValues: conversations.map { ($0.id, $0) })
+        return top.compactMap { entry in
+            guard let conversation = byID[entry.key] else { return nil }
+            return ConversationSearchResult(
+                conversation: conversation,
+                snippet: semanticSnippet(entry.value.text)
+            )
+        }
+    }
+
+    /// A compact one-line preview of the matched message: whitespace collapsed,
+    /// clipped to roughly a list row.
+    private static func semanticSnippet(_ text: String) -> String? {
+        let collapsed = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard !collapsed.isEmpty else { return nil }
+        guard collapsed.count > 100 else { return collapsed }
+        return String(collapsed.prefix(100)) + "…"
     }
 }
 

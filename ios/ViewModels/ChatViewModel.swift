@@ -1263,6 +1263,8 @@ final class ChatViewModel {
         commitTask = Task { _ = await rowCommit.value }
         Task { [weak self] in
             guard await rowCommit.value else { return }
+            // New rows for the semantic search index (fire-and-forget).
+            self?.env?.indexSearchEmbeddings()
             await self?.cacheServerImages(messageID: messageID, content: content)
             try? await store.updateConversation(
                 id: conversationID, title: nil, modelID: nil, updatedAt: .now

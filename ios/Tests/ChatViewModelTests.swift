@@ -666,6 +666,7 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
     var requestedCalendarAuthorization = false
     var warmedModels: [String] = []
     var spokenTexts: [String] = []
+    var searchIndexRequests = 0
 
     private let client: ScriptedChatClient
     private let ollamaClient = ScriptedChatClient()
@@ -724,6 +725,10 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
 
     func speak(_ text: String, messageID: UUID) {
         spokenTexts.append(text)
+    }
+
+    func indexSearchEmbeddings() {
+        searchIndexRequests += 1
     }
 }
 
