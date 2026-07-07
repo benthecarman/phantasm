@@ -1,5 +1,6 @@
 import PhantasmKit
 import SwiftUI
+import UIKit
 
 /// Top-level navigation (Claude-style): the app opens straight into a chat with
 /// the composer ready. Conversation history lives in a slide-over drawer the
@@ -41,8 +42,15 @@ struct RootView: View {
                 }
             } else {
                 ZStack(alignment: .leading) {
+                    // Hit-testing off (not `.disabled`): toggling `disabled` flips
+                    // the `isEnabled` environment for the whole chat subtree, which
+                    // re-renders every visible message (MarkdownUI re-parse) on the
+                    // main thread right as the drawer opens — the drawer felt frozen
+                    // for the first second or two. The scrim already swallows taps;
+                    // this only needs the chat to stop hit-testing underneath it.
                     chatArea
-                        .disabled(isDrawerOpen)
+                        .allowsHitTesting(!isDrawerOpen)
+                        .accessibilityHidden(isDrawerOpen)
 
                     edgeOpenArea
                     scrim
@@ -190,6 +198,10 @@ struct RootView: View {
         .frame(width: drawerWidth)
         .frame(maxHeight: .infinity)
         .offset(x: drawerXOffset)
+        // UIKit pan (see HorizontalPanGesture): begins only on horizontal drags,
+        // so the history List's vertical scroll never contends with it. A SwiftUI
+        // drag here — exclusive or simultaneous — breaks the list's scrolling on
+        // iOS 26.
         .gesture(closeDragGesture)
         .allowsHitTesting(isDrawerOpen)
         .accessibilityHidden(!isDrawerOpen)
@@ -224,17 +236,18 @@ struct RootView: View {
     }
 
     /// Swipe the open drawer back to the left to dismiss it.
-    private var closeDragGesture: some Gesture {
-        DragGesture(minimumDistance: 8)
-            .onChanged { value in
-                guard isDrawerOpen, value.translation.width < 0 else { return }
-                dragOffset = value.translation.width
-            }
-            .onEnded { value in
+    private var closeDragGesture: HorizontalPanGesture {
+        HorizontalPanGesture(
+            onChanged: { translationX in
+                guard isDrawerOpen, translationX < 0 else { return }
+                dragOffset = translationX
+            },
+            onEnded: { translationX in
                 guard isDrawerOpen else { return }
-                if value.translation.width < -drawerWidth / 3 { closeDrawer() }
+                if translationX < -drawerWidth / 3 { closeDrawer() }
                 dragOffset = 0
             }
+        )
     }
 
     // MARK: Actions
@@ -282,6 +295,11 @@ struct RootView: View {
     private func openDrawer() {
         dragOffset = 0
         guard !isDrawerOpen else { return }
+        // Drop the composer keyboard. `.disabled` on the chat area used to force
+        // this as a side effect; with hit-testing-only blocking it must be explicit.
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil
+        )
         Haptics.selection()
         isDrawerOpen = true
     }

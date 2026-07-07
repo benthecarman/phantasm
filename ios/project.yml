@@ -121,6 +121,20 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         DEVELOPMENT_TEAM: "6JWFWV65BL"
         CODE_SIGN_STYLE: Automatic
+  PhantasmUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Phantasm
+    info:
+      path: UITests/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.phantasm.app.uitests
+        TEST_TARGET_NAME: Phantasm
   PhantasmTests:
     type: bundle.unit-test
     platform: iOS
@@ -145,3 +159,14 @@ schemes:
     test:
       targets:
         - PhantasmTests
+  # Separate scheme: the UI tests need a pre-seeded simulator (see
+  # UITests/SidebarScrollUITests.swift), so they must not gate the default
+  # `xcodebuild test` run.
+  PhantasmUITests:
+    build:
+      targets:
+        Phantasm: all
+        PhantasmUITests: [test]
+    test:
+      targets:
+        - PhantasmUITests

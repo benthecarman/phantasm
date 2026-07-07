@@ -218,16 +218,12 @@ private struct SwipeToDelete: ViewModifier {
     /// Measured row width, so a committed swipe slides the content fully off and
     /// the red fills the rest of the row.
     @State private var rowWidth: CGFloat = 0
-    /// Horizontal-vs-vertical intent, decided once at the start of a drag (nil =
-    /// undecided). Deciding up front — instead of re-checking width-vs-height
-    /// every frame — keeps the row tracking the finger through the final pixels of
-    /// a slide-back, where the cumulative horizontal delta shrinks below any
-    /// incidental vertical drift and a per-frame guard would freeze it.
-    @State private var horizontalDrag: Bool?
     /// Reused, pre-prepared generator — firing it is cheap, unlike building a
     /// fresh `UIImpactFeedbackGenerator` + `prepare()` on the main thread mid-drag
     /// (that synchronous spin-up was the stall felt when crossing the threshold).
-    @State private var armHaptic = UIImpactFeedbackGenerator(style: .rigid)
+    /// Shared across rows: a per-row `@State` default value re-allocated a
+    /// generator on every row struct init, which added up during list scrolling.
+    private static let armHaptic = UIImpactFeedbackGenerator(style: .rigid)
 
     /// Leftward drag distance past which releasing commits the delete.
     private let commitThreshold: CGFloat = 100
@@ -264,52 +260,44 @@ private struct SwipeToDelete: ViewModifier {
                 }
             }
             .clipped()
-            .simultaneousGesture(
-                // simultaneous (not exclusive) so the List keeps scrolling
-                // vertically and the row's tap still selects the chat.
-                DragGesture(minimumDistance: 12)
-                    .onChanged { value in
-                        // Decide direction once, on the first movement, then commit
-                        // to it for the rest of the drag (so the final pixels of a
-                        // slide-back still track the finger).
-                        if horizontalDrag == nil {
-                            horizontalDrag = abs(value.translation.width) > abs(value.translation.height)
-                            if horizontalDrag == true { armHaptic.prepare() }
+            // UIKit pan (see HorizontalPanGesture): a SwiftUI drag here would
+            // suppress the list's scroll pan on iOS 26.
+            .gesture(HorizontalPanGesture(
+                onBegan: { Self.armHaptic.prepare() },
+                onChanged: { translationX in
+                    // Track the finger but clamp closed at 0 — this lets you drag
+                    // back the whole way to fully shut it.
+                    offset = min(0, translationX)
+                    let nowArmed = -offset >= commitThreshold
+                    if nowArmed != armed {
+                        // Tick only when *arming* (crossing far enough), not when
+                        // backing off — a haptic on the slide-back is what stalled
+                        // it near the threshold.
+                        if nowArmed {
+                            Self.armHaptic.impactOccurred()
+                            Self.armHaptic.prepare()
                         }
-                        guard horizontalDrag == true else { return }
-                        // Track the finger but clamp closed at 0 — this lets you
-                        // drag back the whole way to fully shut it.
-                        offset = min(0, value.translation.width)
-                        let nowArmed = -offset >= commitThreshold
-                        if nowArmed != armed {
-                            // Tick only when *arming* (crossing far enough), not
-                            // when backing off — a haptic on the slide-back is what
-                            // stalled it near the threshold.
-                            if nowArmed {
-                                armHaptic.impactOccurred()
-                                armHaptic.prepare()
-                            }
-                            armed = nowArmed
-                        }
+                        armed = nowArmed
                     }
-                    .onEnded { _ in
-                        horizontalDrag = nil
-                        if offset < -commitThreshold {
-                            // Slide the content fully off so the red fills the rest
-                            // of the row, then delete after a short beat — long
-                            // enough to register the fill, short enough not to hang.
-                            let target = rowWidth > 0 ? -rowWidth : -2000
-                            withAnimation(.easeOut(duration: 0.18)) { offset = target }
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                                action()
-                            }
-                        } else {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                offset = 0
-                            }
-                            armed = false
+                },
+                onEnded: { _ in
+                    if offset < -commitThreshold {
+                        // Slide the content fully off so the red fills the rest
+                        // of the row, then delete after a short beat — long
+                        // enough to register the fill, short enough not to hang.
+                        let target = rowWidth > 0 ? -rowWidth : -2000
+                        withAnimation(.easeOut(duration: 0.18)) { offset = target }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                            action()
                         }
+                    } else {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                            offset = 0
+                        }
+                        armed = false
                     }
-            )
+                }
+            ))
     }
 }
+
