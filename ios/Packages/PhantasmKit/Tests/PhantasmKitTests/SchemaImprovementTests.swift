@@ -158,6 +158,29 @@ final class SchemaImprovementTests: XCTestCase {
         XCTAssertNil(fetched?.turnModeID)
     }
 
+    // MARK: - On-disk store
+
+    func testOnDiskStoreReopensWithDataIntact() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("phantasm.sqlite")
+
+        let convo = Conversation(title: "Keep me")
+        do {
+            let db = try AppDatabase.open(at: url)
+            try await db.insertConversation(convo)
+        }
+        let reopened = try AppDatabase.open(at: url)
+        let fetched = try await reopened.reader.read { db in
+            try Conversation.fetchOne(db, key: convo.id)
+        }
+        XCTAssertEqual(fetched?.title, "Keep me")
+    }
+
+    // MARK: - Tool settings forward compatibility
+
     func testToolSettingsDecodeDefaultsMissingKeys() throws {
         // A future field must decode to its default from rows written before
         // it existed — that's the whole point of the JSON column.

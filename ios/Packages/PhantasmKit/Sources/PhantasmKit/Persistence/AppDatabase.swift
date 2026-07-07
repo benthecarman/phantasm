@@ -29,27 +29,10 @@ public final class AppDatabase: Sendable {
         return try open(at: dir.appendingPathComponent("phantasm.sqlite"))
     }
 
-    /// Open (or create) the on-disk store at `url`. Internal so tests can
-    /// exercise the pre-release reset below against a scratch file.
+    /// Open (or create) an on-disk store at `url`. Internal so tests can
+    /// exercise on-disk behavior against a scratch file.
     static func open(at url: URL) throws -> AppDatabase {
-        let pool = try DatabasePool(path: url.path)
-        // Pre-release schema reset: the incremental migration lineage was
-        // collapsed into the single migration below before the first release.
-        // A store written by an older dev build carries applied identifiers
-        // this migrator has never heard of, and GRDB (correctly) refuses to
-        // migrate such a database. No released build ever produced one, so a
-        // superseded store is dev data: start fresh instead of dooming every
-        // session to the in-memory fallback.
-        if try pool.read({ try migrator.hasBeenSuperseded($0) }) {
-            let fm = FileManager.default
-            try pool.close()
-            try fm.removeItem(at: url)
-            // SQLite side files; usually gone after a clean close.
-            try? fm.removeItem(at: URL(fileURLWithPath: url.path + "-wal"))
-            try? fm.removeItem(at: URL(fileURLWithPath: url.path + "-shm"))
-            return try AppDatabase(DatabasePool(path: url.path))
-        }
-        return try AppDatabase(pool)
+        try AppDatabase(DatabasePool(path: url.path))
     }
 
     /// In-memory database for tests and SwiftUI previews.
@@ -61,13 +44,9 @@ public final class AppDatabase: Sendable {
 
     private static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
-        // The full schema in one migration. Pre-release, schema changes edit
-        // it in place — and MUST rename the identifier (bump the date suffix):
-        // a dev store that ran the old shape under the old name then reads as
-        // superseded and is reset by `makeShared`; under an unchanged name it
-        // would silently keep its stale shape. Post-release, changes append
-        // new migrations below instead.
-        migrator.registerMigration("v1_2026_07_07") { db in
+        // The schema as of first release. Applied migrations are immutable:
+        // schema changes append new migrations below — never edit this one.
+        migrator.registerMigration("v1") { db in
             try db.create(table: "conversation") { t in
                 t.primaryKey("id", .blob).notNull()
                 t.column("title", .text).notNull()
