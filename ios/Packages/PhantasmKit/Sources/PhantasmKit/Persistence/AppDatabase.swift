@@ -61,12 +61,13 @@ public final class AppDatabase: Sendable {
 
     private static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
-        // The full schema in one migration. The incremental lineage this
-        // replaced (v1–v11) predates the first release; no shipped build ever
-        // ran it, and `makeShared` resets any leftover dev store that did
-        // (`hasBeenSuperseded`). Post-release schema changes append new
-        // migrations below this one.
-        migrator.registerMigration("v1_initial_schema") { db in
+        // The full schema in one migration. Pre-release, schema changes edit
+        // it in place — and MUST rename the identifier (bump the date suffix):
+        // a dev store that ran the old shape under the old name then reads as
+        // superseded and is reset by `makeShared`; under an unchanged name it
+        // would silently keep its stale shape. Post-release, changes append
+        // new migrations below instead.
+        migrator.registerMigration("v1_2026_07_07") { db in
             try db.create(table: "conversation") { t in
                 t.primaryKey("id", .blob).notNull()
                 t.column("title", .text).notNull()
@@ -78,19 +79,14 @@ public final class AppDatabase: Sendable {
                 t.column("deletedAt", .datetime)
                 t.column("modelID", .text)
                 t.column("profileID", .blob)
-                // Per-chat tool selection. Server tools default on, matching
-                // a tools-enabled backend out of the box; the device tools
-                // default off — each is privacy-sensitive and triggers a
-                // system permission prompt.
-                t.column("webSearchEnabled", .boolean).notNull().defaults(to: true)
-                t.column("imageGenerationEnabled", .boolean).notNull().defaults(to: true)
-                t.column("locationEnabled", .boolean).notNull().defaults(to: false)
-                t.column("healthEnabled", .boolean).notNull().defaults(to: false)
-                t.column("calendarEnabled", .boolean).notNull().defaults(to: false)
+                // Per-chat tool selection as one JSON document (`ToolSettings`)
+                // so a new tool is a new field with a default, not a new
+                // column + migration.
+                t.column("toolSettings", .text).notNull()
                 // Selected research/turn mode (nil = ordinary turn). Reaches
-                // the wire only as a `<base>:<modeID>` model-id suffix
+                // the wire only as a `<base>:<mode>` model-id suffix
                 // (redesign §7).
-                t.column("modeID", .text)
+                t.column("turnModeID", .text)
             }
             try db.create(table: "message") { t in
                 t.primaryKey("id", .blob).notNull()
@@ -114,13 +110,16 @@ public final class AppDatabase: Sendable {
                 t.column("toolCalls", .text)
                 t.column("toolCallId", .text)
                 t.column("name", .text)
-                // What FTS indexes: `content` with inline base64 image
-                // payloads stripped. Indexing raw content would tokenize
-                // megabytes of base64 into FTS — slow commits, index bloat,
-                // garbage hits. Maintained by the store whenever `content`
-                // changes.
-                t.column("searchText", .text).notNull()
+                // Explicit per-conversation ordinal (assigned on insert under
+                // the write lock) — the one message order. `createdAt` is
+                // display-only: burst inserts collide at millisecond
+                // precision, and a restamp on completion must never reorder.
+                t.column("position", .integer).notNull()
             }
+            try db.create(
+                index: "message_conversation_position",
+                on: "message", columns: ["conversationId", "position"]
+            )
             try db.create(table: "attachment") { t in
                 t.primaryKey("id", .blob).notNull()
                 t.column("messageId", .blob).notNull()
@@ -134,29 +133,33 @@ public final class AppDatabase: Sendable {
                 t.column("updatedAt", .datetime).notNull()
             }
 
-            // Semantic search index: one vector per message, produced by the
-            // on-device embedder. `model` names the embedder revision —
-            // vectors from different revisions are never comparable, so a
-            // revision bump makes every row a re-embed candidate. An *empty*
-            // vector marks a message that failed to embed, so the indexer
-            // doesn't retry it forever. Rows cascade-delete with their
-            // message; content rewrites delete the row explicitly so the
+            // Semantic search index: one vector per message *per embedder
+            // revision* — vectors from different revisions are never
+            // comparable, so a revision bump re-embeds everything while the
+            // old generation keeps serving search until the indexer prunes
+            // it. An *empty* vector marks a message that failed to embed, so
+            // the indexer doesn't retry it forever. Rows cascade-delete with
+            // their message; content rewrites delete them explicitly so the
             // indexer re-embeds.
             try db.create(table: "message_embedding") { t in
-                t.primaryKey("messageId", .blob).notNull()
+                t.column("messageId", .blob).notNull()
                     .references("message", onDelete: .cascade)
                 t.column("model", .text).notNull()
                 t.column("vector", .blob).notNull()
                 t.column("updatedAt", .datetime).notNull()
+                t.primaryKey(["messageId", "model"])
             }
 
             // FTS5 external-content indexes, kept in sync by triggers that GRDB
             // installs via `synchronize(withTable:)`. unicode61 removes diacritics
             // by default; searches use prefix patterns for search-as-you-type.
+            // Indexing `content` directly is safe because the store extracts
+            // inline base64 images at write time (`InlineImageRef`), so content
+            // never carries megabyte payloads.
             try db.create(virtualTable: "message_ft", using: FTS5()) { t in
                 t.synchronize(withTable: "message")
                 t.tokenizer = .unicode61()
-                t.column("searchText")
+                t.column("content")
             }
             try db.create(virtualTable: "conversation_ft", using: FTS5()) { t in
                 t.synchronize(withTable: "conversation")
@@ -174,6 +177,7 @@ private enum Col {
     static let conversationId = Column("conversationId")
     static let deletedAt = Column("deletedAt")
     static let createdAt = Column("createdAt")
+    static let position = Column("position")
 }
 
 // MARK: - ChatStore
@@ -188,7 +192,12 @@ extension AppDatabase: ChatStore {
 
     public func insertMessage(_ message: Message, attachments: [Attachment]) async throws {
         try await dbWriter.write { db in
+            var message = message
+            message.position = try Self.nextPosition(db, conversationId: message.conversationId)
+            let inline = InlineImageRef.extract(message.content)
+            message.content = inline.text
             try message.insert(db)
+            try Self.insertInlineImages(db, inline.images, messageId: message.id)
             for attachment in attachments {
                 try attachment.insert(db)
             }
@@ -215,10 +224,10 @@ extension AppDatabase: ChatStore {
     ) async throws {
         try await dbWriter.write { db in
             guard var message = try Message.fetchOne(db, key: id) else { return }
-            message.content = content
-            message.searchText = Message.searchProjection(content)
+            try Self.rewriteContent(db, of: &message, to: content)
             message.reasoning = reasoning
             message.isComplete = isComplete
+            // Display-only restamp: ordering is `position`, so this can't reorder.
             if let createdAt { message.createdAt = createdAt }
             message.updatedAt = Date()
             try message.update(db)
@@ -230,8 +239,7 @@ extension AppDatabase: ChatStore {
         try await dbWriter.write { db in
             guard var message = try Message.fetchOne(db, key: id) else { return }
             message.toolCalls = toolCalls
-            message.content = content
-            message.searchText = Message.searchProjection(content)
+            try Self.rewriteContent(db, of: &message, to: content)
             message.isComplete = true
             message.updatedAt = Date()
             try message.update(db)
@@ -259,21 +267,13 @@ extension AppDatabase: ChatStore {
 
     public func setConversationOptions(
         id: UUID,
-        webSearchEnabled: Bool,
-        imageGenerationEnabled: Bool,
-        locationEnabled: Bool,
-        healthEnabled: Bool,
-        calendarEnabled: Bool,
-        modeID: String?
+        toolSettings: ToolSettings,
+        turnModeID: String?
     ) async throws {
         try await dbWriter.write { db in
             guard var convo = try Conversation.fetchOne(db, key: id) else { return }
-            convo.webSearchEnabled = webSearchEnabled
-            convo.imageGenerationEnabled = imageGenerationEnabled
-            convo.locationEnabled = locationEnabled
-            convo.healthEnabled = healthEnabled
-            convo.calendarEnabled = calendarEnabled
-            convo.modeID = modeID
+            convo.toolSettings = toolSettings
+            convo.turnModeID = turnModeID
             try convo.update(db)
         }
     }
@@ -284,10 +284,9 @@ extension AppDatabase: ChatStore {
             let now = Date()
             // Truncate everything after the edited message (cascades to
             // attachments + fires the FTS triggers), then update it in place.
-            try Self.messagesAfter(db, message, inclusive: false)
+            try Self.messagesAfter(message, inclusive: false)
                 .deleteAll(db)
-            message.content = newContent
-            message.searchText = Message.searchProjection(newContent)
+            try Self.rewriteContent(db, of: &message, to: newContent)
             message.updatedAt = now
             try message.update(db)
             try Self.invalidateEmbedding(db, messageId: id)
@@ -305,7 +304,7 @@ extension AppDatabase: ChatStore {
             let now = Date()
             // Delete this message and everything after it (cascades to attachments
             // + fires the FTS triggers).
-            try Self.messagesAfter(db, message, inclusive: true)
+            try Self.messagesAfter(message, inclusive: true)
                 .deleteAll(db)
             if var convo = try Conversation.fetchOne(db, key: message.conversationId) {
                 convo.updatedAt = now
@@ -320,7 +319,7 @@ extension AppDatabase: ChatStore {
             let now = Date()
             // Keep this message; delete everything after it (cascades to
             // attachments + fires the FTS triggers).
-            try Self.messagesAfter(db, message, inclusive: false)
+            try Self.messagesAfter(message, inclusive: false)
                 .deleteAll(db)
             if var convo = try Conversation.fetchOne(db, key: message.conversationId) {
                 convo.updatedAt = now
@@ -360,23 +359,53 @@ extension AppDatabase: ChatStore {
         try await dbWriter.read { db in try Self.conversationDetail(db, id: id) }
     }
 
-    /// Messages at or after `message` in its conversation, in (createdAt, rowid)
-    /// order. rowid breaks same-millisecond ties (burst inserts from the tool
-    /// flow), so truncation never deletes/keeps the wrong sibling.
+    /// Messages at or after `message` in its conversation, by `position`.
     private static func messagesAfter(
-        _ db: Database, _ message: Message, inclusive: Bool
-    ) throws -> QueryInterfaceRequest<Message> {
-        let anchorRowid = try Message
-            .filter(key: message.id)
-            .select(Column.rowID, as: Int64.self)
-            .fetchOne(db) ?? Int64.max
-        let tiebreaker = inclusive ? Column.rowID >= anchorRowid : Column.rowID > anchorRowid
-        return Message
+        _ message: Message, inclusive: Bool
+    ) -> QueryInterfaceRequest<Message> {
+        Message
             .filter(Col.conversationId == message.conversationId)
-            .filter(
-                Col.createdAt > message.createdAt
-                    || (Col.createdAt == message.createdAt && tiebreaker)
-            )
+            .filter(inclusive ? Col.position >= message.position : Col.position > message.position)
+    }
+
+    /// The next per-conversation ordinal. Runs inside the write transaction,
+    /// so two inserts can never claim the same position.
+    private static func nextPosition(_ db: Database, conversationId: UUID) throws -> Int {
+        try Int.fetchOne(
+            db,
+            sql: "SELECT COALESCE(MAX(position), 0) + 1 FROM message WHERE conversationId = ?",
+            arguments: [conversationId]
+        ) ?? 1
+    }
+
+    /// Replace a message's content, re-extracting inline images: previously
+    /// extracted rows for it are dropped (their links are gone from the new
+    /// text) and any data-URI images in the new text become fresh rows. Callers
+    /// still `update(db)` the message afterwards.
+    private static func rewriteContent(
+        _ db: Database, of message: inout Message, to content: String
+    ) throws {
+        try Attachment
+            .filter(Column("messageId") == message.id)
+            .filter(Column("kind") == AttachmentKind.inlineImage.rawValue)
+            .deleteAll(db)
+        let inline = InlineImageRef.extract(content)
+        message.content = inline.text
+        try insertInlineImages(db, inline.images, messageId: message.id)
+    }
+
+    private static func insertInlineImages(
+        _ db: Database, _ images: [InlineImageRef.ExtractedImage], messageId: UUID
+    ) throws {
+        for image in images {
+            try Attachment(
+                messageId: messageId,
+                kind: .inlineImage,
+                name: image.name,
+                data: image.data,
+                mimeType: image.mime
+            ).insert(db)
+        }
     }
 
     public func searchConversations(matching query: String) async throws -> [ConversationSearchResult] {
@@ -389,7 +418,8 @@ extension AppDatabase: ChatStore {
 /// A message the semantic index hasn't embedded yet.
 public struct MessageEmbeddingCandidate: Equatable, Sendable {
     public let id: UUID
-    /// The message's sanitized search projection (same text FTS indexes).
+    /// The message content (clean text — inline images are extracted to
+    /// attachment rows before content is persisted).
     public let text: String
 }
 
@@ -406,14 +436,14 @@ public extension AppDatabase {
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                    SELECT m.id AS id, m.searchText AS text
+                    SELECT m.id AS id, m.content AS text
                     FROM message m
                     LEFT JOIN message_embedding e
                         ON e.messageId = m.id AND e.model = :model
                     WHERE e.messageId IS NULL
                       AND m.isComplete
                       AND m.role IN ('user', 'assistant')
-                      AND trim(m.searchText) <> ''
+                      AND trim(m.content) <> ''
                     ORDER BY m.createdAt DESC
                     LIMIT :limit
                     """,
@@ -433,12 +463,23 @@ public extension AppDatabase {
                 sql: """
                     INSERT INTO message_embedding (messageId, model, vector, updatedAt)
                     VALUES (?, ?, ?, ?)
-                    ON CONFLICT(messageId) DO UPDATE SET
-                        model = excluded.model,
+                    ON CONFLICT(messageId, model) DO UPDATE SET
                         vector = excluded.vector,
                         updatedAt = excluded.updatedAt
                     """,
                 arguments: [messageId, model, VectorCodec.encode(vector), Date()]
+            )
+        }
+    }
+
+    /// Drop vectors from embedder revisions other than `model`. Called once a
+    /// full indexing pass has the current revision covering everything, so an
+    /// old generation serves search during re-embedding but doesn't linger.
+    func pruneEmbeddings(keepingModel model: String) async throws {
+        try await dbWriter.write { db in
+            try db.execute(
+                sql: "DELETE FROM message_embedding WHERE model <> ?",
+                arguments: [model]
             )
         }
     }
@@ -478,7 +519,7 @@ public extension AppDatabase {
         let rows = try Row.fetchAll(
             db,
             sql: """
-                SELECT e.vector AS vector, m.conversationId AS cid, m.searchText AS text
+                SELECT e.vector AS vector, m.conversationId AS cid, m.content AS text
                 FROM message_embedding e
                 JOIN message m ON m.id = e.messageId
                 JOIN conversation c ON c.id = m.conversationId
@@ -536,17 +577,13 @@ public extension AppDatabase {
             .fetchAll(db)
     }
 
-    /// A conversation's messages in chronological order, each with its ordered
-    /// attachments. Empty when the conversation is missing or tombstoned.
+    /// A conversation's messages in conversation order (`position`), each with
+    /// its ordered attachments. Empty when the conversation is missing or
+    /// tombstoned.
     static func messages(_ db: Database, conversationId: UUID) throws -> [ChatMessage] {
-        // rowid breaks createdAt ties: the auto-resolved tool flow inserts an
-        // assistant tool_calls row and its tool result back-to-back, and Date
-        // storage is millisecond-precision — an unspecified tie order could emit
-        // the tool result before its tool_calls row in the wire history, which
-        // strict OpenAI backends reject.
         let messages = try Message
             .filter(Col.conversationId == conversationId)
-            .order(Col.createdAt, Column.rowID)
+            .order(Col.position)
             .fetchAll(db)
         let messageIDs = messages.map(\.id)
         let attachments = try Attachment

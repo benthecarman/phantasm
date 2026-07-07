@@ -80,19 +80,15 @@ public protocol ChatStore: Sendable {
         id: UUID, title: String?, modelID: String?, updatedAt: Date?
     ) async throws
 
-    /// Persist a conversation's per-chat tool selection (web search / image
-    /// generation / location) and selected research mode (`modeID`, nil =
-    /// ordinary). Does not bump `updatedAt`, so toggling doesn't reorder the
-    /// history. A no-op if the conversation doesn't exist yet (an unsent draft
-    /// carries its selection into the first send instead).
+    /// Persist a conversation's per-chat tool selection and selected
+    /// research/turn mode (`turnModeID`, nil = ordinary). Does not bump
+    /// `updatedAt`, so toggling doesn't reorder the history. A no-op if the
+    /// conversation doesn't exist yet (an unsent draft carries its selection
+    /// into the first send instead).
     func setConversationOptions(
         id: UUID,
-        webSearchEnabled: Bool,
-        imageGenerationEnabled: Bool,
-        locationEnabled: Bool,
-        healthEnabled: Bool,
-        calendarEnabled: Bool,
-        modeID: String?
+        toolSettings: ToolSettings,
+        turnModeID: String?
     ) async throws
 
     /// Edit a previously sent message in place and truncate the conversation

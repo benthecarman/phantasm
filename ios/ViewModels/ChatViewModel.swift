@@ -182,7 +182,7 @@ final class ChatViewModel {
     /// The selected research mode for this chat (e.g. `"deep-research"`), or `nil`
     /// for an ordinary turn. It only reaches the wire as a model-id suffix at send
     /// time (redesign §7), gated on the backend advertising it.
-    var modeID: String? { conversation?.modeID }
+    var modeID: String? { conversation?.turnModeID }
 
     /// The research modes the active backend advertises whose needed tools are
     /// usable. Empty ⇒ no research UI. Drives the composer's mode picker.
@@ -277,23 +277,20 @@ final class ChatViewModel {
         calendar: Bool, modeID: String?
     ) {
         guard var conversation else { return }
-        conversation.webSearchEnabled = webSearch
-        conversation.imageGenerationEnabled = imageGeneration
-        conversation.locationEnabled = location
-        conversation.healthEnabled = health
-        conversation.calendarEnabled = calendar
-        conversation.modeID = modeID
+        let settings = ToolSettings(
+            webSearch: webSearch,
+            imageGeneration: imageGeneration,
+            location: location,
+            health: health,
+            calendar: calendar
+        )
+        conversation.toolSettings = settings
+        conversation.turnModeID = modeID
         self.conversation = conversation
         let id = conversation.id
         Task { [store] in
             try? await store?.setConversationOptions(
-                id: id,
-                webSearchEnabled: webSearch,
-                imageGenerationEnabled: imageGeneration,
-                locationEnabled: location,
-                healthEnabled: health,
-                calendarEnabled: calendar,
-                modeID: modeID
+                id: id, toolSettings: settings, turnModeID: modeID
             )
         }
     }

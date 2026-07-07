@@ -236,7 +236,7 @@ final class CapabilityDecodeTests: XCTestCase {
     }
 
     func testWireModelAppendsModeSuffixWhenAdvertisedAndToolCapable() {
-        let convo = Conversation(modeID: "deep-research")
+        let convo = Conversation(turnModeID: "deep-research")
         let modes = [
             Capabilities.Mode(
                 id: "deep-research",
@@ -251,7 +251,7 @@ final class CapabilityDecodeTests: XCTestCase {
     }
 
     func testWireModelStaysBareWhenModeUnselected() {
-        let convo = Conversation(modeID: nil)
+        let convo = Conversation(turnModeID: nil)
         let modes = [
             Capabilities.Mode(
                 id: "deep-research",
@@ -266,7 +266,7 @@ final class CapabilityDecodeTests: XCTestCase {
     }
 
     func testWireModelStaysBareWhenBackendDoesNotAdvertiseMode() {
-        let convo = Conversation(modeID: "deep-research")
+        let convo = Conversation(turnModeID: "deep-research")
         XCTAssertEqual(
             convo.wireModel(base: "qwen2.5:14b", availableModes: [], baseModelIsToolCapable: true),
             "qwen2.5:14b"
@@ -274,7 +274,7 @@ final class CapabilityDecodeTests: XCTestCase {
     }
 
     func testWireModelStaysBareWhenBaseModelNotToolCapable() {
-        let convo = Conversation(modeID: "deep-research")
+        let convo = Conversation(turnModeID: "deep-research")
         let modes = [
             Capabilities.Mode(
                 id: "deep-research",
@@ -315,7 +315,7 @@ final class CapabilityDecodeTests: XCTestCase {
 
     func testRequestedToolNamesIntersectsBackendAndChatToggles() {
         // Web access on, image gen off -> network tools + always-on utilities, no images.
-        let convo = Conversation(webSearchEnabled: true, imageGenerationEnabled: false)
+        let convo = Conversation(toolSettings: ToolSettings(webSearch: true, imageGeneration: false))
         XCTAssertEqual(
             convo.requestedToolNames(supporting: standardSelectors()),
             ["calculator", "unit_convert", "ocr", ToolName.webSearch, "weather"]
@@ -324,7 +324,7 @@ final class CapabilityDecodeTests: XCTestCase {
 
     func testRequestedToolNamesKeepsUtilitiesWhenWebAccessDisabled() {
         // The bug fix: disabling web access must NOT disable the offline tools.
-        let convo = Conversation(webSearchEnabled: false, imageGenerationEnabled: false)
+        let convo = Conversation(toolSettings: ToolSettings(webSearch: false, imageGeneration: false))
         XCTAssertEqual(
             convo.requestedToolNames(supporting: standardSelectors()),
             ["calculator", "unit_convert", "ocr"]
@@ -340,19 +340,19 @@ final class CapabilityDecodeTests: XCTestCase {
                 tools: [ToolName.webSearch]
             )
         ]
-        let convo = Conversation(webSearchEnabled: true, imageGenerationEnabled: true)
+        let convo = Conversation(toolSettings: ToolSettings(webSearch: true, imageGeneration: true))
         XCTAssertEqual(convo.requestedToolNames(supporting: tools), [ToolName.webSearch])
     }
 
     func testRequestedToolNamesEmptyWhenNoUtilitiesAndTogglesOff() {
         // No offline bucket advertised; both toggles off -> nothing requested.
         let tools = toolSelectors(ToolSelectorName.webSearch, ToolSelectorName.imageGeneration)
-        let convo = Conversation(webSearchEnabled: false, imageGenerationEnabled: false)
+        let convo = Conversation(toolSettings: ToolSettings(webSearch: false, imageGeneration: false))
         XCTAssertEqual(convo.requestedToolNames(supporting: tools), [])
     }
 
     func testReasoningEffortUsesSavedThinkingPreference() {
-        let convo = Conversation(modeID: nil)
+        let convo = Conversation(turnModeID: nil)
 
         XCTAssertEqual(
             convo.reasoningEffort(thinkingEnabled: true, disabledEffort: ReasoningEffort.disabled),
@@ -370,7 +370,7 @@ final class CapabilityDecodeTests: XCTestCase {
     func testResearchModeDoesNotForceThinking() {
         // Thinking is independent of the research mode (redesign §7): selecting a
         // mode must not flip reasoning on.
-        let convo = Conversation(modeID: "deep-research")
+        let convo = Conversation(turnModeID: "deep-research")
 
         XCTAssertNil(
             convo.reasoningEffort(thinkingEnabled: false, disabledEffort: nil)

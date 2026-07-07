@@ -50,7 +50,13 @@ public actor EmbeddingIndexer {
         while true {
             guard let batch = try? await database.messagesNeedingEmbedding(
                 model: embedder.identifier, limit: batchSize
-            ), !batch.isEmpty else { return }
+            ) else { return }
+            if batch.isEmpty {
+                // Current revision covers everything: retire any vectors a
+                // previous embedder generation left behind.
+                try? await database.pruneEmbeddings(keepingModel: embedder.identifier)
+                return
+            }
             for candidate in batch {
                 let text = String(candidate.text.prefix(maxCharacters))
                 // A per-message failure stores an empty vector: the row is

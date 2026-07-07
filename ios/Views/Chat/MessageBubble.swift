@@ -29,7 +29,11 @@ struct MessageBubble: View {
     @FocusState private var editorFocused: Bool
 
     private var isUser: Bool { message.message.role == "user" }
-    private var content: String { message.message.content }
+    /// Persisted content with extracted inline images restored to data URIs
+    /// (memoized), so the markdown pipeline sees what the model produced.
+    private var content: String {
+        InlineImageRef.restore(message.message.content, images: message.inlineImages)
+    }
 
     /// Locally-cached server images for this message, keyed by file id, so
     /// references render from local bytes once fetched.

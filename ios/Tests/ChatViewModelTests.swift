@@ -400,7 +400,14 @@ final class ChatViewModelTests: XCTestCase {
         var detail = try await detail(store, conversation.id)
         XCTAssertEqual(detail.messages.map(\.message.role), ["user", "assistant", "tool"])
         XCTAssertEqual(detail.messages[1].message.toolCalls?.isEmpty, false)
-        XCTAssertEqual(detail.messages[1].message.content, "![img](data:image/png;base64,AA==)")
+        // The store extracts the image payload to an attachment row; the wire
+        // restores the exact data-URI markdown so the model re-sees it.
+        XCTAssertTrue(detail.messages[1].message.content.hasPrefix("![img](phantasm-file://"))
+        if case .text(let wire) = detail.messages[1].wireContent() {
+            XCTAssertEqual(wire, "![img](data:image/png;base64,AA==)")
+        } else {
+            XCTFail("expected plain text wire content")
+        }
         XCTAssertEqual(detail.messages[2].message.toolCallId, "time_call")
         XCTAssertEqual(detail.messages[2].message.name, ToolName.currentTime)
 

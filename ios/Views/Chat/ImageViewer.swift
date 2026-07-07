@@ -51,13 +51,15 @@ enum ConversationImages {
                     out.append(GalleryImage(id: "\(m.id):\(i)", data: att.data))
                 }
             } else {
-                // Mirror MarkdownMessageView: inline cached server images, then
-                // pull every base64 payload in appearance order.
+                // Mirror MessageBubble/MarkdownMessageView: restore extracted
+                // inline images, inline cached server images, then pull every
+                // base64 payload in appearance order.
                 var cache: [String: ServerImageRef.CachedImage] = [:]
                 for a in cm.attachments where a.kind == AttachmentKind.remoteImage.rawValue {
                     cache[a.name] = ServerImageRef.CachedImage(data: a.data, mime: a.mimeType)
                 }
-                let resolved = ServerImageRef.inlineCached(m.content, cache: cache)
+                let restored = InlineImageRef.restore(m.content, images: cm.inlineImages)
+                let resolved = ServerImageRef.inlineCached(restored, cache: cache)
                 let extracted = Base64ImageExtractor().extractCached(resolved)
                 for index in extracted.images.keys.sorted() {
                     if let data = extracted.images[index] {

@@ -41,7 +41,29 @@ final class SchemaResetTests: XCTestCase {
         let columns = try db.reader.read { db in
             try db.columns(in: "message").map(\.name)
         }
-        XCTAssertTrue(columns.contains("searchText"))
+        XCTAssertTrue(columns.contains("position"))
+    }
+
+    func testRenamedInitialMigrationResetsOldShape() throws {
+        // Pre-release convention: editing the initial migration in place
+        // renames its identifier, so a store created under the previous name
+        // (old shape, e.g. no `position` column) reads as superseded and resets.
+        do {
+            var old = DatabaseMigrator()
+            old.registerMigration("v1_initial_schema") { db in
+                try db.create(table: "message") { t in
+                    t.primaryKey("id", .blob).notNull()
+                }
+            }
+            let pool = try DatabasePool(path: storeURL.path)
+            try old.migrate(pool)
+            try pool.close()
+        }
+        let db = try AppDatabase.open(at: storeURL)
+        let columns = try db.reader.read { db in
+            try db.columns(in: "message").map(\.name)
+        }
+        XCTAssertTrue(columns.contains("position"))
     }
 
     func testCurrentStoreReopensWithDataIntact() async throws {

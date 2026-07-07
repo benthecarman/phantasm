@@ -5,7 +5,7 @@ import XCTest
 /// "semantic similarity" is scriptable without a real model. Vectors are
 /// normalized, matching the `TextEmbedder` contract.
 private struct StubEmbedder: TextEmbedder {
-    let identifier = "stub.v1"
+    var identifier = "stub.v1"
     /// keyword (contained in the text, case-insensitive) → vector
     var axes: [String: [Float]]
     var failsForTextContaining: Set<String> = []
@@ -181,12 +181,24 @@ final class HybridSearchTests: XCTestCase {
         XCTAssertTrue(hits.isEmpty)
     }
 
-    func testModelRevisionBumpInvalidatesOldVectors() async throws {
+    func testModelRevisionBumpReembedsAndPrunesOldGeneration() async throws {
         let db = try makeDatabase()
         try await insertConversation(db, title: "Chat", messages: ["trip planning"])
         await index(db, embedder: StubEmbedder(axes: travelAxes))
+
+        // The bumped revision sees the message as unembedded (old vectors are
+        // incomparable)…
         let pending = try await db.messagesNeedingEmbedding(model: "stub.v2", limit: 10)
         XCTAssertEqual(pending.count, 1)
+
+        // …and a full pass with the new revision retires the old generation.
+        var bumped = StubEmbedder(axes: travelAxes)
+        bumped.identifier = "stub.v2"
+        await index(db, embedder: bumped)
+        let models = try await db.reader.read { db in
+            try String.fetchAll(db, sql: "SELECT DISTINCT model FROM message_embedding")
+        }
+        XCTAssertEqual(models, ["stub.v2"])
     }
 
     // MARK: - Semantic + hybrid search

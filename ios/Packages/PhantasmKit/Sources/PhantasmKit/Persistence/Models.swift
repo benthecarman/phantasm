@@ -14,6 +14,44 @@ import GRDB
 /// lightweight tombstone, so a future cloud-sync layer can still propagate the
 /// deletion (SPEC §7). Column names match the property names.
 
+/// A conversation's per-chat tool selection, persisted as one JSON column so a
+/// new tool is a new field with a default — not a schema migration. Server
+/// tools default on (matching a tools-enabled backend out of the box); the
+/// device tools default off — each is privacy-sensitive and triggers a system
+/// permission prompt. The composer's tool selector flips them per chat.
+public struct ToolSettings: Codable, Equatable, Sendable {
+    public var webSearch: Bool
+    public var imageGeneration: Bool
+    public var location: Bool
+    public var health: Bool
+    public var calendar: Bool
+
+    public init(
+        webSearch: Bool = true,
+        imageGeneration: Bool = true,
+        location: Bool = false,
+        health: Bool = false,
+        calendar: Bool = false
+    ) {
+        self.webSearch = webSearch
+        self.imageGeneration = imageGeneration
+        self.location = location
+        self.health = health
+        self.calendar = calendar
+    }
+
+    /// Absent keys decode to their defaults, so adding a field never breaks
+    /// rows persisted before it existed.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        webSearch = try c.decodeIfPresent(Bool.self, forKey: .webSearch) ?? true
+        imageGeneration = try c.decodeIfPresent(Bool.self, forKey: .imageGeneration) ?? true
+        location = try c.decodeIfPresent(Bool.self, forKey: .location) ?? false
+        health = try c.decodeIfPresent(Bool.self, forKey: .health) ?? false
+        calendar = try c.decodeIfPresent(Bool.self, forKey: .calendar) ?? false
+    }
+}
+
 public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     FetchableRecord, PersistableRecord
 {
@@ -25,30 +63,14 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     public var deletedAt: Date?
     public var modelID: String?
     public var profileID: UUID?
-    /// Whether this chat wants the server's web-search tool offered (when the
-    /// backend supports it). Defaults on, so behavior matches a tools-enabled
-    /// backend out of the box; the composer's tool selector flips it per chat.
-    public var webSearchEnabled: Bool
-    /// Whether this chat wants the server's image-generation tool offered.
-    public var imageGenerationEnabled: Bool
-    /// Whether this chat wants the app-hosted location tool offered (when the
-    /// backend forwards app tools). Off by default — it's privacy-sensitive and
-    /// triggers a system permission prompt; the composer's tool selector flips it.
-    public var locationEnabled: Bool
-    /// Whether this chat wants the app-hosted health tool offered (when the backend
-    /// forwards app tools). Off by default — it's privacy-sensitive and triggers a
-    /// system permission prompt; the composer's tool selector flips it.
-    public var healthEnabled: Bool
-    /// Whether this chat wants the app-hosted calendar tool offered. Off by
-    /// default — it's privacy-sensitive and triggers a system permission prompt;
-    /// the composer's tool selector flips it.
-    public var calendarEnabled: Bool
-    /// The selected research/turn mode for this chat (e.g. `"deep-research"`), or
-    /// `nil` for an ordinary turn. It's the *UI preference*; at send time it
-    /// reaches the wire only as a suffix on the `model` id (`<base>:<modeID>`),
+    /// Per-chat tool selection (one JSON column; see `ToolSettings`).
+    public var toolSettings: ToolSettings
+    /// The selected research/turn mode for this chat (e.g. `"deep-research"`),
+    /// or `nil` for an ordinary turn. It's the *UI preference*; at send time it
+    /// reaches the wire only as a suffix on the `model` id (`<base>:<mode>`),
     /// and only when the backend advertises that mode. The composer's research
-    /// picker flips it.
-    public var modeID: String?
+    /// picker flips it. (Named to stay visually distinct from `modelID`.)
+    public var turnModeID: String?
     public init(
         id: UUID = UUID(),
         title: String = "New Chat",
@@ -57,12 +79,8 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         deletedAt: Date? = nil,
         modelID: String? = nil,
         profileID: UUID? = nil,
-        webSearchEnabled: Bool = true,
-        imageGenerationEnabled: Bool = true,
-        locationEnabled: Bool = false,
-        healthEnabled: Bool = false,
-        calendarEnabled: Bool = false,
-        modeID: String? = nil
+        toolSettings: ToolSettings = ToolSettings(),
+        turnModeID: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -71,15 +89,35 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
         self.deletedAt = deletedAt
         self.modelID = modelID
         self.profileID = profileID
-        self.webSearchEnabled = webSearchEnabled
-        self.imageGenerationEnabled = imageGenerationEnabled
-        self.locationEnabled = locationEnabled
-        self.healthEnabled = healthEnabled
-        self.calendarEnabled = calendarEnabled
-        self.modeID = modeID
+        self.toolSettings = toolSettings
+        self.turnModeID = turnModeID
     }
 
     public static let databaseTableName = "conversation"
+}
+
+public extension Conversation {
+    // Flat accessors for the composer/tool-menu call sites.
+    var webSearchEnabled: Bool {
+        get { toolSettings.webSearch }
+        set { toolSettings.webSearch = newValue }
+    }
+    var imageGenerationEnabled: Bool {
+        get { toolSettings.imageGeneration }
+        set { toolSettings.imageGeneration = newValue }
+    }
+    var locationEnabled: Bool {
+        get { toolSettings.location }
+        set { toolSettings.location = newValue }
+    }
+    var healthEnabled: Bool {
+        get { toolSettings.health }
+        set { toolSettings.health = newValue }
+    }
+    var calendarEnabled: Bool {
+        get { toolSettings.calendar }
+        set { toolSettings.calendar = newValue }
+    }
 }
 
 public extension Conversation {
@@ -111,7 +149,7 @@ public extension Conversation {
 
     /// The `model` string to send for this turn. When this chat has a research
     /// mode selected AND the backend advertises it (`availableModes`) AND the
-    /// base model is tool-capable, the mode rides as a suffix (`<base>:<modeID>`,
+    /// base model is tool-capable, the mode rides as a suffix (`<base>:<mode>`,
     /// resolved server-side, spec §2.1). Otherwise the bare base model — the only
     /// place mode reaches the wire (redesign §7).
     func wireModel(
@@ -119,11 +157,11 @@ public extension Conversation {
         availableModes: [Capabilities.Mode],
         baseModelIsToolCapable: Bool
     ) -> String {
-        guard let modeID,
+        guard let turnModeID,
               baseModelIsToolCapable,
-              availableModes.contains(where: { $0.id == modeID })
+              availableModes.contains(where: { $0.id == turnModeID })
         else { return base }
-        return "\(base):\(modeID)"
+        return "\(base):\(turnModeID)"
     }
 }
 
@@ -150,11 +188,11 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
     public var toolCallId: String?
     /// The tool name (a `tool`-role result), e.g. `ask_user`.
     public var name: String?
-    /// What the full-text index stores for this message: `content` with inline
-    /// base64 image payloads stripped. Indexing raw content tokenized megabytes
-    /// of base64 into FTS — slow commits, permanent index bloat, and garbage
-    /// search hits. Maintained by the store whenever `content` changes.
-    public var searchText: String
+    /// Explicit per-conversation ordinal, assigned by the store on insert.
+    /// This — not `createdAt` — is the message order: burst inserts from the
+    /// tool flow land in the same millisecond, and strict OpenAI backends
+    /// reject a history whose tool result precedes its `tool_calls` row.
+    public var position: Int
 
     public init(
         id: UUID = UUID(),
@@ -167,7 +205,8 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         isComplete: Bool = true,
         toolCalls: String? = nil,
         toolCallId: String? = nil,
-        name: String? = nil
+        name: String? = nil,
+        position: Int = 0
     ) {
         self.id = id
         self.conversationId = conversationId
@@ -180,13 +219,7 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
         self.name = name
-        self.searchText = Message.searchProjection(content)
-    }
-
-    /// The searchable projection of message content: inline base64 images are
-    /// reduced to a placeholder so their payloads never reach the FTS index.
-    public static func searchProjection(_ content: String) -> String {
-        Base64ImageExtractor.streamingSanitized(content)
+        self.position = position
     }
 
     public static let databaseTableName = "message"
@@ -203,6 +236,12 @@ public enum AttachmentKind: String, Sendable {
     /// expires and offline. `name` holds the server `<id>`. Deliberately *not*
     /// re-serialized to the wire by `wireContent()` — the reference already is.
     case remoteImage = "remote_image"
+    /// A generated image the store extracted from inline base64 markdown at
+    /// persist time (see `InlineImageRef`): the content keeps a compact
+    /// `phantasm-file://<name>` link, these bytes back it. Restored into the
+    /// content — not serialized as image parts — by `wireContent()`, so history
+    /// round-trips the exact markdown the model produced.
+    case inlineImage = "inline_image"
 }
 
 public struct Attachment: Identifiable, Codable, Equatable, Sendable,
@@ -265,16 +304,30 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
         self.attachments = attachments
     }
 
+    /// Bytes of the message's extracted inline images, keyed by their
+    /// `phantasm-file://<name>` link name — the restore input for both the
+    /// wire (`wireContent`) and the renderer.
+    public var inlineImages: [String: ServerImageRef.CachedImage] {
+        var out: [String: ServerImageRef.CachedImage] = [:]
+        for a in attachments where a.kind == AttachmentKind.inlineImage.rawValue {
+            out[a.name] = ServerImageRef.CachedImage(data: a.data, mime: a.mimeType)
+        }
+        return out
+    }
+
     /// The wire body for this message. Plain text unless the message carries
     /// attachments; image attachments become `image_url` parts and text files
     /// are inlined as additional text (so non-vision models still get them).
+    /// Extracted inline images are restored into the text as the data-URI
+    /// markdown the model originally produced.
     public func wireContent() -> WireContent {
+        let content = InlineImageRef.restore(message.content, images: inlineImages)
         let images = attachments.filter { $0.kind == AttachmentKind.image.rawValue }
         let files = attachments.filter { $0.kind == AttachmentKind.text.rawValue }
-        guard !images.isEmpty || !files.isEmpty else { return .text(message.content) }
+        guard !images.isEmpty || !files.isEmpty else { return .text(content) }
 
         var textBlocks: [String] = []
-        if !message.content.isEmpty { textBlocks.append(message.content) }
+        if !content.isEmpty { textBlocks.append(content) }
         for file in files {
             textBlocks.append("Attached file \"\(file.name)\":\n\(file.text)")
         }
