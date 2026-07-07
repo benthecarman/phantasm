@@ -298,7 +298,16 @@ pub async fn run_workflow(
             msg = ws.next() => match msg {
                 Some(Ok(Message::Text(txt))) => {
                     let prev_pct = last_pct;
-                    let done = handle_ws_message(&txt, &prompt_id, &mut last_pct, tx).await;
+                    let done = match handle_ws_message(&txt, &prompt_id, &mut last_pct, tx).await {
+                        Ok(done) => done,
+                        Err(e) => {
+                            // ComfyUI has already completed this prompt with a
+                            // backend-side error; do not let the drop guard send
+                            // a global interrupt that could hit the next prompt.
+                            interrupt.prompt_id = None;
+                            return Err(e);
+                        }
+                    };
                     // Once our prompt is seen executing, a drop/bail-out may use
                     // the global /interrupt (before that, only the queue delete).
                     interrupt.executing = execution_started(last_pct);
@@ -458,14 +467,27 @@ async fn handle_ws_message(
     prompt_id: &str,
     last_pct: &mut i64,
     tx: &mpsc::Sender<TurnEvent>,
-) -> Option<bool> {
-    let v: Value = serde_json::from_str(txt).ok()?;
-    let kind = v.get("type")?.as_str()?;
+) -> Result<Option<bool>, String> {
+    let v: Value = match serde_json::from_str(txt) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let Some(kind) = v.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
     let data = v.get("data");
     match kind {
         "progress" => {
-            let value = data?.get("value")?.as_i64()?;
-            let max = data?.get("max")?.as_i64().filter(|m| *m > 0)?;
+            let Some(value) = data.and_then(|d| d.get("value")).and_then(Value::as_i64) else {
+                return Ok(None);
+            };
+            let Some(max) = data
+                .and_then(|d| d.get("max"))
+                .and_then(Value::as_i64)
+                .filter(|m| *m > 0)
+            else {
+                return Ok(None);
+            };
             let pct = (value * 100 / max).clamp(0, 100);
             // Once we've advanced to the finishing phase (101), ignore a trailing
             // full-progress frame: ComfyUI sometimes emits a final value==max after
@@ -475,7 +497,7 @@ async fn handle_ws_message(
             // second sampler) restarts at a low pct, so it still falls through and
             // resumes the determinate bar.
             if *last_pct == 101 && pct >= 100 {
-                return Some(false);
+                return Ok(Some(false));
             }
             if pct != *last_pct {
                 *last_pct = pct;
@@ -486,14 +508,17 @@ async fn handle_ws_message(
                     })
                     .await;
             }
-            Some(false)
+            Ok(Some(false))
         }
         "executing" => {
-            let node_is_null = data?.get("node").map(|n| n.is_null()).unwrap_or(false);
-            let same_prompt = data?.get("prompt_id").and_then(|p| p.as_str()) == Some(prompt_id);
+            let Some(data) = data else {
+                return Ok(None);
+            };
+            let node_is_null = data.get("node").map(|n| n.is_null()).unwrap_or(false);
+            let same_prompt = data.get("prompt_id").and_then(|p| p.as_str()) == Some(prompt_id);
             // `node: null` for our prompt signals completion (older ComfyUI).
             if node_is_null {
-                return Some(same_prompt);
+                return Ok(Some(same_prompt));
             }
             if same_prompt && *last_pct == -2 {
                 // First sign of execution, before any determinate progress (-2
@@ -515,17 +540,87 @@ async fn handle_ws_message(
                 *last_pct = 101;
                 let _ = tx.send(TurnEvent::Status(STATUS_FINISHING.into())).await;
             }
-            Some(false)
+            Ok(Some(false))
         }
         // Newer ComfyUI signals completion with `execution_success` instead of an
         // `executing` frame carrying `node: null`. Honor both so generation
         // doesn't run to `comfy_timeout_s` on those versions.
         "execution_success" => {
-            let same_prompt = data?.get("prompt_id").and_then(|p| p.as_str()) == Some(prompt_id);
-            Some(same_prompt)
+            let same_prompt = data
+                .and_then(|d| d.get("prompt_id"))
+                .and_then(Value::as_str)
+                == Some(prompt_id);
+            Ok(Some(same_prompt))
         }
-        _ => Some(false),
+        "execution_error" => {
+            let same_prompt = data
+                .and_then(|d| d.get("prompt_id"))
+                .and_then(Value::as_str)
+                == Some(prompt_id);
+            if same_prompt {
+                Err(format_execution_error(data))
+            } else {
+                Ok(Some(false))
+            }
+        }
+        "execution_interrupted" => {
+            let same_prompt = data
+                .and_then(|d| d.get("prompt_id"))
+                .and_then(Value::as_str)
+                == Some(prompt_id);
+            if same_prompt {
+                Err("ComfyUI execution interrupted".into())
+            } else {
+                Ok(Some(false))
+            }
+        }
+        _ => Ok(Some(false)),
     }
+}
+
+fn format_execution_error(data: Option<&Value>) -> String {
+    let node = data
+        .and_then(|d| d.get("node_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+    let node_type = data
+        .and_then(|d| d.get("node_type"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+    let exception_type = data
+        .and_then(|d| d.get("exception_type"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+    let message = data
+        .and_then(|d| d.get("exception_message"))
+        .and_then(Value::as_str)
+        .map(clean_error_message)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown error".into());
+
+    let mut out = String::from("ComfyUI execution failed");
+    match (node, node_type) {
+        (Some(node), Some(node_type)) => out.push_str(&format!(" at node {node} ({node_type})")),
+        (Some(node), None) => out.push_str(&format!(" at node {node}")),
+        (None, Some(node_type)) => out.push_str(&format!(" in {node_type}")),
+        (None, None) => {}
+    }
+    out.push_str(": ");
+    if let Some(exception_type) = exception_type {
+        out.push_str(exception_type);
+        out.push_str(": ");
+    }
+    out.push_str(&message);
+    out
+}
+
+fn clean_error_message(raw: &str) -> String {
+    const MAX: usize = 500;
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX {
+        return compact;
+    }
+    format!("{}...", compact.chars().take(MAX).collect::<String>())
 }
 
 async fn fetch_image(
@@ -777,13 +872,45 @@ mod tests {
         let msg = r#"{"type":"execution_success","data":{"prompt_id":"pid"}}"#;
         assert_eq!(
             handle_ws_message(msg, "pid", &mut last, &tx).await,
-            Some(true)
+            Ok(Some(true))
         );
         // A success frame for a different prompt must not end our wait.
         let other = r#"{"type":"execution_success","data":{"prompt_id":"nope"}}"#;
         assert_eq!(
             handle_ws_message(other, "pid", &mut last, &tx).await,
-            Some(false)
+            Ok(Some(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_error_returns_backend_cause() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut last = -1;
+        let msg = r#"{"type":"execution_error","data":{
+            "prompt_id":"pid",
+            "node_id":"6",
+            "node_type":"CLIPTextEncode",
+            "exception_type":"RuntimeError",
+            "exception_message":"VRAM grow failed: 263192576 bytes\n",
+            "current_inputs":{"text":["do not include this prompt"]}
+        }}"#;
+
+        let err = handle_ws_message(msg, "pid", &mut last, &tx)
+            .await
+            .expect_err("same-prompt execution_error must fail");
+        assert_eq!(
+            err,
+            "ComfyUI execution failed at node 6 (CLIPTextEncode): RuntimeError: VRAM grow failed: 263192576 bytes"
+        );
+        assert!(
+            !err.contains("do not include"),
+            "tool errors must not leak prompt/input content"
+        );
+
+        let other = msg.replace("\"prompt_id\":\"pid\"", "\"prompt_id\":\"other\"");
+        assert_eq!(
+            handle_ws_message(&other, "pid", &mut last, &tx).await,
+            Ok(Some(false))
         );
     }
 
@@ -797,14 +924,14 @@ mod tests {
         // First non-null executing frame for our prompt → one heartbeat, not done.
         assert_eq!(
             handle_ws_message(frame, "pid", &mut last, &tx).await,
-            Some(false)
+            Ok(Some(false))
         );
         assert!(matches!(rx.try_recv(), Ok(TurnEvent::Status(s)) if s == STATUS_LOADING_MODEL));
 
         // Subsequent executing frames stay quiet (heartbeat already advanced to -1).
         assert_eq!(
             handle_ws_message(frame, "pid", &mut last, &tx).await,
-            Some(false)
+            Ok(Some(false))
         );
         assert!(rx.try_recv().is_err());
     }
@@ -819,14 +946,14 @@ mod tests {
         // A node still running after sampling (VAE decode/save) → "finishing up…".
         assert_eq!(
             handle_ws_message(frame, "pid", &mut last, &tx).await,
-            Some(false)
+            Ok(Some(false))
         );
         assert!(matches!(rx.try_recv(), Ok(TurnEvent::Status(s)) if s == STATUS_FINISHING));
 
         // Further post-sampling nodes stay quiet (advanced to 101).
         assert_eq!(
             handle_ws_message(frame, "pid", &mut last, &tx).await,
-            Some(false)
+            Ok(Some(false))
         );
         assert!(rx.try_recv().is_err());
     }
@@ -841,7 +968,7 @@ mod tests {
         let full = r#"{"type":"progress","data":{"value":20,"max":20}}"#;
         assert_eq!(
             handle_ws_message(full, "pid", &mut last, &tx).await,
-            Some(false)
+            Ok(Some(false))
         );
         assert_eq!(last, 101); // unchanged
         assert!(rx.try_recv().is_err()); // no event emitted
@@ -850,7 +977,7 @@ mod tests {
         let low = r#"{"type":"progress","data":{"value":2,"max":20}}"#;
         assert_eq!(
             handle_ws_message(low, "pid", &mut last, &tx).await,
-            Some(false)
+            Ok(Some(false))
         );
         assert_eq!(last, 10);
         assert!(matches!(
@@ -867,12 +994,12 @@ mod tests {
         // drop guard must NOT be allowed to fire the global /interrupt (that
         // would abort the other turn's generation).
         let other = r#"{"type":"executing","data":{"node":"3","prompt_id":"other"}}"#;
-        handle_ws_message(other, "pid", &mut last, &tx).await;
+        let _ = handle_ws_message(other, "pid", &mut last, &tx).await;
         assert!(!execution_started(last));
 
         // Our own executing frame flips it: the interrupt is now about us.
         let ours = r#"{"type":"executing","data":{"node":"3","prompt_id":"pid"}}"#;
-        handle_ws_message(ours, "pid", &mut last, &tx).await;
+        let _ = handle_ws_message(ours, "pid", &mut last, &tx).await;
         assert!(execution_started(last));
     }
 
@@ -882,7 +1009,7 @@ mod tests {
         let mut last = -2;
         assert!(!execution_started(last), "queued-only must not interrupt");
         let progress = r#"{"type":"progress","data":{"value":1,"max":20}}"#;
-        handle_ws_message(progress, "pid", &mut last, &tx).await;
+        let _ = handle_ws_message(progress, "pid", &mut last, &tx).await;
         assert!(execution_started(last));
     }
 
@@ -893,7 +1020,7 @@ mod tests {
         let done = r#"{"type":"executing","data":{"node":null,"prompt_id":"pid"}}"#;
         assert_eq!(
             handle_ws_message(done, "pid", &mut last, &tx).await,
-            Some(true)
+            Ok(Some(true))
         );
     }
 

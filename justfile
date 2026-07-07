@@ -107,3 +107,21 @@ vllm-test:
     sleep 2
   done
   REAL_UPSTREAM_TEST_THINKING=1 REAL_UPSTREAM_TEST_TOOLS=1 just _real-upstream-test vllm "$base" "$model"
+
+comfy-test env_file="/etc/phantasm/orchestrator.env":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  command -v curl >/dev/null || { echo "curl not found" >&2; exit 1; }
+  env_file="{{env_file}}"
+  if [[ ! -f "$env_file" ]]; then
+    echo "ComfyUI env file not found: $env_file" >&2
+    exit 1
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
+  base="${COMFYUI_BASE_URL:-http://127.0.0.1:8188}"
+  curl -fsS --max-time 10 "$base/system_stats" >/dev/null
+  cd orchestrator
+  cargo test --test real_comfy -- --ignored --nocapture
