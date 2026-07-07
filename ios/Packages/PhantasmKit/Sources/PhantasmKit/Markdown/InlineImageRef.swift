@@ -10,6 +10,10 @@ import Foundation
 /// `phantasm-file://<id>` link in the content; `restore` re-inlines the data
 /// URI wherever the original markdown is needed (the wire, the renderer).
 /// Round-trip is byte-exact: the model re-sees precisely what it produced.
+///
+/// The `phantasm-file://` scheme string is part of the persisted content
+/// format — links using it live in message rows, so renaming it requires a
+/// data migration, not just a code change.
 public enum InlineImageRef {
     public struct ExtractedImage: Sendable, Equatable {
         /// Generated id — becomes the attachment's `name` and the link target.

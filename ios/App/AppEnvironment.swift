@@ -106,13 +106,17 @@ final class AppEnvironment {
         AppToolRegistry.configureLocation(provider: locationProvider)
         AppToolRegistry.configureHealth(provider: healthProvider)
         AppToolRegistry.configureCalendar(provider: calendarProvider)
-        profiles = profileStore.load()
+        let loadedProfiles = profileStore.load()
+        profiles = loadedProfiles.profiles
         thinkingPreferences = modelPreferenceStore.loadThinkingPreferences()
         reasoningEffortPreferences = modelPreferenceStore.loadReasoningEffortPreferences()
         // Keychain tokens outlive an app uninstall but the UserDefaults profile
         // list does not, so a reinstall can strand tokens with no owning
-        // profile. Reconcile the two on launch.
-        keychain.deleteTokens(notIn: Set(profiles.map(\.id)))
+        // profile. Reconcile the two on launch — but only from a fully-decoded
+        // list: a partial or failed load must not delete real tokens.
+        if loadedProfiles.isComplete {
+            keychain.deleteTokens(notIn: Set(profiles.map(\.id)))
+        }
         activeProfileID = profileStore.activeProfileID ?? profiles.first?.id
         // Lazily refresh capabilities for the active backend on launch; the
         // picker is seeded from the cache (see `availableModels`) in the meantime.

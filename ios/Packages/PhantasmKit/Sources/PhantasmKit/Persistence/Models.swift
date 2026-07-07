@@ -19,6 +19,9 @@ import GRDB
 /// tools default on (matching a tools-enabled backend out of the box); the
 /// device tools default off — each is privacy-sensitive and triggers a system
 /// permission prompt. The composer's tool selector flips them per chat.
+///
+/// Field names are the persisted JSON keys — renaming one requires a data
+/// migration; only additions (with decode defaults) are free.
 public struct ToolSettings: Codable, Equatable, Sendable {
     public var webSearch: Bool
     public var imageGeneration: Bool

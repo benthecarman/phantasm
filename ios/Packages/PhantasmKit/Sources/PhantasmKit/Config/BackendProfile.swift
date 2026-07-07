@@ -87,12 +87,37 @@ public final class ProfileStore: @unchecked Sendable {
         self.defaults = defaults
     }
 
-    public func load() -> [BackendProfile] {
-        guard let data = defaults.data(forKey: listKey),
-              let profiles = try? JSONDecoder().decode([BackendProfile].self, from: data) else {
-            return []
+    /// The persisted profile list, plus whether it decoded in full.
+    ///
+    /// `isComplete` separates "nothing stored" (fresh install — complete and
+    /// empty) from "stored data that didn't fully decode". The distinction is
+    /// load-bearing: launch reconciles keychain tokens against this list and
+    /// deletes any without a matching profile, so treating a failed decode as
+    /// an empty list would permanently destroy every backend token. Callers
+    /// must skip destructive reconciliation when `isComplete` is false.
+    public struct LoadedProfiles {
+        public let profiles: [BackendProfile]
+        public let isComplete: Bool
+    }
+
+    public func load() -> LoadedProfiles {
+        guard let data = defaults.data(forKey: listKey) else {
+            return LoadedProfiles(profiles: [], isComplete: true)
         }
-        return profiles
+        // Lossy per-element decode: one undecodable profile drops that entry,
+        // not the whole list.
+        guard let lossy = try? JSONDecoder().decode([LossyProfile].self, from: data) else {
+            return LoadedProfiles(profiles: [], isComplete: false)
+        }
+        let profiles = lossy.compactMap(\.profile)
+        return LoadedProfiles(profiles: profiles, isComplete: profiles.count == lossy.count)
+    }
+
+    private struct LossyProfile: Decodable {
+        let profile: BackendProfile?
+        init(from decoder: Decoder) {
+            profile = try? BackendProfile(from: decoder)
+        }
     }
 
     public func save(_ profiles: [BackendProfile]) {

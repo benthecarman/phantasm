@@ -64,7 +64,7 @@ enum AskService {
         // system-instantiated, so there's no `AppEnvironment` to lean on. These
         // are cheap, stateless reads of the same UserDefaults/Keychain the app uses.
         let profileStore = ProfileStore()
-        let profiles = profileStore.load()
+        let profiles = profileStore.load().profiles
         let profile = profiles.first { $0.id == profileStore.activeProfileID } ?? profiles.first
         guard let profile, let base = profile.baseURL else { throw AskError.noBackend }
         let token = KeychainStore().token(for: profile.id) ?? ""

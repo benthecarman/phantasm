@@ -49,6 +49,43 @@ final class ProfileStoreTests: XCTestCase {
         let reopened = ProfileStore(defaults: defaults)
         XCTAssertEqual(reopened.cachedModels(for: id), ["persisted"])
     }
+
+    // MARK: - Profile list load safety
+
+    func testFreshInstallLoadsEmptyAndComplete() {
+        let loaded = store.load()
+        XCTAssertTrue(loaded.profiles.isEmpty)
+        XCTAssertTrue(loaded.isComplete)
+    }
+
+    func testSaveAndLoadRoundTripIsComplete() {
+        let profile = BackendProfile(name: "Home", baseURLString: "https://backend.example")
+        store.save([profile])
+        let loaded = store.load()
+        XCTAssertEqual(loaded.profiles, [profile])
+        XCTAssertTrue(loaded.isComplete)
+    }
+
+    func testUndecodableBlobLoadsEmptyButIncomplete() {
+        // `isComplete == false` is the signal that gates the launch-time
+        // keychain reconciliation — a failed decode must never read as
+        // "no profiles exist, delete all tokens".
+        defaults.set(Data("not json".utf8), forKey: "phantasm.profiles")
+        let loaded = store.load()
+        XCTAssertTrue(loaded.profiles.isEmpty)
+        XCTAssertFalse(loaded.isComplete)
+    }
+
+    func testOneCorruptProfileIsDroppedWithoutLosingTheRest() throws {
+        let good = BackendProfile(name: "Good", baseURLString: "https://ok.example")
+        let goodJSON = String(data: try JSONEncoder().encode(good), encoding: .utf8)!
+        // Second element is missing required keys — undecodable as a profile.
+        let blob = "[\(goodJSON), {\"junk\": true}]"
+        defaults.set(Data(blob.utf8), forKey: "phantasm.profiles")
+        let loaded = store.load()
+        XCTAssertEqual(loaded.profiles, [good])
+        XCTAssertFalse(loaded.isComplete)
+    }
 }
 
 final class ModelPreferenceStoreTests: XCTestCase {
