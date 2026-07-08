@@ -172,7 +172,7 @@ final class AppEnvironment {
     /// probe result, falls back to the per-backend cache (so the full list shows
     /// instantly on launch, before the probe completes).
     var availableModels: [String] {
-        discoveredModels.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        discoveredModels
     }
 
     /// The active profile's configured default model, if any. Surfaced so the

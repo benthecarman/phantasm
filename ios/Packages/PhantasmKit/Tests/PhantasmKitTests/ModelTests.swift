@@ -121,6 +121,24 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertNil(caps.reasoningEffortModelIDs)
     }
 
+    func testBackendModePreservesBackendModelOrder() throws {
+        let json = """
+        {"version":"x",
+         "models":[
+           {"id":"zeta","capabilities":{"completion":true}},
+           {"id":"alpha","capabilities":{"completion":true}},
+           {"id":"embed","capabilities":{"completion":false}}
+         ],
+         "tool_selectors":[]}
+        """
+        let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
+
+        XCTAssertEqual(caps.models, ["zeta", "alpha"])
+        XCTAssertEqual(BackendMode.full(caps).models, ["zeta", "alpha"])
+        XCTAssertEqual(BackendMode.ollamaNative(models: ["zeta", "alpha"]).models, ["zeta", "alpha"])
+        XCTAssertEqual(BackendMode.plainChatOnly(models: ["zeta", "alpha"]).models, ["zeta", "alpha"])
+    }
+
     // MARK: - Per-chat tool selection (standard OpenAI tools/tool_choice)
 
     private func encodedKeys(_ request: ChatRequest) throws -> [String: Any] {
