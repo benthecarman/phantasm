@@ -7,9 +7,18 @@ import Ollama
 public struct OllamaNativeChatClient: ChatClienting {
     private let session: URLSession
 
-    public init(session: URLSession = .shared) {
-        self.session = session
+    public init(session: URLSession? = nil) {
+        self.session = session ?? Self.streamingSession
     }
+
+    /// Match the OpenAI client's cold-model tolerance: native Ollama can also
+    /// sit idle while loading weights before emitting its first NDJSON chunk.
+    private static let streamingSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForResource = 60 * 60
+        return URLSession(configuration: config)
+    }()
 
     // `turnID` is ignored: a raw Ollama backend has no turn registry, so there's
     // nothing to resume — the connection-bound stream is the only mode.
@@ -130,6 +139,8 @@ public struct OllamaNativeChatClient: ChatClienting {
             defer { lock.unlock() }
             if let cached = sessions[token] { return cached }
             let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 300
+            config.timeoutIntervalForResource = 60 * 60
             config.httpAdditionalHeaders = ["Authorization": "Bearer \(token)"]
             let session = URLSession(configuration: config)
             // Profiles change tokens rarely; drop stale sessions instead of

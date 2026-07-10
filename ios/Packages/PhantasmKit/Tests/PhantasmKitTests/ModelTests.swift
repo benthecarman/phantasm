@@ -632,6 +632,39 @@ final class CapabilityResolveTests: XCTestCase {
         XCTAssertEqual(try? result.get(), .plainChatOnly(models: ["generic-model"]))
     }
 
+    func testNativeOllamaShowDiscoversVisionToolsAndContextLength() async {
+        RoutingProtocol.responses = [
+            "/api/show": (
+                200,
+                #"{"capabilities":["completion","vision","tools"],"model_info":{"family.context_length":32768}}"#
+            ),
+        ]
+
+        let capabilities = await CapabilitiesClient(session: session())
+            .fetchOllamaModelCapabilities(
+                base: URL(string: "https://backend.example")!,
+                token: "",
+                models: ["native-model"]
+            )
+
+        XCTAssertEqual(capabilities.visionModels, Set(["native-model"]))
+        XCTAssertEqual(capabilities.toolModels, Optional(Set(["native-model"])))
+        XCTAssertEqual(capabilities.contextLengths, ["native-model": 32_768])
+    }
+
+    func testFailedNativeOllamaShowKeepsToolSupportUnknown() async {
+        RoutingProtocol.responses = ["/api/show": (500, "error")]
+
+        let capabilities = await CapabilitiesClient(session: session())
+            .fetchOllamaModelCapabilities(
+                base: URL(string: "https://backend.example")!,
+                token: "",
+                models: ["native-model"]
+            )
+
+        XCTAssertNil(capabilities.toolModels)
+    }
+
 }
 
 final class ErrorMappingTests: XCTestCase {

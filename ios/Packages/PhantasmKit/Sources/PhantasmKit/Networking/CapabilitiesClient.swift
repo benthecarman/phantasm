@@ -71,30 +71,73 @@ public struct CapabilitiesClient: Sendable {
         }
     }
 
-    /// Probe each native-Ollama model's `/api/show` capabilities concurrently and
-    /// return the set that declares `"vision"`. Used to gate image attachments
-    /// when talking to a bare Ollama (no orchestrator manifest to consult).
+    public struct OllamaModelCapabilities: Sendable, Equatable {
+        public let visionModels: Set<String>
+        /// `nil` when any probe failed, preserving the app's optimistic
+        /// compatibility behavior instead of falsely hiding tools.
+        public let toolModels: Set<String>?
+        public let contextLengths: [String: Int]
+    }
+
+    /// Probe native-Ollama `/api/show` metadata in bounded batches. Alongside
+    /// vision this discovers tool calling and context lengths, while avoiding a
+    /// connection burst on hosts with a large model library.
+    public func fetchOllamaModelCapabilities(
+        base: URL,
+        token: String,
+        models: [String],
+        maxConcurrency: Int = 6
+    ) async -> OllamaModelCapabilities {
+        var vision: Set<String> = []
+        var tools: Set<String> = []
+        var contextLengths: [String: Int] = [:]
+        var allSucceeded = true
+        let width = max(1, maxConcurrency)
+
+        for start in stride(from: 0, to: models.count, by: width) {
+            let end = min(models.count, start + width)
+            let batch = Array(models[start..<end])
+            await withTaskGroup(of: (String, OllamaShowMetadata?).self) { group in
+                for model in batch {
+                    group.addTask {
+                        (model, await self.ollamaModelMetadata(
+                            base: base, token: token, model: model
+                        ))
+                    }
+                }
+                for await (model, metadata) in group {
+                    guard let metadata else {
+                        allSucceeded = false
+                        continue
+                    }
+                    if metadata.capabilities.contains("vision") { vision.insert(model) }
+                    if metadata.capabilities.contains("tools") { tools.insert(model) }
+                    if let contextLength = metadata.contextLength {
+                        contextLengths[model] = contextLength
+                    }
+                }
+            }
+        }
+        return .init(
+            visionModels: vision,
+            toolModels: allSucceeded ? tools : nil,
+            contextLengths: contextLengths
+        )
+    }
+
+    /// Backward-compatible vision-only facade retained for existing callers.
     public func fetchOllamaVisionModels(
         base: URL,
         token: String,
         models: [String]
     ) async -> Set<String> {
-        await withTaskGroup(of: String?.self) { group in
-            for model in models {
-                group.addTask {
-                    await self.ollamaModelIsVision(base: base, token: token, model: model)
-                        ? model : nil
-                }
-            }
-            var vision: Set<String> = []
-            for await result in group {
-                if let result { vision.insert(result) }
-            }
-            return vision
-        }
+        await fetchOllamaModelCapabilities(base: base, token: token, models: models)
+            .visionModels
     }
 
-    private func ollamaModelIsVision(base: URL, token: String, model: String) async -> Bool {
+    private func ollamaModelMetadata(
+        base: URL, token: String, model: String
+    ) async -> OllamaShowMetadata? {
         var req = URLRequest(url: base.appendingPathComponent("api/show"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -103,10 +146,16 @@ public struct CapabilitiesClient: Sendable {
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model])
         guard let (data, response) = try? await session.data(for: req),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
-              let show = try? JSONDecoder().decode(OllamaShowResponse.self, from: data) else {
-            return false
-        }
-        return show.capabilities?.contains("vision") ?? false
+              let rawObject = try? JSONSerialization.jsonObject(with: data),
+              let object = rawObject as? [String: Any]
+        else { return nil }
+        let capabilities = Set(object["capabilities"] as? [String] ?? [])
+        let info = object["model_info"] as? [String: Any] ?? [:]
+        let contextLength = info
+            .first { $0.key.hasSuffix(".context_length") }
+            .flatMap { ($0.value as? NSNumber)?.intValue }
+            .flatMap { $0 > 0 ? $0 : nil }
+        return .init(capabilities: capabilities, contextLength: contextLength)
     }
 
     /// Best-effort native Ollama model list. `nil` means `/api/tags` did not
@@ -137,7 +186,8 @@ public struct CapabilitiesClient: Sendable {
         let models: [Entry]
     }
 
-    private struct OllamaShowResponse: Decodable {
-        let capabilities: [String]?
+    private struct OllamaShowMetadata: Sendable {
+        let capabilities: Set<String>
+        let contextLength: Int?
     }
 }

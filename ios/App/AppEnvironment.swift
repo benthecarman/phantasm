@@ -314,8 +314,8 @@ final class AppEnvironment {
     /// Resolve which models accept images / can drive tools for the current
     /// backend: from the orchestrator manifest when present, by probing Ollama
     /// `/api/show` for a bare native backend, and unknown (optimistic) for
-    /// generic OpenAI. Server tools require the orchestrator, so `toolModels` is
-    /// only meaningful in `.full` mode — the other modes leave it unknown.
+    /// generic OpenAI. Bare Ollama exposes vision/tool/context metadata through
+    /// `/api/show`; failed tool probes stay unknown (optimistic) for compatibility.
     private func modelCapabilities(
         for mode: BackendMode,
         base: URL,
@@ -335,10 +335,15 @@ final class AppEnvironment {
                 caps.contextLengthByID
             )
         case .ollamaNative(let models):
-            let vision = await capabilitiesClient.fetchOllamaVisionModels(
+            let capabilities = await capabilitiesClient.fetchOllamaModelCapabilities(
                 base: base, token: token, models: models
             )
-            return (vision, nil, nil, nil)
+            return (
+                capabilities.visionModels,
+                capabilities.toolModels,
+                nil,
+                capabilities.contextLengths.isEmpty ? nil : capabilities.contextLengths
+            )
         case .plainChatOnly:
             return (nil, nil, nil, nil)
         }
