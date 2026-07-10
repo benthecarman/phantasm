@@ -386,6 +386,7 @@ fn mock_openai_compatible_streaming_tools_no_call(requests: RecordedRequests) ->
                     let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
                                 data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n\
                                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                                data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n\
                                 data: [DONE]\n\n";
                     ([(CONTENT_TYPE, "text/event-stream")], body).into_response()
                 }
@@ -1788,7 +1789,7 @@ async fn openai_compatible_upstream_runs_server_tool_loop() {
 }
 
 #[tokio::test]
-async fn openai_compatible_streaming_tools_no_call_does_not_reissue_final_stream() {
+async fn openai_compatible_streaming_tools_no_call_records_usage_without_reissuing() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let openai = spawn(mock_openai_compatible_streaming_tools_no_call(
         requests.clone(),
@@ -1838,6 +1839,29 @@ async fn openai_compatible_streaming_tools_no_call_does_not_reissue_final_stream
             .as_array()
             .is_some_and(|tools| !tools.is_empty()),
         "expected the single upstream request to carry offered tools"
+    );
+
+    drop(requests);
+    let metrics = reqwest::Client::new()
+        .get(format!("{base}/metrics"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("phantasm_prompt_tokens_total{model=\"m\"} 7"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phantasm_completion_tokens_total{model=\"m\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("phantasm_generation_tokens_per_second_count{model=\"m\"} 1"),
+        "{metrics}"
     );
 }
 

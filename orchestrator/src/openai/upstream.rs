@@ -401,7 +401,9 @@ impl ChatBackend for OpenAICompatibleClient {
             .await?;
         Ok(Some(Box::pin(sse_bytes_to_tool_deltas(
             resp.bytes_stream(),
-            None,
+            self.metrics
+                .clone()
+                .map(|metrics| (metrics, model.to_string())),
         ))))
     }
 }
@@ -512,7 +514,11 @@ where
                 };
                 if payload == b"[DONE]" {
                     if metrics.is_some() {
-                        yield ToolStreamDelta::new("", "", None, true, pending_done_reason.take());
+                        yield finish_tool_stream(
+                            &tool_calls,
+                            &mut scan,
+                            pending_done_reason.take(),
+                        )?;
                         terminal_seen = true;
                     }
                     break 'read;
@@ -561,23 +567,31 @@ where
                         Err(AppError::UpstreamError(message))?;
                     }
                     if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
-                        return;
-                    }
-                    tool_calls.absorb_chunk(&value);
-                    let normalized = think_tags.normalize(delta_from_openai_chunk(&value));
-                    let released = scan.push(&normalized.content);
-                    if !released.is_empty() || !normalized.reasoning.is_empty() {
-                        yield ToolStreamDelta::new(
-                            released,
-                            normalized.reasoning,
-                            None,
-                            false,
-                            None,
-                        );
-                    }
-                    if normalized.done {
-                        yield finish_tool_stream(&tool_calls, &mut scan, normalized.done_reason)?;
-                        terminal_seen = true;
+                        if metrics.is_some() {
+                            yield finish_tool_stream(
+                                &tool_calls,
+                                &mut scan,
+                                pending_done_reason.take(),
+                            )?;
+                            terminal_seen = true;
+                        }
+                    } else {
+                        tool_calls.absorb_chunk(&value);
+                        let normalized = think_tags.normalize(delta_from_openai_chunk(&value));
+                        let released = scan.push(&normalized.content);
+                        if !released.is_empty() || !normalized.reasoning.is_empty() {
+                            yield ToolStreamDelta::new(
+                                released,
+                                normalized.reasoning,
+                                None,
+                                false,
+                                None,
+                            );
+                        }
+                        if normalized.done {
+                            yield finish_tool_stream(&tool_calls, &mut scan, normalized.done_reason)?;
+                            terminal_seen = true;
+                        }
                     }
                 }
             }
@@ -587,7 +601,7 @@ where
         // withheld or accumulated, so a buffered XML block (or an already
         // streamed native batch) is neither lost nor leaked.
         if !terminal_seen {
-            let delta = finish_tool_stream(&tool_calls, &mut scan, None)?;
+            let delta = finish_tool_stream(&tool_calls, &mut scan, pending_done_reason.take())?;
             if delta.tool_calls.is_some() || !delta.content.is_empty() {
                 yield delta;
             }
@@ -1452,6 +1466,37 @@ mod tests {
         let stats = metrics.model("m");
         assert_eq!(stats.prompt_tokens.get(), 7);
         assert_eq!(stats.completion_tokens.get(), 3);
+        assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
+    }
+
+    #[tokio::test]
+    async fn sse_tool_stream_usage_records_metrics_and_preserves_calls() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let metrics = crate::metrics::Metrics::without_store();
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<ToolStreamDelta> =
+            sse_bytes_to_tool_deltas(stream::iter(chunks), Some((metrics.clone(), "m".into())))
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+
+        let last = deltas.last().expect("terminal tool delta");
+        assert!(last.done);
+        assert_eq!(last.done_reason.as_deref(), Some("tool_calls"));
+        let calls = last.tool_calls.as_ref().expect("structured call preserved");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "weather");
+
+        let stats = metrics.model("m");
+        assert_eq!(stats.prompt_tokens.get(), 11);
+        assert_eq!(stats.completion_tokens.get(), 4);
         assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
     }
 
