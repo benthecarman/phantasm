@@ -25,6 +25,8 @@ use crate::turn_registry::RegistryCounts;
 const PAGE: &str = include_str!("dashboard.html");
 const OLLAMA_PS_TIMEOUT: Duration = Duration::from_millis(1500);
 const UPSTREAM_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+const HOUR_SECONDS: i64 = 3600;
+const DAY_SECONDS: i64 = 24 * HOUR_SECONDS;
 
 pub async fn page() -> Html<&'static str> {
     Html(PAGE)
@@ -32,7 +34,7 @@ pub async fn page() -> Html<&'static str> {
 
 #[derive(Debug, Deserialize)]
 pub struct DashboardParams {
-    /// `3h` (default) | `24h` | `7d`.
+    /// `24h` | `7d` (default) | `30d` | `all`.
     pub range: Option<String>,
     /// Model filter for the range-scoped sections; absent or `all` => all.
     pub model: Option<String>,
@@ -98,16 +100,25 @@ pub async fn data(
     State(state): State<AppState>,
     Query(params): Query<DashboardParams>,
 ) -> Json<DashboardData> {
-    let (range_seconds, bucket_seconds) = match params.range.as_deref() {
-        Some("24h") => (24 * 3600, 600),
-        Some("7d") => (7 * 24 * 3600, 3600),
-        _ => (3 * 3600, 60),
-    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let since_ts = now - range_seconds;
+    let (since_ts, range_seconds, bucket_seconds) = match params.range.as_deref() {
+        Some("24h") => {
+            let range = DAY_SECONDS;
+            (now - range, range, 10 * 60)
+        }
+        Some("30d") => {
+            let range = 30 * DAY_SECONDS;
+            (now - range, range, 6 * HOUR_SECONDS)
+        }
+        Some("all") => (0, now.max(0), DAY_SECONDS),
+        _ => {
+            let range = 7 * DAY_SECONDS;
+            (now - range, range, HOUR_SECONDS)
+        }
+    };
     let model = params.model.filter(|m| !m.trim().is_empty() && m != "all");
 
     let history_fut = query_history(&state, since_ts, bucket_seconds, model);

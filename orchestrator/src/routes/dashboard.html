@@ -61,9 +61,10 @@
   </label>
   <label class="meta">range
     <select id="range">
-      <option value="3h">3 h</option>
-      <option value="24h">24 h</option>
-      <option value="7d">7 d</option>
+      <option value="24h">24h</option>
+      <option value="7d" selected>7d</option>
+      <option value="30d">30d</option>
+      <option value="all">all time</option>
     </select>
   </label>
 </header>
@@ -128,7 +129,8 @@ function refreshSoon(ms) { clearTimeout(timer); timer = setTimeout(() => { refre
 
 function render(d) {
   $("meta").textContent = `v${d.version} · up ${fmtUp(d.uptime_seconds)}`;
-  $("rangeLabel").textContent = "· last " + $("range").value;
+  const rangeLabels = {"24h": "last 24h", "7d": "last 7d", "30d": "last 30d", "all": "all time"};
+  $("rangeLabel").textContent = "· " + (rangeLabels[$("range").value] || "last 7d");
   const h = d.history;
 
   const o = h ? h.outcomes : {};
@@ -255,7 +257,7 @@ function drawSeries(canvas, h, d, layers) {
   }
   const bucket = d.bucket_seconds;
   const end = Math.floor(Date.now() / 1000 / bucket) * bucket;
-  const start = end - d.range_seconds + bucket;
+  const start = $("range").value === "all" ? h.series[0].t : end - d.range_seconds + bucket;
   const n = Math.floor((end - start) / bucket) + 1;
   const byT = new Map(h.series.map(p => [p.t, p]));
   const slots = Array.from({length: n}, (_, i) => byT.get(start + i * bucket) || null);

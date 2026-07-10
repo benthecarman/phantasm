@@ -2307,6 +2307,11 @@ async fn dashboard_page_public_and_data_gated_with_history() {
     assert!(ct.starts_with("text/html"), "{ct}");
     let html = page.text().await.unwrap();
     assert!(html.contains("Phantasm"));
+    assert!(html.contains(r#"<option value="24h">24h</option>"#));
+    assert!(html.contains(r#"<option value="7d" selected>7d</option>"#));
+    assert!(html.contains(r#"<option value="30d">30d</option>"#));
+    assert!(html.contains(r#"<option value="all">all time</option>"#));
+    assert!(!html.contains(r#"value="3h""#));
     assert!(
         !html.contains(TOKEN),
         "the public page must not embed the token"
@@ -2325,7 +2330,7 @@ async fn dashboard_page_public_and_data_gated_with_history() {
     let mut data = serde_json::Value::Null;
     for _ in 0..200 {
         let resp = client
-            .get(format!("{base}/dashboard/data?range=3h"))
+            .get(format!("{base}/dashboard/data"))
             .header("Authorization", format!("Bearer {TOKEN}"))
             .send()
             .await
@@ -2337,6 +2342,8 @@ async fn dashboard_page_public_and_data_gated_with_history() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    assert_eq!(data["range_seconds"], 7 * 24 * 3600, "{data}");
+    assert_eq!(data["bucket_seconds"], 3600, "{data}");
     assert_eq!(data["history"]["outcomes"]["completed"], 1, "{data}");
     assert_eq!(data["history"]["outcomes"]["plain"], 1, "{data}");
     assert_eq!(data["history"]["tokens"]["prompt"], 7, "{data}");
@@ -2360,7 +2367,7 @@ async fn dashboard_page_public_and_data_gated_with_history() {
 
     // The model filter scopes the range sections but not the per-model summary.
     let filtered: serde_json::Value = client
-        .get(format!("{base}/dashboard/data?range=3h&model=nope"))
+        .get(format!("{base}/dashboard/data?range=7d&model=nope"))
         .header("Authorization", format!("Bearer {TOKEN}"))
         .send()
         .await
@@ -2373,6 +2380,21 @@ async fn dashboard_page_public_and_data_gated_with_history() {
         "{filtered}"
     );
     assert_eq!(filtered["history"]["models"][0]["model"], "m", "{filtered}");
+
+    let all_time: serde_json::Value = client
+        .get(format!("{base}/dashboard/data?range=all"))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all_time["bucket_seconds"], 24 * 3600, "{all_time}");
+    assert_eq!(
+        all_time["history"]["outcomes"]["completed"], 1,
+        "{all_time}"
+    );
 }
 
 /// `PHANTASM_DASHBOARD=false` removes both dashboard routes entirely; /metrics
