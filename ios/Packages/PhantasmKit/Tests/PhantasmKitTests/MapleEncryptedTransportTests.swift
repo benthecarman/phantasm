@@ -5,6 +5,85 @@ import XCTest
 final class MapleEncryptedTransportTests: XCTestCase {
     private let key = SymmetricKey(data: Data(repeating: 0x2a, count: 32))
 
+    func testLiveMapleModelsWhenAPIKeyIsConfigured() async throws {
+        guard let token = ProcessInfo.processInfo.environment["MAPLE_API_KEY"],
+              !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw XCTSkip("Set MAPLE_API_KEY to run the live Maple model-loading test.")
+        }
+        let base = try XCTUnwrap(URL(string: "https://enclave.trymaple.ai"))
+        let client = CapabilitiesClient(session: MapleEncryptedTransport.session())
+
+        let mode = try await client.resolveOpenAICompatible(
+            base: base,
+            token: token.trimmingCharacters(in: .whitespacesAndNewlines)
+        ).get()
+
+        XCTAssertFalse(mode.models.isEmpty)
+    }
+
+    func testLiveMapleChatStreamWhenAPIKeyIsConfigured() async throws {
+        guard let token = ProcessInfo.processInfo.environment["MAPLE_API_KEY"],
+              !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw XCTSkip("Set MAPLE_API_KEY to run the live Maple chat test.")
+        }
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = try XCTUnwrap(URL(string: "https://enclave.trymaple.ai"))
+        let session = MapleEncryptedTransport.session()
+        let mode = try await CapabilitiesClient(session: session)
+            .resolveOpenAICompatible(base: base, token: trimmedToken)
+            .get()
+        let model = try XCTUnwrap(mode.models.first)
+        let request = ChatRequest(
+            model: model,
+            messages: [
+                WireMessage(role: "user", content: "Reply with only: pong")
+            ],
+            stream: true
+        )
+
+        var text = ""
+        var didFinish = false
+        do {
+            for try await event in ChatClient(session: session).stream(
+                request, base: base, token: trimmedToken
+            ) {
+                switch event {
+                case .token(let token):
+                    text += token
+                case .done:
+                    didFinish = true
+                default:
+                    break
+                }
+            }
+        } catch {
+            XCTFail("Maple chat failed with \(type(of: error)): \(String(reflecting: error))")
+            return
+        }
+
+        XCTAssertFalse(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        XCTAssertTrue(didFinish)
+    }
+
+    func testLiveMapleAttestationParser() async throws {
+        guard ProcessInfo.processInfo.environment["MAPLE_API_KEY"] != nil else {
+            throw XCTSkip("Set MAPLE_API_KEY to run the live Maple attestation parser test.")
+        }
+        let nonce = UUID().uuidString.lowercased()
+        let url = try XCTUnwrap(URL(string: "https://enclave.trymaple.ai/attestation/\(nonce)"))
+
+        let (data, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+
+        struct AttestationResponse: Decodable { let attestationDocument: String }
+        let attestation = try Wire.decoder().decode(AttestationResponse.self, from: data)
+        let document = try XCTUnwrap(Data(base64Encoded: attestation.attestationDocument))
+        let fields = try MapleAttestationKeyExtractor.extract(from: document)
+
+        XCTAssertEqual(fields.publicKey.count, 32)
+        XCTAssertEqual(fields.nonce, Data(nonce.utf8))
+    }
+
     func testChaChaCombinedRepresentationRoundTrips() throws {
         let clear = Data("private message".utf8)
         let encrypted = try MapleCrypto.seal(clear, using: key)
@@ -33,6 +112,23 @@ final class MapleEncryptedTransportTests: XCTestCase {
             try MapleCrypto.open(encrypted, using: key),
             try XCTUnwrap(request.httpBody)
         )
+    }
+
+    func testRequestEnvelopeEncryptsBodyStreamFromURLProtocolRequest() throws {
+        let clear = Data(#"{"model":"m","stream":true}"#.utf8)
+        var request = URLRequest(url: URL(string: "https://enclave.example/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.httpBodyStream = InputStream(data: clear)
+        let material = MapleSessionMaterial(id: UUID().uuidString, key: key)
+
+        let wrapped = try MapleRequestEnvelope.wrap(request, using: material)
+
+        XCTAssertNil(wrapped.httpBodyStream)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(wrapped.httpBody)) as? [String: String]
+        )
+        let encrypted = try XCTUnwrap(Data(base64Encoded: XCTUnwrap(object["encrypted"])))
+        XCTAssertEqual(try MapleCrypto.open(encrypted, using: key), clear)
     }
 
     func testJSONEnvelopeDecryptsToOriginalOpenAIResponse() throws {
@@ -88,6 +184,26 @@ final class MapleEncryptedTransportTests: XCTestCase {
 
         XCTAssertEqual(
             try MapleAttestationKeyExtractor.extract(from: cose),
+            MapleAttestationFields(publicKey: publicKey, nonce: nonce)
+        )
+    }
+
+    func testAttestationParserAcceptsNitroDocumentMapShape() throws {
+        let publicKey = Data((0..<32).map { UInt8(255 - $0) })
+        let nonce = Data("nonce-456".utf8)
+
+        var document = Data([0xa4]) // map(4)
+        document.append(cborText("module_id"))
+        document.append(cborText("test-module"))
+        document.append(cborText("public_key"))
+        document.append(cborBytes(publicKey))
+        document.append(cborText("nonce"))
+        document.append(cborBytes(nonce))
+        document.append(cborText("user_data"))
+        document.append(cborBytes(Data()))
+
+        XCTAssertEqual(
+            try MapleAttestationKeyExtractor.extract(from: document),
             MapleAttestationFields(publicKey: publicKey, nonce: nonce)
         )
     }

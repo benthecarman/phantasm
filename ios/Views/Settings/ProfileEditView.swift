@@ -216,7 +216,7 @@ struct ProfileEditView: View {
         let result = await env.backendResolver.resolve(
             base: base,
             token: normalizedToken,
-            preferMaple: resolvedTransport == .mapleEncrypted
+            preferMaple: effectiveTransportForCurrentURL == .mapleEncrypted
         )
         if case .success(let mode) = result {
             models = mode.models
@@ -235,7 +235,7 @@ struct ProfileEditView: View {
         let result = await env.backendResolver.resolve(
             base: base,
             token: normalizedToken,
-            preferMaple: resolvedTransport == .mapleEncrypted
+            preferMaple: effectiveTransportForCurrentURL == .mapleEncrypted
         )
         isTesting = false
         switch result {
@@ -257,7 +257,7 @@ struct ProfileEditView: View {
             name: name.trimmingCharacters(in: .whitespaces),
             baseURLString: BackendProfile.normalizedBaseURLString(urlString),
             defaultModel: defaultModel.isEmpty ? nil : defaultModel,
-            transport: resolvedTransport,
+            transport: effectiveTransportForCurrentURL,
             autoWarm: autoWarm
         )
         let token = normalizedToken
@@ -272,6 +272,12 @@ struct ProfileEditView: View {
         Haptics.notify(.success)
         dismiss()
         onSaved()
+    }
+
+    private var effectiveTransportForCurrentURL: BackendTransport {
+        resolvedTransport == .mapleEncrypted
+            ? .mapleEncrypted
+            : BackendProfile.defaultTransport(for: BackendProfile.normalizedBaseURLString(urlString))
     }
 
     private func clearStaleDefaultModel() {

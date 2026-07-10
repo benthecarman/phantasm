@@ -264,7 +264,11 @@ struct OnboardingView: View {
         guard let base = URL(string: normalizedURLString) else { return }
         isTesting = true
         testResult = nil
-        let result = await env.backendResolver.resolve(base: base, token: normalizedToken)
+        let result = await env.backendResolver.resolve(
+            base: base,
+            token: normalizedToken,
+            preferMaple: BackendProfile.defaultTransport(for: normalizedURLString) == .mapleEncrypted
+        )
         isTesting = false
         switch result {
         case .success(let mode):
@@ -287,7 +291,9 @@ struct OnboardingView: View {
             name: name.trimmingCharacters(in: .whitespacesAndNewlines),
             baseURLString: normalizedURLString,
             defaultModel: defaultModel.isEmpty ? nil : defaultModel,
-            transport: resolvedTransport,
+            transport: resolvedTransport == .mapleEncrypted
+                ? .mapleEncrypted
+                : BackendProfile.defaultTransport(for: normalizedURLString),
             autoWarm: autoWarm
         )
         env.upsert(profile, token: normalizedToken.isEmpty ? nil : normalizedToken)

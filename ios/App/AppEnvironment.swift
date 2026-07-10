@@ -126,7 +126,7 @@ final class AppEnvironment {
         // synchronously on launch; otherwise a fast send before the async probe
         // finishes would briefly use the ordinary URLSession and fail with 401.
         if let active = profiles.first(where: { $0.id == activeProfileID }),
-           active.transport == .mapleEncrypted {
+           active.effectiveTransport == .mapleEncrypted {
             backendMode = .mapleEncrypted(models: profileStore.cachedModels(for: active.id))
         }
         // Lazily refresh capabilities for the active backend on launch; the
@@ -288,7 +288,7 @@ final class AppEnvironment {
             return
         }
         let models = profileStore.cachedModels(for: profile.id)
-        backendMode = profile.transport == .mapleEncrypted
+        backendMode = profile.effectiveTransport == .mapleEncrypted
             ? .mapleEncrypted(models: models)
             : .plainChatOnly(models: models)
     }
@@ -312,7 +312,7 @@ final class AppEnvironment {
         let result = await backendResolver.resolve(
             base: base,
             token: token,
-            preferMaple: profile.transport == .mapleEncrypted
+            preferMaple: profile.effectiveTransport == .mapleEncrypted
         )
         let mode: BackendMode
         switch result {
@@ -322,7 +322,7 @@ final class AppEnvironment {
             // Keep a known Maple profile on the encrypted transport while it is
             // temporarily unreachable. The cached model list preserves the same
             // launch/offline behavior as other backends.
-            mode = profile.transport == .mapleEncrypted
+            mode = profile.effectiveTransport == .mapleEncrypted
                 ? .mapleEncrypted(models: profileStore.cachedModels(for: profileID))
                 : .plainChatOnly(models: [])
         }

@@ -71,4 +71,43 @@ final class BackendProfileTests: XCTestCase {
         XCTAssertEqual(decoded, original)
         XCTAssertEqual(decoded.transport, .mapleEncrypted)
     }
+
+    func testTryMapleHostDefaultsToMapleTransport() {
+        XCTAssertEqual(
+            BackendProfile.defaultTransport(for: "https://enclave.trymaple.ai"),
+            .mapleEncrypted
+        )
+        XCTAssertEqual(
+            BackendProfile.defaultTransport(for: " https://enclave.trymaple.ai/v1/ "),
+            .mapleEncrypted
+        )
+        XCTAssertEqual(
+            BackendProfile.defaultTransport(for: "https://enclave.trymaple.ai:443"),
+            .mapleEncrypted
+        )
+    }
+
+    func testTryMapleDefaultRequiresExactHTTPSHostRoot() {
+        XCTAssertEqual(
+            BackendProfile.defaultTransport(for: "http://enclave.trymaple.ai"),
+            .standard
+        )
+        XCTAssertEqual(
+            BackendProfile.defaultTransport(for: "https://api.trymaple.ai"),
+            .standard
+        )
+        XCTAssertEqual(
+            BackendProfile.defaultTransport(for: "https://enclave.trymaple.ai/proxy"),
+            .standard
+        )
+    }
+
+    func testEffectiveTransportUsesTryMapleDefault() {
+        let profile = BackendProfile(
+            name: "Maple",
+            baseURLString: "https://enclave.trymaple.ai"
+        )
+        XCTAssertEqual(profile.transport, .standard)
+        XCTAssertEqual(profile.effectiveTransport, .mapleEncrypted)
+    }
 }

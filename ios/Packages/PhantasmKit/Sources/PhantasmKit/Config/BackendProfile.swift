@@ -53,6 +53,23 @@ public struct BackendProfile: Identifiable, Codable, Sendable, Hashable {
         URL(string: Self.normalizedBaseURLString(baseURLString))
     }
 
+    public var effectiveTransport: BackendTransport {
+        transport == .mapleEncrypted ? .mapleEncrypted : Self.defaultTransport(for: baseURLString)
+    }
+
+    public static func defaultTransport(for raw: String) -> BackendTransport {
+        let normalized = normalizedBaseURLString(raw)
+        guard let components = URLComponents(string: normalized),
+              components.scheme?.lowercased() == "https",
+              components.host?.lowercased() == "enclave.trymaple.ai",
+              components.port == nil || components.port == 443,
+              components.path.isEmpty
+        else {
+            return .standard
+        }
+        return .mapleEncrypted
+    }
+
     /// Normalizes a user-entered base URL to the host root the networking layer
     /// expects. The clients append `v1/...` (and `api/...`) paths themselves, so
     /// a pasted OpenAI-style `https://host/v1` would otherwise double up to

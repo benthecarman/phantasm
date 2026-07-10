@@ -88,9 +88,9 @@ enum AskService {
         ).resolve(
             base: base,
             token: token,
-            preferMaple: profile.transport == .mapleEncrypted
+            preferMaple: profile.effectiveTransport == .mapleEncrypted
         ).get())
-            ?? (profile.transport == .mapleEncrypted
+            ?? (profile.effectiveTransport == .mapleEncrypted
                 ? .mapleEncrypted(models: profileStore.cachedModels(for: profile.id))
                 : .plainChatOnly(models: []))
         guard let model = mode.resolvedChatModel(

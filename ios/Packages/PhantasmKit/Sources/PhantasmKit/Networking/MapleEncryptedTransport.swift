@@ -259,16 +259,40 @@ enum MapleRequestEnvelope {
         -> URLRequest
     {
         var wrapped = request
-        if let body = request.httpBody, !body.isEmpty {
+        wrapped.httpBodyStream = nil
+        if let body = try request.mapleHTTPBody, !body.isEmpty {
             let encrypted = try MapleCrypto.seal(body, using: material.key)
             wrapped.httpBody = try JSONEncoder().encode(Body(encrypted: encrypted.base64EncodedString()))
-        } else if request.httpBodyStream != nil {
-            throw MapleTransportError.streamingRequestBodyUnsupported
         }
         wrapped.setValue("application/json", forHTTPHeaderField: "Content-Type")
         wrapped.setValue(material.id, forHTTPHeaderField: "x-session-id")
         wrapped.setValue(nil, forHTTPHeaderField: "Content-Length")
         return wrapped
+    }
+}
+
+private extension URLRequest {
+    var mapleHTTPBody: Data? {
+        get throws {
+            if let httpBody { return httpBody }
+            guard let stream = httpBodyStream else { return nil }
+
+            stream.open()
+            defer { stream.close() }
+
+            var data = Data()
+            var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+            while true {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count > 0 {
+                    data.append(buffer, count: count)
+                } else if count == 0 {
+                    return data
+                } else {
+                    throw stream.streamError ?? MapleTransportError.requestBodyStreamUnreadable
+                }
+            }
+        }
     }
 }
 
@@ -480,19 +504,34 @@ struct MapleAttestationFields: Equatable {
 }
 
 enum MapleAttestationKeyExtractor {
-    /// Extracts only the key-exchange fields from COSE_Sign1. This is parsing,
-    /// not attestation verification; see `MapleEncryptedTransport` above.
+    /// Extracts only the key-exchange fields from the Nitro attestation document.
+    /// This is parsing, not attestation verification; see
+    /// `MapleEncryptedTransport` above.
     static func extract(from document: Data) throws -> MapleAttestationFields {
         var outerParser = MinimalCBORParser(data: document)
         let outer = try outerParser.parse().untagged
-        guard case .array(let cose) = outer, cose.count == 4,
-              case .bytes(let payload) = cose[2]
-        else { throw MapleTransportError.invalidAttestationDocument }
+        switch outer {
+        case .map(let fields):
+            return try extract(fromFields: fields)
 
-        var payloadParser = MinimalCBORParser(data: payload)
-        guard case .map(let fields) = try payloadParser.parse().untagged else {
+        case .array(let cose):
+            guard cose.count == 4, case .bytes(let payload) = cose[2] else {
+                throw MapleTransportError.invalidAttestationDocument
+            }
+            var payloadParser = MinimalCBORParser(data: payload)
+            guard case .map(let fields) = try payloadParser.parse().untagged else {
+                throw MapleTransportError.invalidAttestationDocument
+            }
+            return try extract(fromFields: fields)
+
+        default:
             throw MapleTransportError.invalidAttestationDocument
         }
+    }
+
+    private static func extract(
+        fromFields fields: [(MinimalCBORValue, MinimalCBORValue)]
+    ) throws -> MapleAttestationFields {
         var publicKey: Data?
         var nonce: Data?
         for (key, value) in fields {
@@ -543,10 +582,12 @@ private struct MinimalCBORParser {
             guard raw <= UInt64(Int64.max) else { throw MapleTransportError.invalidCBOR }
             return .negative(-1 - Int64(raw))
         case 2:
+            if additional == 31 { return .bytes(try parseIndefiniteBytes()) }
             let rawCount = try length(additional)
             let count = try integerCount(rawCount)
             return .bytes(try readData(count: count))
         case 3:
+            if additional == 31 { return .text(try parseIndefiniteText()) }
             let rawCount = try length(additional)
             let count = try integerCount(rawCount)
             let bytes = try readData(count: count)
@@ -555,6 +596,7 @@ private struct MinimalCBORParser {
             }
             return .text(text)
         case 4:
+            if additional == 31 { return .array(try parseIndefiniteArray()) }
             let rawCount = try length(additional)
             let count = try integerCount(rawCount)
             var values: [MinimalCBORValue] = []
@@ -562,6 +604,7 @@ private struct MinimalCBORParser {
             for _ in 0..<count { values.append(try parse()) }
             return .array(values)
         case 5:
+            if additional == 31 { return .map(try parseIndefiniteMap()) }
             let rawCount = try length(additional)
             let count = try integerCount(rawCount)
             var values: [(MinimalCBORValue, MinimalCBORValue)] = []
@@ -600,9 +643,53 @@ private struct MinimalCBORParser {
         return Int(value)
     }
 
+    private mutating func parseIndefiniteBytes() throws -> Data {
+        var result = Data()
+        while !consumeBreakIfPresent() {
+            guard case .bytes(let chunk) = try parse() else {
+                throw MapleTransportError.invalidCBOR
+            }
+            result.append(chunk)
+        }
+        return result
+    }
+
+    private mutating func parseIndefiniteText() throws -> String {
+        var result = ""
+        while !consumeBreakIfPresent() {
+            guard case .text(let chunk) = try parse() else {
+                throw MapleTransportError.invalidCBOR
+            }
+            result.append(chunk)
+        }
+        return result
+    }
+
+    private mutating func parseIndefiniteArray() throws -> [MinimalCBORValue] {
+        var values: [MinimalCBORValue] = []
+        while !consumeBreakIfPresent() {
+            values.append(try parse())
+        }
+        return values
+    }
+
+    private mutating func parseIndefiniteMap() throws -> [(MinimalCBORValue, MinimalCBORValue)] {
+        var values: [(MinimalCBORValue, MinimalCBORValue)] = []
+        while !consumeBreakIfPresent() {
+            values.append((try parse(), try parse()))
+        }
+        return values
+    }
+
     private mutating func readUInt(byteCount: Int) throws -> UInt64 {
         let bytes = try readData(count: byteCount)
         return bytes.reduce(0) { ($0 << 8) | UInt64($1) }
+    }
+
+    private mutating func consumeBreakIfPresent() -> Bool {
+        guard offset < data.count, data[offset] == 0xff else { return false }
+        offset += 1
+        return true
     }
 
     private mutating func readByte() throws -> UInt8 {
@@ -623,7 +710,7 @@ private struct MinimalCBORParser {
 enum MapleTransportError: Error, LocalizedError, Equatable {
     case missingURL
     case unrecognizedEndpoint(String)
-    case streamingRequestBodyUnsupported
+    case requestBodyStreamUnreadable
     case invalidBase64
     case invalidUTF8
     case invalidCBOR
@@ -638,7 +725,7 @@ enum MapleTransportError: Error, LocalizedError, Equatable {
         switch self {
         case .missingURL: return "Maple request is missing its URL."
         case .unrecognizedEndpoint(let path): return "Maple cannot adapt endpoint path \(path)."
-        case .streamingRequestBodyUnsupported: return "Maple does not support streamed request bodies."
+        case .requestBodyStreamUnreadable: return "Maple could not read the request body stream."
         case .invalidBase64: return "Maple returned invalid encrypted data."
         case .invalidUTF8: return "Maple returned invalid text data."
         case .invalidCBOR: return "Maple returned malformed CBOR."

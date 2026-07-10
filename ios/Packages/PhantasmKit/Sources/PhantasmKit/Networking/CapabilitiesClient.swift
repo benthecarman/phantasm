@@ -44,13 +44,10 @@ public struct CapabilitiesClient: Sendable {
         (try? await resolve(base: base, token: token).get().models) ?? []
     }
 
-    /// Confirm a bare backend by listing models. Prefer native Ollama when
-    /// `/api/tags` is present; otherwise use generic OpenAI `/v1/models`.
-    private func confirmPlainBackend(base: URL, token: String) async -> Result<BackendMode, AppError> {
-        if let models = await fetchOllamaModelList(base: base, token: token) {
-            return .success(.ollamaNative(models: models))
-        }
-
+    /// Confirm a backend through the OpenAI-compatible model list only. Maple
+    /// resolution uses this after its own handshake because Ollama probes such
+    /// as `/api/tags` are not part of Maple's encrypted API surface.
+    public func resolveOpenAICompatible(base: URL, token: String) async -> Result<BackendMode, AppError> {
         var req = URLRequest(url: base.appendingPathComponent("v1/models"))
         if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.timeoutInterval = 8
@@ -64,11 +61,24 @@ public struct CapabilitiesClient: Sendable {
             case 401, 403:
                 return .failure(.authFailed)
             default:
-                return .failure(.modelError("Not an OpenAI-compatible endpoint (HTTP \(http.statusCode))"))
+                let detail = String(data: data.prefix(2_048), encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let suffix = detail.isEmpty ? "" : ": \(detail)"
+                return .failure(.modelError("Not an OpenAI-compatible endpoint (HTTP \(http.statusCode))\(suffix)"))
             }
         } catch {
             return .failure(.from(error))
         }
+    }
+
+    /// Confirm a bare backend by listing models. Prefer native Ollama when
+    /// `/api/tags` is present; otherwise use generic OpenAI `/v1/models`.
+    private func confirmPlainBackend(base: URL, token: String) async -> Result<BackendMode, AppError> {
+        if let models = await fetchOllamaModelList(base: base, token: token) {
+            return .success(.ollamaNative(models: models))
+        }
+
+        return await resolveOpenAICompatible(base: base, token: token)
     }
 
     public struct OllamaModelCapabilities: Sendable, Equatable {
@@ -239,7 +249,7 @@ public struct BackendResolver: Sendable {
             return nil
         }
 
-        switch await maple.resolve(base: base, token: token) {
+        switch await maple.resolveOpenAICompatible(base: base, token: token) {
         case .success(let mode):
             return .success(.mapleEncrypted(models: mode.models))
         case .failure(let error):
