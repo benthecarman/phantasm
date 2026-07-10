@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "PhantasmKit",
     // macOS is included so the pure-logic tests run on the host via `swift test`
-    // (SwiftData requires macOS 14+). The app itself targets iOS 17+.
+    // without UIKit. The app itself targets iOS 18+.
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "PhantasmKit", targets: ["PhantasmKit"])

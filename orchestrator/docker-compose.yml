@@ -24,3 +24,8 @@ services:
     volumes:
       # Mount a custom workflow without rebuilding the image.
       - ./workflows:/app/workflows:ro
+      # Durable metrics and optional IMAGE_STORE_DIR data.
+      - phantasm-data:/var/lib/phantasm
+
+volumes:
+  phantasm-data:

@@ -1,6 +1,6 @@
 # Phantasm iOS
 
-A fast, thin AI chat client (SwiftUI, iOS 17+). It speaks OpenAI-compatible
+A fast, thin AI chat client (SwiftUI, iOS 18+). It speaks OpenAI-compatible
 streaming for the [Phantasm orchestrator](../orchestrator) and generic backends,
 and uses Ollama's native `/api/chat` stream when it detects a bare Ollama
 instance. Tools (web search, image generation) run server-side and are invisible
@@ -11,11 +11,11 @@ markdown, and reads the optional `x_status` field for progress.
 
 - **`Packages/PhantasmKit/`** — pure, host-testable logic: the SSE parser +
   streaming `ChatClient`, native Ollama chat adapter, capability detection,
-  `AppError` taxonomy, Keychain token storage, SwiftData models, profile store,
+  `AppError` taxonomy, Keychain token storage, GRDB models, profile store,
   and the base64-image markdown extractor.
 - **App target** (`App/`, `Views/`, `ViewModels/`) — SwiftUI with `@Observable`
-  MVVM. Depends on `PhantasmKit` and [MarkdownUI](https://github.com/gonzalezreal/swift-markdown-ui)
-  (the only third-party dependency).
+  MVVM. Uses MarkdownUI for rendering, GRDB/GRDBQuery for SQLite persistence,
+  and ollama-swift for bare-Ollama transport.
 
 The project is generated from [`project.yml`](project.yml) with
 [`xcodegen`](https://github.com/yonaskolb/XcodeGen) so the repo stays free of a
@@ -44,10 +44,9 @@ Ollama, then falls back to generic OpenAI-compatible `/v1/models`.
 swift test --package-path Packages/PhantasmKit
 ```
 
-15 unit tests cover the SSE line classifier + event stream (fixture-driven, no
-network), capability decoding + degradation, the error taxonomy, the base64
-image extractor, and SwiftData persistence (cascade delete, buffer-then-commit)
-on an in-memory store.
+More than 280 host and app tests cover streaming, capability degradation, error
+mapping, markdown/image handling, tools, and GRDB persistence on an in-memory
+store.
 
 ## Key behaviors
 
@@ -69,5 +68,4 @@ on an in-memory store.
 
 - Built in Swift 5 language mode for SwiftUI ergonomics; the networking code is
   written `async`/`await` + `Sendable`-clean.
-- Only the iOS 26.2 simulator runtime may be installed locally; the deployment
-  target is 17.0 and runs there. Multiple-backend profiles are supported.
+- The app deployment target is iOS 18. Multiple-backend profiles are supported.

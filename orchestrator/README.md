@@ -26,8 +26,8 @@ iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ O
 - **Tool turns** run the standard function-calling loop *upstream* (orchestrator
   ↔ Ollama). The client only sees the final streamed answer, plus optional
   progress on the additive `x_status` SSE field.
-- Generated **images** are embedded in the answer as markdown
-  `![generated](data:image/png;base64,…)`.
+- Generated **images** are embedded as data-URI markdown by default, or as
+  signed `/v1/files/{id}/content` links when URL delivery is configured.
 - **Tool privacy boundary:** tools do not persist conversation content, fetched
   pages, tool outputs, attachments, or intermediate data to durable local
   storage. The only cache is in-memory and scoped to one turn. When a backend
@@ -62,7 +62,10 @@ docker compose up             # builds + starts on :8080
 ```
 
 If Ollama/ComfyUI run on the host, the compose file points the container at
-`host.docker.internal` by default.
+`host.docker.internal` by default. The container runs as uid/gid 10001 and the
+compose file persists `/var/lib/phantasm` in the `phantasm-data` volume. Put
+`IMAGE_STORE_DIR=/var/lib/phantasm/images` there when enabling URL image
+delivery.
 
 ### Cargo (local dev)
 
@@ -83,20 +86,15 @@ opts into `depth="thorough"` per query, leaving simple lookups snippet-fast.
 ### systemd (bare metal)
 
 For a non-Docker host, [`deploy/phantasm-orchestrator.service`](deploy/phantasm-orchestrator.service)
-is a hardened `Type=notify` unit (sandboxed, runs as a dedicated `phantasm`
-user, drains in-flight turns on stop). Build, then follow the install header in
-the file:
+is a `Type=notify` unit that also supports rootless Podman for `code_exec` and
+drains in-flight turns on stop. Its `YOURUSER`/`YOURUID` placeholders are
+intentionally invalid; build the binary, then follow the complete install header
+in the unit to choose a real login user, configure lingering, and install it:
 
 ```sh
 cargo build --release
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin phantasm
 sudo install -m 0755 target/release/phantasm-orchestrator /usr/local/bin/
-sudo install -d -m 0755 /etc/phantasm
-sudo cp .env.example /etc/phantasm/orchestrator.env   # then edit PHANTASM_AUTH_TOKEN
-sudo chown root:phantasm /etc/phantasm/orchestrator.env && sudo chmod 0640 /etc/phantasm/orchestrator.env
-sudo cp deploy/phantasm-orchestrator.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now phantasm-orchestrator
-journalctl -u phantasm-orchestrator -f
+# Continue with steps 0–5 at the top of deploy/phantasm-orchestrator.service.
 ```
 
 The orchestrator emits `READY=1` once it's listening, so `systemctl start`
@@ -111,7 +109,7 @@ full annotated list.
 ## Tests
 
 ```sh
-cargo test                    # 20 unit + 6 integration, no real backends needed
+cargo test                    # unit + integration, no real backends needed
 cargo clippy --all-targets    # lints
 ```
 
