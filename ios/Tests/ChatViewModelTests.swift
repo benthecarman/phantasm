@@ -858,7 +858,7 @@ private final class FakeImageFetcher: ImageFetching, @unchecked Sendable {
         self.image = image
     }
 
-    func fetch(_ url: URL) async -> ServerImageRef.CachedImage? {
+    func fetch(_ url: URL, trustedBase: URL) async -> ServerImageRef.CachedImage? {
         return image
     }
 }

@@ -371,7 +371,9 @@ Consequences:
     exempt from bearer auth — image loaders can't send an `Authorization` header.
   - **Lifecycle**: the app owns it. `DELETE /v1/files/<id>` (bearer-authed) drops
     a blob when its conversation is deleted; a server-side TTL (`IMAGE_STORE_TTL_S`)
-    is the backstop for deletes that never arrive.
+    is the backstop for deletes that never arrive. New ids are unique per
+    delivery, so deleting one conversation cannot break another; legacy shared
+    content-hash blobs rely on TTL cleanup instead of explicit deletion.
   - The edit tool resolves a URL-delivered image back to bytes server-side, so
     editing a previously-generated image works in either form.
 - **Progress** rides optional additive fields on the SSE chunk, e.g.
@@ -452,7 +454,7 @@ behind an explicit confirmation showing the target host, and render a pairing
 QR for an existing profile to pair a second device (FR-A12,
 [`qr-pairing.md`](qr-pairing.md)).
 
-**Non-functional:** iOS 18+ (NFR-A1), token in Keychain (NFR-A2), local SwiftData
+**Non-functional:** iOS 18+ (NFR-A1), token in Keychain (NFR-A2), local GRDB/SQLite
 persistence (NFR-A3), smooth streaming off the main thread (NFR-A4), fast cold
 start (NFR-A5), optional multiple backend profiles (NFR-A6).
 

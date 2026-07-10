@@ -113,13 +113,18 @@ public protocol ChatStore: Sendable {
     /// A no-op if the message no longer exists.
     func deleteMessagesAfter(id: UUID) async throws
 
-    /// Tombstone the conversation (set `deletedAt`) and hard-delete its messages
-    /// + attachments, reclaiming the heavy data while leaving a slim tombstone.
+    /// Permanently delete the conversation and its messages + attachments.
+    /// Older databases keep the nullable `deletedAt` column for schema
+    /// compatibility, but local-only history has no sync consumer for tombstones.
     func deleteConversation(id: UUID) async throws
 
-    /// Tombstone every conversation and hard-delete all messages + attachments —
-    /// the bulk equivalent of `deleteConversation` across the whole history.
+    /// Permanently delete every conversation and all messages + attachments.
     func deleteAllConversations() async throws
+
+    /// One-shot fetch of all live conversations and their messages. Used by
+    /// destructive data controls to discover server-hosted image references
+    /// before the local rows are removed.
+    func allConversationDetails() async throws -> [ConversationDetail]
 
     /// One-shot fetch of a conversation with its ordered message history. Returns
     /// nil if the conversation is missing or tombstoned.

@@ -8,11 +8,9 @@ import GRDB
 /// chronological/wire-format helpers live on the `ChatMessage` aggregate and the
 /// `[ChatMessage]` array (see below) instead of on the records themselves.
 ///
-/// Every row carries `updatedAt`; `Conversation` additionally carries a nullable
-/// `deletedAt` tombstone. Deleting a conversation hard-removes its messages +
-/// attachments (reclaiming the heavy data) but leaves the conversation row as a
-/// lightweight tombstone, so a future cloud-sync layer can still propagate the
-/// deletion (SPEC §7). Column names match the property names.
+/// Every row carries `updatedAt`. `Conversation` retains the nullable `deletedAt`
+/// field from the original schema so existing databases remain readable, though
+/// current local-only deletes remove the row. Column names match the properties.
 
 /// A conversation's per-chat tool selection, persisted as one JSON column so a
 /// new tool is a new field with a default — not a schema migration. Server
@@ -62,7 +60,7 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable,
     public var title: String
     public var createdAt: Date
     public var updatedAt: Date
-    /// Tombstone: non-nil once the conversation has been deleted.
+    /// Legacy tombstone field retained for on-disk compatibility.
     public var deletedAt: Date?
     public var modelID: String?
     public var profileID: UUID?

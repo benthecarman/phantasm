@@ -136,7 +136,7 @@ struct UserNotificationManager: NotificationManaging {
 }
 
 protocol ImageFetching: Sendable {
-    func fetch(_ url: URL) async -> ServerImageRef.CachedImage?
+    func fetch(_ url: URL, trustedBase: URL) async -> ServerImageRef.CachedImage?
 }
 
 extension ImageClient: ImageFetching {}

@@ -52,9 +52,8 @@ public final class AppDatabase: Sendable {
                 t.column("title", .text).notNull()
                 t.column("createdAt", .datetime).notNull()
                 t.column("updatedAt", .datetime).notNull()
-                // Tombstone: deletes keep this slim row (messages are
-                // hard-deleted) so a future cloud-sync layer can propagate
-                // the deletion (SPEC §7).
+                // Retained for compatibility with the original on-disk schema.
+                // Current local-only deletes remove the whole conversation row.
                 t.column("deletedAt", .datetime)
                 t.column("modelID", .text)
                 t.column("profileID", .blob)
@@ -309,28 +308,26 @@ extension AppDatabase: ChatStore {
 
     public func deleteConversation(id: UUID) async throws {
         try await dbWriter.write { db in
-            // Hard-delete the heavy data: removing messages cascades to
-            // attachments (FK) and fires the FTS triggers that clean message_ft.
-            try Message.filter(Col.conversationId == id).deleteAll(db)
-            // Leave a lightweight tombstone so a future sync can propagate the delete.
-            guard var convo = try Conversation.fetchOne(db, key: id) else { return }
-            let now = Date()
-            convo.deletedAt = now
-            convo.updatedAt = now
-            try convo.update(db)
+            // The conversation FK cascades to messages, attachments, and
+            // embeddings; message delete triggers keep FTS in sync.
+            try Conversation.deleteOne(db, key: id)
         }
     }
 
     public func deleteAllConversations() async throws {
         try await dbWriter.write { db in
-            // Hard-delete all messages (cascades to attachments + fires FTS
-            // triggers), then tombstone every live conversation — same shape as
-            // deleteConversation, applied across the whole history.
-            try Message.deleteAll(db)
-            let now = Date()
-            try Conversation
-                .filter(Col.deletedAt == nil)
-                .updateAll(db, Col.deletedAt.set(to: now), Column("updatedAt").set(to: now))
+            try Conversation.deleteAll(db)
+        }
+    }
+
+    public func allConversationDetails() async throws -> [ConversationDetail] {
+        try await dbWriter.read { db in
+            try Self.recentConversations(db).map { conversation in
+                ConversationDetail(
+                    conversation: conversation,
+                    messages: try Self.messages(db, conversationId: conversation.id)
+                )
+            }
         }
     }
 

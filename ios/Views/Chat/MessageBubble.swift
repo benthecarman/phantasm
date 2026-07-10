@@ -69,8 +69,13 @@ struct MessageBubble: View {
                             chartFallback(error)
                         }
                     }
-                    if !content.isEmpty {
-                        MarkdownMessageView(text: content, cachedImages: cachedImages) { index, image in
+                    if !message.message.content.isEmpty {
+                        MarkdownMessageView(
+                            text: message.message.content,
+                            storedImages: message.inlineImages,
+                            cachedImages: cachedImages,
+                            trustedImageBase: env.activeProfile?.baseURL
+                        ) { index, image in
                             onTapImage(message.message.id, index, image)
                         }
                     }

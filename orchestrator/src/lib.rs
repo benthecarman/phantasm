@@ -457,14 +457,21 @@ pub fn build_state_with_upstreams(
     let capabilities = state::CapabilitiesCache::new(capabilities);
     // Stand up the server-hosted image store when configured. A configured-but-
     // unwritable directory degrades to inline delivery (logged) rather than
-    // taking down startup. The signed-URL HMAC key is the auth token when one is
-    // set; with auth disabled there's no token, so derive a random per-process
-    // key (blobs are ephemeral, so a key that resets on restart is fine).
-    let image_signing_key = cfg
-        .auth_token
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // taking down startup. Key resolution preserves the historical auth-token
+    // behavior and persists a stable random key for tokenless deployments.
     let images = cfg.image_store_dir.as_ref().and_then(|dir| {
+        let image_signing_key = match images::resolve_signing_key(
+            dir,
+            cfg.image_signing_key.as_deref(),
+            cfg.auth_token.as_deref(),
+        ) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(dir = %dir.display(), error = %e,
+                    "image signing key unavailable; falling back to inline image delivery");
+                return None;
+            }
+        };
         match images::BlobStore::new(
             dir.clone(),
             &image_signing_key,
@@ -473,6 +480,8 @@ pub fn build_state_with_upstreams(
             cfg.public_base_url.as_ref(),
         ) {
             Ok(store) => {
+                let prune_interval = Duration::from_secs(cfg.image_store_ttl_s.clamp(60, 60 * 60));
+                store.spawn_pruner(prune_interval);
                 tracing::info!(dir = %dir.display(), "server-hosted image store enabled");
                 Some(store)
             }

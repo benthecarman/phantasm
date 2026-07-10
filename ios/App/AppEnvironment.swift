@@ -162,10 +162,35 @@ final class AppEnvironment {
         let ids = detail.messages.flatMap { ServerImageRef.ids(in: $0.message.content) }
         guard !ids.isEmpty else { return }
         let profile = profiles.first { $0.id == detail.conversation.profileID } ?? activeProfile
-        guard let profile, let base = profile.baseURL,
-              let token = keychain.token(for: profile.id)
-        else { return }
+        guard let profile, let base = profile.baseURL else { return }
+        let token = keychain.token(for: profile.id) ?? ""
         await ImageClient().delete(ids: ids, base: base, token: token)
+    }
+
+    /// Best-effort server cleanup for the bulk history control. References are
+    /// grouped by their owning backend so tokenless and authenticated profiles
+    /// both work, and no request is sent to an unrelated active backend.
+    func purgeAllServerImages() async {
+        guard let details = try? await store.allConversationDetails() else { return }
+        var idsByProfile: [UUID: Set<String>] = [:]
+        for detail in details {
+            guard let profileID = detail.conversation.profileID ?? activeProfileID,
+                  profiles.contains(where: { $0.id == profileID })
+            else { continue }
+            let ids = detail.messages.flatMap { ServerImageRef.ids(in: $0.message.content) }
+            idsByProfile[profileID, default: []].formUnion(ids)
+        }
+        for (profileID, ids) in idsByProfile {
+            guard !ids.isEmpty,
+                  let profile = profiles.first(where: { $0.id == profileID }),
+                  let base = profile.baseURL
+            else { continue }
+            await ImageClient().delete(
+                ids: Array(ids),
+                base: base,
+                token: keychain.token(for: profileID) ?? ""
+            )
+        }
     }
 
     /// Models to offer in the picker for the active backend. Prefers the live

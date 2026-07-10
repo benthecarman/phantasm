@@ -3,7 +3,7 @@ import Foundation
 /// Helpers for the server-hosted image references the orchestrator embeds under
 /// URL delivery (spec §2.2b): markdown links whose target is an absolute
 /// `…/v1/files/<id>/content?exp=…&sig=…` URL. The `<id>` is the server's content
-/// hash — used to clean the blob up (`DELETE /v1/files/<id>`) when its
+/// opaque identifier — used to clean the blob up (`DELETE /v1/files/<id>`) when its
 /// conversation is deleted.
 public enum ServerImageRef {
     private static let marker = "/v1/files/"
@@ -47,6 +47,78 @@ public enum ServerImageRef {
             .map { (ns.substring(with: $0.range(at: 2)), ns.substring(with: $0.range(at: 1))) }
     }
 
+    /// Only URLs minted by the orchestrator are eligible for automatic network
+    /// loading. Arbitrary markdown image URLs require an explicit user tap in
+    /// the app, preventing tracking pixels from silently learning the device IP.
+    public static func isSignedContentURL(_ url: URL) -> Bool {
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let query = components.queryItems else { return false }
+        let parts = url.pathComponents.filter { $0 != "/" }
+        guard parts.count >= 4,
+              Array(parts.suffix(4).prefix(2)) == ["v1", "files"],
+              parts.last == "content",
+              !parts[parts.count - 2].isEmpty,
+              parts[parts.count - 2].allSatisfy({
+                  $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_"
+              }) else { return false }
+        let exp = query.first(where: { $0.name == "exp" })?.value ?? ""
+        let sig = query.first(where: { $0.name == "sig" })?.value ?? ""
+        return Int64(exp) != nil && !sig.isEmpty
+    }
+
+    /// Automatic loads must also stay on the configured backend origin. The
+    /// URL shape/signature fields alone cannot prove provenance client-side: an
+    /// arbitrary tracker could imitate that path on its own host.
+    public static func isTrustedContentURL(_ url: URL, backendBase: URL?) -> Bool {
+        guard isSignedContentURL(url), let backendBase,
+              let candidate = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let backend = URLComponents(url: backendBase, resolvingAgainstBaseURL: false)
+        else { return false }
+        return candidate.scheme?.lowercased() == backend.scheme?.lowercased()
+            && candidate.host?.lowercased() == backend.host?.lowercased()
+            && effectivePort(candidate) == effectivePort(backend)
+    }
+
+    private static func effectivePort(_ components: URLComponents) -> Int? {
+        components.port ?? (components.scheme?.lowercased() == "https" ? 443 : 80)
+    }
+
+    /// Render cached server images via binary placeholders rather than a
+    /// Data→base64→Data round trip. Signed uncached links remain unchanged.
+    public static func cachedPlaceholders(
+        in text: String,
+        cache: [String: CachedImage],
+        startingAt start: Int = 0
+    ) -> Base64ImageExtractor.Result {
+        guard !cache.isEmpty, let regex = linkRegex else {
+            return .init(markdown: text, images: [:])
+        }
+        let ns = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        var output = ""
+        var images: [Int: Data] = [:]
+        var cursor = 0
+        var index = start
+        for match in matches {
+            let id = ns.substring(with: match.range(at: 2))
+            guard let image = cache[id] else { continue }
+            output += ns.substring(
+                with: NSRange(location: cursor, length: match.range.location - cursor)
+            )
+            // Preserve the original alt text; replace only the URL target.
+            let full = ns.substring(with: match.range)
+            let url = ns.substring(with: match.range(at: 1))
+            output += full.replacingOccurrences(of: url, with: "phantasm-img://\(index)")
+            images[index] = image.data
+            index += 1
+            cursor = match.range.location + match.range.length
+        }
+        guard !images.isEmpty else { return .init(markdown: text, images: [:]) }
+        output += ns.substring(from: cursor)
+        return .init(markdown: output, images: images)
+    }
+
     /// Rewrite every server-image link whose id is in `cache` to an inline
     /// `data:` URI, so it renders from local bytes — offline and after the signed
     /// URL expires. Uncached links are left untouched (they still load over the
@@ -55,7 +127,7 @@ public enum ServerImageRef {
         guard !cache.isEmpty else { return text }
         // Memoized: committed rows re-render on every layout/scroll pass, and
         // re-encoding cached image bytes to base64 each time is main-thread
-        // work proportional to the image sizes. Ids are content hashes, so
+        // work proportional to the image sizes. Blob ids are immutable, so
         // (text, ids) fully determines the result.
         let key = (text + "|" + cache.keys.sorted().joined(separator: ",")) as NSString
         if let hit = memo.object(forKey: key) { return hit as String }

@@ -483,6 +483,7 @@ fn test_config(upstream_base: &str) -> Config {
         comfy_timeout_s: 120,
         comfy_max_image_bytes: 16 * 1024 * 1024,
         image_store_dir: None,
+        image_signing_key: None,
         image_store_ttl_s: 7 * 24 * 60 * 60,
         public_base_url: None,
         comfy_gen_workflow: None,

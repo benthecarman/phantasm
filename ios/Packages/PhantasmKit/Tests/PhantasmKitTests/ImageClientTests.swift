@@ -51,14 +51,58 @@ final class ImageClientTests: XCTestCase {
         override func stopLoading() {}
     }
 
+    final class OversizeContentProtocol: URLProtocol {
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+        override func startLoading() {
+            let http = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "image/png", "Content-Length": "3"]
+            )!
+            client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data([1, 2, 3]))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        override func stopLoading() {}
+    }
+
     func testFetchReturnsBytesAndContentType() async {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [ContentProtocol.self]
         let client = ImageClient(session: URLSession(configuration: config))
 
-        let img = await client.fetch(URL(string: "https://host.example/v1/files/x/content?sig=z")!)
+        let img = await client.fetch(
+            URL(string: "https://host.example/v1/files/x/content?exp=9999999999&sig=z")!,
+            trustedBase: URL(string: "https://host.example")!
+        )
         XCTAssertEqual(img?.data, Data([0xAA, 0xBB, 0xCC]))
         XCTAssertEqual(img?.mime, "image/webp")
+    }
+
+    func testFetchRejectsUnsignedURLWithoutNetworkRequest() async {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [ContentProtocol.self]
+        let client = ImageClient(session: URLSession(configuration: config))
+
+        let img = await client.fetch(
+            URL(string: "https://tracker.example/pixel.png")!,
+            trustedBase: URL(string: "https://host.example")!
+        )
+        XCTAssertNil(img)
+    }
+
+    func testFetchRejectsBodyOverConfiguredCap() async {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [OversizeContentProtocol.self]
+        let client = ImageClient(
+            session: URLSession(configuration: config), maxResponseBytes: 2
+        )
+
+        let img = await client.fetch(
+            URL(string: "https://host.example/v1/files/x/content?exp=9999999999&sig=z")!,
+            trustedBase: URL(string: "https://host.example")!
+        )
+        XCTAssertNil(img)
     }
 
     func testDeletesEachIDWithBearer() async {
@@ -79,5 +123,17 @@ final class ImageClientTests: XCTestCase {
                 "https://host.example/v1/files/abc123",
                 "https://host.example/v1/files/DEF-_4",
             ])
+    }
+
+    func testDeleteSupportsTokenlessBackend() async {
+        RecordingProtocol.hits = []
+        await ImageClient(session: session()).delete(
+            ids: ["abc123"],
+            base: URL(string: "http://host.example")!,
+            token: ""
+        )
+
+        XCTAssertEqual(RecordingProtocol.hits.count, 1)
+        XCTAssertNil(RecordingProtocol.hits.first?.auth)
     }
 }

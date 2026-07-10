@@ -44,6 +44,16 @@ final class SchemaImprovementTests: XCTestCase {
         XCTAssertEqual(wire, original)
     }
 
+    func testPersistedInlineImageRendersThroughBinaryPlaceholder() {
+        let result = InlineImageRef.placeholders(
+            in: "![generated](phantasm-file://saved-id)",
+            images: ["saved-id": .init(data: pngBytes, mime: "image/png")]
+        )
+        XCTAssertEqual(result.markdown, "![generated](phantasm-img://0)")
+        XCTAssertEqual(result.images, [0: pngBytes])
+        XCTAssertFalse(result.markdown.contains("base64"))
+    }
+
     func testContentRewriteReplacesExtractedImages() async throws {
         let db = try AppDatabase.empty()
         let convo = try await makeConversation(db)

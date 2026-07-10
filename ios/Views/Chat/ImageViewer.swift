@@ -51,18 +51,26 @@ enum ConversationImages {
                     out.append(GalleryImage(id: "\(m.id):\(i)", data: att.data))
                 }
             } else {
-                // Mirror MessageBubble/MarkdownMessageView: restore extracted
-                // inline images, inline cached server images, then pull every
-                // base64 payload in appearance order.
+                // Mirror MarkdownMessageView's no-base64 renderer pipeline so
+                // tap ordinals remain stable without encoding stored bytes.
                 var cache: [String: ServerImageRef.CachedImage] = [:]
                 for a in cm.attachments where a.kind == AttachmentKind.remoteImage.rawValue {
                     cache[a.name] = ServerImageRef.CachedImage(data: a.data, mime: a.mimeType)
                 }
-                let restored = InlineImageRef.restore(m.content, images: cm.inlineImages)
-                let resolved = ServerImageRef.inlineCached(restored, cache: cache)
-                let extracted = Base64ImageExtractor().extractCached(resolved)
-                for index in extracted.images.keys.sorted() {
-                    if let data = extracted.images[index] {
+                let base64 = Base64ImageExtractor().extractCached(m.content)
+                let next = (base64.images.keys.max() ?? -1) + 1
+                let stored = InlineImageRef.placeholders(
+                    in: base64.markdown, images: cm.inlineImages, startingAt: next
+                )
+                let server = ServerImageRef.cachedPlaceholders(
+                    in: stored.markdown,
+                    cache: cache,
+                    startingAt: next + stored.images.count
+                )
+                let images = base64.images.merging(stored.images) { current, _ in current }
+                    .merging(server.images) { current, _ in current }
+                for index in images.keys.sorted() {
+                    if let data = images[index] {
                         out.append(GalleryImage(id: "\(m.id):\(index)", data: data))
                     }
                 }

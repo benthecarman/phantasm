@@ -1035,7 +1035,7 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(detail?.wireHistory(), [WireMessage(role: "assistant", content: "answer")])
     }
 
-    func testDeleteTombstonesConversationAndHardDeletesChildren() async throws {
+    func testDeleteHardDeletesConversationAndChildren() async throws {
         let store = try AppDatabase.empty()
         let convo = Conversation(title: "T")
         try await store.insertConversation(convo)
@@ -1050,17 +1050,37 @@ final class PersistenceTests: XCTestCase {
 
         try await store.deleteConversation(id: convo.id)
 
-        // Tombstoned: detail no longer returns the conversation.
+        // Detail no longer returns the conversation.
         let after = try await store.conversationDetail(id: convo.id)
         XCTAssertNil(after)
 
-        // Heavy data is physically gone; the conversation row remains as a tombstone.
+        // The conversation and all child data are physically gone.
         try await store.reader.read { db in
             XCTAssertEqual(try Message.fetchCount(db), 0)
             XCTAssertEqual(try Attachment.fetchCount(db), 0)
             let row = try Conversation.fetchOne(db, key: convo.id)
-            XCTAssertNotNil(row)
-            XCTAssertNotNil(row?.deletedAt)
+            XCTAssertNil(row)
+        }
+    }
+
+    func testDeleteAllHardDeletesConversationsAndChildren() async throws {
+        let store = try AppDatabase.empty()
+        for title in ["One", "Two"] {
+            let conversation = Conversation(title: title)
+            try await store.insertConversation(conversation)
+            let message = Message(conversationId: conversation.id, role: "user", content: title)
+            try await store.insertMessage(
+                message,
+                attachments: [Attachment(messageId: message.id, kind: .image, name: "p.jpg")]
+            )
+        }
+
+        try await store.deleteAllConversations()
+
+        try await store.reader.read { db in
+            XCTAssertEqual(try Conversation.fetchCount(db), 0)
+            XCTAssertEqual(try Message.fetchCount(db), 0)
+            XCTAssertEqual(try Attachment.fetchCount(db), 0)
         }
     }
 

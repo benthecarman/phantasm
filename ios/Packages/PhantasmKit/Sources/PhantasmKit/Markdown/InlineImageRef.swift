@@ -29,6 +29,40 @@ public enum InlineImageRef {
         public let images: [ExtractedImage]
     }
 
+    /// Replace persisted `phantasm-file://` targets with renderer placeholders
+    /// without converting binary data to base64 and immediately decoding it
+    /// again. Unknown names are left alone for backward-compatible recovery.
+    public static func placeholders(
+        in text: String,
+        images: [String: ServerImageRef.CachedImage],
+        startingAt start: Int = 0
+    ) -> Base64ImageExtractor.Result {
+        guard !images.isEmpty, text.contains("phantasm-file://"),
+              let regex = fileRegex else {
+            return .init(markdown: text, images: [:])
+        }
+        let ns = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        var output = ""
+        var outputImages: [Int: Data] = [:]
+        var cursor = 0
+        var index = start
+        for match in matches {
+            let name = ns.substring(with: match.range(at: 1))
+            guard let image = images[name] else { continue }
+            output += ns.substring(
+                with: NSRange(location: cursor, length: match.range.location - cursor)
+            )
+            output += "](phantasm-img://\(index))"
+            outputImages[index] = image.data
+            index += 1
+            cursor = match.range.location + match.range.length
+        }
+        guard !outputImages.isEmpty else { return .init(markdown: text, images: [:]) }
+        output += ns.substring(from: cursor)
+        return .init(markdown: output, images: outputImages)
+    }
+
     /// Pull every decodable `data:image/…` markdown image out of `text`.
     /// An undecodable payload is dropped to a `*(image)*` marker (same
     /// behavior as the renderer's extractor) rather than kept.
@@ -95,5 +129,11 @@ public enum InlineImageRef {
     /// Groups: 1 = alt text, 2 = image subtype, 3 = base64 payload.
     private static let dataURIRegex = try? NSRegularExpression(
         pattern: #"!\[([^\]]*)\]\(data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)\)"#
+    )
+
+    /// Group 1 = persisted attachment name. The full match starts at `](` so
+    /// the image's original alt text remains untouched.
+    private static let fileRegex = try? NSRegularExpression(
+        pattern: #"\]\(phantasm-file://([A-Za-z0-9_-]+)\)"#
     )
 }

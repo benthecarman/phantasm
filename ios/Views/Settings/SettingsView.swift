@@ -8,7 +8,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     /// Invoked after chat history is fully cleared, so the host can drop the
-    /// (now-tombstoned) open conversation and present a fresh chat.
+    /// open conversation and present a fresh chat.
     var onHistoryCleared: () -> Void = {}
 
     @State private var editing: BackendProfile?
@@ -138,6 +138,7 @@ struct SettingsView: View {
                     Haptics.notify(.warning)
                     let store = env.store
                     Task {
+                        await env.purgeAllServerImages()
                         try? await store.deleteAllConversations()
                         onHistoryCleared()
                     }

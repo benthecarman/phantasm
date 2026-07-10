@@ -1303,10 +1303,12 @@ final class ChatViewModel {
     private func cacheServerImages(
         messageID: UUID, refs: [(id: String, url: String)]
     ) async {
-        guard !refs.isEmpty, let store else { return }
+        guard !refs.isEmpty, let store,
+              let trustedBase = env?.activeProfile?.baseURL else { return }
         var attachments: [Attachment] = []
         for ref in refs {
-            guard let url = URL(string: ref.url), let img = await imageFetcher.fetch(url) else {
+            guard let url = URL(string: ref.url),
+                  let img = await imageFetcher.fetch(url, trustedBase: trustedBase) else {
                 continue
             }
             attachments.append(

@@ -1,5 +1,6 @@
 import MarkdownUI
 import PhantasmKit
+import ImageIO
 import SwiftUI
 
 /// Renders assistant markdown (FR-A4) with fenced code blocks (copy button) and
@@ -7,10 +8,16 @@ import SwiftUI
 /// provider.
 struct MarkdownMessageView: View {
     let text: String
+    /// Persisted inline-image attachments keyed by `phantasm-file://` name.
+    /// These feed the renderer as bytes, avoiding a base64 encode/decode cycle.
+    var storedImages: [String: ServerImageRef.CachedImage] = [:]
     /// Locally-cached server image bytes, keyed by file id. A referenced image
     /// present here renders from local bytes (offline / after URL expiry) instead
     /// of refetching; absent ones still load over the network.
     var cachedImages: [String: ServerImageRef.CachedImage] = [:]
+    /// Origin allowed for automatic signed-image loads. Nil means remote images
+    /// remain explicit links (the safe streaming/default behavior).
+    var trustedImageBase: URL? = nil
     /// Live streaming preview: the view re-renders per token, so inline base64
     /// images are stripped without decoding (no multi-MB regex/decode on the
     /// main actor per token); they render when the message commits.
@@ -20,20 +27,41 @@ struct MarkdownMessageView: View {
     var onTapImage: (Int, UIImage) -> Void = { _, _ in }
 
     var body: some View {
-        let extracted = isStreaming
-            ? Base64ImageExtractor.Result(
+        let extracted: Base64ImageExtractor.Result = isStreaming
+            ? .init(
                 markdown: Base64ImageExtractor.streamingSanitized(text), images: [:]
             )
-            : Base64ImageExtractor()
-                .extractCached(ServerImageRef.inlineCached(text, cache: cachedImages))
+            : preparedImages()
         Markdown(extracted.markdown)
             .markdownTheme(.phantasmChat)
-            .markdownImageProvider(PhantasmImageProvider(images: extracted.images, onTap: onTapImage))
+            .markdownImageProvider(PhantasmImageProvider(
+                images: extracted.images,
+                trustedBase: trustedImageBase,
+                onTap: onTapImage
+            ))
             .markdownBlockStyle(\.codeBlock) { configuration in
                 CodeBlockView(configuration: configuration)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .textSelection(.enabled)
+    }
+
+    private func preparedImages() -> Base64ImageExtractor.Result {
+        let base64 = Base64ImageExtractor().extractCached(text)
+        let next = (base64.images.keys.max() ?? -1) + 1
+        let stored = InlineImageRef.placeholders(
+            in: base64.markdown, images: storedImages, startingAt: next
+        )
+        let server = ServerImageRef.cachedPlaceholders(
+            in: stored.markdown,
+            cache: cachedImages,
+            startingAt: next + stored.images.count
+        )
+        return .init(
+            markdown: server.markdown,
+            images: base64.images.merging(stored.images) { current, _ in current }
+                .merging(server.images) { current, _ in current }
+        )
     }
 }
 
@@ -190,6 +218,7 @@ struct PhantasmImageProvider: ImageProvider {
     static let remoteOrdinal = Int.min
 
     let images: [Int: Data]
+    let trustedBase: URL?
     var onTap: (Int, UIImage) -> Void = { _, _ in }
 
     func makeImage(url: URL?) -> some View {
@@ -202,12 +231,19 @@ struct PhantasmImageProvider: ImageProvider {
                     .contentShape(Rectangle())
                     .onTapGesture { onTap(index, uiImage) }
                     .contextMenu { ImageActions(image: uiImage) }
-            } else if let url {
+            } else if let url, let trustedBase,
+                      ServerImageRef.isTrustedContentURL(url, backendBase: trustedBase) {
                 // Server-hosted / external images arrive as absolute URLs (spec
                 // §2.2b). Load them to bytes (not `AsyncImage`) so a tap can hand
                 // the decoded `UIImage` to the viewer; inline base64 is above.
-                RemoteImage(url: url) { uiImage in
+                RemoteImage(url: url, trustedBase: trustedBase) { uiImage in
                     onTap(Self.remoteOrdinal, uiImage)
+                }
+            } else if let url, ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                Link(destination: url) {
+                    Label("External image — tap to open", systemImage: "arrow.up.right.square")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             } else {
                 EmptyView()
@@ -234,6 +270,7 @@ private extension Image {
 /// a tap can hand the decoded bytes to the full-screen viewer and save/share.
 private struct RemoteImage: View {
     let url: URL
+    let trustedBase: URL
     let onTap: (UIImage) -> Void
     @State private var image: UIImage?
     @State private var loadFailed = false
@@ -263,7 +300,7 @@ private struct RemoteImage: View {
     @MainActor
     private func load() async {
         loadFailed = false
-        if let loaded = await RemoteImageCache.shared.image(for: url) {
+        if let loaded = await RemoteImageCache.shared.image(for: url, trustedBase: trustedBase) {
             image = loaded
         } else {
             loadFailed = true
@@ -278,13 +315,22 @@ private final class RemoteImageCache: @unchecked Sendable {
     static let shared = RemoteImageCache()
     private let cache = NSCache<NSURL, UIImage>()
 
-    func image(for url: URL) async -> UIImage? {
+    func image(for url: URL, trustedBase: URL) async -> UIImage? {
         if let hit = cache.object(forKey: url as NSURL) { return hit }
         // Bound the wait: a stalled fetch should resolve to a failure (and
         // collapse the placeholder) rather than spin indefinitely.
-        let request = URLRequest(url: url, timeoutInterval: 20)
-        guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let image = UIImage(data: data) else { return nil }
+        guard let cached = await ImageClient().fetch(url, trustedBase: trustedBase),
+              let source = CGImageSourceCreateWithData(cached.data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.intValue > 0, height.intValue > 0,
+              width.intValue <= 16_384, height.intValue <= 16_384,
+              width.int64Value * height.int64Value <= 40_000_000,
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else { return nil }
+        let image = UIImage(cgImage: cgImage)
         cache.setObject(image, forKey: url as NSURL)
         return image
     }

@@ -7,33 +7,33 @@
 //! multi-MB data URIs).
 //!
 //! Protection model:
-//!   * **Content-hash ids** (sha256 → base64url): opaque, non-enumerable, and
-//!     self-deduplicating. Validated to a fixed charset so an id can never
-//!     escape the store directory (no path traversal).
+//!   * **Random opaque ids** (UUID): non-enumerable and unique per delivery, so
+//!     deleting one conversation can never invalidate an identical image owned
+//!     by another. Legacy content-hash ids remain readable.
 //!   * **Signed URLs** (HMAC-SHA256 over `id:exp`, keyed by the server's auth
 //!     token): the fetch route is exempt from bearer auth — markdown image
 //!     loaders can't send an `Authorization` header — so a valid, unexpired
-//!     signature is what authorizes a read. The content-hash id is the primary
-//!     guard; the signature + expiry (the URL expires with the blob, governed by
-//!     `IMAGE_STORE_TTL_S`) are defense-in-depth.
+//!     signature is what authorizes a read. The random id prevents enumeration;
+//!     the signature + expiry enforce access and lifetime.
 //!   * **Lifecycle**: the app deletes a blob when its conversation is deleted
 //!     (`DELETE /v1/files/<id>`); a lazy TTL pruner (`IMAGE_STORE_TTL_S`) is the
 //!     backstop for deletes that never arrive (uninstall, lost request).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-/// A filesystem-backed, content-addressed image store. Cheap to clone (`Arc`).
+/// A filesystem-backed image store. Cheap to clone (`Arc`).
 #[derive(Clone)]
 pub struct BlobStore {
     inner: Arc<Inner>,
@@ -41,9 +41,8 @@ pub struct BlobStore {
 
 struct Inner {
     dir: PathBuf,
-    /// Signing key (the server auth token's bytes). Rotating the token
-    /// invalidates outstanding URLs — acceptable; the app re-fetches on next view
-    /// and the content-hash id still gates access.
+    /// Signing key bytes. Authenticated deployments default to the existing
+    /// bearer token for compatibility; open deployments persist a random key.
     key: Vec<u8>,
     store_ttl_s: u64,
     max_bytes: usize,
@@ -99,8 +98,9 @@ impl BlobStore {
         })
     }
 
-    /// Persist `bytes`, returning the content-hash id. Idempotent: identical
-    /// bytes map to the same id and file. Prunes expired blobs opportunistically.
+    /// Persist `bytes`, returning a unique opaque id. Unique ids intentionally
+    /// avoid cross-conversation ownership ambiguity for identical images.
+    /// Prunes expired blobs opportunistically.
     pub async fn put(&self, bytes: &[u8]) -> std::io::Result<String> {
         if bytes.len() > self.inner.max_bytes {
             return Err(std::io::Error::new(
@@ -108,13 +108,9 @@ impl BlobStore {
                 "image exceeds store byte cap",
             ));
         }
-        let id = content_id(bytes);
-        let path = self.path_for(&id).expect("content id is always valid");
-        // Write only if absent (dedup) — and via a temp file + rename so a
-        // concurrent reader never sees a half-written blob.
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return Ok(id);
-        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let path = self.path_for(&id).expect("generated id is always valid");
+        // Temp file + rename so a concurrent reader never sees a partial blob.
         let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
         tokio::fs::write(&tmp, bytes).await?;
         tokio::fs::rename(&tmp, &path).await?;
@@ -137,6 +133,12 @@ impl BlobStore {
     /// Delete a blob by id. `Ok(true)` if a file was removed, `Ok(false)` if the
     /// id was malformed or already gone (idempotent).
     pub async fn delete(&self, id: &str) -> std::io::Result<bool> {
+        // Pre-unique stores used one 43-character content hash for every
+        // identical image, so ownership is unknowable. Keep those legacy blobs
+        // until TTL rather than let deleting one old conversation break another.
+        if id.len() != 32 {
+            return Ok(false);
+        }
         let Some(path) = self.path_for(id) else {
             return Ok(false);
         };
@@ -186,8 +188,8 @@ impl BlobStore {
         B64.encode(mac.finalize().into_bytes())
     }
 
-    /// Resolve an id to its on-disk path, rejecting any id that isn't our exact
-    /// base64url content-hash shape — the path-traversal guard.
+    /// Resolve an id to its on-disk path, rejecting anything outside the legacy
+    /// hash/new UUID shared charset and length bound — the traversal guard.
     fn path_for(&self, id: &str) -> Option<PathBuf> {
         is_valid_id(id).then(|| self.inner.dir.join(id))
     }
@@ -200,7 +202,14 @@ impl BlobStore {
         tokio::task::spawn_blocking(move || {
             let mut usage = StoreUsage { files: 0, bytes: 0 };
             for entry in std::fs::read_dir(&dir).ok()? {
-                let Ok(meta) = entry.and_then(|e| e.metadata()) else {
+                let Ok(entry) = entry else { continue };
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if name == SIGNING_KEY_FILE || name.starts_with(".write-probe-") {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
                     continue;
                 };
                 if meta.is_file() {
@@ -227,12 +236,79 @@ impl BlobStore {
             tracing::debug!(removed, "pruned expired image blobs");
         }
     }
+
+    /// Periodically prune even when no new images are generated. The prior lazy
+    /// put-time pruning left expired stores untouched on otherwise-idle servers.
+    pub fn spawn_pruner(&self, interval: std::time::Duration) {
+        let store = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                store.prune().await;
+            }
+        });
+    }
 }
 
-/// sha256(bytes) as base64url — a 43-char opaque, collision-resistant id.
-fn content_id(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    B64.encode(digest)
+const SIGNING_KEY_FILE: &str = ".signing-key";
+
+/// Resolve a stable HMAC key without changing authenticated deployments:
+/// explicit `IMAGE_SIGNING_KEY`, then an already-persisted tokenless key, then
+/// the existing auth token, otherwise a new key persisted beside the blobs.
+pub fn resolve_signing_key(
+    dir: &Path,
+    configured: Option<&str>,
+    auth_token: Option<&str>,
+) -> std::io::Result<String> {
+    if let Some(key) = configured.filter(|key| !key.trim().is_empty()) {
+        return Ok(key.to_string());
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(SIGNING_KEY_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return Ok(existing.to_string());
+        }
+    }
+    if let Some(key) = auth_token.filter(|key| !key.trim().is_empty()) {
+        return Ok(key.to_string());
+    }
+
+    let generated = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(generated.as_bytes())?;
+            file.sync_all()?;
+            Ok(generated)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(path)?;
+            let existing = existing.trim();
+            if existing.is_empty() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "image signing key file is empty",
+                ))
+            } else {
+                Ok(existing.to_string())
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// A valid id is exactly the base64url alphabet, non-empty, and length-bounded
@@ -276,6 +352,12 @@ fn prune_dir(dir: &Path, ttl_s: u64) -> usize {
     let now = SystemTime::now();
     let mut removed = 0;
     for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == SIGNING_KEY_FILE || name.starts_with(".write-probe-") {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
             continue;
@@ -323,15 +405,40 @@ mod tests {
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
 
     #[tokio::test]
-    async fn put_get_roundtrip_and_dedup() {
+    async fn put_get_roundtrip_uses_unique_ownership_ids() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
         let id1 = s.put(PNG).await.unwrap();
         let id2 = s.put(PNG).await.unwrap();
-        assert_eq!(id1, id2, "identical bytes dedupe to one id");
+        assert_ne!(
+            id1, id2,
+            "each delivery owns an independently deletable blob"
+        );
         let blob = s.get(&id1).await.unwrap();
         assert_eq!(blob.bytes, PNG);
         assert_eq!(blob.content_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn tokenless_signing_key_persists_and_is_not_counted_or_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = resolve_signing_key(tmp.path(), None, None).unwrap();
+        let second = resolve_signing_key(tmp.path(), None, None).unwrap();
+        assert_eq!(first, second);
+        let s = BlobStore::new(tmp.path().to_path_buf(), &first, 0, 1 << 20, None).unwrap();
+        let usage = s.usage().await.unwrap();
+        assert_eq!(usage.files, 0);
+        s.prune().await;
+        assert!(tmp.path().join(SIGNING_KEY_FILE).exists());
+        assert_eq!(
+            resolve_signing_key(tmp.path(), Some("explicit"), Some("auth")).unwrap(),
+            "explicit"
+        );
+        let auth_tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_signing_key(auth_tmp.path(), None, Some("auth")).unwrap(),
+            "auth"
+        );
     }
 
     #[tokio::test]
@@ -342,6 +449,21 @@ mod tests {
         assert!(s.delete(&id).await.unwrap(), "first delete removes");
         assert!(!s.delete(&id).await.unwrap(), "second delete is a no-op");
         assert!(s.get(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_delete_preserves_legacy_shared_hash_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let legacy = "a".repeat(43);
+        tokio::fs::write(s.path_for(&legacy).unwrap(), PNG)
+            .await
+            .unwrap();
+        assert!(!s.delete(&legacy).await.unwrap());
+        assert!(
+            s.get(&legacy).await.is_some(),
+            "legacy refs rely on TTL cleanup"
+        );
     }
 
     #[cfg(unix)]
