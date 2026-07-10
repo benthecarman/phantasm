@@ -29,6 +29,12 @@ enum AttachmentLoader {
     static let jpegQuality: CGFloat = 0.7
     /// Cap on inlined file text so a huge file can't blow up the prompt.
     static let maxFileCharacters = 200_000
+    /// Input caps are deliberately larger than the final character cap to
+    /// preserve compatibility with ordinary documents while avoiding an
+    /// unbounded `Data(contentsOf:)` allocation for a picked file.
+    static let maxTextSourceBytes = 1 * 1024 * 1024
+    static let maxPDFSourceBytes = 25 * 1024 * 1024
+    static let maxPDFPages = 200
 
     /// File types offered to the document importer.
     static let importableTypes: [UTType] = [
@@ -82,17 +88,43 @@ enum AttachmentLoader {
         let name = url.lastPathComponent
         let text: String
         if url.pathExtension.lowercased() == "pdf" {
-            guard let doc = PDFDocument(url: url), let extracted = doc.string else { return nil }
+            if let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+               size > maxPDFSourceBytes { return nil }
+            guard let doc = PDFDocument(url: url) else { return nil }
+            var extracted = ""
+            for index in 0..<min(doc.pageCount, maxPDFPages) {
+                guard let page = doc.page(at: index), let pageText = page.string else { continue }
+                let remaining = maxFileCharacters - extracted.count
+                guard remaining > 0 else { break }
+                extracted += String(pageText.prefix(remaining))
+                extracted += "\n"
+                if extracted.count >= maxFileCharacters { break }
+            }
             text = extracted
         } else {
-            guard let data = try? Data(contentsOf: url) else { return nil }
-            guard let decoded = String(data: data, encoding: .utf8)
-                ?? String(data: data, encoding: .isoLatin1) else { return nil }
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            guard let data = try? handle.read(upToCount: maxTextSourceBytes),
+                  !data.isEmpty else { return nil }
+            guard let decoded = decodeTextPrefix(data) else { return nil }
             text = decoded
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return FilePayload(name: name, text: String(trimmed.prefix(maxFileCharacters)))
+    }
+
+    /// A bounded read can stop in the middle of a UTF-8 scalar. Drop at most
+    /// the three incomplete trailing bytes before falling back to Latin-1, so a
+    /// large valid UTF-8 document does not turn into mojibake at the cap.
+    private static func decodeTextPrefix(_ data: Data) -> String? {
+        if let decoded = String(data: data, encoding: .utf8) { return decoded }
+        for count in 1...3 where data.count > count {
+            if let decoded = String(data: Data(data.dropLast(count)), encoding: .utf8) {
+                return decoded
+            }
+        }
+        return String(data: data, encoding: .isoLatin1)
     }
 
     private static func downscale(_ image: UIImage) -> UIImage {

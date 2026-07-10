@@ -5,6 +5,20 @@ import XCTest
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testTextAttachmentCapsReadWithoutCorruptingSplitUTF8Scalar() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension("txt")
+        var data = Data(repeating: 0x61, count: AttachmentLoader.maxTextSourceBytes - 1)
+        data.append(contentsOf: "€".utf8) // the bounded read sees only its first byte
+        try data.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let attachment = await AttachmentLoader.file(at: url)
+
+        XCTAssertEqual(attachment?.text.count, AttachmentLoader.maxFileCharacters)
+        XCTAssertFalse(attachment?.text.contains("â") ?? true, "UTF-8 prefix became Latin-1 mojibake")
+    }
+
     func testSendStreamsCommitsTitleSpeaksAndCachesServerImage() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
