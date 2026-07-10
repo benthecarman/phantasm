@@ -30,7 +30,7 @@
 //! ```
 //! Nothing accumulates monotonically; raw pages live and die inside a sub-agent.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
@@ -295,6 +295,11 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
         ChatMessage::system(preset.subagent_prompt),
         ChatMessage::user(&sub_question),
     ];
+    let allowed_tools: HashSet<&str> = schemas
+        .iter()
+        .filter_map(|schema| schema.pointer("/function/name")?.as_str())
+        .collect();
+    let mut observed_sources = HashSet::new();
 
     // `searches_per_subq` is a SEARCH budget, not a round-trip budget: it counts
     // executed web_search tool calls, since one assistant turn may emit several
@@ -335,7 +340,27 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
                     if cancel.is_cancelled() || searches_left == 0 {
                         break 'agent;
                     }
+                    if !allowed_tools.contains(call.function.name.as_str()) {
+                        tracing::warn!(
+                            tool = %call.function.name,
+                            "research model requested a tool that was not advertised"
+                        );
+                        msgs.push(ChatMessage::tool_result(
+                            call.id.as_deref().unwrap_or("research-invalid-tool"),
+                            &call.function.name,
+                            format!(
+                                "{} failed: tool is not available in research mode",
+                                call.function.name
+                            ),
+                        ));
+                        continue;
+                    }
                     let outcome = tools.execute(call, ctx, dummy_tx(), cancel.clone()).await;
+                    if call.function.name == "web_search" && !outcome.is_error {
+                        if let Some(text) = message_text(outcome.message.clone()) {
+                            observed_sources.extend(search_result_urls(&text));
+                        }
+                    }
                     msgs.push(outcome.message);
                     // Only an actual search spends budget; non-search tool calls
                     // (none today, but defensive) don't draw it down.
@@ -379,7 +404,8 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
     .and_then(Result::ok)
     .and_then(message_text)
     .unwrap_or_default();
-    let (text, sources) = parse_compression(&raw);
+    let (text, claimed_sources) = parse_compression(&raw);
+    let sources = retain_observed_sources(claimed_sources, &observed_sources);
     Finding {
         sub_question,
         text,
@@ -559,6 +585,42 @@ fn parse_compression(raw: &str) -> (String, Vec<String>) {
         }
     }
     (raw.trim().to_string(), Vec::new())
+}
+
+/// Extract only the canonical result URLs emitted in numbered web-search result
+/// lines. Page extracts are untrusted prose and may themselves contain URLs;
+/// those must never become citation provenance merely because they appeared in
+/// a fetched body.
+fn search_result_urls(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let (ordinal, _) = trimmed.split_once('.')?;
+            if ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let start = trimmed.rfind("(http")? + 1;
+            let end = trimmed.rfind(')')?;
+            (end > start).then(|| &trimmed[start..end])
+        })
+        .filter_map(canonical_http_url)
+        .collect()
+}
+
+fn canonical_http_url(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
+}
+
+/// A compression model may claim arbitrary source strings. Only keep claims
+/// whose canonical URL was mechanically observed as a web-search result.
+fn retain_observed_sources(claimed: Vec<String>, observed: &HashSet<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    claimed
+        .into_iter()
+        .filter_map(|raw| canonical_http_url(&raw))
+        .filter(|url| observed.contains(url) && seen.insert(url.clone()))
+        .collect()
 }
 
 /// Pull the first balanced `{…}` JSON object out of a string, tolerating
@@ -746,6 +808,29 @@ mod tests {
     }
 
     #[test]
+    fn citation_sources_must_come_from_numbered_search_results() {
+        let output = concat!(
+            "<untrusted>\n",
+            "1. Real — result (https://real.example/article?x=1)\n",
+            "   Page text mentions https://injected.example/track\n",
+            "2. Other — result (http://other.example/path)\n"
+        );
+        let observed = search_result_urls(output);
+        let retained = retain_observed_sources(
+            vec![
+                "https://injected.example/track".into(),
+                "https://invented.example/".into(),
+                "https://real.example/article?x=1".into(),
+                "https://real.example/article?x=1".into(),
+            ],
+            &observed,
+        );
+        assert_eq!(retained, vec!["https://real.example/article?x=1"]);
+        assert!(observed.contains("http://other.example/path"));
+        assert!(!observed.contains("https://injected.example/track"));
+    }
+
+    #[test]
     fn number_sources_dedups_across_findings() {
         let findings = vec![
             Finding {
@@ -796,6 +881,7 @@ mod tests {
         verify_reply: Arc<String>,
         seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
         subagent_should_search: Arc<Mutex<bool>>,
+        subagent_tool: Arc<String>,
         /// Optional gate: when set, the compress stage signals `reached` and
         /// waits on `resume` so a test can deterministically cancel *between*
         /// research and synthesis.
@@ -813,9 +899,15 @@ mod tests {
                 verify_reply: Arc::new(verify.into()),
                 seen: Arc::new(Mutex::new(vec![])),
                 subagent_should_search: Arc::new(Mutex::new(true)),
+                subagent_tool: Arc::new("web_search".into()),
                 gate: None,
                 subagent_gate: None,
             }
+        }
+
+        fn with_subagent_tool(mut self, tool: &str) -> Self {
+            self.subagent_tool = Arc::new(tool.into());
+            self
         }
 
         fn system_text(messages: &[ChatMessage]) -> String {
@@ -891,7 +983,7 @@ mod tests {
                 let mut flag = self.subagent_should_search.lock().unwrap();
                 if *flag {
                     *flag = false;
-                    return Ok(ass_calling("web_search"));
+                    return Ok(ass_calling(&self.subagent_tool));
                 }
                 return Ok(ass("I have enough to answer."));
             }
@@ -953,7 +1045,9 @@ mod tests {
                 message: ChatMessage::tool_result(
                     "c1",
                     "web_search",
-                    format!("results: {RAW_PAGE_SENTINEL} https://src.example/a"),
+                    format!(
+                        "Web search results for \"x\":\n\n1. Source — {RAW_PAGE_SENTINEL} (https://src.example/a)\n"
+                    ),
                 ),
                 append_to_answer: None,
                 is_error: false,
@@ -1072,6 +1166,37 @@ mod tests {
             })
             .collect();
         assert!(subagent_users.iter().any(|u| u == "the only question"));
+    }
+
+    #[tokio::test]
+    async fn research_never_executes_a_hallucinated_unadvertised_tool() {
+        let backend = Engine::new(
+            r#"{"brief":"b","sub_questions":["q"]}"#,
+            r#"{"finding":"f","sources":[]}"#,
+            "FINAL",
+        )
+        .with_subagent_tool("image_generation");
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = RawPageTool {
+            executed: executed.clone(),
+        };
+        let (tx, rx) = mpsc::channel(256);
+        run_research(
+            cfg(),
+            backend,
+            tools,
+            Arc::new(Semaphore::new(4)),
+            quick(),
+            "m".into(),
+            history("q"),
+            Map::new(),
+            tx,
+            CancellationToken::new(),
+            false,
+        )
+        .await;
+        let _ = drain(rx).await;
+        assert!(executed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
