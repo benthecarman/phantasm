@@ -229,9 +229,10 @@ standard OpenAI; a client that ignores it gets the legacy behavior. See
   Legacy clients don't need it (they cancel by disconnecting).
 - **Retention.** A finished turn's buffer is kept for `TURN_RESULT_TTL_S` so a
   late reconnect still gets the result; total buffered turns are bounded by
-  `TURN_REGISTRY_MAX`. A still-running turn with no connected client past
-  `TURN_ABANDON_GRACE_S` is cancelled by a watchdog (the force-killed-app
-  backstop). All three are server config.
+  `TURN_REGISTRY_MAX`, each turn by `TURN_BUFFER_MAX_BYTES`, and aggregate event
+  data by `TURN_REGISTRY_MAX_BYTES`. A still-running turn with no connected
+  client past `TURN_ABANDON_GRACE_S` is cancelled by a watchdog (the
+  force-killed-app backstop). All are server config.
 
 ### 2.2d Pairing URI (optional, additive)
 

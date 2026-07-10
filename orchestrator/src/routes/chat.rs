@@ -95,7 +95,7 @@ pub async fn chat_completions(
         }
         // Replay from the client's cursor (or the start); the iOS app rebuilds
         // from scratch and so omits `Last-Event-ID`.
-        let start = last_event_id.map(|n| n + 1).unwrap_or(0);
+        let start = last_event_id.map(|n| n.saturating_add(1)).unwrap_or(0);
         return attach_response(model_name, active, start, spill, state.metrics.clone());
     }
 
@@ -416,7 +416,9 @@ fn spawn_pump(
                 }
                 other => other,
             };
-            active.push(ev);
+            if !active.push(ev) {
+                break;
+            }
         }
         active.finish();
     });

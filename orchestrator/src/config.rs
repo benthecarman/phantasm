@@ -136,6 +136,10 @@ pub struct Config {
     /// entry can hold a full turn (incl. an inline base64 image), so this bounds
     /// worst-case memory like `CONTINUATION_MAX`.
     pub turn_registry_max: usize,
+    /// Approximate encoded event-byte cap for one resumable turn.
+    pub turn_buffer_max_bytes: usize,
+    /// Aggregate approximate event-byte cap across the whole registry.
+    pub turn_registry_max_bytes: usize,
     /// How long a still-running turn may have no attached client before the
     /// watchdog cancels it (frees the GPU for an app that was force-killed and
     /// will never reconnect). `0` disables the watchdog. Terminal turns are
@@ -394,6 +398,8 @@ impl Config {
             .max(1),
             turn_result_ttl_s: env_parse("TURN_RESULT_TTL_S", 24 * 60 * 60),
             turn_registry_max: env_parse("TURN_REGISTRY_MAX", 128usize),
+            turn_buffer_max_bytes: env_parse("TURN_BUFFER_MAX_BYTES", 64 * 1024 * 1024usize),
+            turn_registry_max_bytes: env_parse("TURN_REGISTRY_MAX_BYTES", 256 * 1024 * 1024usize),
             turn_abandon_grace_s: env_parse("TURN_ABANDON_GRACE_S", 300u64),
             max_request_body_bytes: env_parse("MAX_REQUEST_BODY_BYTES", 32 * 1024 * 1024),
             max_request_images: env_parse("MAX_REQUEST_IMAGES", 16usize),
@@ -940,6 +946,8 @@ pub mod tests_support {
             upstream_concurrency: 4,
             turn_result_ttl_s: 24 * 60 * 60,
             turn_registry_max: 128,
+            turn_buffer_max_bytes: 64 * 1024 * 1024,
+            turn_registry_max_bytes: 256 * 1024 * 1024,
             turn_abandon_grace_s: 300,
             max_request_body_bytes: 32 * 1024 * 1024,
             max_request_images: 16,

@@ -508,6 +508,8 @@ pub fn build_state_with_upstreams(
     let turns = turn_registry::TurnRegistry::new(
         Duration::from_secs(cfg.turn_result_ttl_s),
         cfg.turn_registry_max,
+        cfg.turn_buffer_max_bytes,
+        cfg.turn_registry_max_bytes,
     );
     // Background maintenance: evict result-TTL-expired finished turns, and cancel
     // turns left running with no client (a force-killed app) so they don't hold

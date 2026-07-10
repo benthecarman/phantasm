@@ -9,6 +9,7 @@
 //! bounded; a miss degrades gracefully (the app re-issues the turn as new).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,10 +33,17 @@ pub struct ActiveTurn {
     /// the whole point: backgrounding detaches the responder but the turn runs on.
     pub cancel: CancellationToken,
     created_at: Instant,
+    local_max_bytes: usize,
+    budget: Arc<BufferBudget>,
 }
 
 struct TurnLog {
     events: Vec<TurnEvent>,
+    /// Approximate encoded bytes held by `events`.
+    buffered_bytes: usize,
+    /// Portion of `buffered_bytes` reserved from the shared budget (the small
+    /// terminal overflow error itself is deliberately allowed outside it).
+    reserved_bytes: usize,
     /// Set once a terminal `Done`/`Error` is appended (or the producer's channel
     /// closes). Tells a responder to stop after draining.
     done: bool,
@@ -52,11 +60,13 @@ struct TurnLog {
 }
 
 impl ActiveTurn {
-    fn new(cancel: CancellationToken) -> Self {
+    fn new(cancel: CancellationToken, local_max_bytes: usize, budget: Arc<BufferBudget>) -> Self {
         let (len_tx, _) = watch::channel(0usize);
         ActiveTurn {
             inner: Mutex::new(TurnLog {
                 events: Vec::new(),
+                buffered_bytes: 0,
+                reserved_bytes: 0,
                 done: false,
                 terminal_at: None,
                 attached: 0,
@@ -67,6 +77,8 @@ impl ActiveTurn {
             len_tx,
             cancel,
             created_at: Instant::now(),
+            local_max_bytes: local_max_bytes.max(1),
+            budget,
         }
     }
 
@@ -98,18 +110,41 @@ impl ActiveTurn {
 
     /// Append an event produced by the turn task, marking the turn terminal on a
     /// `Done`/`Error`, then wake attached responders.
-    pub fn push(&self, event: TurnEvent) {
-        let len = {
+    pub fn push(&self, event: TurnEvent) -> bool {
+        let (len, accepted, overflowed) = {
             let mut log = self.inner.lock().unwrap();
-            if matches!(event, TurnEvent::Done { .. } | TurnEvent::Error(_)) {
+            if log.done {
+                return false;
+            }
+            let bytes = event_size(&event);
+            if bytes > self.local_max_bytes.saturating_sub(log.buffered_bytes)
+                || !self.budget.try_reserve(bytes)
+            {
+                let error = TurnEvent::Error(
+                    "resumable turn buffer exceeded its configured byte limit".into(),
+                );
+                log.buffered_bytes = log.buffered_bytes.saturating_add(event_size(&error));
+                log.events.push(error);
                 log.done = true;
                 log.terminal_at.get_or_insert_with(Instant::now);
+                (log.events.len(), false, true)
+            } else {
+                log.buffered_bytes += bytes;
+                log.reserved_bytes += bytes;
+                if matches!(event, TurnEvent::Done { .. } | TurnEvent::Error(_)) {
+                    log.done = true;
+                    log.terminal_at.get_or_insert_with(Instant::now);
+                }
+                log.events.push(event);
+                (log.events.len(), true, false)
             }
-            log.events.push(event);
-            log.events.len()
         };
+        if overflowed {
+            self.cancel.cancel();
+        }
         // Bump the watch value so responders awaiting `changed()` wake.
         let _ = self.len_tx.send(len);
+        accepted
     }
 
     /// Mark the turn finished without another event — used when the producer's
@@ -156,6 +191,55 @@ impl ActiveTurn {
     }
 }
 
+impl Drop for ActiveTurn {
+    fn drop(&mut self) {
+        let reserved = self.inner.get_mut().unwrap().reserved_bytes;
+        self.budget.release(reserved);
+    }
+}
+
+struct BufferBudget {
+    used: AtomicUsize,
+    max: usize,
+}
+
+impl BufferBudget {
+    fn new(max: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            max: max.max(1),
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.max)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
+fn event_size(event: &TurnEvent) -> usize {
+    const OVERHEAD: usize = 32;
+    OVERHEAD
+        + match event {
+            TurnEvent::Status(text)
+            | TurnEvent::Reasoning(text)
+            | TurnEvent::Token(text)
+            | TurnEvent::Error(text) => text.len(),
+            TurnEvent::Progress { status, .. } => status.len() + std::mem::size_of::<f64>(),
+            TurnEvent::Done { reason } => reason.len(),
+            TurnEvent::ToolCalls { app, held } => serde_json::to_vec(&(app, held))
+                .map(|bytes| bytes.len())
+                .unwrap_or(OVERHEAD),
+        }
+}
+
 /// Counts reported by [`TurnRegistry::snapshot_counts`] for metrics.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct RegistryCounts {
@@ -167,6 +251,8 @@ pub struct RegistryCounts {
     pub detached_running: u64,
     /// Terminal turns retained for replay.
     pub buffered_terminal: u64,
+    /// Approximate encoded event bytes retained across all turns.
+    pub buffered_bytes: u64,
 }
 
 /// Store of buffered resumable turns, keyed by the client's `Idempotency-Key`.
@@ -175,14 +261,23 @@ pub struct TurnRegistry {
     map: Arc<Mutex<HashMap<String, Arc<ActiveTurn>>>>,
     result_ttl: Duration,
     max: usize,
+    per_turn_max_bytes: usize,
+    budget: Arc<BufferBudget>,
 }
 
 impl TurnRegistry {
-    pub fn new(result_ttl: Duration, max: usize) -> Self {
+    pub fn new(
+        result_ttl: Duration,
+        max: usize,
+        per_turn_max_bytes: usize,
+        registry_max_bytes: usize,
+    ) -> Self {
         TurnRegistry {
             map: Arc::new(Mutex::new(HashMap::new())),
             result_ttl,
             max: max.max(1),
+            per_turn_max_bytes: per_turn_max_bytes.max(1),
+            budget: Arc::new(BufferBudget::new(registry_max_bytes)),
         }
     }
 
@@ -197,7 +292,11 @@ impl TurnRegistry {
         if let Some(turn) = map.get(key) {
             return (turn.clone(), false);
         }
-        let turn = Arc::new(ActiveTurn::new(CancellationToken::new()));
+        let turn = Arc::new(ActiveTurn::new(
+            CancellationToken::new(),
+            self.per_turn_max_bytes,
+            self.budget.clone(),
+        ));
         map.insert(key.to_string(), turn.clone());
         (turn, true)
     }
@@ -213,6 +312,7 @@ impl TurnRegistry {
         let mut counts = RegistryCounts::default();
         for turn in map.values() {
             let log = turn.inner.lock().unwrap();
+            counts.buffered_bytes += log.buffered_bytes as u64;
             counts.attached += log.attached as u64;
             if log.done {
                 counts.buffered_terminal += 1;
@@ -333,7 +433,7 @@ mod tests {
     use super::*;
 
     fn registry() -> TurnRegistry {
-        TurnRegistry::new(Duration::from_secs(900), 128)
+        TurnRegistry::new(Duration::from_secs(900), 128, 1 << 20, 8 << 20)
     }
 
     #[test]
@@ -413,8 +513,35 @@ mod tests {
     }
 
     #[test]
+    fn per_turn_byte_cap_emits_terminal_error_and_cancels_work() {
+        let reg = TurnRegistry::new(Duration::from_secs(900), 8, 64, 1024);
+        let (turn, _) = reg.get_or_create("large");
+        assert!(!turn.push(TurnEvent::Token("x".repeat(128))));
+        let (events, done) = turn.snapshot_from(0);
+        assert!(done);
+        assert!(turn.cancel.is_cancelled());
+        assert!(matches!(events.as_slice(), [TurnEvent::Error(message)]
+            if message.contains("buffer exceeded")));
+    }
+
+    #[test]
+    fn registry_byte_cap_is_shared_and_released_on_eviction() {
+        // Each 40-byte token costs 72 bytes with event overhead.
+        let reg = TurnRegistry::new(Duration::from_secs(900), 8, 1024, 100);
+        let (first, _) = reg.get_or_create("first");
+        assert!(first.push(TurnEvent::Token("a".repeat(40))));
+        let (second, _) = reg.get_or_create("second");
+        assert!(!second.push(TurnEvent::Token("b".repeat(40))));
+
+        reg.remove("first");
+        drop(first);
+        let (third, _) = reg.get_or_create("third");
+        assert!(third.push(TurnEvent::Token("c".repeat(40))));
+    }
+
+    #[test]
     fn over_cap_evicts_terminal_entries_first() {
-        let reg = TurnRegistry::new(Duration::from_secs(900), 2);
+        let reg = TurnRegistry::new(Duration::from_secs(900), 2, 1 << 20, 8 << 20);
         // Two terminal turns, then a fresh create should evict a terminal one,
         // not exceed the cap.
         let (t1, _) = reg.get_or_create("k1");
@@ -434,7 +561,7 @@ mod tests {
         // With only running turns to choose from, purge evicts the oldest one —
         // and must fire its token, or the evicted generation would keep running
         // with no way left to cancel it (its token is gone from the map).
-        let reg = TurnRegistry::new(Duration::from_secs(900), 2);
+        let reg = TurnRegistry::new(Duration::from_secs(900), 2, 1 << 20, 8 << 20);
         let (running, _) = reg.get_or_create("old-running");
         let (finished, _) = reg.get_or_create("old-finished");
         finished.finish();
@@ -488,7 +615,7 @@ mod tests {
     #[test]
     fn evict_expired_drops_only_finished_turns_past_ttl() {
         // ttl 0 → any terminal turn is immediately expired; running turns stay.
-        let reg = TurnRegistry::new(Duration::ZERO, 128);
+        let reg = TurnRegistry::new(Duration::ZERO, 128, 1 << 20, 8 << 20);
         let (running, _) = reg.get_or_create("run");
         let (finished, _) = reg.get_or_create("fin");
         finished.push(TurnEvent::Done {

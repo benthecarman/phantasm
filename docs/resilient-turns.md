@@ -1,10 +1,6 @@
 # Resilient turns — surviving client disconnect (background) mid-generation
 
-Design plan for fixing: *backgrounding the app during a server-side image
-generation abandons the work; you have to keep the app foregrounded to see it
-finish.*
-
-Status: **proposal** (not yet implemented). Owner: TBD.
+Implementation and design notes for resumable turns. Status: **implemented**.
 
 ## 1. Problem recap
 
@@ -172,17 +168,20 @@ happen, but be defensive) clamps to the log end and tails from there.
   (`image_delivery::offload_inline_images`); `attach_response` re-inlines it from
   the store per stream (`inline_image_refs`), so client delivery is byte-for-byte
   unchanged — only the in-memory copy is compact.
-- **No store at all**: nowhere to spill, so the base64 stays in the log (bounded
-  by `TURN_REGISTRY_MAX`). Set `IMAGE_STORE_DIR` to keep images off the heap.
+- **No store at all**: nowhere to spill, so the base64 stays in the log. The
+  per-turn `TURN_BUFFER_MAX_BYTES` and aggregate `TURN_REGISTRY_MAX_BYTES` caps
+  terminate an oversized replay safely. Set `IMAGE_STORE_DIR` to keep images off
+  the heap.
 
-Bound with `TURN_REGISTRY_MAX` (evict oldest *terminal* entry first), mirroring
-`CONTINUATION_MAX`.
+The registry is bounded by count (`TURN_REGISTRY_MAX`, evicting the oldest
+terminal entry first), per-turn bytes (`TURN_BUFFER_MAX_BYTES`, default 64 MiB),
+and aggregate bytes (`TURN_REGISTRY_MAX_BYTES`, default 256 MiB).
 
 **TTL.** Two timers:
 - `RESULT_TTL` (`TURN_RESULT_TTL_S`, default 24h): after `terminal_at`, keep the
   finished log so a late reconnect can still fetch it, then evict. The long
   default lets a reconnect recover a generation even long after the app closed;
-  memory is bounded by `TURN_REGISTRY_MAX`, not the TTL.
+  memory is bounded by the count and byte caps, not the TTL.
 - `ABANDONED_TTL` / safety cap (`TURN_ABANDON_GRACE_S`, default 300s; `0`
   disables): a background watchdog cancels + drops any still-running turn whose
   `attached` count has been 0 since `detached_at` for longer than the grace, so
@@ -329,13 +328,13 @@ Update `docs/SPEC.md` §2 deliberately (both halves). Note that resume is a
 
 ## 11. Open decisions
 
-1. **Cancel endpoint shape** — `POST /v1/chat/cancel {turn_id}` (proposed) vs.
-   `DELETE /v1/chat/turns/{turn_id}` vs. piggybacking a flag on the chat
-   endpoint. Affects SPEC §2.
+1. ✅ **Cancel endpoint shape** — implemented as `POST /v1/chat/cancel` with the
+   turn id in `Idempotency-Key`.
 2. ✅ **Abandoned-running-turn policy** — added the no-attached-responder
    watchdog; `TURN_ABANDON_GRACE_S` default 300s (`0` disables).
-3. ✅ **`RESULT_TTL` / `TURN_REGISTRY_MAX` values** — `TURN_RESULT_TTL_S` default
-   24h, `TURN_REGISTRY_MAX` default 128; both env-configurable.
+3. ✅ **Retention bounds** — `TURN_RESULT_TTL_S` defaults to 24h,
+   `TURN_REGISTRY_MAX` to 128, `TURN_BUFFER_MAX_BYTES` to 64 MiB, and
+   `TURN_REGISTRY_MAX_BYTES` to 256 MiB; all are env-configurable.
 4. ✅ **Inline vs URL image delivery** — the pump now spills inline base64 images
    to the blob store (when `IMAGE_STORE_DIR` is set) and re-inlines per stream, so
    the in-memory log holds a ref regardless of public-base config; only a
@@ -351,9 +350,9 @@ Update `docs/SPEC.md` §2 deliberately (both halves). Note that resume is a
    pump; chat route reads `Idempotency-Key`/`Last-Event-ID`, routes resumable
    streaming turns through the registry (`spawn_turn`/`spawn_pump`/
    `attach_response` in `routes/chat.rs`), no drop-guard on that path;
-   `TURN_RESULT_TTL_S`/`TURN_REGISTRY_MAX` config + TTL/size eviction. Tested:
+   count and byte caps plus TTL eviction. Tested:
    registry unit tests + integration `resumable_turn_replays_on_reconnect_*`.
-   Not yet user-visible — dormant until the iOS app sends the header (phase 2).
+   The iOS app sends the header and reconnects in phase 2 below.
 2. ✅ **Done.** Server: `POST /v1/chat/cancel` (`routes/chat.rs::cancel`,
    registered in `routes/mod.rs`) + ComfyUI interrupt-on-drop
    (`tools/comfy.rs::InterruptOnDrop` → `/interrupt` + `/queue` delete). iOS:
