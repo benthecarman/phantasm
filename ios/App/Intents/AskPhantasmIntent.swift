@@ -81,8 +81,18 @@ enum AskService {
         // suppress thinking tokens only when the endpoint explicitly says the
         // selected model can think. Unknown support omits `reasoning_effort` so
         // stricter backends do not reject a guessed value.
-        let mode = (try? await CapabilitiesClient(session: session).resolve(base: base, token: token).get())
-            ?? .plainChatOnly(models: [])
+        let mapleSession = MapleEncryptedTransport.session(configuration: config)
+        let mode = (try? await BackendResolver(
+            session: session,
+            mapleSession: mapleSession
+        ).resolve(
+            base: base,
+            token: token,
+            preferMaple: profile.transport == .mapleEncrypted
+        ).get())
+            ?? (profile.transport == .mapleEncrypted
+                ? .mapleEncrypted(models: profileStore.cachedModels(for: profile.id))
+                : .plainChatOnly(models: []))
         guard let model = mode.resolvedChatModel(
             conversationModel: nil,
             defaultModel: profile.defaultModel
@@ -95,7 +105,9 @@ enum AskService {
             reasoningEffort: disabledReasoningEffort(for: model, mode: mode)
         )
 
-        let client = ChatClient(session: session)
+        let client: any ChatClienting = mode.usesMapleEncryptedChat
+            ? MapleChatClient(session: mapleSession)
+            : ChatClient(session: session)
         let answer = try await client.complete(request, base: base, token: token)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !answer.isEmpty else { throw AskError.emptyAnswer }

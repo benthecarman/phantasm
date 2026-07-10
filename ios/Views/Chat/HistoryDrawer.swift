@@ -186,6 +186,8 @@ struct HistoryDrawer: View {
             return env.backendMode.showsTools ? "Tools enabled" : "Tools disabled"
         case .ollamaNative:
             return "Ollama native"
+        case .mapleEncrypted:
+            return "Maple encrypted"
         case .plainChatOnly:
             return "Plain chat"
         }
@@ -197,6 +199,8 @@ struct HistoryDrawer: View {
             return env.backendMode.showsTools ? "wand.and.stars" : "server.rack"
         case .ollamaNative:
             return "cpu"
+        case .mapleEncrypted:
+            return "lock.shield"
         case .plainChatOnly:
             return "text.bubble"
         }
@@ -331,4 +335,3 @@ private struct SwipeToDelete: ViewModifier {
             ))
     }
 }
-

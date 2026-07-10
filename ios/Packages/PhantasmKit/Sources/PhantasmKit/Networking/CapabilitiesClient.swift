@@ -191,3 +191,69 @@ public struct CapabilitiesClient: Sendable {
         let contextLength: Int?
     }
 }
+
+/// Resolves the same backend surface as `CapabilitiesClient`, with one
+/// additional fallback: when ordinary Phantasm/Ollama/OpenAI probing fails,
+/// try the OpenSecret encrypted transport. A successful Maple probe is marked
+/// in `BackendMode` so chat can use `MapleChatClient`; the model list and all
+/// subsequent chat semantics remain ordinary OpenAI-compatible behavior.
+public struct BackendResolver: Sendable {
+    private let standard: CapabilitiesClient
+    private let maple: CapabilitiesClient
+
+    public init(
+        session: URLSession = .shared,
+        mapleSession: URLSession? = nil
+    ) {
+        self.standard = CapabilitiesClient(session: session)
+        self.maple = CapabilitiesClient(
+            session: mapleSession ?? MapleEncryptedTransport.session()
+        )
+    }
+
+    public func resolve(
+        base: URL,
+        token: String,
+        preferMaple: Bool = false
+    ) async -> Result<BackendMode, AppError> {
+        if preferMaple, let encrypted = await resolveMaple(base: base, token: token) {
+            return encrypted
+        }
+
+        let ordinary = await standard.resolve(base: base, token: token)
+        if case .success = ordinary { return ordinary }
+
+        return await resolveMaple(base: base, token: token) ?? ordinary
+    }
+
+    private func resolveMaple(
+        base: URL,
+        token: String
+    ) async -> Result<BackendMode, AppError>? {
+        // The attestation/key-exchange endpoints are the positive Maple signal.
+        // A random unreachable or non-Maple OpenAI host keeps its original error
+        // instead of being relabeled as an encrypted backend failure.
+        do {
+            try await MapleEncryptedTransport.prepare(base: base)
+        } catch {
+            return nil
+        }
+
+        switch await maple.resolve(base: base, token: token) {
+        case .success(let mode):
+            return .success(.mapleEncrypted(models: mode.models))
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
+
+    public func models(
+        base: URL,
+        token: String,
+        preferMaple: Bool = false
+    ) async -> [String] {
+        (try? await resolve(
+            base: base, token: token, preferMaple: preferMaple
+        ).get().models) ?? []
+    }
+}

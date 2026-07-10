@@ -49,4 +49,26 @@ final class BackendProfileTests: XCTestCase {
         let profile = BackendProfile(name: "x", baseURLString: "https://host.example/v1/")
         XCTAssertEqual(profile.baseURL?.absoluteString, "https://host.example")
     }
+
+    func testLegacyProfileDefaultsToStandardTransport() throws {
+        let id = UUID()
+        let json = """
+        {"id":"\(id.uuidString)","name":"Old","baseURLString":"https://host.example","autoWarm":false}
+        """
+        let profile = try JSONDecoder().decode(BackendProfile.self, from: Data(json.utf8))
+        XCTAssertEqual(profile.transport, .standard)
+    }
+
+    func testMapleTransportRoundTrips() throws {
+        let original = BackendProfile(
+            name: "Maple",
+            baseURLString: "https://enclave.example",
+            transport: .mapleEncrypted
+        )
+        let decoded = try JSONDecoder().decode(
+            BackendProfile.self, from: JSONEncoder().encode(original)
+        )
+        XCTAssertEqual(decoded, original)
+        XCTAssertEqual(decoded.transport, .mapleEncrypted)
+    }
 }

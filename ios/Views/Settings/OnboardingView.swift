@@ -11,6 +11,7 @@ struct OnboardingView: View {
     @State private var token = ""
     @State private var defaultModel = ""
     @State private var autoWarm = false
+    @State private var resolvedTransport: BackendTransport = .standard
     @State private var revealToken = false
     @State private var isTesting = false
     @State private var testResult: TestResult?
@@ -263,11 +264,12 @@ struct OnboardingView: View {
         guard let base = URL(string: normalizedURLString) else { return }
         isTesting = true
         testResult = nil
-        let result = await env.capabilitiesClient.resolve(base: base, token: normalizedToken)
+        let result = await env.backendResolver.resolve(base: base, token: normalizedToken)
         isTesting = false
         switch result {
         case .success(let mode):
             models = mode.models
+            resolvedTransport = mode.usesMapleEncryptedChat ? .mapleEncrypted : .standard
             testedURLString = normalizedURLString
             testedToken = normalizedToken
             Haptics.notify(.success)
@@ -285,6 +287,7 @@ struct OnboardingView: View {
             name: name.trimmingCharacters(in: .whitespacesAndNewlines),
             baseURLString: normalizedURLString,
             defaultModel: defaultModel.isEmpty ? nil : defaultModel,
+            transport: resolvedTransport,
             autoWarm: autoWarm
         )
         env.upsert(profile, token: normalizedToken.isEmpty ? nil : normalizedToken)

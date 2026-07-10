@@ -36,7 +36,7 @@ public struct WarmupClient: Sendable {
                 base: base,
                 token: token
             )
-        case .plainChatOnly:
+        case .mapleEncrypted, .plainChatOnly:
             break
         }
     }

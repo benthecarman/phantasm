@@ -30,7 +30,9 @@ protocol ChatViewModelEnvironment: AnyObject {
 }
 
 extension AppEnvironment: ChatViewModelEnvironment {
-    var chatStreamingClient: any ChatClienting { chatClient }
+    var chatStreamingClient: any ChatClienting {
+        backendMode.usesMapleEncryptedChat ? mapleChatClient : chatClient
+    }
     var ollamaStreamingClient: any ChatClienting { ollamaChatClient }
     var autoSpeakEnabled: Bool { voicePreferenceStore.autoSpeak }
 

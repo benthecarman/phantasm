@@ -1,5 +1,13 @@
 import Foundation
 
+/// The HTTP envelope a backend profile requires. Maple is still OpenAI-
+/// compatible above this layer; the persisted marker lets launch select its
+/// encrypted session immediately while capability refresh runs.
+public enum BackendTransport: String, Codable, Sendable, Hashable {
+    case standard
+    case mapleEncrypted = "maple_encrypted"
+}
+
 /// A saved backend connection (NFR-A6). The token is NOT stored here — it lives
 /// in the Keychain keyed by `id`.
 public struct BackendProfile: Identifiable, Codable, Sendable, Hashable {
@@ -7,6 +15,7 @@ public struct BackendProfile: Identifiable, Codable, Sendable, Hashable {
     public var name: String
     public var baseURLString: String
     public var defaultModel: String?
+    public var transport: BackendTransport
     /// Preload the active model after connecting / switching backends so the
     /// first turn skips cold-start. Opt-in (off by default): warming wakes the
     /// backend and can pull a model into memory, which isn't always wanted.
@@ -17,23 +26,26 @@ public struct BackendProfile: Identifiable, Codable, Sendable, Hashable {
         name: String,
         baseURLString: String,
         defaultModel: String? = nil,
+        transport: BackendTransport = .standard,
         autoWarm: Bool = false
     ) {
         self.id = id
         self.name = name
         self.baseURLString = baseURLString
         self.defaultModel = defaultModel
+        self.transport = transport
         self.autoWarm = autoWarm
     }
 
-    // Custom decoding so profiles saved before `autoWarm` existed still load
-    // (the synthesized decoder would fail on the missing key).
+    // Custom decoding so profiles saved before `transport` / `autoWarm`
+    // existed still load (the synthesized decoder would fail on missing keys).
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
         baseURLString = try c.decode(String.self, forKey: .baseURLString)
         defaultModel = try c.decodeIfPresent(String.self, forKey: .defaultModel)
+        transport = try c.decodeIfPresent(BackendTransport.self, forKey: .transport) ?? .standard
         autoWarm = try c.decodeIfPresent(Bool.self, forKey: .autoWarm) ?? false
     }
 

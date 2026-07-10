@@ -20,6 +20,7 @@ struct ProfileEditView: View {
     @State private var token: String
     @State private var defaultModel: String
     @State private var autoWarm: Bool
+    @State private var resolvedTransport: BackendTransport
     @State private var testResult: TestResult?
     @State private var isTesting = false
     @State private var revealToken = false
@@ -44,6 +45,7 @@ struct ProfileEditView: View {
         _urlString = State(initialValue: pairing?.baseURLString ?? profile?.baseURLString ?? "https://")
         _defaultModel = State(initialValue: profile?.defaultModel ?? "")
         _autoWarm = State(initialValue: profile?.autoWarm ?? false)
+        _resolvedTransport = State(initialValue: profile?.transport ?? .standard)
         // Pre-fill the token from the Keychain when editing (see onAppear);
         // a pairing token wins over the stored one.
         _token = State(initialValue: pairing?.token ?? "")
@@ -211,7 +213,17 @@ struct ProfileEditView: View {
     private func loadModels() async {
         guard let base = URL(string: BackendProfile.normalizedBaseURLString(urlString)) else { return }
         loadingModels = true
-        models = await env.capabilitiesClient.models(base: base, token: normalizedToken)
+        let result = await env.backendResolver.resolve(
+            base: base,
+            token: normalizedToken,
+            preferMaple: resolvedTransport == .mapleEncrypted
+        )
+        if case .success(let mode) = result {
+            models = mode.models
+            resolvedTransport = mode.usesMapleEncryptedChat ? .mapleEncrypted : .standard
+        } else {
+            models = []
+        }
         clearStaleDefaultModel()
         loadingModels = false
     }
@@ -220,11 +232,16 @@ struct ProfileEditView: View {
         guard let base = URL(string: BackendProfile.normalizedBaseURLString(urlString)) else { return }
         isTesting = true
         testResult = nil
-        let result = await env.capabilitiesClient.resolve(base: base, token: normalizedToken)
+        let result = await env.backendResolver.resolve(
+            base: base,
+            token: normalizedToken,
+            preferMaple: resolvedTransport == .mapleEncrypted
+        )
         isTesting = false
         switch result {
         case .success(let mode):
             models = mode.models
+            resolvedTransport = mode.usesMapleEncryptedChat ? .mapleEncrypted : .standard
             clearStaleDefaultModel()
             Haptics.notify(.success)
             testResult = .success(mode.connectionTestMessage)
@@ -240,6 +257,7 @@ struct ProfileEditView: View {
             name: name.trimmingCharacters(in: .whitespaces),
             baseURLString: BackendProfile.normalizedBaseURLString(urlString),
             defaultModel: defaultModel.isEmpty ? nil : defaultModel,
+            transport: resolvedTransport,
             autoWarm: autoWarm
         )
         let token = normalizedToken

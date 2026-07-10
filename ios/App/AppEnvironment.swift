@@ -40,8 +40,12 @@ final class AppEnvironment {
     /// stays in the app target.
     let calendarProvider = CalendarProvider()
     let chatClient = ChatClient()
+    /// Maple uses the same OpenAI request/stream parser as `chatClient`; this
+    /// facade swaps only the encrypted URL loading transport.
+    let mapleChatClient = MapleChatClient()
     let ollamaChatClient = OllamaNativeChatClient()
     let capabilitiesClient = CapabilitiesClient()
+    let backendResolver = BackendResolver()
     let warmupClient = WarmupClient()
     /// On-device semantic embedder (Apple's contextual embedding — OS-provided
     /// assets, nothing bundled) + the indexer that keeps message vectors in
@@ -118,6 +122,13 @@ final class AppEnvironment {
             keychain.deleteTokens(notIn: Set(profiles.map(\.id)))
         }
         activeProfileID = profileStore.activeProfileID ?? profiles.first?.id
+        // A previously detected Maple profile must select its encrypted client
+        // synchronously on launch; otherwise a fast send before the async probe
+        // finishes would briefly use the ordinary URLSession and fail with 401.
+        if let active = profiles.first(where: { $0.id == activeProfileID }),
+           active.transport == .mapleEncrypted {
+            backendMode = .mapleEncrypted(models: profileStore.cachedModels(for: active.id))
+        }
         // Lazily refresh capabilities for the active backend on launch; the
         // picker is seeded from the cache (see `availableModels`) in the meantime.
         Task { await refreshCapabilities() }
@@ -240,6 +251,7 @@ final class AppEnvironment {
         if activeProfileID == nil {
             setActive(profile.id)
         } else if activeProfileID == profile.id {
+            seedBackendMode(from: profile)
             Task { await refreshCapabilities() }
         }
     }
@@ -259,7 +271,26 @@ final class AppEnvironment {
     func setActive(_ id: UUID?) {
         activeProfileID = id
         profileStore.activeProfileID = id
+        seedBackendMode(from: profiles.first { $0.id == id })
         Task { await refreshCapabilities() }
+    }
+
+    /// Select the persisted transport synchronously while the live probe runs.
+    /// This prevents a quick send after editing/switching profiles from using
+    /// whichever client's mode happened to be active immediately beforehand.
+    private func seedBackendMode(from profile: BackendProfile?) {
+        visionModels = nil
+        toolModels = nil
+        reasoningEffortsByModel = nil
+        contextLengths = nil
+        guard let profile else {
+            backendMode = .plainChatOnly(models: [])
+            return
+        }
+        let models = profileStore.cachedModels(for: profile.id)
+        backendMode = profile.transport == .mapleEncrypted
+            ? .mapleEncrypted(models: models)
+            : .plainChatOnly(models: models)
     }
 
     func refreshCapabilities() async {
@@ -278,10 +309,28 @@ final class AppEnvironment {
         isProbing = true
         let profileID = profile.id
         let token = keychain.token(for: profileID) ?? ""
-        let mode = (try? await capabilitiesClient.resolve(base: base, token: token).get())
-            ?? .plainChatOnly(models: [])
+        let result = await backendResolver.resolve(
+            base: base,
+            token: token,
+            preferMaple: profile.transport == .mapleEncrypted
+        )
+        let mode: BackendMode
+        switch result {
+        case .success(let resolved):
+            mode = resolved
+        case .failure:
+            // Keep a known Maple profile on the encrypted transport while it is
+            // temporarily unreachable. The cached model list preserves the same
+            // launch/offline behavior as other backends.
+            mode = profile.transport == .mapleEncrypted
+                ? .mapleEncrypted(models: profileStore.cachedModels(for: profileID))
+                : .plainChatOnly(models: [])
+        }
         guard isCurrentCapabilityRefresh(generation, profileID: profileID) else { return }
         backendMode = mode
+        if case .success = result {
+            persistResolvedTransport(mode, for: profileID)
+        }
         isProbing = false
         // Cache the discovered model list so it's available instantly next launch.
         let models = mode.models
@@ -300,6 +349,16 @@ final class AppEnvironment {
 
     private func isCurrentCapabilityRefresh(_ generation: Int, profileID: UUID) -> Bool {
         generation == capabilityRefreshGeneration && activeProfileID == profileID
+    }
+
+    private func persistResolvedTransport(_ mode: BackendMode, for profileID: UUID) {
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
+        let transport: BackendTransport = mode.usesMapleEncryptedChat
+            ? .mapleEncrypted
+            : .standard
+        guard profiles[index].transport != transport else { return }
+        profiles[index].transport = transport
+        profileStore.save(profiles)
     }
 
     private func clearStaleDefaultModel(for profileID: UUID, availableModels: [String]) {
@@ -344,7 +403,7 @@ final class AppEnvironment {
                 nil,
                 capabilities.contextLengths.isEmpty ? nil : capabilities.contextLengths
             )
-        case .plainChatOnly:
+        case .mapleEncrypted, .plainChatOnly:
             return (nil, nil, nil, nil)
         }
     }

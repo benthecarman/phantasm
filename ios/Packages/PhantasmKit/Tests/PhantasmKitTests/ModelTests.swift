@@ -91,6 +91,10 @@ final class CapabilityDecodeTests: XCTestCase {
             "Connected - native Ollama chat. 1 model."
         )
         XCTAssertEqual(
+            BackendMode.mapleEncrypted(models: ["private-model"]).connectionTestMessage,
+            "Connected - Maple encrypted chat. 1 model."
+        )
+        XCTAssertEqual(
             BackendMode.plainChatOnly(models: ["gpt-oss", "local"]).connectionTestMessage,
             "Connected - chat only (no web search or image tools). 2 models."
         )
@@ -136,6 +140,7 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(caps.models, ["zeta", "alpha"])
         XCTAssertEqual(BackendMode.full(caps).models, ["zeta", "alpha"])
         XCTAssertEqual(BackendMode.ollamaNative(models: ["zeta", "alpha"]).models, ["zeta", "alpha"])
+        XCTAssertEqual(BackendMode.mapleEncrypted(models: ["zeta", "alpha"]).models, ["zeta", "alpha"])
         XCTAssertEqual(BackendMode.plainChatOnly(models: ["zeta", "alpha"]).models, ["zeta", "alpha"])
     }
 
@@ -413,6 +418,15 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertEqual(mode.models, ["native-model"])
         XCTAssertNil(mode.capabilities)
         XCTAssertTrue(mode.usesOllamaNativeChat)
+    }
+
+    func testMapleModeUsesEncryptedOpenAITransport() {
+        let mode = BackendMode.mapleEncrypted(models: ["private-model"])
+        XCTAssertFalse(mode.showsTools)
+        XCTAssertEqual(mode.models, ["private-model"])
+        XCTAssertNil(mode.capabilities)
+        XCTAssertFalse(mode.usesOllamaNativeChat)
+        XCTAssertTrue(mode.usesMapleEncryptedChat)
     }
 
     func testOllamaNativeResolverKeepsValidConversationModel() {

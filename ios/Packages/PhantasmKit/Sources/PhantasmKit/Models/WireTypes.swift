@@ -577,6 +577,10 @@ public enum BackendMode: Sendable, Equatable {
     case full(Capabilities)
     /// Raw Ollama detected via `/api/tags` — use native `/api/chat` streaming.
     case ollamaNative(models: [String])
+    /// Maple/OpenSecret detected via its attestation + key-exchange endpoints.
+    /// Requests still have the ordinary OpenAI shape; only their HTTP envelope
+    /// uses the encrypted transport.
+    case mapleEncrypted(models: [String])
     /// No manifest (404 / not an orchestrator) — plain chat only, no tool UI.
     /// Carries any models discovered from `/v1/models` so the picker still works.
     case plainChatOnly(models: [String])
@@ -591,6 +595,7 @@ public enum BackendMode: Sendable, Equatable {
         switch self {
         case .full(let caps): return caps.models
         case .ollamaNative(let models): return models
+        case .mapleEncrypted(let models): return models
         case .plainChatOnly(let models): return models
         }
     }
@@ -612,6 +617,9 @@ public enum BackendMode: Sendable, Equatable {
         case .ollamaNative(let models):
             let suffix = models.isEmpty ? "" : " \(Self.modelCount(models.count))."
             return "Connected - native Ollama chat.\(suffix)"
+        case .mapleEncrypted(let models):
+            let suffix = models.isEmpty ? "" : " \(Self.modelCount(models.count))."
+            return "Connected - Maple encrypted chat.\(suffix)"
         case .plainChatOnly(let models):
             let suffix = models.isEmpty ? "" : " \(Self.modelCount(models.count))."
             return "Connected - chat only (no web search or image tools).\(suffix)"
@@ -633,6 +641,11 @@ public enum BackendMode: Sendable, Equatable {
 
     public var usesOllamaNativeChat: Bool {
         if case .ollamaNative = self { return true }
+        return false
+    }
+
+    public var usesMapleEncryptedChat: Bool {
+        if case .mapleEncrypted = self { return true }
         return false
     }
 
@@ -658,7 +671,7 @@ public enum BackendMode: Sendable, Equatable {
             }
             return models.first
 
-        case .full, .plainChatOnly:
+        case .full, .mapleEncrypted, .plainChatOnly:
             return conversationModel ?? defaultModel ?? models.first
         }
     }

@@ -44,6 +44,8 @@ targets:
         CFBundleDisplayName: Phantasm
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # `false` means exempt encryption: Phantasm uses Apple-provided
+        # URLSession/CryptoKit implementations, with no bundled crypto library.
         ITSAppUsesNonExemptEncryption: false
         UILaunchScreen: {}
         # QR pairing deep link (SPEC §2.2d): a phantasm://pair URI scanned by
