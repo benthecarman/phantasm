@@ -691,7 +691,7 @@ final class ChatViewModel {
             // The model called app-hosted tools: resolve the batch (auto tools on
             // device, interactive ones via a prompt) and either continue the turn
             // or wait for the user.
-            if let calls = batchedCalls, !calls.isEmpty {
+            if sawDone, let calls = batchedCalls, !calls.isEmpty {
                 resolveToolBatch(
                     calls, conversationId: conversationId, model: model,
                     base: base, token: token, env: env, store: store
@@ -712,7 +712,9 @@ final class ChatViewModel {
                 finish(error: nil, emptyPendingDisposition: .keepForRecovery)
             } else {
                 let completionError: AppError?
-                if reasoningOnlyResponse {
+                if !sawDone {
+                    completionError = .modelError("The connection closed before the response finished.")
+                } else if reasoningOnlyResponse {
                     completionError = .modelError("The model produced thinking but no answer.")
                 } else if emptyResponse {
                     completionError = .modelError("The stream completed without any assistant text.")
@@ -1191,7 +1193,8 @@ final class ChatViewModel {
                     conversationID: conversation.id,
                     messageID: pendingID,
                     content: committed,
-                    notifyInBackground: shouldNotifyWhenCommitted
+                    notifyInBackground: shouldNotifyWhenCommitted,
+                    isCleanCompletion: error == nil
                 ) {
                     try await store.updateMessage(
                         id: pendingID,
@@ -1214,7 +1217,8 @@ final class ChatViewModel {
                     conversationID: conversation.id,
                     messageID: assistant.id,
                     content: committed,
-                    notifyInBackground: shouldNotifyWhenCommitted
+                    notifyInBackground: shouldNotifyWhenCommitted,
+                    isCleanCompletion: error == nil
                 ) {
                     try await store.insertMessage(assistant, attachments: [])
                 }
@@ -1245,6 +1249,7 @@ final class ChatViewModel {
         messageID: UUID,
         content: String,
         notifyInBackground: Bool,
+        isCleanCompletion: Bool,
         write: @escaping @Sendable () async throws -> Void
     ) {
         let rowCommit = Task { [weak self] () -> Bool in
@@ -1270,7 +1275,7 @@ final class ChatViewModel {
                 await self?.notifications.scheduleBackgroundCompletion(
                     conversationID: conversationID
                 )
-            } else if !content.isEmpty {
+            } else if isCleanCompletion && !content.isEmpty {
                 await self?.maybeGenerateTitle()
             }
             self?.endBackgroundStreamingTask()

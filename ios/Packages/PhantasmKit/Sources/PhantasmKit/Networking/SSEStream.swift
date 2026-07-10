@@ -119,7 +119,8 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                     let key = call.index ?? offset
                     mergeToolCall(call, into: &toolCalls, key: key)
                 }
-                return chunk.choices.first?.finishReason != nil
+                return chunk.choices.first?.finishReason?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             }
 
             // Emit accumulated tool calls (ordered by index) before `.done`.

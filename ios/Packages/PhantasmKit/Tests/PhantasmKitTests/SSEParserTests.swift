@@ -110,6 +110,20 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(events, [.token("hi"), .done])
     }
 
+    func testEmptyFinishReasonDoesNotEndStream() async throws {
+        // Some compatibility servers encode an absent finish reason as an
+        // empty string. It is not terminal; later content must not be dropped.
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"one \"},\"finish_reason\":\"\"}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}",
+            "",
+            "data: [DONE]",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        XCTAssertEqual(events, [.token("one "), .token("two"), .done])
+    }
+
     func testJunkChunkIsTolerated() async throws {
         // A malformed data line must not break the stream (FR-A8 robustness).
         let lines = [

@@ -249,6 +249,32 @@ final class ChatViewModelTests: XCTestCase {
         }
     }
 
+    func testForegroundEOFCommitsPartialAnswerAndSurfacesError() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        vm.setViewVisible(true)
+
+        // The sequence ends without the protocol's terminal `.done` event.
+        client.enqueue(events: [.token("partial answer")])
+        vm.send("hello")
+
+        let expected = AppError.modelError(
+            "The connection closed before the response finished."
+        ).userMessage
+        try await waitUntil { vm.errorMessage == expected }
+        try await waitUntil {
+            guard let detail = try await store.conversationDetail(id: conversation.id),
+                  detail.messages.count == 2 else { return false }
+            return detail.messages.last?.message.content == "partial answer"
+                && detail.messages.last?.message.isComplete == true
+        }
+        XCTAssertFalse(vm.isStreaming)
+        XCTAssertEqual(client.requests.count, 1, "an incomplete response must not generate a title")
+    }
+
     func testReasoningOnlyCompletionCommitsReasoningAndSurfacesSpecificError() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
