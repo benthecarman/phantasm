@@ -47,6 +47,13 @@
 	<string>Phantasm does not write to Apple Health.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Phantasm shares your current location with the AI model only when you turn on the Location tool for a chat and the model asks for it.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Phantasm connects to AI servers that you host on your local network.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Phantasm uses the microphone so you can dictate messages. Audio is transcribed on-device and never leaves your phone.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
