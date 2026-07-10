@@ -95,12 +95,16 @@ private final class MapleEncryptedURLProtocol: URLProtocol, @unchecked Sendable 
         do {
             guard let url = request.url else { throw MapleTransportError.missingURL }
             let base = try MapleAPIBase.baseURL(for: url)
+            // URLProtocol exposes Foundation's one-shot body stream rather than
+            // the original Data in some requests. Read it exactly once so a
+            // stale-session retry can encrypt the same payload again.
+            let preparedRequest = try MapleRequestEnvelope.prepare(request)
 
             var attempt = 0
             while true {
                 try Task.checkCancellation()
                 let material = try await MapleSessionCache.shared.session(for: base)
-                let upstreamRequest = try MapleRequestEnvelope.wrap(request, using: material)
+                let upstreamRequest = try preparedRequest.wrapped(using: material)
                 let (bytes, response) = try await MapleNetwork.streaming.bytes(for: upstreamRequest)
 
                 // OpenSecret treats a 400 as a possibly expired encrypted
@@ -255,19 +259,34 @@ struct MapleSessionMaterial: @unchecked Sendable {
 enum MapleRequestEnvelope {
     private struct Body: Encodable { let encrypted: String }
 
+    struct Prepared {
+        fileprivate let request: URLRequest
+        fileprivate let clearBody: Data?
+
+        func wrapped(using material: MapleSessionMaterial) throws -> URLRequest {
+            var wrapped = request
+            wrapped.httpBodyStream = nil
+            if let clearBody, !clearBody.isEmpty {
+                let encrypted = try MapleCrypto.seal(clearBody, using: material.key)
+                wrapped.httpBody = try JSONEncoder().encode(
+                    Body(encrypted: encrypted.base64EncodedString())
+                )
+            }
+            wrapped.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            wrapped.setValue(material.id, forHTTPHeaderField: "x-session-id")
+            wrapped.setValue(nil, forHTTPHeaderField: "Content-Length")
+            return wrapped
+        }
+    }
+
+    static func prepare(_ request: URLRequest) throws -> Prepared {
+        Prepared(request: request, clearBody: try request.mapleHTTPBody)
+    }
+
     static func wrap(_ request: URLRequest, using material: MapleSessionMaterial) throws
         -> URLRequest
     {
-        var wrapped = request
-        wrapped.httpBodyStream = nil
-        if let body = try request.mapleHTTPBody, !body.isEmpty {
-            let encrypted = try MapleCrypto.seal(body, using: material.key)
-            wrapped.httpBody = try JSONEncoder().encode(Body(encrypted: encrypted.base64EncodedString()))
-        }
-        wrapped.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        wrapped.setValue(material.id, forHTTPHeaderField: "x-session-id")
-        wrapped.setValue(nil, forHTTPHeaderField: "Content-Length")
-        return wrapped
+        try prepare(request).wrapped(using: material)
     }
 }
 

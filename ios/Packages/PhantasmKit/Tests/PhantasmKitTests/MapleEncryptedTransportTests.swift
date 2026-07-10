@@ -131,6 +131,23 @@ final class MapleEncryptedTransportTests: XCTestCase {
         XCTAssertEqual(try MapleCrypto.open(encrypted, using: key), clear)
     }
 
+    func testPreparedRequestReusesBodyStreamPayloadForSessionRetry() throws {
+        let clear = Data(#"{"model":"m","stream":true}"#.utf8)
+        var request = URLRequest(url: URL(string: "https://enclave.example/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.httpBodyStream = InputStream(data: clear)
+        let prepared = try MapleRequestEnvelope.prepare(request)
+        let firstMaterial = MapleSessionMaterial(id: UUID().uuidString, key: key)
+        let secondKey = SymmetricKey(data: Data(repeating: 0x5a, count: 32))
+        let secondMaterial = MapleSessionMaterial(id: UUID().uuidString, key: secondKey)
+
+        let first = try prepared.wrapped(using: firstMaterial)
+        let second = try prepared.wrapped(using: secondMaterial)
+
+        XCTAssertEqual(try decryptedRequestBody(first, using: key), clear)
+        XCTAssertEqual(try decryptedRequestBody(second, using: secondKey), clear)
+    }
+
     func testJSONEnvelopeDecryptsToOriginalOpenAIResponse() throws {
         let clear = Data(#"{"object":"list","data":[{"id":"maple-model"}]}"#.utf8)
         let encrypted = try MapleCrypto.seal(clear, using: key).base64EncodedString()
@@ -238,6 +255,16 @@ final class MapleEncryptedTransportTests: XCTestCase {
 
     private func cborText(_ text: String) -> Data {
         cbor(major: 3, data: Data(text.utf8))
+    }
+
+    private func decryptedRequestBody(_ request: URLRequest, using key: SymmetricKey) throws
+        -> Data
+    {
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: String]
+        )
+        let encrypted = try XCTUnwrap(Data(base64Encoded: XCTUnwrap(object["encrypted"])))
+        return try MapleCrypto.open(encrypted, using: key)
     }
 
     private func cborBytes(_ data: Data) -> Data {

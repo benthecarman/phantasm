@@ -21,6 +21,7 @@ struct ProfileEditView: View {
     @State private var defaultModel: String
     @State private var autoWarm: Bool
     @State private var resolvedTransport: BackendTransport
+    @State private var resolvedTransportCanonicalURLString: String?
     @State private var testResult: TestResult?
     @State private var isTesting = false
     @State private var revealToken = false
@@ -41,11 +42,24 @@ struct ProfileEditView: View {
         self.existing = profile
         self.pairing = pairing
         self.onSaved = onSaved
+        let initialURLString = pairing?.baseURLString ?? profile?.baseURLString ?? "https://"
+        let initialURLMatchesProfile = profile.map {
+            BackendProfile.canonicalBaseURLString($0.baseURLString)
+                == BackendProfile.canonicalBaseURLString(initialURLString)
+        } ?? false
+        let initialTransport: BackendTransport = initialURLMatchesProfile
+            ? (profile?.transport ?? .standard)
+            : .standard
         _name = State(initialValue: pairing.map(\.displayName) ?? profile?.name ?? "")
-        _urlString = State(initialValue: pairing?.baseURLString ?? profile?.baseURLString ?? "https://")
+        _urlString = State(initialValue: initialURLString)
         _defaultModel = State(initialValue: profile?.defaultModel ?? "")
         _autoWarm = State(initialValue: profile?.autoWarm ?? false)
-        _resolvedTransport = State(initialValue: profile?.transport ?? .standard)
+        _resolvedTransport = State(initialValue: initialTransport)
+        _resolvedTransportCanonicalURLString = State(initialValue:
+            initialTransport == .mapleEncrypted
+                ? BackendProfile.canonicalBaseURLString(initialURLString)
+                : nil
+        )
         // Pre-fill the token from the Keychain when editing (see onAppear);
         // a pairing token wins over the stored one.
         _token = State(initialValue: pairing?.token ?? "")
@@ -206,21 +220,33 @@ struct ProfileEditView: View {
         token.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var normalizedURLString: String {
+        BackendProfile.normalizedBaseURLString(urlString)
+    }
+
     private var pickerOptions: [String] {
         models
     }
 
     private func loadModels() async {
-        guard let base = URL(string: BackendProfile.normalizedBaseURLString(urlString)) else { return }
+        let requestedURLString = normalizedURLString
+        guard let base = URL(string: requestedURLString) else { return }
         loadingModels = true
         let result = await env.backendResolver.resolve(
             base: base,
             token: normalizedToken,
             preferMaple: effectiveTransportForCurrentURL == .mapleEncrypted
         )
+        guard normalizedURLString == requestedURLString else {
+            loadingModels = false
+            return
+        }
         if case .success(let mode) = result {
             models = mode.models
             resolvedTransport = mode.usesMapleEncryptedChat ? .mapleEncrypted : .standard
+            resolvedTransportCanonicalURLString = BackendProfile.canonicalBaseURLString(
+                requestedURLString
+            )
         } else {
             models = []
         }
@@ -229,7 +255,8 @@ struct ProfileEditView: View {
     }
 
     private func test() async {
-        guard let base = URL(string: BackendProfile.normalizedBaseURLString(urlString)) else { return }
+        let requestedURLString = normalizedURLString
+        guard let base = URL(string: requestedURLString) else { return }
         isTesting = true
         testResult = nil
         let result = await env.backendResolver.resolve(
@@ -237,11 +264,18 @@ struct ProfileEditView: View {
             token: normalizedToken,
             preferMaple: effectiveTransportForCurrentURL == .mapleEncrypted
         )
+        guard normalizedURLString == requestedURLString else {
+            isTesting = false
+            return
+        }
         isTesting = false
         switch result {
         case .success(let mode):
             models = mode.models
             resolvedTransport = mode.usesMapleEncryptedChat ? .mapleEncrypted : .standard
+            resolvedTransportCanonicalURLString = BackendProfile.canonicalBaseURLString(
+                requestedURLString
+            )
             clearStaleDefaultModel()
             Haptics.notify(.success)
             testResult = .success(mode.connectionTestMessage)
@@ -255,7 +289,7 @@ struct ProfileEditView: View {
         let profile = BackendProfile(
             id: existing?.id ?? UUID(),
             name: name.trimmingCharacters(in: .whitespaces),
-            baseURLString: BackendProfile.normalizedBaseURLString(urlString),
+            baseURLString: normalizedURLString,
             defaultModel: defaultModel.isEmpty ? nil : defaultModel,
             transport: effectiveTransportForCurrentURL,
             autoWarm: autoWarm
@@ -275,9 +309,11 @@ struct ProfileEditView: View {
     }
 
     private var effectiveTransportForCurrentURL: BackendTransport {
-        resolvedTransport == .mapleEncrypted
-            ? .mapleEncrypted
-            : BackendProfile.defaultTransport(for: BackendProfile.normalizedBaseURLString(urlString))
+        let defaultTransport = BackendProfile.defaultTransport(for: normalizedURLString)
+        if defaultTransport == .mapleEncrypted { return .mapleEncrypted }
+        let canonicalURLString = BackendProfile.canonicalBaseURLString(normalizedURLString)
+        guard resolvedTransportCanonicalURLString == canonicalURLString else { return .standard }
+        return resolvedTransport
     }
 
     private func clearStaleDefaultModel() {
