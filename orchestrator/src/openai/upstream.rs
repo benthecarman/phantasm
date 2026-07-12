@@ -432,7 +432,7 @@ where
         let mut buf = BytesMut::new();
         let mut think_tags = ThinkTagNormalizer::default();
         let started_at = Instant::now();
-        let mut recorded_usage = false;
+        let mut pending_usage = None;
         let mut pending_done_reason: Option<String> = None;
         'read: while let Some(next) = bytes.next().await {
             let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
@@ -444,6 +444,7 @@ where
                     continue;
                 };
                 if payload == b"[DONE]" {
+                    record_pending_stream_usage(&metrics, &mut pending_usage, started_at);
                     if metrics.is_some() {
                         yield StreamDelta::new("", "", true, pending_done_reason.take());
                     }
@@ -454,7 +455,7 @@ where
                 if let Some(message) = in_band_error(&value) {
                     Err(AppError::UpstreamError(message))?;
                 }
-                if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
+                if capture_stream_usage(&value, &mut pending_usage) {
                     continue;
                 }
                 let mut delta = delta_from_openai_chunk(&value);
@@ -477,12 +478,20 @@ where
                     if let Some(message) = in_band_error(&value) {
                         Err(AppError::UpstreamError(message))?;
                     }
-                    if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
-                        return;
+                    if !capture_stream_usage(&value, &mut pending_usage) {
+                        let mut delta = delta_from_openai_chunk(&value);
+                        if metrics.is_some() && delta.done {
+                            pending_done_reason = delta.done_reason.clone();
+                            delta.done = false;
+                        }
+                        yield think_tags.normalize(delta);
                     }
-                    yield think_tags.normalize(delta_from_openai_chunk(&value));
                 }
             }
+        }
+        record_pending_stream_usage(&metrics, &mut pending_usage, started_at);
+        if metrics.is_some() && pending_done_reason.is_some() {
+            yield StreamDelta::new("", "", true, pending_done_reason.take());
         }
     }
 }
@@ -501,7 +510,7 @@ where
         let mut scan = XmlToolScan::default();
         let mut terminal_seen = false;
         let started_at = Instant::now();
-        let mut recorded_usage = false;
+        let mut pending_usage = None;
         let mut pending_done_reason: Option<String> = None;
         'read: while let Some(next) = bytes.next().await {
             let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
@@ -513,6 +522,7 @@ where
                     continue;
                 };
                 if payload == b"[DONE]" {
+                    record_pending_stream_usage(&metrics, &mut pending_usage, started_at);
                     if metrics.is_some() {
                         yield finish_tool_stream(
                             &tool_calls,
@@ -528,7 +538,7 @@ where
                 if let Some(message) = in_band_error(&value) {
                     Err(AppError::UpstreamError(message))?;
                 }
-                if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
+                if capture_stream_usage(&value, &mut pending_usage) {
                     continue;
                 }
                 tool_calls.absorb_chunk(&value);
@@ -566,7 +576,7 @@ where
                     if let Some(message) = in_band_error(&value) {
                         Err(AppError::UpstreamError(message))?;
                     }
-                    if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
+                    if capture_stream_usage(&value, &mut pending_usage) {
                         if metrics.is_some() {
                             yield finish_tool_stream(
                                 &tool_calls,
@@ -596,6 +606,7 @@ where
                 }
             }
         }
+        record_pending_stream_usage(&metrics, &mut pending_usage, started_at);
 
         // Stream ended without a terminal chunk: resolve whatever was
         // withheld or accumulated, so a buffered XML block (or an already
@@ -634,35 +645,60 @@ fn finish_tool_stream(
     Ok(ToolStreamDelta::new(end.raw, "", None, true, done_reason))
 }
 
-fn record_stream_usage(
-    metrics: &Option<(Arc<crate::metrics::Metrics>, String)>,
-    value: &Value,
-    started_at: Instant,
-    recorded: &mut bool,
-) -> bool {
+#[derive(Default)]
+struct StreamUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+/// Retain the latest usage counters without consuming a chunk that also carries
+/// a choice delta. Most OpenAI-compatible servers emit one final usage-only
+/// chunk, but some routers attach cumulative usage to every content/reasoning
+/// chunk. Returning `true` means this is genuinely a usage-only event.
+fn capture_stream_usage(value: &Value, pending: &mut Option<StreamUsage>) -> bool {
     let Some(usage) = value.get("usage") else {
         return false;
     };
     let count = |key: &str| usage.get(key).and_then(Value::as_u64);
     let prompt_tokens = count("prompt_tokens");
     let completion_tokens = count("completion_tokens");
-    if *recorded || (prompt_tokens.is_none() && completion_tokens.is_none()) {
-        return true;
+    if prompt_tokens.is_some() || completion_tokens.is_some() {
+        let latest = pending.get_or_insert_with(StreamUsage::default);
+        if prompt_tokens.is_some() {
+            latest.prompt_tokens = prompt_tokens;
+        }
+        if completion_tokens.is_some() {
+            latest.completion_tokens = completion_tokens;
+        }
     }
+
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+}
+
+fn record_pending_stream_usage(
+    metrics: &Option<(Arc<crate::metrics::Metrics>, String)>,
+    pending: &mut Option<StreamUsage>,
+    started_at: Instant,
+) {
+    let Some(usage) = pending.take() else {
+        return;
+    };
     if let Some((metrics, model)) = metrics {
-        let eval_duration_ns = completion_tokens
+        let eval_duration_ns = usage
+            .completion_tokens
             .filter(|tokens| *tokens > 0)
             .map(|_| started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         metrics.record_usage(
             model,
-            prompt_tokens,
-            completion_tokens,
+            usage.prompt_tokens,
+            usage.completion_tokens,
             eval_duration_ns,
             None,
         );
     }
-    *recorded = true;
-    true
 }
 
 /// The error message of an in-band error object some compat servers report as
@@ -1470,6 +1506,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_stream_preserves_deltas_with_cumulative_usage() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        // Maple-style routers attach cumulative usage to every SSE event, not
+        // just a final empty-choices event. Those events still carry the actual
+        // reasoning/content and must not be mistaken for usage-only chunks.
+        let metrics = crate::metrics::Metrics::without_store();
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"reasoning\":\"plan\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1,\"total_tokens\":8}}\n\n\
+              data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":4,\"total_tokens\":11}}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<StreamDelta> =
+            sse_bytes_to_deltas(stream::iter(chunks), Some((metrics.clone(), "m".into())))
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|d| d.reasoning.as_str())
+                .collect::<String>(),
+            "plan"
+        );
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|d| d.content.as_str())
+                .collect::<String>(),
+            "OK"
+        );
+        assert!(deltas.last().expect("terminal delta").done);
+        let stats = metrics.model("m");
+        assert_eq!(stats.prompt_tokens.get(), 7);
+        assert_eq!(stats.completion_tokens.get(), 4);
+        assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
+    }
+
+    #[tokio::test]
     async fn sse_tool_stream_usage_records_metrics_and_preserves_calls() {
         use bytes::Bytes;
         use futures_util::stream;
@@ -1494,6 +1572,35 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "weather");
 
+        let stats = metrics.model("m");
+        assert_eq!(stats.prompt_tokens.get(), 11);
+        assert_eq!(stats.completion_tokens.get(), 4);
+        assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
+    }
+
+    #[tokio::test]
+    async fn sse_tool_stream_preserves_calls_with_cumulative_usage() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let metrics = crate::metrics::Metrics::without_store();
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13}}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<ToolStreamDelta> =
+            sse_bytes_to_tool_deltas(stream::iter(chunks), Some((metrics.clone(), "m".into())))
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+
+        let last = deltas.last().expect("terminal tool delta");
+        assert!(last.done);
+        assert_eq!(last.done_reason.as_deref(), Some("tool_calls"));
+        let calls = last.tool_calls.as_ref().expect("structured call preserved");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "weather");
         let stats = metrics.model("m");
         assert_eq!(stats.prompt_tokens.get(), 11);
         assert_eq!(stats.completion_tokens.get(), 4);
