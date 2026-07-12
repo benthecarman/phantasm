@@ -270,6 +270,7 @@ pub struct Config {
     pub image_gen_enabled: bool,
     pub image_edit_enabled: bool,
     pub audio_gen_enabled: bool,
+    pub video_gen_enabled: bool,
     pub comfy_base: Url,
     pub comfy_timeout_s: u64,
     /// Max bytes accepted from ComfyUI's `/view` for a single image. Guards
@@ -277,6 +278,8 @@ pub struct Config {
     pub comfy_max_image_bytes: usize,
     pub comfy_audio_timeout_s: u64,
     pub comfy_max_audio_bytes: usize,
+    pub comfy_video_timeout_s: u64,
+    pub comfy_max_video_bytes: usize,
 
     // Server-hosted media blobs. When `image_store_dir` is set, generated/edited
     // media is persisted there and delivered to the app as signed URL
@@ -322,6 +325,18 @@ pub struct Config {
     pub comfy_audio_duration: Option<NodeInput>,
     pub comfy_audio_seed: Option<NodeInput>,
     pub comfy_audio_output: Option<String>,
+
+    // Video generation workflow + optional input mappings. Like audio, video
+    // is delivered through the signed artifact store.
+    pub comfy_video_workflow: Option<PathBuf>,
+    pub comfy_video_prompt: Option<NodeInput>,
+    pub comfy_video_negative: Option<NodeInput>,
+    pub comfy_video_width: Option<NodeInput>,
+    pub comfy_video_height: Option<NodeInput>,
+    pub comfy_video_frames: Option<NodeInput>,
+    pub comfy_video_fps: Option<NodeInput>,
+    pub comfy_video_seed: Option<NodeInput>,
+    pub comfy_video_output: Option<String>,
 
     // Observability. `/metrics` (Prometheus, authed) is always on; the pair of
     // dashboard routes is gated because the HTML page itself is public.
@@ -389,6 +404,7 @@ impl Config {
         let image_gen_enabled = env_bool("TOOL_IMAGE_GEN", false);
         let image_edit_enabled = env_bool("TOOL_IMAGE_EDIT", false);
         let audio_gen_enabled = env_bool("TOOL_AUDIO_GEN", false);
+        let video_gen_enabled = env_bool("TOOL_VIDEO_GEN", false);
         let comfy_base = parse_url("COMFYUI_BASE_URL", "http://localhost:8188")?;
 
         Ok(Config {
@@ -507,11 +523,14 @@ impl Config {
             image_gen_enabled,
             image_edit_enabled,
             audio_gen_enabled,
+            video_gen_enabled,
             comfy_base,
             comfy_timeout_s: env_parse("COMFYUI_TIMEOUT_S", 120u64),
             comfy_max_image_bytes: env_parse("COMFYUI_MAX_IMAGE_BYTES", 16 * 1024 * 1024),
             comfy_audio_timeout_s: env_parse("COMFYUI_AUDIO_TIMEOUT_S", 5 * 60u64),
             comfy_max_audio_bytes: env_parse("COMFYUI_MAX_AUDIO_BYTES", 128 * 1024 * 1024usize),
+            comfy_video_timeout_s: env_parse("COMFYUI_VIDEO_TIMEOUT_S", 15 * 60u64),
+            comfy_max_video_bytes: env_parse("COMFYUI_MAX_VIDEO_BYTES", 512 * 1024 * 1024usize),
             image_store_dir: env_path("IMAGE_STORE_DIR"),
             image_signing_key: env_nonempty("IMAGE_SIGNING_KEY"),
             image_store_ttl_s: env_parse("IMAGE_STORE_TTL_S", 90 * 24 * 60 * 60),
@@ -533,6 +552,15 @@ impl Config {
             comfy_audio_duration: env_node("COMFYUI_AUDIO_DURATION")?,
             comfy_audio_seed: env_node("COMFYUI_AUDIO_SEED")?,
             comfy_audio_output: env_nonempty("COMFYUI_AUDIO_OUTPUT"),
+            comfy_video_workflow: env_path("COMFYUI_VIDEO_WORKFLOW"),
+            comfy_video_prompt: env_node("COMFYUI_VIDEO_PROMPT")?,
+            comfy_video_negative: env_node("COMFYUI_VIDEO_NEGATIVE")?,
+            comfy_video_width: env_node("COMFYUI_VIDEO_WIDTH")?,
+            comfy_video_height: env_node("COMFYUI_VIDEO_HEIGHT")?,
+            comfy_video_frames: env_node("COMFYUI_VIDEO_FRAMES")?,
+            comfy_video_fps: env_node("COMFYUI_VIDEO_FPS")?,
+            comfy_video_seed: env_node("COMFYUI_VIDEO_SEED")?,
+            comfy_video_output: env_nonempty("COMFYUI_VIDEO_OUTPUT"),
             dashboard_enabled: env_bool("PHANTASM_DASHBOARD", true),
             // Unset => the default file next to the process; set-but-empty =>
             // memory-only (the opt-out), matching the "empty disables" idiom of
@@ -683,6 +711,17 @@ impl Config {
             && self.comfy_audio_workflow.is_some()
             && self.comfy_audio_prompt.is_some()
             && self.comfy_audio_output.is_some()
+            && self.image_store_dir.is_some()
+            && self.public_base_url.is_some()
+    }
+
+    /// Generated video is always delivered by signed URL so chat history stays
+    /// compact. Require an absolute public origin for standard Markdown clients.
+    pub fn video_gen_usable(&self) -> bool {
+        self.video_gen_enabled
+            && self.comfy_video_workflow.is_some()
+            && self.comfy_video_prompt.is_some()
+            && self.comfy_video_output.is_some()
             && self.image_store_dir.is_some()
             && self.public_base_url.is_some()
     }
@@ -1052,11 +1091,14 @@ pub mod tests_support {
             image_gen_enabled: false,
             image_edit_enabled: false,
             audio_gen_enabled: false,
+            video_gen_enabled: false,
             comfy_base: "http://localhost:8188".parse().unwrap(),
             comfy_timeout_s: 120,
             comfy_max_image_bytes: 16 * 1024 * 1024,
             comfy_audio_timeout_s: 5 * 60,
             comfy_max_audio_bytes: 128 * 1024 * 1024,
+            comfy_video_timeout_s: 15 * 60,
+            comfy_max_video_bytes: 512 * 1024 * 1024,
             image_store_dir: None,
             image_signing_key: None,
             image_store_ttl_s: 7 * 24 * 60 * 60,
@@ -1078,6 +1120,15 @@ pub mod tests_support {
             comfy_audio_duration: None,
             comfy_audio_seed: None,
             comfy_audio_output: None,
+            comfy_video_workflow: None,
+            comfy_video_prompt: None,
+            comfy_video_negative: None,
+            comfy_video_width: None,
+            comfy_video_height: None,
+            comfy_video_frames: None,
+            comfy_video_fps: None,
+            comfy_video_seed: None,
+            comfy_video_output: None,
             dashboard_enabled: true,
             metrics_db: None,
             metrics_retention_days: 90,
@@ -1422,6 +1473,19 @@ mod tests {
         assert!(!cfg.audio_gen_usable());
         cfg.public_base_url = Some("https://phantasm.example".parse().unwrap());
         assert!(cfg.audio_gen_usable());
+    }
+
+    #[test]
+    fn video_generation_requires_workflow_prompt_output_and_artifact_store() {
+        let mut cfg = crate::config::tests_support::minimal();
+        cfg.video_gen_enabled = true;
+        cfg.comfy_video_workflow = Some("video.json".into());
+        cfg.comfy_video_prompt = Some(NodeInput::parse("1.text").unwrap());
+        cfg.comfy_video_output = Some("9".into());
+        assert!(!cfg.video_gen_usable());
+        cfg.image_store_dir = Some("/tmp/artifacts".into());
+        cfg.public_base_url = Some("https://phantasm.example".parse().unwrap());
+        assert!(cfg.video_gen_usable());
     }
 
     #[test]

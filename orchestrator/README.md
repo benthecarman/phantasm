@@ -3,7 +3,7 @@
 An OpenAI-compatible orchestration proxy for self-hosted AI. It sits between a
 thin chat client (the Phantasm iOS app, or any OpenAI client) and your own
 [Ollama](https://ollama.com) + [ComfyUI](https://github.com/comfyanonymous/ComfyUI),
-adding **read-only tools**, **web search**, and **image/audio generation** via a
+adding **read-only tools**, **web search**, and **image/audio/video generation** via a
 server-side tool loop that is *invisible to the client*.
 
 The client only ever speaks plain OpenAI SSE, so it can point at this
@@ -18,7 +18,7 @@ iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ O
                              ├── Brave Search / web fetch / APIs
                              ├── local utility tools (time, calculator, units)
                              ├── tesseract OCR (temp-file handoff only)
-                             └── ComfyUI       (image / edit / audio generation)
+                             └── ComfyUI       (image / edit / audio / video)
 ```
 
 - **Plain turns** are a near-passthrough: one upstream streaming chat call,
@@ -86,6 +86,10 @@ requires `IMAGE_STORE_DIR` plus `PUBLIC_BASE_URL` for compact signed artifact
 delivery. The model never authors
 or submits ComfyUI graphs. Any model and API-format workflow can be used by
 setting `COMFYUI_AUDIO_WORKFLOW` and its input/output node mappings.
+`TOOL_VIDEO_GEN` follows the same fixed-workflow contract with prompt/output
+bindings and optional negative/size/frame-rate/frame-count/seed mappings. The
+selected output may come from any ComfyUI node that reports one retrievable file
+artifact; VideoHelperSuite's Video Combine node is forced to temporary output.
 Thorough (full-page-fetch) search: set `SEARCH_FETCH_PAGES=true`; the model then
 opts into `depth="thorough"` per query, leaving simple lookups snippet-fast.
 

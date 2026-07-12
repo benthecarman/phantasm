@@ -17,8 +17,8 @@ use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::TurnEvent;
 use crate::tools::{
     audio_gen, calculator, code_exec, code_exec_pool::CodeExecPools, github, image_edit, image_gen,
-    maps_places, market_data, ocr, sports, time as time_tool, unit_convert, weather, web_fetch,
-    web_search,
+    maps_places, market_data, ocr, sports, time as time_tool, unit_convert, video_gen, weather,
+    web_fetch, web_search,
 };
 
 /// Result of executing one tool call: the `tool`-role message to feed back to
@@ -182,6 +182,9 @@ impl ToolExecutor for ToolRegistry {
         if self.cfg.audio_gen_usable() {
             out.push(audio_gen::schema());
         }
+        if self.cfg.video_gen_usable() {
+            out.push(video_gen::schema());
+        }
         out
     }
 
@@ -274,6 +277,9 @@ impl ToolExecutor for ToolRegistry {
             }
             "audio_generation" if self.cfg.audio_gen_usable() => {
                 audio_gen::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
+            }
+            "video_generation" if self.cfg.video_gen_usable() => {
+                video_gen::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
             }
             other => {
                 // Unknown / disabled tool: tell the model so it can recover.

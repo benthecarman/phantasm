@@ -249,6 +249,7 @@ async fn tool_selectors(cfg: &Config, http: &reqwest::Client) -> Vec<ToolSelecto
                 (cfg.image_gen_usable(), "image_generation"),
                 (cfg.image_edit_usable(), "image_edit"),
                 (cfg.audio_gen_usable(), "audio_generation"),
+                (cfg.video_gen_usable(), "video_generation"),
             ],
         ) {
             selectors.push(images);
@@ -343,7 +344,9 @@ fn tool_selector_id(tool: &str) -> Option<&'static str> {
         // `code_exec` lives in both utilities and web_search; report its always-on
         // home (utilities) for mode-requirement resolution.
         "calculator" | "time" | "unit_convert" | "ocr" | "code_exec" => Some("utilities"),
-        "image_generation" | "image_edit" | "audio_generation" => Some("image_generation"),
+        "image_generation" | "image_edit" | "audio_generation" | "video_generation" => {
+            Some("image_generation")
+        }
         _ => None,
     }
 }
@@ -477,7 +480,9 @@ pub fn build_state_with_upstreams(
             dir.clone(),
             &image_signing_key,
             cfg.image_store_ttl_s,
-            cfg.comfy_max_image_bytes.max(cfg.comfy_max_audio_bytes),
+            cfg.comfy_max_image_bytes
+                .max(cfg.comfy_max_audio_bytes)
+                .max(cfg.comfy_max_video_bytes),
             cfg.public_base_url.as_ref(),
         ) {
             Ok(store) => {
@@ -593,7 +598,12 @@ mod tests {
                 "{tool} should gate under utilities"
             );
         }
-        for tool in ["image_generation", "image_edit", "audio_generation"] {
+        for tool in [
+            "image_generation",
+            "image_edit",
+            "audio_generation",
+            "video_generation",
+        ] {
             assert_eq!(tool_selector_id(tool), Some("image_generation"));
         }
         assert_eq!(tool_selector_id("nonexistent"), None);

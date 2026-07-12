@@ -391,21 +391,23 @@ pub(crate) fn recognized_audio_type(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+pub(crate) fn recognized_video_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        Some("video/mp4")
+    } else if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        Some("video/webm")
+    } else {
+        None
+    }
+}
+
 /// Generated artifact type identified from magic bytes. The image subset stays
 /// unchanged for request-image validation; media is accepted only for generated
 /// server-hosted artifacts.
 pub(crate) fn recognized_artifact_type(bytes: &[u8]) -> Option<&'static str> {
     recognized_image_type(bytes)
         .or_else(|| recognized_audio_type(bytes))
-        .or_else(|| {
-            if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-                Some("video/mp4")
-            } else if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
-                Some("video/webm")
-            } else {
-                None
-            }
-        })
+        .or_else(|| recognized_video_type(bytes))
 }
 
 /// Identify the image type from magic bytes; defaults to PNG (ComfyUI's usual

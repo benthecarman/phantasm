@@ -382,6 +382,28 @@ pub struct WorkflowArtifact {
     pub filename: String,
 }
 
+#[derive(Clone, Copy)]
+enum ArtifactKind {
+    Audio,
+    Video,
+}
+
+impl ArtifactKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+struct ArtifactRunOptions<'a> {
+    output_nodes: &'a [String],
+    timeout_s: u64,
+    max_bytes: usize,
+    kind: ArtifactKind,
+}
+
 /// Run a configured audio workflow and retrieve its single temporary artifact.
 /// Durable saver nodes are rewritten to `PreviewAudio` before submission so
 /// prompts do not accumulate in ComfyUI's output library.
@@ -396,29 +418,50 @@ pub async fn run_audio_workflow(
         .as_deref()
         .ok_or("COMFYUI_AUDIO_OUTPUT is not configured")?;
     let output_nodes = force_temporary_audio_outputs(&mut workflow, selected)?;
-    let mut artifacts = run_artifact_workflow(
-        cfg,
-        http,
-        workflow,
-        &output_nodes,
-        tx,
-        cfg.comfy_audio_timeout_s,
-        cfg.comfy_max_audio_bytes,
-    )
-    .await?;
+    let options = ArtifactRunOptions {
+        output_nodes: &output_nodes,
+        timeout_s: cfg.comfy_audio_timeout_s,
+        max_bytes: cfg.comfy_max_audio_bytes,
+        kind: ArtifactKind::Audio,
+    };
+    let mut artifacts = run_artifact_workflow(cfg, http, workflow, tx, &options).await?;
     artifacts
         .pop()
         .ok_or_else(|| "audio workflow produced no artifact".into())
+}
+
+/// Run a configured video workflow and retrieve its selected file artifact.
+/// Known output nodes are switched to temporary delivery when they expose such
+/// a setting; the rest of the graph is passed through unchanged.
+pub async fn run_video_workflow(
+    cfg: &Config,
+    http: &reqwest::Client,
+    mut workflow: Value,
+    tx: &mpsc::Sender<TurnEvent>,
+) -> Result<WorkflowArtifact, String> {
+    let selected = cfg
+        .comfy_video_output
+        .as_deref()
+        .ok_or("COMFYUI_VIDEO_OUTPUT is not configured")?;
+    let output_nodes = prepare_video_output(&mut workflow, selected)?;
+    let options = ArtifactRunOptions {
+        output_nodes: &output_nodes,
+        timeout_s: cfg.comfy_video_timeout_s,
+        max_bytes: cfg.comfy_max_video_bytes,
+        kind: ArtifactKind::Video,
+    };
+    let mut artifacts = run_artifact_workflow(cfg, http, workflow, tx, &options).await?;
+    artifacts
+        .pop()
+        .ok_or_else(|| "video workflow produced no artifact".into())
 }
 
 async fn run_artifact_workflow(
     cfg: &Config,
     http: &reqwest::Client,
     workflow: Value,
-    output_nodes: &[String],
     tx: &mpsc::Sender<TurnEvent>,
-    timeout_s: u64,
-    max_artifact_bytes: usize,
+    options: &ArtifactRunOptions<'_>,
 ) -> Result<Vec<WorkflowArtifact>, String> {
     let client_id = uuid::Uuid::new_v4().simple().to_string();
     let ws_url = ws_url(cfg, &client_id)?;
@@ -451,11 +494,11 @@ async fn run_artifact_workflow(
     interrupt.prompt_id = Some(prompt_id.clone());
     let _ = tx.send(TurnEvent::Status(STATUS_QUEUED.into())).await;
 
-    let deadline = tokio::time::sleep(Duration::from_secs(timeout_s));
+    let deadline = tokio::time::sleep(Duration::from_secs(options.timeout_s));
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _ = &mut deadline => return Err("ComfyUI audio workflow timed out".into()),
+            _ = &mut deadline => return Err(format!("ComfyUI {} workflow timed out", options.kind.name())),
             msg = ws.next() => match msg {
                 Some(Ok(Message::Text(txt))) => {
                     let Ok(event) = serde_json::from_str::<Value>(&txt) else { continue };
@@ -468,7 +511,7 @@ async fn run_artifact_workflow(
                     match kind {
                         "execution_start" if same_prompt => {
                             interrupt.executing = true;
-                            let _ = tx.send(TurnEvent::Status("generating audio…".into())).await;
+                            let _ = tx.send(TurnEvent::Status(format!("generating {}…", options.kind.name()))).await;
                         }
                         "progress" => {
                             let value = data.and_then(|d| d.get("value")).and_then(Value::as_f64);
@@ -476,7 +519,7 @@ async fn run_artifact_workflow(
                             if let (Some(value), Some(max)) = (value, max) {
                                 if max > 0.0 {
                                     let _ = tx.send(TurnEvent::Progress {
-                                        status: "generating audio…".into(),
+                                        status: format!("generating {}…", options.kind.name()),
                                         progress: (value / max).clamp(0.0, 1.0),
                                     }).await;
                                 }
@@ -506,33 +549,22 @@ async fn run_artifact_workflow(
     let _ = tx
         .send(TurnEvent::Status("retrieving artifacts…".into()))
         .await;
-    fetch_artifacts(
-        cfg,
-        http,
-        &prompt_id,
-        output_nodes,
-        tx,
-        timeout_s,
-        max_artifact_bytes,
-    )
-    .await
+    fetch_artifacts(cfg, http, &prompt_id, tx, options).await
 }
 
 async fn fetch_artifacts(
     cfg: &Config,
     http: &reqwest::Client,
     prompt_id: &str,
-    output_nodes: &[String],
     tx: &mpsc::Sender<TurnEvent>,
-    timeout_s: u64,
-    max_artifact_bytes: usize,
+    options: &ArtifactRunOptions<'_>,
 ) -> Result<Vec<WorkflowArtifact>, String> {
     let history: Value = http_util::send_json(
         http.get(http_util::join_base(
             &cfg.comfy_base,
             &format!("/history/{prompt_id}"),
         )),
-        Duration::from_secs(timeout_s),
+        Duration::from_secs(options.timeout_s),
         HISTORY_BODY_CAP,
     )
     .await?;
@@ -542,7 +574,7 @@ async fn fetch_artifacts(
         .and_then(Value::as_object)
         .ok_or_else(|| "ComfyUI history contained no outputs".to_string())?;
     let mut refs = Vec::new();
-    for node_id in output_nodes {
+    for node_id in options.output_nodes {
         let Some(node) = outputs.get(node_id) else {
             continue;
         };
@@ -561,7 +593,8 @@ async fn fetch_artifacts(
     }
     if refs.len() != 1 {
         return Err(format!(
-            "audio output produced {} artifacts; exactly one is required",
+            "{} output produced {} artifacts; exactly one is required",
+            options.kind.name(),
             refs.len()
         ));
     }
@@ -574,7 +607,7 @@ async fn fetch_artifacts(
                 ("subfolder", file.subfolder.as_str()),
                 ("type", file.kind.as_str()),
             ])
-            .timeout(Duration::from_secs(timeout_s))
+            .timeout(Duration::from_secs(options.timeout_s))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -591,7 +624,7 @@ async fn fetch_artifacts(
             .unwrap_or("application/octet-stream")
             .to_string();
         if let Some(len) = resp.content_length() {
-            if len as usize > max_artifact_bytes {
+            if len as usize > options.max_bytes {
                 return Err(format!("artifact too large ({len} bytes)"));
             }
         }
@@ -599,7 +632,7 @@ async fn fetch_artifacts(
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| e.to_string())?;
-            if bytes.len() + chunk.len() > max_artifact_bytes {
+            if bytes.len() + chunk.len() > options.max_bytes {
                 return Err("artifact exceeded byte cap".into());
             }
             bytes.extend_from_slice(&chunk);
@@ -650,6 +683,27 @@ fn force_temporary_audio_outputs(
         return Err(format!(
             "COMFYUI_AUDIO_OUTPUT node {selected} is not a PreviewAudio/SaveAudio output"
         ));
+    }
+    Ok(vec![selected.to_string()])
+}
+
+fn prepare_video_output(workflow: &mut Value, selected: &str) -> Result<Vec<String>, String> {
+    let nodes = workflow
+        .as_object_mut()
+        .ok_or("video workflow must be an API-format object keyed by node id")?;
+    let node = nodes
+        .get_mut(selected)
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| format!("COMFYUI_VIDEO_OUTPUT node {selected} does not exist"))?;
+    // VideoHelperSuite can emit directly into ComfyUI's temp directory. Other
+    // output implementations remain untouched and are retrieved generically
+    // from the selected node's history entry.
+    if node.get("class_type").and_then(Value::as_str) == Some("VHS_VideoCombine") {
+        let inputs = node
+            .get_mut("inputs")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| format!("video output node {selected} has invalid inputs"))?;
+        inputs.insert("save_output".into(), Value::Bool(false));
     }
     Ok(vec![selected.to_string()])
 }
@@ -1131,6 +1185,30 @@ mod tests {
             workflow["9"]["inputs"],
             serde_json::json!({"audio":["8",0]})
         );
+    }
+
+    #[test]
+    fn switches_vhs_video_output_to_temporary_delivery() {
+        let mut workflow = serde_json::json!({
+            "12": {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "images": ["8", 0],
+                    "format": "video/h264-mp4",
+                    "save_output": true
+                }
+            }
+        });
+        assert_eq!(prepare_video_output(&mut workflow, "12").unwrap(), ["12"]);
+        assert_eq!(workflow["12"]["inputs"]["save_output"], false);
+    }
+
+    #[test]
+    fn accepts_generic_selected_video_output() {
+        let mut workflow = serde_json::json!({
+            "12": {"class_type":"CustomVideoSaver","inputs":{"video":["8",0]}}
+        });
+        assert_eq!(prepare_video_output(&mut workflow, "12").unwrap(), ["12"]);
     }
 
     #[test]

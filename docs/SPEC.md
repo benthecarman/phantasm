@@ -92,7 +92,7 @@ image generation on top of plain inference.
     {
       "id": "image_generation",
       "label": "Media generation",
-      "tools": ["image_generation", "image_edit", "audio_generation"]
+      "tools": ["image_generation", "image_edit", "audio_generation", "video_generation"]
     }
   ]
 }
@@ -155,7 +155,7 @@ weather, maps, market data, GitHub) and is gated by the per-chat web-access
 toggle; `utilities` holds **offline, on-box** tools (calculator, current time,
 unit conversion, local OCR) that the app offers **unconditionally** — disabling
 web access never disables them, and the app needs no separate toggle for them.
-`image_generation` covers image generation, editing, and audio generation,
+`image_generation` covers image generation, editing, audio generation, and video generation,
 gated by the media-generation toggle. Each tool runs an operator-configured
 workflow; models never author or submit ComfyUI graphs. Research
 modes are advertised only when the actual Brave-backed `web_search` schema is
@@ -512,6 +512,9 @@ already reachable from their device.
 - Generated audio is returned as an absolute signed Files-style URL, never an
   inline data URI; byte-range fetches support native streaming playback. Audio
   workflows are operator-configured and must expose one temporary audio output.
+- Generated video uses the same signed, byte-range-capable artifact delivery.
+  Video workflows are operator-configured and expose one selected file output;
+  models provide only bounded semantic inputs, never graph JSON.
 - Ship one default ComfyUI workflow, overridable via config.
 - Pairing rides a `phantasm://pair` URI (§2.2d) carrying the static token
   directly — no token issuance, no `/v1/pair` endpoint, no new HTTP surface.

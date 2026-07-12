@@ -24,6 +24,7 @@ pub mod ocr;
 pub mod sports;
 pub mod time;
 pub mod unit_convert;
+pub mod video_gen;
 pub mod weather;
 pub mod web_fetch;
 pub mod web_search;
