@@ -3,6 +3,7 @@ import PhantasmKit
 import ImageIO
 import AVKit
 import SwiftUI
+import UIKit
 
 /// Renders assistant markdown (FR-A4) with fenced code blocks (copy button) and
 /// inline images (FR-A7), including base64 data-URIs resolved via a custom image
@@ -120,10 +121,7 @@ private struct GeneratedAudioView: View {
                     .font(.caption)
                     .lineLimit(2)
                 Spacer()
-                ShareLink(item: artifact.url) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .accessibilityLabel("Share generated audio")
+                GeneratedMediaShareButton(artifact: artifact)
             }
             if let playbackError {
                 Text(playbackError)
@@ -175,14 +173,126 @@ private struct GeneratedVideoView: View {
                     .font(.caption)
                     .lineLimit(1)
                 Spacer()
-                ShareLink(item: artifact.url) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .accessibilityLabel("Share generated video")
+                GeneratedMediaShareButton(artifact: artifact)
             }
             .foregroundStyle(.secondary)
         }
         .onDisappear { player.pause() }
+    }
+}
+
+private struct GeneratedMediaShareButton: View {
+    let artifact: ServerArtifactRef.Artifact
+    @State private var shareFile: SharedMediaFile?
+    @State private var isPreparing = false
+    @State private var shareError: String?
+
+    var body: some View {
+        Button {
+            Task { await prepareShare() }
+        } label: {
+            if isPreparing {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: "square.and.arrow.up")
+            }
+        }
+        .disabled(isPreparing)
+        .accessibilityLabel("Share generated \(artifact.kind.rawValue)")
+        .sheet(item: $shareFile, onDismiss: cleanupShareFile) { file in
+            ActivityView(activityItems: [file.url])
+        }
+        .alert("Sharing failed", isPresented: Binding(
+            get: { shareError != nil },
+            set: { if !$0 { shareError = nil } }
+        )) {
+            Button("OK", role: .cancel) { shareError = nil }
+        } message: {
+            Text(shareError ?? "The generated media could not be prepared for sharing.")
+        }
+    }
+
+    private func prepareShare() async {
+        guard !isPreparing else { return }
+        isPreparing = true
+        defer { isPreparing = false }
+        cleanupShareFile()
+
+        do {
+            let url = try await GeneratedMediaShareStore.shared.stage(artifact: artifact)
+            shareFile = SharedMediaFile(url: url)
+        } catch {
+            shareError = "The generated \(artifact.kind.rawValue) could not be downloaded."
+        }
+    }
+
+    private func cleanupShareFile() {
+        if let url = shareFile?.url {
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        }
+        shareFile = nil
+    }
+}
+
+private struct SharedMediaFile: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private actor GeneratedMediaShareStore {
+    static let shared = GeneratedMediaShareStore()
+
+    func stage(artifact: ServerArtifactRef.Artifact) async throws -> URL {
+        let source = artifact.url
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PhantasmSharedMedia", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = directory.appendingPathComponent(filename(for: artifact))
+
+        if source.isFileURL {
+            try FileManager.default.copyItem(at: source, to: destination)
+            return destination
+        }
+
+        var request = URLRequest(url: source, timeoutInterval: 60)
+        request.setValue(acceptHeader(for: artifact.kind), forHTTPHeaderField: "Accept")
+        let (downloadedURL, response) = try await URLSession.shared.download(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        try FileManager.default.moveItem(at: downloadedURL, to: destination)
+        return destination
+    }
+
+    private func filename(for artifact: ServerArtifactRef.Artifact) -> String {
+        let trimmed = artifact.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = artifact.kind == .audio ? "generated-audio.m4a" : "generated-video.mp4"
+        let raw = trimmed.isEmpty ? fallback : trimmed
+        let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:")
+            .union(.newlines)
+            .union(.controlCharacters)
+        let sanitized = raw.components(separatedBy: invalid).joined(separator: "-")
+        return sanitized.isEmpty ? fallback : sanitized
+    }
+
+    private func acceptHeader(for kind: ServerArtifactRef.Kind) -> String {
+        switch kind {
+        case .audio: return "audio/*"
+        case .video: return "video/*"
+        }
     }
 }
 
