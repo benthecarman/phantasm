@@ -188,9 +188,9 @@ struct OnboardingView: View {
                     text: "When your backend supports it, the model can search or fetch web pages to answer a chat."
                 )
                 toolInfo(
-                    title: "Image generation",
+                    title: "Media generation",
                     systemImage: "wand.and.stars",
-                    text: "When your backend supports it, generated images are returned in the assistant message and can be saved by you."
+                    text: "When your backend supports it, generated images and audio are returned in the assistant message with native viewing and playback."
                 )
             }
 

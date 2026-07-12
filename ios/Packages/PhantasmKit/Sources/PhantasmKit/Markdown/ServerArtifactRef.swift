@@ -1,18 +1,24 @@
 import Foundation
 
-/// Signed, server-hosted non-image artifacts embedded as ordinary Markdown
-/// links. The first dynamic-workflow release emits video links using the stable
-/// `Video: <filename>` label; standard clients still see a normal usable link.
+/// Signed, server-hosted media embedded as ordinary Markdown links. Standard
+/// clients see usable `Video:` / `Audio:` links; Phantasm renders them natively.
 public enum ServerArtifactRef {
+    public enum Kind: String, Equatable, Sendable {
+        case video
+        case audio
+    }
+
     public struct Artifact: Identifiable, Equatable, Sendable {
         public let id: String
         public let label: String
         public let url: URL
+        public let kind: Kind
 
-        public init(id: String, label: String, url: URL) {
+        public init(id: String, label: String, url: URL, kind: Kind) {
             self.id = id
             self.label = label
             self.url = url
+            self.kind = kind
         }
     }
 
@@ -26,7 +32,7 @@ public enum ServerArtifactRef {
         }
     }
 
-    /// Remove trusted Phantasm video links from Markdown and return them as
+    /// Remove trusted Phantasm media links from Markdown and return them as
     /// structured artifacts for native playback. Untrusted/lookalike links stay
     /// in Markdown and require the user's normal explicit link tap.
     public static func extractTrusted(in text: String, backendBase: URL?) -> Extraction {
@@ -36,13 +42,15 @@ public enum ServerArtifactRef {
         var output = text
         var artifacts: [Artifact] = []
         for match in matches.reversed() {
-            let label = ns.substring(with: match.range(at: 1))
-            let target = ns.substring(with: match.range(at: 2))
-            let id = ns.substring(with: match.range(at: 3))
-            guard let url = URL(string: target),
+            let kindText = ns.substring(with: match.range(at: 1)).lowercased()
+            let label = ns.substring(with: match.range(at: 2))
+            let target = ns.substring(with: match.range(at: 3))
+            let id = ns.substring(with: match.range(at: 4))
+            guard let url = resolvedContentURL(target, backendBase: backendBase),
+                  let kind = Kind(rawValue: kindText),
                   ServerImageRef.isTrustedContentURL(url, backendBase: backendBase)
             else { continue }
-            artifacts.insert(.init(id: id, label: label, url: url), at: 0)
+            artifacts.insert(.init(id: id, label: label, url: url, kind: kind), at: 0)
             if let range = Range(match.range, in: output) {
                 output.removeSubrange(range)
             }
@@ -54,7 +62,15 @@ public enum ServerArtifactRef {
     }
 
     private static let regex = try? NSRegularExpression(
-        pattern: #"\[Video:\s*([^\]]+)\]\((https?://[^)\s]*/v1/files/([A-Za-z0-9_-]+)/content[^)\s]*)\)"#,
+        pattern: #"\[(Video|Audio):\s*([^\]]+)\]\(((?:https?://[^)\s]*|)/v1/files/([A-Za-z0-9_-]+)/content[^)\s]*)\)"#,
         options: [.caseInsensitive]
     )
+
+    private static func resolvedContentURL(_ target: String, backendBase: URL?) -> URL? {
+        if target.hasPrefix("/") {
+            guard let backendBase else { return nil }
+            return URL(string: target, relativeTo: backendBase)?.absoluteURL
+        }
+        return URL(string: target)
+    }
 }

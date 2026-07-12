@@ -51,7 +51,12 @@ struct MarkdownMessageView: View {
             }
             if !isStreaming {
                 ForEach(artifacts.artifacts) { artifact in
-                    GeneratedVideoView(artifact: artifact)
+                    switch artifact.kind {
+                    case .video:
+                        GeneratedVideoView(artifact: artifact)
+                    case .audio:
+                        GeneratedAudioView(artifact: artifact)
+                    }
                 }
             }
         }
@@ -73,6 +78,81 @@ struct MarkdownMessageView: View {
             images: base64.images.merging(stored.images) { current, _ in current }
                 .merging(server.images) { current, _ in current }
         )
+    }
+}
+
+private struct GeneratedAudioView: View {
+    let artifact: ServerArtifactRef.Artifact
+    @State private var player: AVPlayer
+    @State private var isPlaying = false
+    @State private var playbackError: String?
+
+    init(artifact: ServerArtifactRef.Artifact) {
+        self.artifact = artifact
+        _player = State(initialValue: AVPlayer(url: artifact.url))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                Button {
+                    if isPlaying {
+                        player.pause()
+                        isPlaying = false
+                    } else {
+                        do {
+                            try activateAudioPlaybackSession()
+                            player.play()
+                            playbackError = nil
+                            isPlaying = true
+                        } catch {
+                            playbackError = "Audio playback failed."
+                        }
+                    }
+                } label: {
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .frame(width: 32, height: 32)
+                        .background(.thinMaterial, in: Circle())
+                }
+                .accessibilityLabel(isPlaying ? "Pause generated audio" : "Play generated audio")
+
+                Label(artifact.label, systemImage: "waveform")
+                    .font(.caption)
+                    .lineLimit(2)
+                Spacer()
+                ShareLink(item: artifact.url) {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .accessibilityLabel("Share generated audio")
+            }
+            if let playbackError {
+                Text(playbackError)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        .onDisappear {
+            player.pause()
+            isPlaying = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { note in
+            guard let item = note.object as? AVPlayerItem, item === player.currentItem else { return }
+            player.seek(to: .zero)
+            isPlaying = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime)) { note in
+            guard let item = note.object as? AVPlayerItem, item === player.currentItem else { return }
+            isPlaying = false
+            playbackError = "Audio playback failed."
+        }
+    }
+
+    private func activateAudioPlaybackSession() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default, options: [.duckOthers])
+        try session.setActive(true)
     }
 }
 

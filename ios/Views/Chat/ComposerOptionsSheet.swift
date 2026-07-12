@@ -14,7 +14,7 @@ struct ComposerOptionsSheet: View {
     let allowsImageAttachments: Bool
     /// Whether the backend advertises each server tool (spec §2.1). Most tools
     /// also require the model to drive function calls (`modelSupportsTools`);
-    /// image generation is server-resolved and stays available for every model
+    /// media generation is server-resolved and stays available for every model
     /// when the backend advertises it.
     let supportsWebSearch: Bool
     let supportsImageGeneration: Bool
@@ -99,7 +99,7 @@ struct ComposerOptionsSheet: View {
                         isOn: webSearchEnabled
                     )
                     toolRow(
-                        "Image generation",
+                        "Media generation",
                         systemImage: "wand.and.stars",
                         backendSupports: supportsImageGeneration,
                         requiresModelTools: false,
@@ -207,7 +207,7 @@ struct ComposerOptionsSheet: View {
     }
 
     /// A server-tool toggle. Most tools need both the backend to advertise them
-    /// and a model that can drive tools; image generation opts out because the
+    /// and a model that can drive tools; media generation opts out because the
     /// server-side tool loop can resolve it for any selected model.
     private func toolRow(
         _ title: String,

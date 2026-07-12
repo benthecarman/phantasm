@@ -70,8 +70,8 @@ store.
   metadata (URL, name, model) in `UserDefaults`.
 - **Markdown** via MarkdownUI with a custom image provider that resolves base64
   data-URIs (extracted to `phantasm-img://` placeholders) and a code-block style
-  with a copy button. Trusted signed video artifacts from advanced ComfyUI
-  workflows render with native playback controls.
+  with a copy button. Trusted signed video and generated-audio artifacts render
+  with native playback controls.
 
 ## Notes
 
