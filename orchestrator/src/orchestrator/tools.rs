@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::TurnEvent;
 use crate::tools::{
-    calculator, code_exec, code_exec_pool::CodeExecPools, github, image_edit, image_gen,
+    audio_gen, calculator, code_exec, code_exec_pool::CodeExecPools, github, image_edit, image_gen,
     maps_places, market_data, ocr, sports, time as time_tool, unit_convert, weather, web_fetch,
     web_search,
 };
@@ -179,6 +179,9 @@ impl ToolExecutor for ToolRegistry {
         if self.cfg.image_edit_usable() {
             out.push(image_edit::schema());
         }
+        if self.cfg.audio_gen_usable() {
+            out.push(audio_gen::schema());
+        }
         out
     }
 
@@ -268,6 +271,9 @@ impl ToolExecutor for ToolRegistry {
             }
             "image_edit" if self.cfg.image_edit_usable() => {
                 image_edit::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
+            }
+            "audio_generation" if self.cfg.audio_gen_usable() => {
+                audio_gen::run(&self.cfg, &self.http, call, &call_id, ctx, &tx, &cancel).await
             }
             other => {
                 // Unknown / disabled tool: tell the model so it can recover.

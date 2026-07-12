@@ -14,6 +14,7 @@
 //! [`upload_temp_image`] handles that via `POST /upload/image` with
 //! `type=temp`, then references it as an annotated `LoadImage` path.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -372,6 +373,311 @@ pub async fn run_workflow(
     // Fallback path: locate the produced image in ComfyUI's history, then download.
     let _ = tx.send(TurnEvent::Status(STATUS_RETRIEVING.into())).await;
     fetch_image(cfg, http, &prompt_id, tx).await
+}
+
+/// A file artifact emitted by a configured workflow output node.
+pub struct WorkflowArtifact {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub filename: String,
+}
+
+/// Run a configured audio workflow and retrieve its single temporary artifact.
+/// Durable saver nodes are rewritten to `PreviewAudio` before submission so
+/// prompts do not accumulate in ComfyUI's output library.
+pub async fn run_audio_workflow(
+    cfg: &Config,
+    http: &reqwest::Client,
+    mut workflow: Value,
+    tx: &mpsc::Sender<TurnEvent>,
+) -> Result<WorkflowArtifact, String> {
+    let selected = cfg
+        .comfy_audio_output
+        .as_deref()
+        .ok_or("COMFYUI_AUDIO_OUTPUT is not configured")?;
+    let output_nodes = force_temporary_audio_outputs(&mut workflow, selected)?;
+    let mut artifacts = run_artifact_workflow(
+        cfg,
+        http,
+        workflow,
+        &output_nodes,
+        tx,
+        cfg.comfy_audio_timeout_s,
+        cfg.comfy_max_audio_bytes,
+    )
+    .await?;
+    artifacts
+        .pop()
+        .ok_or_else(|| "audio workflow produced no artifact".into())
+}
+
+async fn run_artifact_workflow(
+    cfg: &Config,
+    http: &reqwest::Client,
+    workflow: Value,
+    output_nodes: &[String],
+    tx: &mpsc::Sender<TurnEvent>,
+    timeout_s: u64,
+    max_artifact_bytes: usize,
+) -> Result<Vec<WorkflowArtifact>, String> {
+    let client_id = uuid::Uuid::new_v4().simple().to_string();
+    let ws_url = ws_url(cfg, &client_id)?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .map_err(|e| format!("cannot open ComfyUI websocket: {e}"))?;
+    let mut interrupt = InterruptOnDrop {
+        comfy_base: cfg.comfy_base.clone(),
+        http: http.clone(),
+        prompt_id: None,
+        executing: false,
+    };
+    let resp = http
+        .post(http_util::join_base(&cfg.comfy_base, "/prompt"))
+        .json(&serde_json::json!({"prompt": workflow, "client_id": client_id}))
+        .send()
+        .await
+        .map_err(|e| format!("backend unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("ComfyUI rejected workflow ({status}): {body}"));
+    }
+    let submitted: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let prompt_id = submitted
+        .get("prompt_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ComfyUI did not return a prompt_id".to_string())?
+        .to_string();
+    interrupt.prompt_id = Some(prompt_id.clone());
+    let _ = tx.send(TurnEvent::Status(STATUS_QUEUED.into())).await;
+
+    let deadline = tokio::time::sleep(Duration::from_secs(timeout_s));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Err("ComfyUI audio workflow timed out".into()),
+            msg = ws.next() => match msg {
+                Some(Ok(Message::Text(txt))) => {
+                    let Ok(event) = serde_json::from_str::<Value>(&txt) else { continue };
+                    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+                    let data = event.get("data");
+                    let same_prompt = data
+                        .and_then(|d| d.get("prompt_id"))
+                        .and_then(Value::as_str)
+                        == Some(prompt_id.as_str());
+                    match kind {
+                        "execution_start" if same_prompt => {
+                            interrupt.executing = true;
+                            let _ = tx.send(TurnEvent::Status("generating audio…".into())).await;
+                        }
+                        "progress" => {
+                            let value = data.and_then(|d| d.get("value")).and_then(Value::as_f64);
+                            let max = data.and_then(|d| d.get("max")).and_then(Value::as_f64);
+                            if let (Some(value), Some(max)) = (value, max) {
+                                if max > 0.0 {
+                                    let _ = tx.send(TurnEvent::Progress {
+                                        status: "generating audio…".into(),
+                                        progress: (value / max).clamp(0.0, 1.0),
+                                    }).await;
+                                }
+                            }
+                        }
+                        "execution_success" if same_prompt => break,
+                        "execution_error" if same_prompt => {
+                            interrupt.prompt_id = None;
+                            return Err(format_execution_error(data));
+                        }
+                        "execution_interrupted" if same_prompt => {
+                            interrupt.prompt_id = None;
+                            return Err("ComfyUI execution interrupted".into());
+                        }
+                        "executing" if same_prompt && data.and_then(|d| d.get("node")).is_some_and(Value::is_null) => break,
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(format!("websocket error: {e}")),
+            }
+        }
+    }
+    drop(ws);
+    interrupt.prompt_id = None;
+    let _ = tx
+        .send(TurnEvent::Status("retrieving artifacts…".into()))
+        .await;
+    fetch_artifacts(
+        cfg,
+        http,
+        &prompt_id,
+        output_nodes,
+        tx,
+        timeout_s,
+        max_artifact_bytes,
+    )
+    .await
+}
+
+async fn fetch_artifacts(
+    cfg: &Config,
+    http: &reqwest::Client,
+    prompt_id: &str,
+    output_nodes: &[String],
+    tx: &mpsc::Sender<TurnEvent>,
+    timeout_s: u64,
+    max_artifact_bytes: usize,
+) -> Result<Vec<WorkflowArtifact>, String> {
+    let history: Value = http_util::send_json(
+        http.get(http_util::join_base(
+            &cfg.comfy_base,
+            &format!("/history/{prompt_id}"),
+        )),
+        Duration::from_secs(timeout_s),
+        HISTORY_BODY_CAP,
+    )
+    .await?;
+    let outputs = history
+        .get(prompt_id)
+        .and_then(|v| v.get("outputs"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ComfyUI history contained no outputs".to_string())?;
+    let mut refs = Vec::new();
+    for node_id in output_nodes {
+        let Some(node) = outputs.get(node_id) else {
+            continue;
+        };
+        collect_file_refs(node, &mut refs);
+    }
+    let mut seen = HashSet::new();
+    refs.retain(|file| {
+        seen.insert((
+            file.filename.clone(),
+            file.subfolder.clone(),
+            file.kind.clone(),
+        ))
+    });
+    if refs.is_empty() {
+        return Err("selected output nodes produced no retrievable artifacts".into());
+    }
+    if refs.len() != 1 {
+        return Err(format!(
+            "audio output produced {} artifacts; exactly one is required",
+            refs.len()
+        ));
+    }
+    let mut artifacts = Vec::with_capacity(refs.len());
+    for file in refs {
+        let resp = http
+            .get(http_util::join_base(&cfg.comfy_base, "/view"))
+            .query(&[
+                ("filename", file.filename.as_str()),
+                ("subfolder", file.subfolder.as_str()),
+                ("type", file.kind.as_str()),
+            ])
+            .timeout(Duration::from_secs(timeout_s))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "cannot retrieve ComfyUI artifact ({})",
+                resp.status()
+            ));
+        }
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        if let Some(len) = resp.content_length() {
+            if len as usize > max_artifact_bytes {
+                return Err(format!("artifact too large ({len} bytes)"));
+            }
+        }
+        let mut bytes = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            if bytes.len() + chunk.len() > max_artifact_bytes {
+                return Err("artifact exceeded byte cap".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let _ = tx
+            .send(TurnEvent::Status("storing artifacts…".into()))
+            .await;
+        artifacts.push(WorkflowArtifact {
+            bytes,
+            mime,
+            filename: file.filename,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn force_temporary_audio_outputs(
+    workflow: &mut Value,
+    selected: &str,
+) -> Result<Vec<String>, String> {
+    let nodes = workflow
+        .as_object_mut()
+        .ok_or("audio workflow must be an API-format object keyed by node id")?;
+    let mut outputs = Vec::new();
+    for (id, node) in nodes {
+        let Some(obj) = node.as_object_mut() else {
+            continue;
+        };
+        let class = obj.get("class_type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(
+            class,
+            "PreviewAudio" | "SaveAudio" | "SaveAudioAdvanced" | "SaveAudioMP3" | "SaveAudioOpus"
+        ) {
+            continue;
+        }
+        obj.insert("class_type".into(), Value::String("PreviewAudio".into()));
+        let inputs = obj
+            .get_mut("inputs")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| format!("audio output node {id} has invalid inputs"))?;
+        inputs.retain(|key, _| key == "audio");
+        if !inputs.contains_key("audio") {
+            return Err(format!("audio output node {id} is missing its audio input"));
+        }
+        outputs.push(id.clone());
+    }
+    if !outputs.iter().any(|id| id == selected) {
+        return Err(format!(
+            "COMFYUI_AUDIO_OUTPUT node {selected} is not a PreviewAudio/SaveAudio output"
+        ));
+    }
+    Ok(vec![selected.to_string()])
+}
+
+fn collect_file_refs(value: &Value, out: &mut Vec<ImageRef>) {
+    match value {
+        Value::Array(items) => items.iter().for_each(|v| collect_file_refs(v, out)),
+        Value::Object(obj) => {
+            if let Some(filename) = obj.get("filename").and_then(Value::as_str) {
+                out.push(ImageRef {
+                    filename: filename.to_string(),
+                    subfolder: obj
+                        .get("subfolder")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    kind: obj
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("temp")
+                        .to_string(),
+                });
+                return;
+            }
+            obj.values().for_each(|v| collect_file_refs(v, out));
+        }
+        _ => {}
+    }
 }
 
 /// Encode produced bytes as a `data:<mime>;base64,…` URI (inline delivery).
@@ -787,6 +1093,44 @@ mod tests {
         let img = find_first_image(&hist, "pid").unwrap();
         assert_eq!(img.filename, "out.png");
         assert_eq!(img.kind, "output");
+    }
+
+    #[test]
+    fn collects_nested_file_refs() {
+        let value = serde_json::json!({
+            "images": [{"filename":"a.png","subfolder":"","type":"temp"}],
+            "gifs": [{"filename":"b.mp4","subfolder":"v","type":"temp"}]
+        });
+        let mut refs = Vec::new();
+        collect_file_refs(&value, &mut refs);
+        assert_eq!(refs.len(), 2);
+        let mut names: Vec<_> = refs.into_iter().map(|r| r.filename).collect();
+        names.sort();
+        assert_eq!(names, ["a.png", "b.mp4"]);
+    }
+
+    #[test]
+    fn rewrites_configured_audio_saver_to_temporary_preview() {
+        let mut workflow = serde_json::json!({
+            "9": {
+                "class_type": "SaveAudioAdvanced",
+                "inputs": {
+                    "audio": ["8", 0],
+                    "filename_prefix": "audio/output",
+                    "format": "mp3",
+                    "quality": "V0"
+                }
+            }
+        });
+        assert_eq!(
+            force_temporary_audio_outputs(&mut workflow, "9").unwrap(),
+            ["9"]
+        );
+        assert_eq!(workflow["9"]["class_type"], "PreviewAudio");
+        assert_eq!(
+            workflow["9"]["inputs"],
+            serde_json::json!({"audio":["8",0]})
+        );
     }
 
     #[test]

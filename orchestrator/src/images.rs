@@ -20,6 +20,7 @@
 //!     backstop for deletes that never arrive (uninstall, lost request).
 
 use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -123,11 +124,44 @@ impl BlobStore {
     pub async fn get(&self, id: &str) -> Option<Blob> {
         let path = self.path_for(id)?;
         let bytes = tokio::fs::read(&path).await.ok()?;
-        let content_type = sniff_content_type(&bytes);
+        let content_type = sniff_stored_content_type(&bytes);
         Some(Blob {
             bytes,
             content_type,
         })
+    }
+
+    /// Stored byte length without loading the blob. Used to resolve HTTP range
+    /// requests before reading a video-sized artifact.
+    pub async fn len(&self, id: &str) -> Option<usize> {
+        let path = self.path_for(id)?;
+        tokio::fs::metadata(path).await.ok()?.len().try_into().ok()
+    }
+
+    /// Read one inclusive byte range while sniffing the type from the file
+    /// prefix. Avoids loading a whole video for every AVPlayer range request.
+    pub async fn get_range(&self, id: &str, start: usize, end: usize) -> Option<Blob> {
+        let path = self.path_for(id)?;
+        tokio::task::spawn_blocking(move || {
+            if end < start {
+                return None;
+            }
+            let mut file = std::fs::File::open(path).ok()?;
+            let mut prefix = [0u8; 16];
+            let prefix_len = file.read(&mut prefix).ok()?;
+            let content_type = sniff_stored_content_type(&prefix[..prefix_len]);
+            file.seek(SeekFrom::Start(start as u64)).ok()?;
+            let len = end.checked_sub(start)?.checked_add(1)?;
+            let mut bytes = vec![0; len];
+            file.read_exact(&mut bytes).ok()?;
+            Some(Blob {
+                bytes,
+                content_type,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Delete a blob by id. `Ok(true)` if a file was removed, `Ok(false)` if the
@@ -339,10 +373,49 @@ pub(crate) fn recognized_image_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn recognized_audio_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(b"ID3")
+        || (bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
+    {
+        return Some("audio/mpeg");
+    }
+    None
+}
+
+/// Generated artifact type identified from magic bytes. The image subset stays
+/// unchanged for request-image validation; media is accepted only for generated
+/// server-hosted artifacts.
+pub(crate) fn recognized_artifact_type(bytes: &[u8]) -> Option<&'static str> {
+    recognized_image_type(bytes)
+        .or_else(|| recognized_audio_type(bytes))
+        .or_else(|| {
+            if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+                Some("video/mp4")
+            } else if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+                Some("video/webm")
+            } else {
+                None
+            }
+        })
+}
+
 /// Identify the image type from magic bytes; defaults to PNG (ComfyUI's usual
 /// output) when unrecognized. Returned as a `&'static str` content-type.
 pub(crate) fn sniff_content_type(bytes: &[u8]) -> &'static str {
     recognized_image_type(bytes).unwrap_or("image/png")
+}
+
+fn sniff_stored_content_type(bytes: &[u8]) -> &'static str {
+    recognized_artifact_type(bytes).unwrap_or("application/octet-stream")
 }
 
 fn prune_dir(dir: &Path, ttl_s: u64) -> usize {
@@ -417,6 +490,18 @@ mod tests {
         let blob = s.get(&id1).await.unwrap();
         assert_eq!(blob.bytes, PNG);
         assert_eq!(blob.content_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn range_read_returns_only_requested_media_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let bytes = b"fLaC-audio-payload";
+        let id = s.put(bytes).await.unwrap();
+        assert_eq!(s.len(&id).await, Some(bytes.len()));
+        let range = s.get_range(&id, 5, 9).await.unwrap();
+        assert_eq!(range.bytes, b"audio");
+        assert_eq!(range.content_type, "audio/flac");
     }
 
     #[tokio::test]
@@ -582,5 +667,25 @@ mod tests {
         let webp = b"RIFF\0\0\0\0WEBPVP8 ";
         assert_eq!(sniff_content_type(webp), "image/webp");
         assert_eq!(sniff_content_type(b"unknown"), "image/png");
+    }
+
+    #[test]
+    fn sniffs_generated_video_types() {
+        assert_eq!(recognized_artifact_type(b"....ftypisom"), Some("video/mp4"));
+        assert_eq!(
+            recognized_artifact_type(&[0x1A, 0x45, 0xDF, 0xA3]),
+            Some("video/webm")
+        );
+    }
+
+    #[test]
+    fn sniffs_generated_audio_types() {
+        assert_eq!(recognized_artifact_type(b"fLaCdata"), Some("audio/flac"));
+        assert_eq!(
+            recognized_artifact_type(b"RIFF....WAVEfmt "),
+            Some("audio/wav")
+        );
+        assert_eq!(recognized_artifact_type(b"OggSdata"), Some("audio/ogg"));
+        assert_eq!(recognized_artifact_type(b"ID3data"), Some("audio/mpeg"));
     }
 }

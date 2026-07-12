@@ -479,9 +479,12 @@ fn test_config(upstream_base: &str) -> Config {
         code_exec_max_code_bytes: 256 * 1024,
         image_gen_enabled: false,
         image_edit_enabled: false,
+        audio_gen_enabled: false,
         comfy_base: "http://localhost:8188".parse().unwrap(),
         comfy_timeout_s: 120,
         comfy_max_image_bytes: 16 * 1024 * 1024,
+        comfy_audio_timeout_s: 5 * 60,
+        comfy_max_audio_bytes: 128 * 1024 * 1024,
         image_store_dir: None,
         image_signing_key: None,
         image_store_ttl_s: 7 * 24 * 60 * 60,
@@ -496,6 +499,13 @@ fn test_config(upstream_base: &str) -> Config {
         comfy_edit_prompt: None,
         comfy_edit_image: None,
         comfy_edit_seed: None,
+        comfy_audio_workflow: None,
+        comfy_audio_prompt: None,
+        comfy_audio_negative: None,
+        comfy_audio_lyrics: None,
+        comfy_audio_duration: None,
+        comfy_audio_seed: None,
+        comfy_audio_output: None,
         research_deep_fanout: 4,
         research_deep_searches_per_subq: 3,
         research_deep_verify: true,
@@ -2163,6 +2173,21 @@ async fn image_fetch_is_signed_and_auth_exempt() {
     assert!(ok.status().is_success());
     assert_eq!(ok.headers()[CONTENT_TYPE], "image/png");
     assert_eq!(ok.bytes().await.unwrap().as_ref(), PNG);
+
+    // Files-style content also supports byte ranges for AVPlayer-backed media.
+    let partial = client
+        .get(format!("{base}{signed}"))
+        .header("Range", "bytes=2-5")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(partial.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(partial.headers()["accept-ranges"], "bytes");
+    assert_eq!(
+        partial.headers()["content-range"],
+        format!("bytes 2-5/{}", PNG.len())
+    );
+    assert_eq!(partial.bytes().await.unwrap().as_ref(), &PNG[2..=5]);
 
     // Tampered signature => forbidden.
     let bad = signed.replace("sig=", "sig=zzz");

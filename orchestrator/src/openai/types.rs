@@ -315,16 +315,37 @@ impl MessageContent {
     /// resolves these against the store so the edit tool sees bytes, not a link.
     pub fn store_image_ids(&self) -> Vec<String> {
         match self {
-            MessageContent::Text(s) => extract_store_ids(s),
+            MessageContent::Text(s) => extract_markdown_image_store_ids(s),
             MessageContent::Parts(parts) => parts
                 .iter()
                 .flat_map(|p| match p {
                     ContentPart::ImageUrl { image_url } => extract_store_ids(&image_url.url),
-                    ContentPart::Text { text } => extract_store_ids(text),
+                    ContentPart::Text { text } => extract_markdown_image_store_ids(text),
                 })
                 .collect(),
         }
     }
+}
+
+/// Extract Files-style ids only from Markdown image targets. Ordinary links may
+/// be generated audio/video; those must not be decoded into the image-edit
+/// context merely because they share the same signed blob route.
+fn extract_markdown_image_store_ids(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("![") {
+        let image = &rest[start + 2..];
+        let Some(target_start) = image.find("](") else {
+            break;
+        };
+        let target = &image[target_start + 2..];
+        let Some(target_end) = target.find(')') else {
+            break;
+        };
+        out.extend(extract_store_ids(&target[..target_end]));
+        rest = &target[target_end + 1..];
+    }
+    out
 }
 
 /// Pull every `<id>` out of `/v1/files/<id>/content` occurrences in `s` (id =
@@ -560,6 +581,16 @@ mod tests {
             "a ![x](data:image/png;base64,AAA) b ![y](data:image/jpeg;base64,BBB==) c",
         );
         assert_eq!(payloads, vec!["AAA".to_string(), "BBB==".to_string()]);
+    }
+
+    #[test]
+    fn stored_audio_link_is_not_treated_as_an_editable_image() {
+        let content = MessageContent::Text(
+            "![image](https://h/v1/files/img/content?exp=1&sig=x) \
+             [Audio: clip](https://h/v1/files/sound/content?exp=1&sig=x)"
+                .into(),
+        );
+        assert_eq!(content.store_image_ids(), ["img"]);
     }
 
     #[test]

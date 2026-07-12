@@ -3,7 +3,7 @@
 An OpenAI-compatible orchestration proxy for self-hosted AI. It sits between a
 thin chat client (the Phantasm iOS app, or any OpenAI client) and your own
 [Ollama](https://ollama.com) + [ComfyUI](https://github.com/comfyanonymous/ComfyUI),
-adding **read-only tools**, **web search**, and **image generation** via a
+adding **read-only tools**, **web search**, and **image/audio generation** via a
 server-side tool loop that is *invisible to the client*.
 
 The client only ever speaks plain OpenAI SSE, so it can point at this
@@ -18,7 +18,7 @@ iOS app ──OpenAI SSE──▶ orchestrator ──native /api/chat──▶ O
                              ├── Brave Search / web fetch / APIs
                              ├── local utility tools (time, calculator, units)
                              ├── tesseract OCR (temp-file handoff only)
-                             └── ComfyUI       (image_generation / image_edit)
+                             └── ComfyUI       (image / edit / audio generation)
 ```
 
 - **Plain turns** are a near-passthrough: one upstream streaming chat call,
@@ -80,6 +80,12 @@ tools are `TOOL_WEB_FETCH`, `TOOL_CURRENT_TIME`, `TOOL_CALCULATOR`,
 `TOOL_GITHUB`, and `TOOL_OCR`; key-backed tools also need their API key. Brave
 search still uses `TOOL_WEB_SEARCH` + `BRAVE_API_KEY`; image tools use
 `TOOL_IMAGE_GEN` / `TOOL_IMAGE_EDIT` plus their ComfyUI workflow config.
+`TOOL_AUDIO_GEN` adds fixed-workflow audio generation. It uses the configured
+prompt/output and optional negative/lyrics/duration/seed node bindings, and
+requires `IMAGE_STORE_DIR` plus `PUBLIC_BASE_URL` for compact signed artifact
+delivery. The model never authors
+or submits ComfyUI graphs. Any model and API-format workflow can be used by
+setting `COMFYUI_AUDIO_WORKFLOW` and its input/output node mappings.
 Thorough (full-page-fetch) search: set `SEARCH_FETCH_PAGES=true`; the model then
 opts into `depth="thorough"` per query, leaving simple lookups snippet-fast.
 

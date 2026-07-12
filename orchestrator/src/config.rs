@@ -265,18 +265,21 @@ pub struct Config {
     /// Cap on accepted source size before a container is even touched.
     pub code_exec_max_code_bytes: usize,
 
-    // Image tools (ComfyUI). Generation and editing are independent tools, each
-    // backed by its own API-format workflow and gated by its own toggle.
+    // Media tools (ComfyUI). Each is backed by an operator-configured API-format
+    // workflow; the model only supplies bounded semantic inputs.
     pub image_gen_enabled: bool,
     pub image_edit_enabled: bool,
+    pub audio_gen_enabled: bool,
     pub comfy_base: Url,
     pub comfy_timeout_s: u64,
     /// Max bytes accepted from ComfyUI's `/view` for a single image. Guards
     /// against a misconfigured/4K output stalling or bloating the turn.
     pub comfy_max_image_bytes: usize,
+    pub comfy_audio_timeout_s: u64,
+    pub comfy_max_audio_bytes: usize,
 
-    // Server-hosted image blobs. When `image_store_dir` is set, generated/edited
-    // images are persisted there and delivered to the app as signed URL
+    // Server-hosted media blobs. When `image_store_dir` is set, generated/edited
+    // media is persisted there and delivered to the app as signed URL
     // references (`/v1/files/<id>/content`) instead of inline base64 — keeping re-sent
     // history small. Unset => disabled, and images stay inline (back-compat).
     pub image_store_dir: Option<PathBuf>,
@@ -309,6 +312,16 @@ pub struct Config {
     pub comfy_edit_prompt: Option<NodeInput>,
     pub comfy_edit_image: Option<NodeInput>,
     pub comfy_edit_seed: Option<NodeInput>,
+
+    // Audio generation workflow + optional input mappings. Audio always uses
+    // the signed artifact store rather than embedding multi-megabyte data URIs.
+    pub comfy_audio_workflow: Option<PathBuf>,
+    pub comfy_audio_prompt: Option<NodeInput>,
+    pub comfy_audio_negative: Option<NodeInput>,
+    pub comfy_audio_lyrics: Option<NodeInput>,
+    pub comfy_audio_duration: Option<NodeInput>,
+    pub comfy_audio_seed: Option<NodeInput>,
+    pub comfy_audio_output: Option<String>,
 
     // Observability. `/metrics` (Prometheus, authed) is always on; the pair of
     // dashboard routes is gated because the HTML page itself is public.
@@ -375,6 +388,7 @@ impl Config {
 
         let image_gen_enabled = env_bool("TOOL_IMAGE_GEN", false);
         let image_edit_enabled = env_bool("TOOL_IMAGE_EDIT", false);
+        let audio_gen_enabled = env_bool("TOOL_AUDIO_GEN", false);
         let comfy_base = parse_url("COMFYUI_BASE_URL", "http://localhost:8188")?;
 
         Ok(Config {
@@ -492,9 +506,12 @@ impl Config {
             code_exec_max_code_bytes: env_parse("CODE_EXEC_MAX_CODE_BYTES", 256 * 1024),
             image_gen_enabled,
             image_edit_enabled,
+            audio_gen_enabled,
             comfy_base,
             comfy_timeout_s: env_parse("COMFYUI_TIMEOUT_S", 120u64),
             comfy_max_image_bytes: env_parse("COMFYUI_MAX_IMAGE_BYTES", 16 * 1024 * 1024),
+            comfy_audio_timeout_s: env_parse("COMFYUI_AUDIO_TIMEOUT_S", 5 * 60u64),
+            comfy_max_audio_bytes: env_parse("COMFYUI_MAX_AUDIO_BYTES", 128 * 1024 * 1024usize),
             image_store_dir: env_path("IMAGE_STORE_DIR"),
             image_signing_key: env_nonempty("IMAGE_SIGNING_KEY"),
             image_store_ttl_s: env_parse("IMAGE_STORE_TTL_S", 90 * 24 * 60 * 60),
@@ -509,6 +526,13 @@ impl Config {
             comfy_edit_prompt: env_node("COMFYUI_EDIT_PROMPT")?,
             comfy_edit_image: env_node("COMFYUI_EDIT_IMAGE")?,
             comfy_edit_seed: env_node("COMFYUI_EDIT_SEED")?,
+            comfy_audio_workflow: env_path("COMFYUI_AUDIO_WORKFLOW"),
+            comfy_audio_prompt: env_node("COMFYUI_AUDIO_PROMPT")?,
+            comfy_audio_negative: env_node("COMFYUI_AUDIO_NEGATIVE")?,
+            comfy_audio_lyrics: env_node("COMFYUI_AUDIO_LYRICS")?,
+            comfy_audio_duration: env_node("COMFYUI_AUDIO_DURATION")?,
+            comfy_audio_seed: env_node("COMFYUI_AUDIO_SEED")?,
+            comfy_audio_output: env_nonempty("COMFYUI_AUDIO_OUTPUT"),
             dashboard_enabled: env_bool("PHANTASM_DASHBOARD", true),
             // Unset => the default file next to the process; set-but-empty =>
             // memory-only (the opt-out), matching the "empty disables" idiom of
@@ -650,6 +674,17 @@ impl Config {
             && self.comfy_edit_workflow.is_some()
             && self.comfy_edit_prompt.is_some()
             && self.comfy_edit_image.is_some()
+    }
+
+    /// Generated audio is always delivered by signed URL so chat history stays
+    /// compact. Require an absolute public origin for standard Markdown clients.
+    pub fn audio_gen_usable(&self) -> bool {
+        self.audio_gen_enabled
+            && self.comfy_audio_workflow.is_some()
+            && self.comfy_audio_prompt.is_some()
+            && self.comfy_audio_output.is_some()
+            && self.image_store_dir.is_some()
+            && self.public_base_url.is_some()
     }
 }
 
@@ -1016,9 +1051,12 @@ pub mod tests_support {
             code_exec_max_code_bytes: 256 * 1024,
             image_gen_enabled: false,
             image_edit_enabled: false,
+            audio_gen_enabled: false,
             comfy_base: "http://localhost:8188".parse().unwrap(),
             comfy_timeout_s: 120,
             comfy_max_image_bytes: 16 * 1024 * 1024,
+            comfy_audio_timeout_s: 5 * 60,
+            comfy_max_audio_bytes: 128 * 1024 * 1024,
             image_store_dir: None,
             image_signing_key: None,
             image_store_ttl_s: 7 * 24 * 60 * 60,
@@ -1033,6 +1071,13 @@ pub mod tests_support {
             comfy_edit_prompt: None,
             comfy_edit_image: None,
             comfy_edit_seed: None,
+            comfy_audio_workflow: None,
+            comfy_audio_prompt: None,
+            comfy_audio_negative: None,
+            comfy_audio_lyrics: None,
+            comfy_audio_duration: None,
+            comfy_audio_seed: None,
+            comfy_audio_output: None,
             dashboard_enabled: true,
             metrics_db: None,
             metrics_retention_days: 90,
@@ -1363,6 +1408,20 @@ mod tests {
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].name, "vllm");
         assert_eq!(specs[1].name, "ollama");
+    }
+
+    #[test]
+    fn audio_generation_requires_workflow_prompt_store_and_public_base() {
+        let mut cfg = crate::config::tests_support::minimal();
+        cfg.audio_gen_enabled = true;
+        cfg.comfy_audio_workflow = Some("audio.json".into());
+        cfg.comfy_audio_prompt = Some(NodeInput::parse("1.text").unwrap());
+        cfg.comfy_audio_output = Some("9".into());
+        assert!(!cfg.audio_gen_usable());
+        cfg.image_store_dir = Some("/tmp/artifacts".into());
+        assert!(!cfg.audio_gen_usable());
+        cfg.public_base_url = Some("https://phantasm.example".parse().unwrap());
+        assert!(cfg.audio_gen_usable());
     }
 
     #[test]

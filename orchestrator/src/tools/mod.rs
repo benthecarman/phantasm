@@ -8,6 +8,7 @@ use crate::openai::types::{ChatMessage, ToolCall};
 use crate::orchestrator::tools::ToolOutcome;
 use crate::orchestrator::TurnEvent;
 
+pub mod audio_gen;
 pub mod calculator;
 pub mod code_exec;
 pub mod code_exec_pool;
