@@ -2,6 +2,9 @@
 /orchestrator/target
 **/*.rs.bk
 
+# Runtime state
+/orchestrator/phantasm-metrics.sqlite*
+
 # Env / secrets
 .env
 *.env.local
