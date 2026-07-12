@@ -150,9 +150,9 @@ public enum ServerImageRef {
         return cache
     }()
 
-    /// Matches a markdown link target `](<url>)` whose URL is a
+    /// Matches a markdown image target `![...](<url>)` whose URL is a
     /// `/v1/files/<id>/content` reference. Group 1 = full URL, group 2 = id.
     private static let linkRegex = try? NSRegularExpression(
-        pattern: #"\]\(([^)\s]*?/v1/files/([A-Za-z0-9_-]+)/content[^)\s]*)\)"#
+        pattern: #"!\[[^\]]*\]\(([^)\s]*?/v1/files/([A-Za-z0-9_-]+)/content[^)\s]*)\)"#
     )
 }

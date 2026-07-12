@@ -1,6 +1,7 @@
 import MarkdownUI
 import PhantasmKit
 import ImageIO
+import AVKit
 import SwiftUI
 
 /// Renders assistant markdown (FR-A4) with fenced code blocks (copy button) and
@@ -27,27 +28,37 @@ struct MarkdownMessageView: View {
     var onTapImage: (Int, UIImage) -> Void = { _, _ in }
 
     var body: some View {
+        let artifacts = ServerArtifactRef.extractTrusted(in: text, backendBase: trustedImageBase)
         let extracted: Base64ImageExtractor.Result = isStreaming
             ? .init(
-                markdown: Base64ImageExtractor.streamingSanitized(text), images: [:]
+                markdown: Base64ImageExtractor.streamingSanitized(artifacts.markdown), images: [:]
             )
-            : preparedImages()
-        Markdown(extracted.markdown)
-            .markdownTheme(.phantasmChat)
-            .markdownImageProvider(PhantasmImageProvider(
-                images: extracted.images,
-                trustedBase: trustedImageBase,
-                onTap: onTapImage
-            ))
-            .markdownBlockStyle(\.codeBlock) { configuration in
-                CodeBlockView(configuration: configuration)
+            : preparedImages(in: artifacts.markdown)
+        VStack(alignment: .leading, spacing: 10) {
+            if !extracted.markdown.isEmpty {
+                Markdown(extracted.markdown)
+                    .markdownTheme(.phantasmChat)
+                    .markdownImageProvider(PhantasmImageProvider(
+                        images: extracted.images,
+                        trustedBase: trustedImageBase,
+                        onTap: onTapImage
+                    ))
+                    .markdownBlockStyle(\.codeBlock) { configuration in
+                        CodeBlockView(configuration: configuration)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .textSelection(.enabled)
+            if !isStreaming {
+                ForEach(artifacts.artifacts) { artifact in
+                    GeneratedVideoView(artifact: artifact)
+                }
+            }
+        }
     }
 
-    private func preparedImages() -> Base64ImageExtractor.Result {
-        let base64 = Base64ImageExtractor().extractCached(text)
+    private func preparedImages(in source: String) -> Base64ImageExtractor.Result {
+        let base64 = Base64ImageExtractor().extractCached(source)
         let next = (base64.images.keys.max() ?? -1) + 1
         let stored = InlineImageRef.placeholders(
             in: base64.markdown, images: storedImages, startingAt: next
@@ -62,6 +73,36 @@ struct MarkdownMessageView: View {
             images: base64.images.merging(stored.images) { current, _ in current }
                 .merging(server.images) { current, _ in current }
         )
+    }
+}
+
+private struct GeneratedVideoView: View {
+    let artifact: ServerArtifactRef.Artifact
+    @State private var player: AVPlayer
+
+    init(artifact: ServerArtifactRef.Artifact) {
+        self.artifact = artifact
+        _player = State(initialValue: AVPlayer(url: artifact.url))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            VideoPlayer(player: player)
+                .frame(minHeight: 220)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            HStack {
+                Label(artifact.label, systemImage: "film")
+                    .font(.caption)
+                    .lineLimit(1)
+                Spacer()
+                ShareLink(item: artifact.url) {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .accessibilityLabel("Share generated video")
+            }
+            .foregroundStyle(.secondary)
+        }
+        .onDisappear { player.pause() }
     }
 }
 
@@ -226,8 +267,10 @@ struct PhantasmImageProvider: ImageProvider {
             if let url, url.scheme == "phantasm-img",
                let index = Int(url.host ?? ""),
                let data = images[index],
-               let uiImage = UIImage(data: data) {
-                resizable(Image(uiImage: uiImage))
+               let uiImage = decodedUIImage(data) {
+                InlineUIImage(image: uiImage)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
                     .contentShape(Rectangle())
                     .onTapGesture { onTap(index, uiImage) }
                     .contextMenu { ImageActions(image: uiImage) }
@@ -250,20 +293,6 @@ struct PhantasmImageProvider: ImageProvider {
             }
         }
     }
-
-    private func resizable(_ image: Image) -> some View {
-        image.inlineImageStyle()
-    }
-}
-
-private extension Image {
-    /// Shared sizing/clipping for an inline chat image (base64 or remote).
-    func inlineImageStyle() -> some View {
-        resizable()
-            .aspectRatio(contentMode: .fit)
-            .frame(maxWidth: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-    }
 }
 
 /// An inline `http(s)` image loaded to a `UIImage` (rather than `AsyncImage`) so
@@ -278,8 +307,9 @@ private struct RemoteImage: View {
     var body: some View {
         Group {
             if let image {
-                Image(uiImage: image)
-                    .inlineImageStyle()
+                InlineUIImage(image: image)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
                     .contentShape(Rectangle())
                     .onTapGesture { onTap(image) }
                     .contextMenu { ImageActions(image: image) }
@@ -328,12 +358,69 @@ private final class RemoteImageCache: @unchecked Sendable {
               width.intValue > 0, height.intValue > 0,
               width.intValue <= 16_384, height.intValue <= 16_384,
               width.int64Value * height.int64Value <= 40_000_000,
-              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
+              CGImageSourceCreateImageAtIndex(source, 0, nil) != nil
         else { return nil }
-        let image = UIImage(cgImage: cgImage)
+        guard let image = decodedUIImage(cached.data) else { return nil }
         cache.setObject(image, forKey: url as NSURL)
         return image
     }
+}
+
+/// UIKit-backed rendering is required for animated GIF/WebP; SwiftUI's `Image`
+/// displays only the first frame of an animated `UIImage`.
+private struct InlineUIImage: UIViewRepresentable {
+    let image: UIImage
+
+    func makeUIView(context: Context) -> UIImageView {
+        let view = UIImageView()
+        view.contentMode = .scaleAspectFit
+        view.clipsToBounds = true
+        return view
+    }
+
+    func updateUIView(_ view: UIImageView, context: Context) {
+        view.image = image
+        if image.images != nil { view.startAnimating() }
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UIImageView, context: Context) -> CGSize? {
+        let width = proposal.width ?? image.size.width
+        guard image.size.width > 0 else { return CGSize(width: width, height: width) }
+        return CGSize(width: width, height: width * image.size.height / image.size.width)
+    }
+}
+
+private func decodedUIImage(_ data: Data) -> UIImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+        return UIImage(data: data)
+    }
+    let count = CGImageSourceGetCount(source)
+    let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+        as? [CFString: Any]
+    let width = (properties?[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
+    let height = (properties?[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
+    guard width > 0, height > 0, width <= 16_384, height <= 16_384,
+          Int64(width) * Int64(height) <= 40_000_000 else { return nil }
+    guard count > 1 else {
+        guard let frame = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return UIImage(cgImage: frame)
+    }
+    var frames: [UIImage] = []
+    var duration = 0.0
+    let area = max(1, width * height)
+    let frameCap = max(1, min(600, 80_000_000 / area))
+    for index in 0..<min(count, frameCap) {
+        guard let frame = CGImageSourceCreateImageAtIndex(source, index, nil) else { continue }
+        frames.append(UIImage(cgImage: frame))
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil)
+            as? [CFString: Any]
+        let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        duration += (gif?[kCGImagePropertyGIFUnclampedDelayTime] as? NSNumber)?.doubleValue
+            ?? (gif?[kCGImagePropertyGIFDelayTime] as? NSNumber)?.doubleValue
+            ?? 0.1
+    }
+    guard !frames.isEmpty else { return nil }
+    return UIImage.animatedImage(with: frames, duration: max(duration, 0.1))
 }
 
 /// Save / share actions for a generated image (FR-A7).
