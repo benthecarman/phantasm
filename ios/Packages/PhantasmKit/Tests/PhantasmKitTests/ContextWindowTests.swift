@@ -67,6 +67,17 @@ final class ContextWindowTests: XCTestCase {
         XCTAssertEqual(usage?.isNearLimit, false)
     }
 
+    func testDisplayedFractionStaysInProgressRange() {
+        XCTAssertEqual(
+            ContextUsage(estimatedTokens: 1_250, contextLength: 1_000).displayedFraction,
+            1
+        )
+        XCTAssertEqual(
+            ContextUsage(estimatedTokens: -100, contextLength: 1_000).displayedFraction,
+            0
+        )
+    }
+
     func testComfortablyUnderLimitDoesNotWarn() {
         let usage = ContextWindow.usage(for: [msg("short")], contextLength: 32768)
         XCTAssertEqual(usage?.isNearLimit, false)

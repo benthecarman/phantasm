@@ -116,7 +116,7 @@ struct ChatView: View {
     @State private var estimatedTokens = 0
 
     /// Estimated context-window usage for this conversation, or `nil` when the
-    /// model's window is unknown (then no warning shows).
+    /// model's window is unknown (then no usage indicator appears).
     private var contextUsage: ContextUsage? {
         guard let length = currentModelID.flatMap({ env.contextLengths?[$0] }),
               length > 0 else { return nil }
@@ -163,9 +163,6 @@ struct ChatView: View {
                         }
                         .id(confirmation.toolCallId)
                     }
-                }
-                if let usage = contextUsage, usage.isNearLimit || usage.isOverLimit {
-                    ContextLimitBanner(usage: usage)
                 }
                 ComposerView(
                     input: $input,
@@ -420,7 +417,10 @@ struct ChatView: View {
             .accessibilityLabel("Chat history")
         }
         if !isEmpty {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if let usage = contextUsage {
+                    ContextUsageIndicator(usage: usage)
+                }
                 Button {
                     Haptics.selection()
                     onNewChat()

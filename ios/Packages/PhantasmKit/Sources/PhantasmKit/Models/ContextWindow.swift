@@ -19,7 +19,14 @@ public struct ContextUsage: Equatable, Sendable {
     /// Fraction of the window used (clamped at 0; may exceed 1 when over limit).
     public var fraction: Double {
         guard contextLength > 0 else { return 0 }
-        return Double(estimatedTokens) / Double(contextLength)
+        return max(Double(estimatedTokens) / Double(contextLength), 0)
+    }
+
+    /// Fraction suitable for a progress indicator, capped once the window is
+    /// full. `fraction` remains uncapped so callers can still report usage over
+    /// 100 percent.
+    public var displayedFraction: Double {
+        min(fraction, 1)
     }
 
     /// Within the warning band but not yet over the window.
