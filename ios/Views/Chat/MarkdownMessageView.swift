@@ -44,12 +44,16 @@ struct MarkdownMessageView: View {
                 ) { _, block in
                     switch block {
                     case .markdown(let markdown):
-                        Markdown(markdown)
+                        let prepared = InlineMathParser.prepare(markdown)
+                        Markdown(prepared.markdown)
                             .markdownTheme(.phantasmChat)
                             .markdownImageProvider(PhantasmImageProvider(
                                 images: extracted.images,
                                 trustedBase: trustedImageBase,
                                 onTap: onTapImage
+                            ))
+                            .markdownInlineImageProvider(PhantasmInlineMathProvider(
+                                expressions: prepared.expressions
                             ))
                             .markdownBlockStyle(\.codeBlock) { configuration in
                                 CodeBlockView(configuration: configuration)
@@ -91,6 +95,41 @@ struct MarkdownMessageView: View {
                 .merging(server.images) { current, _ in current }
         )
     }
+}
+
+private struct PhantasmInlineMathProvider: InlineImageProvider {
+    let expressions: [Int: String]
+
+    func image(with url: URL, label: String) async throws -> Image {
+        guard url.scheme == "phantasm-math",
+              let index = Int(url.host ?? ""),
+              let expression = expressions[index] else {
+            return try await DefaultInlineImageProvider.default.image(with: url, label: label)
+        }
+
+        return try await MainActor.run {
+            let renderer = ImageRenderer(
+                content: Math(expression)
+                    .mathFont(Math.Font(name: .latinModern, size: 17))
+                    .mathTypesettingStyle(.text)
+                    .foregroundStyle(.black)
+                    .fixedSize()
+                    .padding(.horizontal, 1)
+            )
+            renderer.scale = UIScreen.main.scale
+            guard let rendered = renderer.uiImage else {
+                throw InlineMathRenderingError.failed
+            }
+            let aligned = rendered
+                .withBaselineOffset(fromBottom: 3)
+                .withRenderingMode(.alwaysTemplate)
+            return Image(uiImage: aligned).renderingMode(.template)
+        }
+    }
+}
+
+private enum InlineMathRenderingError: Error {
+    case failed
 }
 
 private struct DisplayMathView: View {
