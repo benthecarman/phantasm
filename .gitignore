@@ -17,6 +17,7 @@ ios/Phantasm.xcodeproj/
 ios/build/
 ios/build-device/
 ios/DerivedData/
+ios/.build/
 **/.DS_Store
 **/xcuserdata/
 **/*.xcworkspace/xcuserdata/
