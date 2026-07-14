@@ -419,7 +419,10 @@ struct ChatView: View {
         if !isEmpty {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if let usage = contextUsage {
-                    ContextUsageIndicator(usage: usage)
+                    ContextUsageIndicator(
+                        usage: usage,
+                        tokensPerSecond: vm.latestTokensPerSecond
+                    )
                 }
                 Button {
                     Haptics.selection()

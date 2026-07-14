@@ -28,6 +28,9 @@ final class ChatViewModel {
     /// VM-owned (not view `@State`) so it's reset every turn rather than reused by
     /// SwiftUI for the recycled bubble.
     private(set) var streamingStartedAt = Date.now
+    /// Estimated generation speed for the latest clean response. Updated once
+    /// at completion so the full chat view does not re-render for every token.
+    private(set) var latestTokensPerSecond: Double?
     private(set) var statusText: String?
     private(set) var statusProgress: Double?
     /// Whether the assistant-preview bubble has content to show. Stored — not
@@ -386,6 +389,7 @@ final class ChatViewModel {
         isStreaming = true
         hasAssistantPreview = true
         streamingStartedAt = .now
+        latestTokensPerSecond = nil
         streamingText = ""
         streamingReasoning = ""
         statusText = nil
@@ -596,7 +600,8 @@ final class ChatViewModel {
         base: URL,
         token: String,
         env: any ChatViewModelEnvironment,
-        store: ChatStore
+        store: ChatStore,
+        measuresThroughput: Bool = true
     ) async {
         // Wait for the previous turn's row commit (not its follow-up work) so
         // a fast follow-up send can't read a history missing the last reply.
@@ -659,6 +664,8 @@ final class ChatViewModel {
         // App-hosted tool calls forwarded this turn, captured so the post-stream
         // step can resolve them (the turn ends once the model calls one).
         var batchedCalls: [WireToolCall]?
+        var firstAnswerTokenAt: Date?
+        var generatedCharacterCount = 0
         // Whether the turn actually finished (a terminal `.done`) versus the
         // stream just ending because the connection dropped — e.g. the app was
         // backgrounded and the local task was cancelled. A cancelled
@@ -671,6 +678,8 @@ final class ChatViewModel {
                 case .token(let t):
                     statusText = nil
                     statusProgress = nil
+                    if firstAnswerTokenAt == nil { firstAnswerTokenAt = .now }
+                    generatedCharacterCount += t.count
                     streamingText += t
                 case .reasoning(let r):
                     streamingReasoning += r
@@ -720,6 +729,12 @@ final class ChatViewModel {
                     completionError = .modelError("The stream completed without any assistant text.")
                 } else {
                     completionError = nil
+                }
+                if completionError == nil, measuresThroughput, let firstAnswerTokenAt {
+                    latestTokensPerSecond = ContextWindow.estimatedTokensPerSecond(
+                        characterCount: generatedCharacterCount,
+                        duration: Date.now.timeIntervalSince(firstAnswerTokenAt)
+                    )
                 }
                 finish(error: completionError)
             }
@@ -801,7 +816,8 @@ final class ChatViewModel {
                 base: base,
                 token: env.activeToken ?? "",
                 env: env,
-                store: store
+                store: store,
+                measuresThroughput: false
             )
         }
     }

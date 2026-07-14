@@ -5,6 +5,27 @@ import XCTest
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testCompletedResponseRecordsEstimatedTokensPerSecond() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        client.enqueue(
+            events: [.token(String(repeating: "a", count: 20)), .token(String(repeating: "b", count: 20)), .done],
+            pauseAfterEventNanoseconds: 100_000_000
+        )
+        client.enqueue(events: [.token("Speed test"), .done])
+
+        vm.send("hello")
+
+        try await waitUntil { !vm.isStreaming && vm.latestTokensPerSecond != nil }
+        let rate = try XCTUnwrap(vm.latestTokensPerSecond)
+        XCTAssertGreaterThan(rate, 35)
+        XCTAssertLessThan(rate, 65)
+    }
+
     func testTextAttachmentCapsReadWithoutCorruptingSplitUTF8Scalar() async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("txt")

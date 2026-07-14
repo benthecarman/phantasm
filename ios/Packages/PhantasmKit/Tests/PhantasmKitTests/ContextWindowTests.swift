@@ -84,6 +84,15 @@ final class ContextWindowTests: XCTestCase {
         XCTAssertEqual(usage?.isOverLimit, false)
     }
 
+    func testEstimatedGenerationThroughput() {
+        XCTAssertEqual(
+            ContextWindow.estimatedTokensPerSecond(characterCount: 400, duration: 2),
+            50
+        )
+        XCTAssertNil(ContextWindow.estimatedTokensPerSecond(characterCount: 0, duration: 2))
+        XCTAssertNil(ContextWindow.estimatedTokensPerSecond(characterCount: 400, duration: 0.01))
+    }
+
     func testFormatTokens() {
         XCTAssertEqual(ContextWindow.formatTokens(512), "512")
         XCTAssertEqual(ContextWindow.formatTokens(8192), "8K")

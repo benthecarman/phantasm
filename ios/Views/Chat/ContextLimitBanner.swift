@@ -6,6 +6,7 @@ import SwiftUI
 /// estimate without permanently taking space away from the transcript.
 struct ContextUsageIndicator: View {
     let usage: ContextUsage
+    let tokensPerSecond: Double?
 
     @State private var showsDetails = false
 
@@ -70,6 +71,16 @@ struct ContextUsageIndicator: View {
             Text("~\(usage.estimatedTokens.formatted()) of \(usage.contextLength.formatted()) tokens")
                 .font(.subheadline.weight(.medium))
 
+            if let tokensPerSecond {
+                HStack {
+                    Label("Latest response", systemImage: "gauge.with.dots.needle.50percent")
+                    Spacer()
+                    Text("~\(tokensPerSecond.formatted(.number.precision(.fractionLength(1)))) tok/s")
+                        .monospacedDigit()
+                }
+                .font(.subheadline.weight(.medium))
+            }
+
             Text(detailMessage)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -87,6 +98,6 @@ struct ContextUsageIndicator: View {
         if usage.isNearLimit {
             return "This chat is approaching the model's context limit. Token use is estimated from saved messages and attachments."
         }
-        return "Estimated from saved messages and attachments. Actual tokenization varies by model."
+        return "Token use and generation speed are estimated. Actual tokenization varies by model."
     }
 }

@@ -51,6 +51,17 @@ public enum ContextWindow {
     /// Warn once the estimate reaches this fraction of the window.
     public static let warnThreshold = 0.8
 
+    /// Estimate generation throughput when a backend does not report exact token
+    /// timing. The same character heuristic as context usage keeps the number
+    /// honest about its precision while still making model speed comparable.
+    public static func estimatedTokensPerSecond(
+        characterCount: Int,
+        duration: TimeInterval
+    ) -> Double? {
+        guard characterCount > 0, duration >= 0.05 else { return nil }
+        return Double(characterCount) / Double(charactersPerToken) / duration
+    }
+
     /// Estimated prompt tokens for the history actually sent upstream: completed
     /// messages' text plus inlined text attachments, with a flat cost per image.
     /// Reasoning is excluded — it is never replayed into future prompts.
