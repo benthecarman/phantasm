@@ -252,6 +252,119 @@ async fn real_upstream_plain_chat_smoke() {
 }
 
 #[tokio::test]
+#[ignore = "requires a real vLLM server; run with just vllm-test"]
+async fn real_upstream_vllm_server_usage_mode() {
+    if upstream_kind_env() != "vllm" {
+        eprintln!("skipping: forced continuous usage is a vLLM-specific mode");
+        return;
+    }
+
+    let h = real_harness().await;
+    let expect_continuous = truthy_env("REAL_VLLM_EXPECT_CONTINUOUS_USAGE");
+
+    // Verify which server mode the just recipe actually launched. The request
+    // asks only for the standard final usage trailer; non-null usage on choice
+    // chunks must therefore come from vLLM's server-wide force flag.
+    let upstream_base = std::env::var("UPSTREAM_BASE_URL")
+        .expect("UPSTREAM_BASE_URL is set by the real-upstream recipe");
+    let upstream_chat = if upstream_base.trim_end_matches('/').ends_with("/v1") {
+        format!("{}/chat/completions", upstream_base.trim_end_matches('/'))
+    } else {
+        format!(
+            "{}/v1/chat/completions",
+            upstream_base.trim_end_matches('/')
+        )
+    };
+    let upstream_token = std::env::var("UPSTREAM_API_KEY")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    let upstream_response = authed(h.client.post(upstream_chat), &upstream_token)
+        .json(&serde_json::json!({
+            "model": h.model,
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "chat_template_kwargs": { "enable_thinking": false },
+            "messages": [{
+                "role": "user",
+                "content": "Reply with one short sentence."
+            }]
+        }))
+        .send()
+        .await
+        .expect("direct vLLM streaming request");
+    let upstream_status = upstream_response.status();
+    let upstream_body = upstream_response.text().await.expect("vLLM stream body");
+    assert!(
+        upstream_status.is_success(),
+        "direct vLLM stream returned {upstream_status}: {upstream_body}"
+    );
+    let (upstream_events, upstream_done) = sse_events(&upstream_body);
+    assert!(upstream_done, "direct vLLM stream omitted [DONE]");
+    let choice_events: Vec<&Value> = upstream_events
+        .iter()
+        .filter(|event| {
+            event["choices"]
+                .as_array()
+                .is_some_and(|choices| !choices.is_empty())
+        })
+        .collect();
+    assert!(
+        !choice_events.is_empty(),
+        "direct vLLM stream emitted no choice chunks: {upstream_body}"
+    );
+    let choice_usage_count = choice_events
+        .iter()
+        .filter(|event| !event["usage"].is_null())
+        .count();
+    if expect_continuous {
+        assert!(
+            choice_usage_count > 0,
+            "expected --enable-force-include-usage to put usage on choice chunks: {upstream_body}"
+        );
+    } else {
+        assert_eq!(
+            choice_usage_count, 0,
+            "expected final-only usage without the force flag: {upstream_body}"
+        );
+    }
+
+    // The client-facing request does not send `continuous_usage_stats`. In the
+    // forced phase this reproduces Maple's unsolicited cumulative usage shape;
+    // Phantasm must still relay the content instead of consuming every chunk.
+    let response = h
+        .post("/v1/chat/completions")
+        .json(&serde_json::json!({
+            "model": h.model,
+            "stream": true,
+            "reasoning_effort": "none",
+            "messages": [{
+                "role": "user",
+                "content": "Reply with one short sentence."
+            }]
+        }))
+        .send()
+        .await
+        .expect("orchestrated vLLM streaming request");
+    let status = response.status();
+    let body = response.text().await.expect("orchestrated stream body");
+    assert!(
+        status.is_success(),
+        "expect_continuous={expect_continuous} returned {status}: {body}"
+    );
+
+    let (events, saw_done) = sse_events(&body);
+    assert!(
+        saw_done,
+        "expect_continuous={expect_continuous} omitted [DONE]: {body}"
+    );
+    let content = content_text(&events);
+    assert!(
+        !content.trim().is_empty(),
+        "expect_continuous={expect_continuous} lost every content delta: {body}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires a real upstream model host; see docs/REAL_UPSTREAM_TESTS.md"]
 async fn real_upstream_bad_model_surfaces_upstream_error() {
     let kind = upstream_kind_env();

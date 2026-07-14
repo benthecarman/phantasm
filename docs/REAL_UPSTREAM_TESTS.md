@@ -13,6 +13,13 @@ Each backend command runs the full real-upstream suite:
   `reasoning_effort: "none"`
 - real model tool calling through the server-side current-time tool
 
+`just vllm-test` additionally launches vLLM in both server usage modes. It first
+runs with `--no-enable-force-include-usage`, then restarts with
+`--enable-force-include-usage`. In each phase a direct request verifies the
+upstream wire shape, while a normal client request (without
+`continuous_usage_stats`) verifies that content survives through the
+orchestrator and terminates with `[DONE]`.
+
 For OpenAI-compatible hosts, the orchestrator forwards `reasoning_effort` and
 also sends the Qwen-style `chat_template_kwargs.enable_thinking` hint so
 llama.cpp/vLLM templates can disable thinking per request.
@@ -38,9 +45,10 @@ just llama-cpp-test
 just vllm-test
 ```
 
-Each command reuses an already-running backend if its port responds. Otherwise
-it starts the backend, waits for readiness, runs the ignored smoke test, and
-stops only the process it started.
+The Ollama and llama.cpp commands reuse an already-running backend if its port
+responds. `vllm-test` requires an unused endpoint because it owns and restarts
+the vLLM process to cover both server usage modes. Each command stops only the
+processes it started.
 
 ## Ollama
 
@@ -113,16 +121,22 @@ VLLM_TOOL_CALL_PARSER=qwen3_xml just vllm-test
 VLLM_TEST_ARGS="--generation-config vllm" just vllm-test
 ```
 
-The recipe starts:
+The recipe starts vLLM twice:
 
 ```sh
-VLLM_USE_FLASHINFER_SAMPLER=0 vllm serve Qwen/Qwen3-1.7B
+VLLM_USE_FLASHINFER_SAMPLER=0 vllm serve Qwen/Qwen3-1.7B \
+  --no-enable-force-include-usage
+
+VLLM_USE_FLASHINFER_SAMPLER=0 vllm serve Qwen/Qwen3-1.7B \
+  --enable-force-include-usage
 ```
 
 with `--max-model-len 4096`, `--enforce-eager`, `--gpu-memory-utilization
 0.60`, `--enable-auto-tool-choice`, and `--tool-call-parser qwen3_xml` unless
-overridden. These defaults keep startup reliable on local 16GB GPUs and make the
-tool-calling smoke test meaningful.
+overridden. The full smoke suite runs in the standard phase; after restart, the
+forced phase reruns the usage-mode test with an ordinary client request. These
+defaults keep startup reliable on local 16GB GPUs and make the tool-calling
+smoke test meaningful.
 
 ## Raw Cargo Command
 

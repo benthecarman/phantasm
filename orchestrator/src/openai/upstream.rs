@@ -643,6 +643,20 @@ fn record_stream_usage(
     let Some(usage) = value.get("usage") else {
         return false;
     };
+
+    // OpenAI's `include_usage` response includes `usage: null` on ordinary
+    // choice chunks, and vLLM's `continuous_usage_stats` extension attaches
+    // cumulative, non-null usage to those same chunks. In both cases the
+    // choices still carry the stream delta and must be parsed normally. The
+    // dedicated usage trailer is distinguished by its empty `choices` array.
+    if value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
+    {
+        return false;
+    }
+
     let count = |key: &str| usage.get(key).and_then(Value::as_u64);
     let prompt_tokens = count("prompt_tokens");
     let completion_tokens = count("completion_tokens");
@@ -1450,8 +1464,8 @@ mod tests {
 
         let metrics = crate::metrics::Metrics::without_store();
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
-              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}],\"usage\":null}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n\
               data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n\
               data: [DONE]\n\n",
         ))];
@@ -1466,6 +1480,53 @@ mod tests {
         let stats = metrics.model("m");
         assert_eq!(stats.prompt_tokens.get(), 7);
         assert_eq!(stats.completion_tokens.get(), 3);
+        assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_preserves_vllm_continuous_usage_deltas() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        // vLLM 0.25 emits this shape when continuous usage is requested or
+        // forced server-side: cumulative counters accompany every choice, then
+        // a standard empty-choices usage trailer carries the final totals.
+        let metrics = crate::metrics::Metrics::without_store();
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":0,\"total_tokens\":7}}\n\n\
+              data: {\"choices\":[{\"delta\":{\"reasoning\":\"plan\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1,\"total_tokens\":8}}\n\n\
+              data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":4,\"total_tokens\":11}}\n\n\
+              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":4,\"total_tokens\":11}}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<StreamDelta> =
+            sse_bytes_to_deltas(stream::iter(chunks), Some((metrics.clone(), "m".into())))
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| delta.reasoning.as_str())
+                .collect::<String>(),
+            "plan"
+        );
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| delta.content.as_str())
+                .collect::<String>(),
+            "OK"
+        );
+        let terminal = deltas.last().expect("terminal delta");
+        assert!(terminal.done);
+        assert_eq!(terminal.done_reason.as_deref(), Some("stop"));
+
+        let stats = metrics.model("m");
+        assert_eq!(stats.prompt_tokens.get(), 7);
+        assert_eq!(stats.completion_tokens.get(), 4);
         assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
     }
 
@@ -1493,6 +1554,45 @@ mod tests {
         let calls = last.tool_calls.as_ref().expect("structured call preserved");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "weather");
+
+        let stats = metrics.model("m");
+        assert_eq!(stats.prompt_tokens.get(), 11);
+        assert_eq!(stats.completion_tokens.get(), 4);
+        assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
+    }
+
+    #[tokio::test]
+    async fn sse_tool_stream_preserves_vllm_continuous_usage_calls() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let metrics = crate::metrics::Metrics::without_store();
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\"}}]},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":1,\"total_tokens\":12}}\n\n\
+              data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14}}\n\n\
+              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n\
+              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n\
+              data: [DONE]\n\n",
+        ))];
+        let deltas: Vec<ToolStreamDelta> =
+            sse_bytes_to_tool_deltas(stream::iter(chunks), Some((metrics.clone(), "m".into())))
+                .map(|r| r.unwrap())
+                .collect()
+                .await;
+
+        let terminal = deltas.last().expect("terminal tool delta");
+        assert!(terminal.done);
+        assert_eq!(terminal.done_reason.as_deref(), Some("tool_calls"));
+        let calls = terminal
+            .tool_calls
+            .as_ref()
+            .expect("structured call preserved");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "weather");
+        match &calls[0].function.arguments {
+            RawArguments::Str(arguments) => assert_eq!(arguments, "{\"city\":\"Paris\"}"),
+            other => panic!("expected string arguments, got {other:?}"),
+        }
 
         let stats = metrics.model("m");
         assert_eq!(stats.prompt_tokens.get(), 11);

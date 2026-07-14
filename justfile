@@ -79,7 +79,35 @@ vllm-test:
   port="${VLLM_TEST_PORT:-8000}"
   model="${VLLM_TEST_MODEL:-Qwen/Qwen3-1.7B}"
   started_pid=""
-  if ! curl -fsS "$base/v1/models" >/dev/null; then
+
+  cleanup() {
+    if [[ -n "$started_pid" ]]; then
+      kill "$started_pid" 2>/dev/null || true
+      wait "$started_pid" 2>/dev/null || true
+      started_pid=""
+    fi
+  }
+  trap cleanup EXIT
+
+  wait_ready() {
+    local deadline=$((SECONDS + 900))
+    until curl -fsS "$base/v1/models" >/dev/null; do
+      if ! kill -0 "$started_pid" 2>/dev/null; then
+        echo "vLLM exited before becoming ready" >&2
+        wait "$started_pid" || true
+        exit 1
+      fi
+      if (( SECONDS >= deadline )); then
+        echo "Timed out waiting for $base/v1/models" >&2
+        exit 1
+      fi
+      sleep 2
+    done
+  }
+
+  start_vllm() {
+    local usage_flag="$1"
+    echo "Starting vLLM with $usage_flag"
     VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}" \
     vllm serve "$model" \
       --host 127.0.0.1 \
@@ -89,24 +117,40 @@ vllm-test:
       --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.60}" \
       --enable-auto-tool-choice \
       --tool-call-parser "${VLLM_TOOL_CALL_PARSER:-qwen3_xml}" \
-      ${VLLM_TEST_ARGS:-} &
+      ${VLLM_TEST_ARGS:-} \
+      "$usage_flag" &
     started_pid=$!
-    trap 'if [[ -n "$started_pid" ]]; then kill "$started_pid" 2>/dev/null || true; fi' EXIT
+    wait_ready
+  }
+
+  stop_vllm() {
+    cleanup
+    local deadline=$((SECONDS + 60))
+    while curl -fsS "$base/v1/models" >/dev/null 2>&1; do
+      if (( SECONDS >= deadline )); then
+        echo "Timed out waiting for vLLM to release $base" >&2
+        exit 1
+      fi
+      sleep 1
+    done
+  }
+
+  if curl -fsS "$base/v1/models" >/dev/null 2>&1; then
+    echo "vllm-test needs an unused endpoint so it can restart vLLM in both usage modes: $base" >&2
+    echo "Stop the existing server or choose free VLLM_TEST_BASE/VLLM_TEST_PORT values." >&2
+    exit 1
   fi
-  deadline=$((SECONDS + 900))
-  until curl -fsS "$base/v1/models" >/dev/null; do
-    if [[ -n "$started_pid" ]] && ! kill -0 "$started_pid" 2>/dev/null; then
-      echo "vLLM exited before becoming ready" >&2
-      wait "$started_pid" || true
-      exit 1
-    fi
-    if (( SECONDS >= deadline )); then
-      echo "Timed out waiting for $base/v1/models" >&2
-      exit 1
-    fi
-    sleep 2
-  done
-  REAL_UPSTREAM_TEST_THINKING=1 REAL_UPSTREAM_TEST_TOOLS=1 just _real-upstream-test vllm "$base" "$model"
+
+  start_vllm --no-enable-force-include-usage
+  REAL_VLLM_EXPECT_CONTINUOUS_USAGE=0 \
+    REAL_UPSTREAM_TEST_THINKING=1 \
+    REAL_UPSTREAM_TEST_TOOLS=1 \
+    just _real-upstream-test vllm "$base" "$model"
+  stop_vllm
+
+  start_vllm --enable-force-include-usage
+  REAL_VLLM_EXPECT_CONTINUOUS_USAGE=1 \
+    just _real-upstream-test vllm "$base" "$model" real_upstream_vllm_server_usage_mode
 
 comfy-test env_file="/etc/phantasm/orchestrator.env":
   #!/usr/bin/env bash
