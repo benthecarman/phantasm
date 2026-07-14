@@ -15,6 +15,9 @@ packages:
   MarkdownUI:
     url: https://github.com/gonzalezreal/swift-markdown-ui
     from: "2.0.0"
+  SwiftUIMath:
+    url: https://github.com/gonzalezreal/swiftui-math
+    from: "0.1.0"
   GRDB:
     url: https://github.com/groue/GRDB.swift
     from: "7.0.0"
@@ -34,6 +37,8 @@ targets:
       - package: PhantasmKit
       - package: MarkdownUI
         product: MarkdownUI
+      - package: SwiftUIMath
+        product: SwiftUIMath
       - package: GRDB
         product: GRDB
       - package: GRDBQuery

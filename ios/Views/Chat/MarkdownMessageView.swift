@@ -3,6 +3,7 @@ import PhantasmKit
 import ImageIO
 import AVKit
 import SwiftUI
+import SwiftUIMath
 import UIKit
 
 /// Renders assistant markdown (FR-A4) with fenced code blocks (copy button) and
@@ -37,18 +38,28 @@ struct MarkdownMessageView: View {
             : preparedImages(in: artifacts.markdown)
         VStack(alignment: .leading, spacing: 10) {
             if !extracted.markdown.isEmpty {
-                Markdown(extracted.markdown)
-                    .markdownTheme(.phantasmChat)
-                    .markdownImageProvider(PhantasmImageProvider(
-                        images: extracted.images,
-                        trustedBase: trustedImageBase,
-                        onTap: onTapImage
-                    ))
-                    .markdownBlockStyle(\.codeBlock) { configuration in
-                        CodeBlockView(configuration: configuration)
+                ForEach(
+                    Array(DisplayMathParser.blocks(in: extracted.markdown).enumerated()),
+                    id: \.offset
+                ) { _, block in
+                    switch block {
+                    case .markdown(let markdown):
+                        Markdown(markdown)
+                            .markdownTheme(.phantasmChat)
+                            .markdownImageProvider(PhantasmImageProvider(
+                                images: extracted.images,
+                                trustedBase: trustedImageBase,
+                                onTap: onTapImage
+                            ))
+                            .markdownBlockStyle(\.codeBlock) { configuration in
+                                CodeBlockView(configuration: configuration)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    case .math(let expression):
+                        DisplayMathView(expression: expression)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
+                }
             }
             if !isStreaming {
                 ForEach(artifacts.artifacts) { artifact in
@@ -79,6 +90,24 @@ struct MarkdownMessageView: View {
             images: base64.images.merging(stored.images) { current, _ in current }
                 .merging(server.images) { current, _ in current }
         )
+    }
+}
+
+private struct DisplayMathView: View {
+    let expression: String
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Math(expression)
+                .mathFont(Math.Font(name: .latinModern, size: 20))
+                .mathTypesettingStyle(.display)
+                .fixedSize()
+                .padding(.horizontal, 4)
+                .padding(.vertical, 6)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Equation: \(expression)")
     }
 }
 
