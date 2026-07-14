@@ -62,6 +62,10 @@
 	<string>Phantasm lets you choose photos from your library to attach to a message.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Phantasm uses speech recognition to transcribe your dictation. On supported devices this runs entirely on-device.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

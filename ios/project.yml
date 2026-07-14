@@ -53,6 +53,8 @@ targets:
         # URLSession/CryptoKit implementations, with no bundled crypto library.
         ITSAppUsesNonExemptEncryption: false
         UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
         # QR pairing deep link (SPEC §2.2d): a phantasm://pair URI scanned by
         # the system Camera or tapped in Messages opens the confirmation flow.
         CFBundleURLTypes:

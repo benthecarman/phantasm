@@ -154,6 +154,10 @@ private struct GeneratedAudioView: View {
     let artifact: ServerArtifactRef.Artifact
     @State private var player: AVPlayer
     @State private var isPlaying = false
+    @State private var currentTime = 0.0
+    @State private var duration = 0.0
+    @State private var isSeeking = false
+    @State private var timeObserver: Any?
     @State private var playbackError: String?
 
     init(artifact: ServerArtifactRef.Artifact) {
@@ -163,17 +167,28 @@ private struct GeneratedAudioView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Button {
                     if isPlaying {
                         player.pause()
                         isPlaying = false
+                        GeneratedAudioNowPlayingCoordinator.shared.updatePlaybackState(
+                            for: player,
+                            duration: duration,
+                            isPlaying: false
+                        )
                     } else {
                         do {
-                            try activateAudioPlaybackSession()
+                            try GeneratedAudioNowPlayingCoordinator.shared.prepareForPlayback()
                             player.play()
                             playbackError = nil
                             isPlaying = true
+                            GeneratedAudioNowPlayingCoordinator.shared.activate(
+                                player: player,
+                                duration: duration,
+                                onPlaybackChanged: { isPlaying = $0 },
+                                onPositionChanged: { currentTime = $0 }
+                            )
                         } catch {
                             playbackError = "Audio playback failed."
                         }
@@ -185,10 +200,27 @@ private struct GeneratedAudioView: View {
                 }
                 .accessibilityLabel(isPlaying ? "Pause generated audio" : "Play generated audio")
 
-                Label(artifact.label, systemImage: "waveform")
-                    .font(.caption)
-                    .lineLimit(2)
-                Spacer()
+                VStack(spacing: 0) {
+                    Slider(
+                        value: $currentTime,
+                        in: 0...max(duration, 1),
+                        onEditingChanged: seek
+                    )
+                    .controlSize(.mini)
+                    .disabled(duration <= 0)
+                    .accessibilityLabel("Playback position")
+                    .accessibilityValue(playbackAccessibilityValue)
+
+                    HStack {
+                        Text(formattedTime(currentTime))
+                        Spacer()
+                        Text(duration > 0 ? formattedTime(duration) : "–:––")
+                    }
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                }
+
                 GeneratedMediaShareButton(artifact: artifact)
             }
             if let playbackError {
@@ -199,27 +231,99 @@ private struct GeneratedAudioView: View {
         }
         .padding(10)
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+        .task { await loadDuration() }
+        .onAppear(perform: startObservingPlayback)
         .onDisappear {
             player.pause()
             isPlaying = false
+            stopObservingPlayback()
+            GeneratedAudioNowPlayingCoordinator.shared.deactivate(player: player)
         }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { note in
             guard let item = note.object as? AVPlayerItem, item === player.currentItem else { return }
             player.seek(to: .zero)
+            currentTime = 0
             isPlaying = false
+            GeneratedAudioNowPlayingCoordinator.shared.updatePlaybackState(
+                for: player,
+                duration: duration,
+                isPlaying: false,
+                elapsedTime: 0
+            )
         }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime)) { note in
             guard let item = note.object as? AVPlayerItem, item === player.currentItem else { return }
             isPlaying = false
             playbackError = "Audio playback failed."
+            GeneratedAudioNowPlayingCoordinator.shared.updatePlaybackState(
+                for: player,
+                duration: duration,
+                isPlaying: false
+            )
         }
     }
 
-    private func activateAudioPlaybackSession() throws {
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playback, mode: .default, options: [.duckOthers])
-        try session.setActive(true)
+    private var playbackAccessibilityValue: String {
+        guard duration > 0 else { return formattedTime(currentTime) }
+        return "\(formattedTime(currentTime)) of \(formattedTime(duration))"
     }
+
+    private func seek(editing: Bool) {
+        isSeeking = editing
+        guard !editing, duration > 0 else { return }
+        let target = CMTime(
+            seconds: min(max(currentTime, 0), duration),
+            preferredTimescale: 600
+        )
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        GeneratedAudioNowPlayingCoordinator.shared.updatePlaybackState(
+            for: player,
+            duration: duration,
+            isPlaying: isPlaying,
+            elapsedTime: target.seconds
+        )
+    }
+
+    private func startObservingPlayback() {
+        guard timeObserver == nil else { return }
+        timeObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+            queue: .main
+        ) { time in
+            guard !isSeeking, time.seconds.isFinite else { return }
+            currentTime = max(time.seconds, 0)
+        }
+    }
+
+    private func stopObservingPlayback() {
+        guard let timeObserver else { return }
+        player.removeTimeObserver(timeObserver)
+        self.timeObserver = nil
+    }
+
+    private func loadDuration() async {
+        guard let asset = player.currentItem?.asset,
+              let loadedDuration = try? await asset.load(.duration),
+              loadedDuration.seconds.isFinite,
+              loadedDuration.seconds > 0 else { return }
+        duration = loadedDuration.seconds
+        GeneratedAudioNowPlayingCoordinator.shared.updateDuration(
+            for: player,
+            duration: duration
+        )
+    }
+
+    private func formattedTime(_ time: Double) -> String {
+        let totalSeconds = max(Int(time.rounded(.down)), 0)
+        let hours = totalSeconds / 3_600
+        let minutes = (totalSeconds % 3_600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+
 }
 
 private struct GeneratedVideoView: View {
