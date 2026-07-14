@@ -539,6 +539,7 @@ private struct StreamingPreviewSection: View {
                 StreamingBubble(
                     text: vm.streamingText,
                     reasoning: vm.streamingReasoning,
+                    reasoningDuration: vm.streamingReasoningDuration,
                     status: vm.statusText,
                     progress: vm.statusProgress,
                     startedAt: vm.streamingStartedAt

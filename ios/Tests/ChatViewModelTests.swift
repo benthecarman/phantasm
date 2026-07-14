@@ -340,6 +340,31 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(client.requests.count, 1)
     }
 
+    func testCompletedThinkingDurationIsPersisted() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        client.enqueue(
+            events: [.reasoning("first"), .reasoning(" second"), .token("answer"), .done],
+            pauseAfterEventNanoseconds: 100_000_000
+        )
+        client.enqueue(events: [.token("Timed thought"), .done])
+
+        vm.send("hello")
+
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.messages.last?.message.reasoningDuration != nil
+        }
+        let stored = try await detail(store, conversation.id)
+        let duration = try XCTUnwrap(stored.messages.last?.message.reasoningDuration)
+        XCTAssertGreaterThan(duration, 0.15)
+        XCTAssertLessThan(duration, 0.4)
+    }
+
     func testRecoverPendingAssistantRowReplaysStreamingInPlace() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
@@ -368,6 +393,7 @@ final class ChatViewModelTests: XCTestCase {
             let detail = try await self.detail(store, conversation.id)
             return detail.messages.last?.message.content == "partial answer"
                 && detail.messages.last?.message.reasoning == "thinking"
+                && detail.messages.last?.message.reasoningDuration == nil
                 && detail.messages.last?.message.isComplete == true
         }
         XCTAssertFalse(vm.isStreaming)

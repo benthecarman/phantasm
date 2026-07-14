@@ -22,6 +22,9 @@ final class ChatViewModel {
     private var isRecovering = false
     private(set) var streamingText = ""
     private(set) var streamingReasoning = ""
+    /// Finalized once answer text starts (or the reasoning-only stream ends), so
+    /// the collapsed pill can settle before the whole response is committed.
+    private(set) var streamingReasoningDuration: TimeInterval?
     /// When the in-flight turn began. Seeds the loader's verb and the early
     /// pending-row `createdAt` for ordering; the preview shows no timestamp (that
     /// appears only once the turn completes, restamped to the completion time).
@@ -321,6 +324,7 @@ final class ChatViewModel {
         self.pendingAssistantPreviewMessageID = nil
         streamingText = ""
         streamingReasoning = ""
+        streamingReasoningDuration = nil
         statusText = nil
         statusProgress = nil
         hasAssistantPreview = false
@@ -392,6 +396,7 @@ final class ChatViewModel {
         latestTokensPerSecond = nil
         streamingText = ""
         streamingReasoning = ""
+        streamingReasoningDuration = nil
         statusText = nil
         statusProgress = nil
         pendingAssistantMessageID = nil
@@ -573,6 +578,7 @@ final class ChatViewModel {
         streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
+        streamingReasoningDuration = nil
         statusText = nil
         statusProgress = nil
         pendingAssistantMessageID = nil
@@ -601,7 +607,8 @@ final class ChatViewModel {
         token: String,
         env: any ChatViewModelEnvironment,
         store: ChatStore,
-        measuresThroughput: Bool = true
+        measuresThroughput: Bool = true,
+        measuresReasoningDuration: Bool = true
     ) async {
         // Wait for the previous turn's row commit (not its follow-up work) so
         // a fast follow-up send can't read a history missing the last reply.
@@ -666,6 +673,7 @@ final class ChatViewModel {
         var batchedCalls: [WireToolCall]?
         var firstAnswerTokenAt: Date?
         var generatedCharacterCount = 0
+        var firstReasoningTokenAt: Date?
         // Whether the turn actually finished (a terminal `.done`) versus the
         // stream just ending because the connection dropped — e.g. the app was
         // backgrounded and the local task was cancelled. A cancelled
@@ -678,10 +686,16 @@ final class ChatViewModel {
                 case .token(let t):
                     statusText = nil
                     statusProgress = nil
+                    if measuresReasoningDuration,
+                       streamingReasoningDuration == nil,
+                       let firstReasoningTokenAt {
+                        streamingReasoningDuration = Date.now.timeIntervalSince(firstReasoningTokenAt)
+                    }
                     if firstAnswerTokenAt == nil { firstAnswerTokenAt = .now }
                     generatedCharacterCount += t.count
                     streamingText += t
                 case .reasoning(let r):
+                    if firstReasoningTokenAt == nil { firstReasoningTokenAt = .now }
                     streamingReasoning += r
                 case .status(let s):
                     statusText = s
@@ -708,6 +722,11 @@ final class ChatViewModel {
                 return
             }
             let backgrounded = !isSceneActive || suspendedByScene || !isViewVisible
+            if sawDone, measuresReasoningDuration,
+               streamingReasoningDuration == nil,
+               let firstReasoningTokenAt {
+                streamingReasoningDuration = Date.now.timeIntervalSince(firstReasoningTokenAt)
+            }
             // Interrupted before the turn finished (no `.done`) while in the
             // background: keep the incomplete pending row and resume the turn on
             // foreground. Committing the partial here would drop the rest of the
@@ -803,6 +822,7 @@ final class ChatViewModel {
         // preseeding the persisted partial here would double-count them.
         streamingText = ""
         streamingReasoning = ""
+        streamingReasoningDuration = nil
         statusText = nil
         statusProgress = nil
         pendingAssistantMessageID = pending.id
@@ -817,7 +837,8 @@ final class ChatViewModel {
                 token: env.activeToken ?? "",
                 env: env,
                 store: store,
-                measuresThroughput: false
+                measuresThroughput: false,
+                measuresReasoningDuration: false
             )
         }
     }
@@ -915,6 +936,7 @@ final class ChatViewModel {
         streamingStartedAt = .now
         streamingText = ""
         streamingReasoning = ""
+        streamingReasoningDuration = nil
         statusText = status
         statusProgress = nil
         pendingAssistantMessageID = nil
@@ -998,6 +1020,7 @@ final class ChatViewModel {
         let streamedContent = streamingText
         streamingText = ""
         streamingReasoning = ""
+        streamingReasoningDuration = nil
 
         task = Task { [weak self] in
             // Commit the assistant tool_call row first, so every result that
@@ -1090,6 +1113,7 @@ final class ChatViewModel {
         task = nil
         streamingText = ""
         streamingReasoning = ""
+        streamingReasoningDuration = nil
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
@@ -1181,6 +1205,7 @@ final class ChatViewModel {
         // Commit any streamed text as one complete assistant message.
         let committed = streamingText
         let committedReasoning = streamingReasoning
+        let committedReasoningDuration = streamingReasoningDuration
         let hasAssistantPayload = !committed.isEmpty || !committedReasoning.isEmpty
         let pendingID = pendingAssistantMessageID
         pendingAssistantMessageID = nil
@@ -1195,6 +1220,7 @@ final class ChatViewModel {
         if shouldKeepPendingForRecovery {
             streamingText = ""
             streamingReasoning = ""
+            streamingReasoningDuration = nil
             pendingAssistantPreviewMessageID = nil
             hasAssistantPreview = false
             endBackgroundStreamingTask()
@@ -1216,6 +1242,7 @@ final class ChatViewModel {
                         id: pendingID,
                         content: committed,
                         reasoning: committedReasoning,
+                        reasoningDuration: committedReasoningDuration,
                         isComplete: true,
                         createdAt: .now
                     )
@@ -1224,6 +1251,7 @@ final class ChatViewModel {
                 let assistant = Message(
                     conversationId: conversation.id, role: "assistant",
                     content: committed, reasoning: committedReasoning,
+                    reasoningDuration: committedReasoningDuration,
                     createdAt: .now, isComplete: true
                 )
                 pendingAssistantPreviewMessageID = assistant.id
@@ -1245,6 +1273,7 @@ final class ChatViewModel {
             }
             streamingText = ""
             streamingReasoning = ""
+            streamingReasoningDuration = nil
             pendingAssistantPreviewMessageID = nil
             hasAssistantPreview = false
             endBackgroundStreamingTask()
@@ -1303,6 +1332,7 @@ final class ChatViewModel {
         pendingAssistantPreviewMessageID = nil
         streamingText = ""
         streamingReasoning = ""
+        streamingReasoningDuration = nil
         hasAssistantPreview = false
         errorMessage = AppError.from(error).userMessage
     }

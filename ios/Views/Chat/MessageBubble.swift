@@ -57,7 +57,10 @@ struct MessageBubble: View {
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     if !message.message.reasoning.isEmpty {
-                        ThinkingDisclosure(text: message.message.reasoning)
+                        ThinkingDisclosure(
+                            text: message.message.reasoning,
+                            duration: message.message.reasoningDuration
+                        )
                     }
                     // A `render_chart` row draws its chart(s) here; an invalid spec
                     // shows a plain-text note instead of rendering something broken.
@@ -230,6 +233,7 @@ struct MessageBubble: View {
 struct StreamingBubble: View {
     let text: String
     let reasoning: String
+    let reasoningDuration: TimeInterval?
     let status: String?
     let progress: Double?
     /// When the turn began — used only to seed the loader's verb (deterministic
@@ -249,6 +253,7 @@ struct StreamingBubble: View {
                     // that the trace is complete and the chip settles.
                     ThinkingDisclosure(
                         text: reasoning,
+                        duration: reasoningDuration,
                         isStreaming: text.isEmpty,
                         allowsTextSelection: false
                     )
@@ -272,6 +277,9 @@ struct StreamingBubble: View {
 /// arriving it shimmers like the app's other activity indicators.
 struct ThinkingDisclosure: View {
     let text: String
+    /// Elapsed reasoning time once thinking has completed. Nil keeps the legacy
+    /// label for older messages whose duration was not recorded.
+    var duration: TimeInterval? = nil
     /// Whether reasoning tokens are still streaming in — drives the shimmer.
     var isStreaming = false
     /// Live preview text is rebuilt throughout generation; selectable text makes
@@ -285,6 +293,12 @@ struct ThinkingDisclosure: View {
 
     private var shouldAnimate: Bool { isStreaming && !reduceMotion }
 
+    private var label: String {
+        if isStreaming { return "Thinking…" }
+        guard let duration else { return "Thought" }
+        return "Thought for \(ReasoningDuration.format(duration))"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
@@ -295,7 +309,7 @@ struct ThinkingDisclosure: View {
                 chip
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Thinking")
+            .accessibilityLabel(label)
             .accessibilityHint(isExpanded ? "Collapses the reasoning" : "Expands the reasoning")
 
             if isExpanded {
@@ -333,7 +347,7 @@ struct ThinkingDisclosure: View {
         HStack(spacing: 5) {
             Image(systemName: "brain.head.profile")
                 .scaleEffect(shouldAnimate ? (pulse ? 1.08 : 0.94) : 1)
-            Text(isStreaming ? "Thinking…" : "Thinking")
+            Text(label)
             Image(systemName: "chevron.down")
                 .font(.system(size: 8, weight: .bold))
                 .rotationEffect(.degrees(isExpanded ? -180 : 0))

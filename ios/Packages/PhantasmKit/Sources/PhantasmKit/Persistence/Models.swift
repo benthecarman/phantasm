@@ -177,6 +177,9 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
     /// Kept separate from `content` so it is hidden by default and excluded from
     /// future prompts.
     public var reasoning: String
+    /// Elapsed time from the first reasoning delta until answer generation began.
+    /// Nil for messages saved before timing support or streams that were replayed.
+    public var reasoningDuration: TimeInterval?
     public var createdAt: Date
     public var updatedAt: Date
     /// `false` while streaming; flipped to `true` once the turn finishes.
@@ -201,6 +204,7 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         role: String,
         content: String,
         reasoning: String = "",
+        reasoningDuration: TimeInterval? = nil,
         createdAt: Date = .now,
         updatedAt: Date? = nil,
         isComplete: Bool = true,
@@ -214,6 +218,7 @@ public struct Message: Identifiable, Codable, Equatable, Sendable,
         self.role = role
         self.content = content
         self.reasoning = reasoning
+        self.reasoningDuration = reasoningDuration
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.isComplete = isComplete

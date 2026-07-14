@@ -54,6 +54,7 @@ public protocol ChatStore: Sendable {
         id: UUID,
         content: String,
         reasoning: String,
+        reasoningDuration: TimeInterval?,
         isComplete: Bool,
         createdAt: Date?
     ) async throws
@@ -133,4 +134,24 @@ public protocol ChatStore: Sendable {
     /// Full-text search over conversation titles + message content, ranked by
     /// relevance. Tombstoned conversations are excluded. Empty query → no results.
     func searchConversations(matching query: String) async throws -> [ConversationSearchResult]
+}
+
+public extension ChatStore {
+    /// Compatibility overload for updates that carry no measured reasoning time.
+    func updateMessage(
+        id: UUID,
+        content: String,
+        reasoning: String,
+        isComplete: Bool,
+        createdAt: Date?
+    ) async throws {
+        try await updateMessage(
+            id: id,
+            content: content,
+            reasoning: reasoning,
+            reasoningDuration: nil,
+            isComplete: isComplete,
+            createdAt: createdAt
+        )
+    }
 }

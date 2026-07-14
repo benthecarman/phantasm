@@ -77,6 +77,32 @@ final class SchemaImprovementTests: XCTestCase {
         XCTAssertEqual(inline.first?.mimeType, "image/jpeg")
     }
 
+    func testReasoningDurationPersistsOnCompletion() async throws {
+        let db = try AppDatabase.empty()
+        let convo = try await makeConversation(db)
+        let message = Message(
+            conversationId: convo.id,
+            role: "assistant",
+            content: "",
+            reasoning: "",
+            isComplete: false
+        )
+        try await db.insertMessage(message, attachments: [])
+
+        try await db.updateMessage(
+            id: message.id,
+            content: "answer",
+            reasoning: "thinking",
+            reasoningDuration: 12.5,
+            isComplete: true,
+            createdAt: nil
+        )
+
+        let detail = try await db.conversationDetail(id: convo.id)
+        let stored = try XCTUnwrap(detail?.messages.first?.message)
+        XCTAssertEqual(stored.reasoningDuration, 12.5)
+    }
+
     func testUndecodablePayloadIsDroppedNotStored() async throws {
         let db = try AppDatabase.empty()
         let convo = try await makeConversation(db)

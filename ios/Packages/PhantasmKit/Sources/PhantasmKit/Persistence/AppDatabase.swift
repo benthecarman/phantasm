@@ -145,6 +145,11 @@ public final class AppDatabase: Sendable {
                 t.column("title")
             }
         }
+        migrator.registerMigration("v2_reasoning_duration") { db in
+            try db.alter(table: "message") { t in
+                t.add(column: "reasoningDuration", .double)
+            }
+        }
         return migrator
     }
 }
@@ -197,6 +202,7 @@ extension AppDatabase: ChatStore {
         id: UUID,
         content: String,
         reasoning: String,
+        reasoningDuration: TimeInterval? = nil,
         isComplete: Bool,
         createdAt: Date?
     ) async throws {
@@ -204,6 +210,7 @@ extension AppDatabase: ChatStore {
             guard var message = try Message.fetchOne(db, key: id) else { return }
             try Self.rewriteContent(db, of: &message, to: content)
             message.reasoning = reasoning
+            message.reasoningDuration = reasoningDuration
             message.isComplete = isComplete
             // Display-only restamp: ordering is `position`, so this can't reorder.
             if let createdAt { message.createdAt = createdAt }
