@@ -84,6 +84,11 @@ final class ChatViewModel {
     private var startingTurn: StartingTurn?
     private var pendingAssistantMessageID: UUID?
     private var pendingAssistantPreviewMessageID: UUID?
+    /// Set while the owner is coordinating a destructive history operation.
+    /// It blocks new sends and recovery while the active turn is stopped and
+    /// its final row commit drains. If the database delete fails, the owner
+    /// clears this state so the existing conversation remains usable.
+    private var isPreparingForDeletion = false
     private var isSceneActive = true
     private var isViewVisible = false
     private var suspendedByScene = false
@@ -401,14 +406,14 @@ final class ChatViewModel {
 
     var canSend: Bool {
         // The token is optional for direct no-auth backends such as local Ollama.
-        guard backendSession != nil else { return false }
+        guard backendSession != nil, !isPreparingForDeletion else { return false }
         return !isStreaming
     }
 
     /// Bind a legacy/deleted-profile conversation after the user explicitly
     /// chooses where its full history may be sent.
     func bindConversation(to profileID: UUID) {
-        guard !isStreaming, !isBindingBackend, let env, let store,
+        guard !isStreaming, !isPreparingForDeletion, !isBindingBackend, let env, let store,
               let conversation,
               env.backendSession(for: profileID) != nil else { return }
         isBindingBackend = true
@@ -910,7 +915,8 @@ final class ChatViewModel {
         // `recoverPendingTurn` flips it (after its `await`), so two streams attach
         // to the same turn and replay into one buffer: the duplicate image and
         // mangled message.
-        guard !isStreaming, !isRecovering, isSceneActive, isViewVisible else { return }
+        guard !isStreaming, !isRecovering, !isPreparingForDeletion,
+              isSceneActive, isViewVisible else { return }
         isRecovering = true
         Task { [weak self] in
             await self?.recoverPendingTurn()
@@ -919,21 +925,21 @@ final class ChatViewModel {
     }
 
     private func recoverPendingTurn() async {
-        guard !isStreaming, isSceneActive, isViewVisible,
+        guard !isStreaming, !isPreparingForDeletion, isSceneActive, isViewVisible,
               let store, let conversation,
               let session = backendSession else { return }
         // A commit from the just-finished turn may still be landing; reading
         // before it does would mistake the not-yet-completed row for a
         // resumable turn and stream it a second time.
         await commitTask?.value
-        guard !isStreaming else { return }
+        guard !isStreaming, !isPreparingForDeletion else { return }
         guard let detail = try? await store.conversationDetail(
             id: conversation.id,
             attachmentData: .metadataOnly
         ) else { return }
         // A send may have started while either awaited read was in flight. Its
         // generation owns the VM now, so abandon this stale recovery attempt.
-        guard !isStreaming else { return }
+        guard !isStreaming, !isPreparingForDeletion else { return }
 
         // Restore an unanswered interactive prompt from the active tool-call batch.
         // Its rows are *complete* (the assistant tool_call row + any auto-resolved
@@ -1063,7 +1069,7 @@ final class ChatViewModel {
         status: String? = nil,
         result: @escaping @Sendable () async -> String
     ) {
-        guard let prompt = pendingPrompt, !isStreaming,
+        guard let prompt = pendingPrompt, !isStreaming, !isPreparingForDeletion,
               let store, let conversation,
               let session = turnSession ?? backendSession else { return }
         let generation = activeTurnGeneration ?? activateTurn(session: session)
@@ -1323,6 +1329,49 @@ final class ChatViewModel {
             emptyPendingDisposition: .delete
         )
         stoppedTask?.cancel()
+    }
+
+    /// Stop work that could write this conversation, then wait for both the
+    /// turn task and the commit it schedules. The database row must not be
+    /// deleted until this returns: `stop()` deliberately rescues a user message
+    /// or commits buffered assistant text from an uncancelled task.
+    func prepareForDeletion() async {
+        beginPreparingForDeletion()
+
+        // Capture before stop(), which clears `task` synchronously in finish().
+        let runningTask = task
+        if isStreaming {
+            stop()
+        } else {
+            // A task can be finishing the transition into a parked prompt even
+            // after `isStreaming` was cleared. Revoking its generation prevents
+            // any continuation from starting more work.
+            activeTurnGeneration = nil
+            runningTask?.cancel()
+            task = nil
+        }
+
+        runningTask?.cancel()
+        await runningTask?.value
+        // stop() may have replaced the prior commit with a chained rescue, so
+        // read the property only after the turn task has fully unwound.
+        await commitTask?.value
+    }
+
+    /// Synchronous half of deletion preparation. The cache calls this when a
+    /// model is created while a delete is already pending, before configure()
+    /// can launch recovery work for it.
+    func beginPreparingForDeletion() {
+        isPreparingForDeletion = true
+    }
+
+    /// Restore normal interaction when the coordinated database deletion
+    /// failed. A stopped turn stays stopped, but the preserved conversation can
+    /// be sent to again and any durable pending turn can recover normally.
+    func resumeAfterFailedDeletion() {
+        guard isPreparingForDeletion else { return }
+        isPreparingForDeletion = false
+        recoverPendingTurnIfNeeded()
     }
 
     func setModel(_ model: String) {

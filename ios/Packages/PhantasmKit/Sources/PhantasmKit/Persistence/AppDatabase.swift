@@ -333,7 +333,7 @@ extension AppDatabase: ChatStore {
     }
 
     public func deleteConversation(id: UUID) async throws {
-        try await dbWriter.write { db in
+        _ = try await dbWriter.write { db in
             // The conversation FK cascades to messages, attachments, and
             // embeddings; message delete triggers keep FTS in sync.
             try Conversation.deleteOne(db, key: id)
@@ -341,7 +341,7 @@ extension AppDatabase: ChatStore {
     }
 
     public func deleteAllConversations() async throws {
-        try await dbWriter.write { db in
+        _ = try await dbWriter.write { db in
             try Conversation.deleteAll(db)
         }
     }

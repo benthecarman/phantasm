@@ -7,13 +7,15 @@ struct SettingsView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
 
-    /// Invoked after chat history is fully cleared, so the host can drop the
-    /// open conversation and present a fresh chat.
-    var onHistoryCleared: () -> Void = {}
+    /// The root coordinates live turns with the destructive store write and
+    /// only starts a fresh chat after deletion succeeds.
+    var onDeleteAllHistory: () async throws -> Void = {}
 
     @State private var editing: BackendProfile?
     @State private var isCreating = false
     @State private var isConfirmingDeleteAll = false
+    @State private var isDeletingHistory = false
+    @State private var deletionError: String?
     /// Scanner → confirmation as one sheet (FR-A12), so the hand-off between
     /// the two stages can't race a second presentation.
     @State private var pairingRoute: PairingSheetRoute?
@@ -106,8 +108,17 @@ struct SettingsView: View {
                         Haptics.notify(.warning)
                         isConfirmingDeleteAll = true
                     } label: {
-                        Label("Delete All Chat History", systemImage: "trash")
+                        if isDeletingHistory {
+                            Label {
+                                Text("Deleting Chat History…")
+                            } icon: {
+                                ProgressView()
+                            }
+                        } else {
+                            Label("Delete All Chat History", systemImage: "trash")
+                        }
                     }
+                    .disabled(isDeletingHistory)
                 } footer: {
                     Text("Permanently removes every conversation and its messages from this device. This can't be undone.")
                 }
@@ -136,16 +147,30 @@ struct SettingsView: View {
             ) {
                 Button("Delete All", role: .destructive) {
                     Haptics.notify(.warning)
-                    let store = env.store
+                    isDeletingHistory = true
                     Task {
-                        await env.purgeAllServerImages()
-                        try? await store.deleteAllConversations()
-                        onHistoryCleared()
+                        defer { isDeletingHistory = false }
+                        do {
+                            try await onDeleteAllHistory()
+                        } catch {
+                            deletionError = AppError.from(error).userMessage
+                        }
                     }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Are you sure you want to delete all chat history?")
+            }
+            .alert(
+                "Couldn't Delete Chat History",
+                isPresented: Binding(
+                    get: { deletionError != nil },
+                    set: { if !$0 { deletionError = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(deletionError ?? "Chat history could not be deleted.")
             }
         }
     }

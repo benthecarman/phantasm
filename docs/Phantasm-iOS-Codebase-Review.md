@@ -10,17 +10,12 @@ The iOS app has a strong foundation—good protocol seams, extensive `PhantasmKi
 
 The most urgent findings are:
 
-1. “Delete All” races active streams and reports success even if deletion fails.
-2. Maple encryption does not authenticate the enclave and can silently downgrade.
-3. HealthKit-derived chat content is eligible for iCloud backup.
-4. Dictation can continue across chats/background transitions and its privacy copy overpromises.
-5. Several core controls are inaccessible to VoiceOver and other assistive technologies.
+1. Maple encryption does not authenticate the enclave and can silently downgrade.
+2. HealthKit-derived chat content is eligible for iCloud backup.
+3. Dictation can continue across chats/background transitions and its privacy copy overpromises.
+4. Several core controls are inaccessible to VoiceOver and other assistive technologies.
 
 ## Correctness and Swift-specific bugs
-
-### High severity
-
-- **“Delete All” is not coordinated with live turns.** Cached view models can continue network/tool work and recreate messages after deletion. Database errors are swallowed while the UI unconditionally starts a new chat. Stop and await every live turn and commit, then delete with visible failure handling. See [SettingsView.swift:137](../ios/Views/Settings/SettingsView.swift#L137) and [RootView.swift:317](../ios/Views/RootView.swift#L317).
 
 ### Medium severity
 
@@ -48,9 +43,7 @@ The most urgent findings are:
 
 - Tool/model settings launch independent `try?` persistence tasks that can complete out of order. Serialize or coalesce latest-wins writes. See [ChatViewModel.swift:281](../ios/ViewModels/ChatViewModel.swift#L281).
 
-- Individual history deletion navigates away even if deletion fails, and scanner startup errors are swallowed. See [HistoryDrawer.swift:213](../ios/Views/Chat/HistoryDrawer.swift#L213) and [PairingScanSheet.swift:161](../ios/Views/Pairing/PairingScanSheet.swift#L161).
-
-- Release builds emit unused-result warnings for conversation deletions. Explicitly discard or use the returned deletion count. See [AppDatabase.swift:316](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Persistence/AppDatabase.swift#L316).
+- Scanner startup errors are swallowed. See [PairingScanSheet.swift:161](../ios/Views/Pairing/PairingScanSheet.swift#L161).
 
 No unsafe production force casts from network/user data were found. No definite closure retain cycle, strong delegate leak, unremoved observer, or leaked timer was found.
 

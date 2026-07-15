@@ -60,7 +60,7 @@ struct RootView: View {
             }
         }
         .sheet(isPresented: $showSettings) {
-            SettingsView(onHistoryCleared: { startNewChat() })
+            SettingsView(onDeleteAllHistory: deleteAllHistory)
         }
         .onOpenURL { handlePairingURL($0) }
         .sheet(item: $pairingRoute) { _ in
@@ -193,7 +193,7 @@ struct RootView: View {
             onSelect: { open($0) },
             onNewChat: { startNewChat() },
             onOpenSettings: { showSettings = true; closeDrawer() },
-            onDeleted: { chatViewModels.discard(ids: $0) }
+            onDelete: deleteConversation
         )
         .frame(width: drawerWidth)
         .frame(maxHeight: .infinity)
@@ -274,6 +274,37 @@ struct RootView: View {
         closeDrawer()
     }
 
+    /// Coordinate destructive history deletion with every cached owner of the
+    /// affected conversations. A failed store write leaves the current
+    /// selection in place and re-enables its view model.
+    private func deleteConversation(id: UUID) async throws {
+        await chatViewModels.prepareForDeletion(ids: [id])
+        do {
+            // This must inspect messages before their rows are removed.
+            // Server cleanup is best-effort; the database delete is not.
+            await env.purgeServerImages(conversationID: id)
+            try await env.store.deleteConversation(id: id)
+        } catch {
+            chatViewModels.resumeAfterFailedDeletion(ids: [id])
+            throw error
+        }
+        chatViewModels.discard(ids: [id])
+    }
+
+    private func deleteAllHistory() async throws {
+        await chatViewModels.prepareAllForDeletion()
+        do {
+            // Gather and purge server image references before deleting the rows.
+            await env.purgeAllServerImages()
+            try await env.store.deleteAllConversations()
+        } catch {
+            chatViewModels.resumeAllAfterFailedDeletion()
+            throw error
+        }
+        chatViewModels.discardAll()
+        startNewChat()
+    }
+
     private func open(_ convo: Conversation) {
         selection = convo
         closeDrawer()
@@ -315,6 +346,8 @@ struct RootView: View {
 @MainActor
 private final class ChatViewModelCache {
     private var models: [UUID: ChatViewModel] = [:]
+    private var pendingDeletionIDs: Set<UUID> = []
+    private var isDeletingAll = false
     private let capacity = 16
 
     func viewModel(for id: UUID) -> ChatViewModel {
@@ -328,18 +361,53 @@ private final class ChatViewModelCache {
             }
         }
         let model = ChatViewModel()
+        if isDeletingAll || pendingDeletionIDs.contains(id) {
+            model.beginPreparingForDeletion()
+        }
         models[id] = model
         return model
     }
 
-    /// Stop any in-flight turn and drop the cached VMs for deleted chats — a
-    /// deleted conversation's stream must not keep running or commit into
-    /// rows that no longer exist.
-    func discard(ids: [UUID]) {
+    func prepareForDeletion(ids: [UUID]) async {
+        pendingDeletionIDs.formUnion(ids)
+        for id in ids { models[id]?.beginPreparingForDeletion() }
         for id in ids {
-            guard let model = models.removeValue(forKey: id) else { continue }
-            if model.isStreaming { model.stop() }
+            await models[id]?.prepareForDeletion()
         }
+    }
+
+    func resumeAfterFailedDeletion(ids: [UUID]) {
+        pendingDeletionIDs.subtract(ids)
+        for id in ids {
+            models[id]?.resumeAfterFailedDeletion()
+        }
+    }
+
+    func prepareAllForDeletion() async {
+        isDeletingAll = true
+        let snapshot = Array(models.values)
+        for model in snapshot { model.beginPreparingForDeletion() }
+        for model in snapshot { await model.prepareForDeletion() }
+    }
+
+    func resumeAllAfterFailedDeletion() {
+        isDeletingAll = false
+        for (id, model) in models where !pendingDeletionIDs.contains(id) {
+            model.resumeAfterFailedDeletion()
+        }
+    }
+
+    /// Drop cached VMs only after their turns are drained and their rows were
+    /// successfully removed.
+    func discard(ids: [UUID]) {
+        pendingDeletionIDs.subtract(ids)
+        for id in ids { models.removeValue(forKey: id) }
+    }
+
+    func discardAll() {
+        models.removeAll()
+        pendingDeletionIDs.removeAll()
+        isDeletingAll = false
     }
 
     func setSceneActive(_ active: Bool) {

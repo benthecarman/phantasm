@@ -24,9 +24,12 @@ struct HistoryDrawer: View {
     let onSelect: (Conversation) -> Void
     let onNewChat: () -> Void
     let onOpenSettings: () -> Void
-    /// Called with the ids being deleted, before the rows are removed — the
-    /// owner stops any in-flight turn for them and drops their cached VMs.
-    var onDeleted: ([UUID]) -> Void = { _ in }
+    /// The root stops and drains affected turns, performs the store deletion,
+    /// and drops cached VMs. This returns only after the rows are gone.
+    var onDelete: (UUID) async throws -> Void = { _ in }
+
+    @State private var deletingIDs: Set<UUID> = []
+    @State private var deletionError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -56,6 +59,17 @@ struct HistoryDrawer: View {
             Rectangle()
                 .fill(Color(.separator))
                 .frame(width: 0.5)
+        }
+        .alert(
+            "Couldn't Delete Conversation",
+            isPresented: Binding(
+                get: { deletionError != nil },
+                set: { if !$0 { deletionError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(deletionError ?? "The conversation could not be deleted.")
         }
     }
 
@@ -207,25 +221,21 @@ struct HistoryDrawer: View {
     }
 
     private func deleteConversation(_ conversation: Conversation) {
-        deleteConversations(ids: [conversation.id])
-    }
-
-    private func deleteConversations(ids: [UUID]) {
-        guard !ids.isEmpty else { return }
-        // The reactive keyword list drops the rows on its own; the hybrid
-        // overlay is a snapshot and must not keep showing them.
-        hybridOverlay = nil
-        // Stop in-flight turns first: a deleted chat's stream must not keep
-        // running (holding the backend) or commit into rows being removed.
-        onDeleted(ids)
-        if let selectionID = selection?.id, ids.contains(selectionID) { onNewChat() }
-        let store = env.store
+        let id = conversation.id
+        guard !deletingIDs.contains(id) else { return }
+        deletingIDs.insert(id)
         Task {
-            for id in ids {
-                // Clean up server-hosted images first — it reads the messages
-                // that deleteConversation then hard-deletes.
-                await env.purgeServerImages(conversationID: id)
-                try? await store.deleteConversation(id: id)
+            defer { deletingIDs.remove(id) }
+            do {
+                try await onDelete(id)
+                // The reactive keyword list drops deleted rows on its own; the
+                // hybrid overlay is a snapshot and must be invalidated now.
+                hybridOverlay = nil
+                if selection?.id == id {
+                    onNewChat()
+                }
+            } catch {
+                deletionError = AppError.from(error).userMessage
             }
         }
     }

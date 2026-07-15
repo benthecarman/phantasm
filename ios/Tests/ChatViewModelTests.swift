@@ -85,6 +85,53 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(otherClient.cancellations.isEmpty)
     }
 
+    func testPrepareForDeletionDrainsRescuedStartingTurnBeforeReturning() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation(profileID: env.primaryProfileID)
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        // prepareForDeletion runs before the newly-created turn task gets an
+        // executor slice. stop() must therefore rescue the not-yet-persisted
+        // user row and wait for that rescue before permitting the delete.
+        XCTAssertTrue(vm.send("delete me"))
+        await vm.prepareForDeletion()
+
+        XCTAssertFalse(vm.canSend)
+        let persisted = try await detail(store, conversation.id)
+        XCTAssertEqual(persisted.messages.map(\.message.content), ["delete me"])
+
+        try await store.deleteConversation(id: conversation.id)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        let deleted = try await store.conversationDetail(id: conversation.id)
+        XCTAssertNil(deleted)
+    }
+
+    func testFailedDeletionPreparationCanResumeConversation() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation(profileID: env.primaryProfileID)
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        XCTAssertTrue(vm.send("keep me"))
+        await vm.prepareForDeletion()
+        XCTAssertFalse(vm.canSend)
+
+        // The root calls this when the destructive store write throws. The
+        // stopped turn remains durable and the existing chat becomes usable.
+        vm.resumeAfterFailedDeletion()
+        XCTAssertTrue(vm.canSend)
+
+        client.enqueue(events: [.token("still here"), .done])
+        XCTAssertTrue(vm.send("continue"))
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.messages.last?.message.content == "still here"
+        }
+    }
+
     func testMissingProfileFailsClosedUntilExplicitlyBound() async throws {
         let store = try AppDatabase.empty()
         let ownerClient = ScriptedChatClient()
