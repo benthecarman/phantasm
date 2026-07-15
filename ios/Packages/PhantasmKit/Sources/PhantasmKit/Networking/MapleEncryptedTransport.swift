@@ -67,8 +67,38 @@ public struct MapleChatClient: ChatClienting {
 
 // MARK: - URL loading adapter
 
+/// Serializes URLProtocol client delivery with `stopLoading()`. A recursive lock
+/// permits a client callback to stop the protocol reentrantly; a stop from any
+/// other thread waits for an already-started callback, then prevents all later
+/// callbacks before returning.
+final class MapleURLProtocolCallbackGate: @unchecked Sendable {
+    private enum State { case active, stopped, finished }
+
+    private let lock = NSRecursiveLock()
+    private var state = State.active
+
+    @discardableResult
+    func perform(terminal: Bool = false, _ callback: () -> Void) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard state == .active else { return false }
+        if terminal { state = .finished }
+        callback()
+        return true
+    }
+
+    func stop() {
+        lock.lock()
+        state = .stopped
+        lock.unlock()
+    }
+}
+
 private final class MapleEncryptedURLProtocol: URLProtocol, @unchecked Sendable {
+    private let taskLock = NSLock()
+    private let callbackGate = MapleURLProtocolCallbackGate()
     private var loadingTask: Task<Void, Never>?
+    private var loadingStopped = false
 
     override class func canInit(with request: URLRequest) -> Bool {
         // This protocol is installed only in Maple-specific URL sessions. The
@@ -81,14 +111,29 @@ private final class MapleEncryptedURLProtocol: URLProtocol, @unchecked Sendable 
     }
 
     override func startLoading() {
-        loadingTask = Task { [weak self] in
-            await self?.load()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.load()
         }
+        let shouldCancel = taskLock.withLock {
+            guard !loadingStopped, loadingTask == nil else { return true }
+            loadingTask = task
+            return false
+        }
+        if shouldCancel { task.cancel() }
     }
 
     override func stopLoading() {
-        loadingTask?.cancel()
-        loadingTask = nil
+        // Close callback delivery first. When this returns, no callback can
+        // subsequently begin, even if cancellation races the final byte.
+        callbackGate.stop()
+        let task = taskLock.withLock {
+            loadingStopped = true
+            let task = loadingTask
+            loadingTask = nil
+            return task
+        }
+        task?.cancel()
     }
 
     private func load() async {
@@ -132,8 +177,27 @@ private final class MapleEncryptedURLProtocol: URLProtocol, @unchecked Sendable 
             }
         } catch is CancellationError {
             // URLProtocol cancellation is expected when the user stops a turn.
+        } catch let error as URLError where error.code == .cancelled {
+            // URLSession commonly surfaces task cancellation as URLError rather
+            // than Swift's CancellationError.
         } catch {
-            client?.urlProtocol(self, didFailWithError: error)
+            fail(with: error)
+        }
+    }
+
+    private func deliver(
+        terminal: Bool = false,
+        _ callback: (URLProtocolClient) -> Void
+    ) throws {
+        guard let client,
+              callbackGate.perform(terminal: terminal, { callback(client) })
+        else { throw CancellationError() }
+    }
+
+    private func fail(with error: Error) {
+        guard let client else { return }
+        callbackGate.perform(terminal: true) {
+            client.urlProtocol(self, didFailWithError: error)
         }
     }
 
@@ -143,9 +207,11 @@ private final class MapleEncryptedURLProtocol: URLProtocol, @unchecked Sendable 
         material: MapleSessionMaterial
     ) async throws {
         guard let http = response as? HTTPURLResponse else {
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            try deliver {
+                $0.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            }
             try await relayRaw(bytes)
-            client?.urlProtocolDidFinishLoading(self)
+            try deliver(terminal: true) { $0.urlProtocolDidFinishLoading(self) }
             return
         }
 
@@ -154,42 +220,48 @@ private final class MapleEncryptedURLProtocol: URLProtocol, @unchecked Sendable 
             .lowercased().contains("text/event-stream") == true
 
         if !successful {
-            client?.urlProtocol(
-                self,
-                didReceive: MapleResponseHeaders.sanitized(http, contentType: nil),
-                cacheStoragePolicy: .notAllowed
-            )
+            try deliver {
+                $0.urlProtocol(
+                    self,
+                    didReceive: MapleResponseHeaders.sanitized(http, contentType: nil),
+                    cacheStoragePolicy: .notAllowed
+                )
+            }
             try await relayRaw(bytes)
-            client?.urlProtocolDidFinishLoading(self)
+            try deliver(terminal: true) { $0.urlProtocolDidFinishLoading(self) }
             return
         }
 
         if isSSE {
-            client?.urlProtocol(
-                self,
-                didReceive: MapleResponseHeaders.sanitized(
-                    http, contentType: "text/event-stream; charset=utf-8"
-                ),
-                cacheStoragePolicy: .notAllowed
-            )
+            try deliver {
+                $0.urlProtocol(
+                    self,
+                    didReceive: MapleResponseHeaders.sanitized(
+                        http, contentType: "text/event-stream; charset=utf-8"
+                    ),
+                    cacheStoragePolicy: .notAllowed
+                )
+            }
             for try await line in bytes.lines {
                 try Task.checkCancellation()
                 if let clearEvent = try MapleSSEEnvelope.unwrap(line, using: material.key) {
-                    client?.urlProtocol(self, didLoad: clearEvent)
+                    try deliver { $0.urlProtocol(self, didLoad: clearEvent) }
                 }
             }
-            client?.urlProtocolDidFinishLoading(self)
+            try deliver(terminal: true) { $0.urlProtocolDidFinishLoading(self) }
             return
         }
 
         if http.statusCode == 204 {
-            client?.urlProtocol(
-                self,
-                didReceive: MapleResponseHeaders.sanitized(http, contentType: nil),
-                cacheStoragePolicy: .notAllowed
-            )
+            try deliver {
+                $0.urlProtocol(
+                    self,
+                    didReceive: MapleResponseHeaders.sanitized(http, contentType: nil),
+                    cacheStoragePolicy: .notAllowed
+                )
+            }
             for try await _ in bytes { try Task.checkCancellation() }
-            client?.urlProtocolDidFinishLoading(self)
+            try deliver(terminal: true) { $0.urlProtocolDidFinishLoading(self) }
             return
         }
 
@@ -197,17 +269,22 @@ private final class MapleEncryptedURLProtocol: URLProtocol, @unchecked Sendable 
         for try await byte in bytes {
             try Task.checkCancellation()
             encryptedResponse.append(byte)
+            guard encryptedResponse.count <= MapleTransportLimits.maximumJSONResponseBytes else {
+                throw MapleTransportError.responseTooLarge
+            }
         }
         let clearResponse = try MapleJSONEnvelope.unwrap(encryptedResponse, using: material.key)
-        client?.urlProtocol(
-            self,
-            didReceive: MapleResponseHeaders.sanitized(
-                http, contentType: "application/json"
-            ),
-            cacheStoragePolicy: .notAllowed
-        )
-        client?.urlProtocol(self, didLoad: clearResponse)
-        client?.urlProtocolDidFinishLoading(self)
+        try deliver {
+            $0.urlProtocol(
+                self,
+                didReceive: MapleResponseHeaders.sanitized(
+                    http, contentType: "application/json"
+                ),
+                cacheStoragePolicy: .notAllowed
+            )
+        }
+        try deliver { $0.urlProtocol(self, didLoad: clearResponse) }
+        try deliver(terminal: true) { $0.urlProtocolDidFinishLoading(self) }
     }
 
     private func relayRaw(_ bytes: URLSession.AsyncBytes) async throws {
@@ -217,11 +294,47 @@ private final class MapleEncryptedURLProtocol: URLProtocol, @unchecked Sendable 
             try Task.checkCancellation()
             buffer.append(byte)
             if buffer.count >= 16 * 1024 {
-                client?.urlProtocol(self, didLoad: buffer)
+                try deliver { $0.urlProtocol(self, didLoad: buffer) }
                 buffer.removeAll(keepingCapacity: true)
             }
         }
-        if !buffer.isEmpty { client?.urlProtocol(self, didLoad: buffer) }
+        if !buffer.isEmpty { try deliver { $0.urlProtocol(self, didLoad: buffer) } }
+    }
+}
+
+private enum MapleTransportLimits {
+    static let maximumJSONResponseBytes = 16 * 1_024 * 1_024
+}
+
+/// Collects a response without ever allowing Foundation-facing code to retain
+/// more than the configured cap. Content-Length is rejected before iteration;
+/// chunked/missing-length responses are bounded byte by byte.
+enum MapleBoundedResponse {
+    static func collect<Bytes: AsyncSequence>(
+        _ bytes: Bytes,
+        response: URLResponse,
+        limit: Int
+    ) async throws -> Data where Bytes.Element == UInt8 {
+        guard limit >= 0 else { throw MapleTransportError.responseTooLarge }
+        try validateExpectedLength(response, limit: limit)
+        var data = Data()
+        if response.expectedContentLength > 0 {
+            data.reserveCapacity(min(Int(response.expectedContentLength), limit))
+        }
+        for try await byte in bytes {
+            guard data.count < limit else {
+                throw MapleTransportError.responseTooLarge
+            }
+            data.append(byte)
+        }
+        return data
+    }
+
+    static func validateExpectedLength(_ response: URLResponse, limit: Int) throws {
+        let expected = response.expectedContentLength
+        guard expected < 0 || expected <= Int64(limit) else {
+            throw MapleTransportError.responseTooLarge
+        }
     }
 }
 
@@ -419,16 +532,21 @@ private enum MapleHandshake {
         let attestationURL = base
             .appendingPathComponent("attestation")
             .appendingPathComponent(nonce)
-        let (attestationData, attestationResponse) = try await MapleNetwork.json.data(
+        let (attestationBytes, attestationResponse) = try await MapleNetwork.json.bytes(
             from: attestationURL
+        )
+        let attestationData = try await MapleBoundedResponse.collect(
+            attestationBytes,
+            response: attestationResponse,
+            limit: MapleTransportLimits.maximumJSONResponseBytes
         )
         try requireSuccess(attestationResponse, data: attestationData)
         let attestation = try Wire.decoder().decode(
             AttestationResponse.self, from: attestationData
         )
-        guard let document = Data(base64Encoded: attestation.attestationDocument) else {
-            throw MapleTransportError.invalidBase64
-        }
+        let document = try MapleAttestationDocumentDecoder.decode(
+            attestation.attestationDocument
+        )
         let fields = try MapleAttestationKeyExtractor.extract(from: document)
         guard fields.nonce == Data(nonce.utf8) else {
             throw MapleTransportError.attestationNonceMismatch
@@ -446,7 +564,12 @@ private enum MapleHandshake {
             clientPublicKey: privateKey.publicKey.rawRepresentation.base64EncodedString(),
             nonce: nonce
         ))
-        let (keyData, keyResponse) = try await MapleNetwork.json.data(for: keyRequest)
+        let (keyBytes, keyResponse) = try await MapleNetwork.json.bytes(for: keyRequest)
+        let keyData = try await MapleBoundedResponse.collect(
+            keyBytes,
+            response: keyResponse,
+            limit: MapleTransportLimits.maximumJSONResponseBytes
+        )
         try requireSuccess(keyResponse, data: keyData)
         let exchange = try Wire.decoder().decode(KeyExchangeResponse.self, from: keyData)
         guard UUID(uuidString: exchange.sessionId) != nil,
@@ -467,6 +590,24 @@ private enum MapleHandshake {
             let detail = String(data: data.prefix(2_048), encoding: .utf8) ?? ""
             throw MapleTransportError.httpStatus(http.statusCode, detail)
         }
+    }
+}
+
+enum MapleAttestationDocumentDecoder {
+    static let maximumEncodedBytes =
+        ((MapleAttestationKeyExtractor.maximumDocumentBytes + 2) / 3) * 4
+
+    static func decode(_ encoded: String) throws -> Data {
+        guard encoded.utf8.count <= maximumEncodedBytes else {
+            throw MapleTransportError.responseTooLarge
+        }
+        guard let document = Data(base64Encoded: encoded) else {
+            throw MapleTransportError.invalidBase64
+        }
+        guard document.count <= MapleAttestationKeyExtractor.maximumDocumentBytes else {
+            throw MapleTransportError.responseTooLarge
+        }
+        return document
     }
 }
 
@@ -523,12 +664,17 @@ struct MapleAttestationFields: Equatable {
 }
 
 enum MapleAttestationKeyExtractor {
+    static let maximumDocumentBytes = 1_024 * 1_024
+
     /// Extracts only the key-exchange fields from the Nitro attestation document.
     /// This is parsing, not attestation verification; see
     /// `MapleEncryptedTransport` above.
     static func extract(from document: Data) throws -> MapleAttestationFields {
+        guard document.count <= maximumDocumentBytes else {
+            throw MapleTransportError.responseTooLarge
+        }
         var outerParser = MinimalCBORParser(data: document)
-        let outer = try outerParser.parse().untagged
+        let outer = try outerParser.parseComplete().untagged
         switch outer {
         case .map(let fields):
             return try extract(fromFields: fields)
@@ -538,7 +684,7 @@ enum MapleAttestationKeyExtractor {
                 throw MapleTransportError.invalidAttestationDocument
             }
             var payloadParser = MinimalCBORParser(data: payload)
-            guard case .map(let fields) = try payloadParser.parse().untagged else {
+            guard case .map(let fields) = try payloadParser.parseComplete().untagged else {
                 throw MapleTransportError.invalidAttestationDocument
             }
             return try extract(fromFields: fields)
@@ -586,10 +732,22 @@ private indirect enum MinimalCBORValue {
 }
 
 private struct MinimalCBORParser {
+    private static let maximumNestingDepth = 32
+    private static let maximumCollectionCount = 4_096
+
     let data: Data
     var offset = 0
 
-    mutating func parse() throws -> MinimalCBORValue {
+    mutating func parseComplete() throws -> MinimalCBORValue {
+        let value = try parse(depth: 0)
+        guard offset == data.count else { throw MapleTransportError.invalidCBOR }
+        return value
+    }
+
+    private mutating func parse(depth: Int) throws -> MinimalCBORValue {
+        guard depth <= Self.maximumNestingDepth else {
+            throw MapleTransportError.invalidCBOR
+        }
         let initial = try readByte()
         let major = initial >> 5
         let additional = initial & 0x1f
@@ -601,12 +759,12 @@ private struct MinimalCBORParser {
             guard raw <= UInt64(Int64.max) else { throw MapleTransportError.invalidCBOR }
             return .negative(-1 - Int64(raw))
         case 2:
-            if additional == 31 { return .bytes(try parseIndefiniteBytes()) }
+            if additional == 31 { return .bytes(try parseIndefiniteBytes(depth: depth)) }
             let rawCount = try length(additional)
             let count = try integerCount(rawCount)
             return .bytes(try readData(count: count))
         case 3:
-            if additional == 31 { return .text(try parseIndefiniteText()) }
+            if additional == 31 { return .text(try parseIndefiniteText(depth: depth)) }
             let rawCount = try length(additional)
             let count = try integerCount(rawCount)
             let bytes = try readData(count: count)
@@ -615,23 +773,34 @@ private struct MinimalCBORParser {
             }
             return .text(text)
         case 4:
-            if additional == 31 { return .array(try parseIndefiniteArray()) }
+            if additional == 31 { return .array(try parseIndefiniteArray(depth: depth)) }
             let rawCount = try length(additional)
             let count = try integerCount(rawCount)
+            guard count <= Self.maximumCollectionCount else {
+                throw MapleTransportError.invalidCBOR
+            }
             var values: [MinimalCBORValue] = []
             values.reserveCapacity(count)
-            for _ in 0..<count { values.append(try parse()) }
+            for _ in 0..<count { values.append(try parse(depth: depth + 1)) }
             return .array(values)
         case 5:
-            if additional == 31 { return .map(try parseIndefiniteMap()) }
+            if additional == 31 { return .map(try parseIndefiniteMap(depth: depth)) }
             let rawCount = try length(additional)
             let count = try integerCount(rawCount)
+            guard count <= Self.maximumCollectionCount else {
+                throw MapleTransportError.invalidCBOR
+            }
             var values: [(MinimalCBORValue, MinimalCBORValue)] = []
             values.reserveCapacity(count)
-            for _ in 0..<count { values.append((try parse(), try parse())) }
+            for _ in 0..<count {
+                values.append((
+                    try parse(depth: depth + 1),
+                    try parse(depth: depth + 1)
+                ))
+            }
             return .map(values)
         case 6:
-            return .tagged(try length(additional), try parse())
+            return .tagged(try length(additional), try parse(depth: depth + 1))
         case 7:
             switch additional {
             case 0...23: return .simple(additional)
@@ -662,40 +831,61 @@ private struct MinimalCBORParser {
         return Int(value)
     }
 
-    private mutating func parseIndefiniteBytes() throws -> Data {
+    private mutating func parseIndefiniteBytes(depth: Int) throws -> Data {
         var result = Data()
+        var chunkCount = 0
         while !consumeBreakIfPresent() {
-            guard case .bytes(let chunk) = try parse() else {
+            guard chunkCount < Self.maximumCollectionCount,
+                  case .bytes(let chunk) = try parse(depth: depth + 1),
+                  chunk.count <= data.count - result.count else {
                 throw MapleTransportError.invalidCBOR
             }
             result.append(chunk)
+            chunkCount += 1
         }
         return result
     }
 
-    private mutating func parseIndefiniteText() throws -> String {
+    private mutating func parseIndefiniteText(depth: Int) throws -> String {
         var result = ""
+        var chunkCount = 0
         while !consumeBreakIfPresent() {
-            guard case .text(let chunk) = try parse() else {
+            guard chunkCount < Self.maximumCollectionCount,
+                  case .text(let chunk) = try parse(depth: depth + 1) else {
                 throw MapleTransportError.invalidCBOR
             }
             result.append(chunk)
+            chunkCount += 1
+            guard result.utf8.count <= data.count else {
+                throw MapleTransportError.invalidCBOR
+            }
         }
         return result
     }
 
-    private mutating func parseIndefiniteArray() throws -> [MinimalCBORValue] {
+    private mutating func parseIndefiniteArray(depth: Int) throws -> [MinimalCBORValue] {
         var values: [MinimalCBORValue] = []
         while !consumeBreakIfPresent() {
-            values.append(try parse())
+            guard values.count < Self.maximumCollectionCount else {
+                throw MapleTransportError.invalidCBOR
+            }
+            values.append(try parse(depth: depth + 1))
         }
         return values
     }
 
-    private mutating func parseIndefiniteMap() throws -> [(MinimalCBORValue, MinimalCBORValue)] {
+    private mutating func parseIndefiniteMap(
+        depth: Int
+    ) throws -> [(MinimalCBORValue, MinimalCBORValue)] {
         var values: [(MinimalCBORValue, MinimalCBORValue)] = []
         while !consumeBreakIfPresent() {
-            values.append((try parse(), try parse()))
+            guard values.count < Self.maximumCollectionCount else {
+                throw MapleTransportError.invalidCBOR
+            }
+            values.append((
+                try parse(depth: depth + 1),
+                try parse(depth: depth + 1)
+            ))
         }
         return values
     }
@@ -733,6 +923,7 @@ enum MapleTransportError: Error, LocalizedError, Equatable {
     case invalidBase64
     case invalidUTF8
     case invalidCBOR
+    case responseTooLarge
     case invalidAttestationDocument
     case attestationNonceMismatch
     case invalidKeyExchange
@@ -748,6 +939,7 @@ enum MapleTransportError: Error, LocalizedError, Equatable {
         case .invalidBase64: return "Maple returned invalid encrypted data."
         case .invalidUTF8: return "Maple returned invalid text data."
         case .invalidCBOR: return "Maple returned malformed CBOR."
+        case .responseTooLarge: return "Maple returned a response that was too large."
         case .invalidAttestationDocument: return "Maple returned an unusable attestation document."
         case .attestationNonceMismatch: return "Maple returned an attestation for a different handshake."
         case .invalidKeyExchange: return "Maple returned an invalid key exchange response."

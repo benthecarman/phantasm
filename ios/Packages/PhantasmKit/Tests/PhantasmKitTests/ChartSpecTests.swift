@@ -72,6 +72,8 @@ struct ChartSpecTests {
         let spec = try requireSuccess(ChartSpec.decode(fromArguments: json))
         #expect(spec.isTimeSeries)
         #expect(ChartSpec.parseISODate("2024-01-15") != nil)
+        #expect(ChartSpec.parseISODate("2024-01-15T08:30:00.123Z") != nil)
+        #expect(ChartSpec.parseISODate("2024-02-31") == nil)
         #expect(ChartSpec.parseISODate("Q1") == nil)
     }
 

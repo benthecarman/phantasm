@@ -16,6 +16,7 @@ struct PairingScanSheet: View {
 
     @State private var cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
     @State private var hint: String?
+    @State private var scannerStartupError: String?
     @State private var handled = false
 
     var body: some View {
@@ -56,7 +57,13 @@ struct PairingScanSheet: View {
     }
 
     private var scanner: some View {
-        QRScannerRepresentable { handle($0) }
+        QRScannerRepresentable(
+            onScan: { handle($0) },
+            onStartupError: { error in
+                scannerStartupError = "Camera scanning couldn't start: \(error.localizedDescription)"
+            },
+            onStartupSuccess: { scannerStartupError = nil }
+        )
             .ignoresSafeArea(edges: .bottom)
             .overlay(alignment: .bottom) {
                 VStack(spacing: 12) {
@@ -93,8 +100,8 @@ struct PairingScanSheet: View {
 
     @ViewBuilder
     private var hintLabel: some View {
-        if let hint {
-            Text(hint)
+        if let message = hint ?? scannerStartupError {
+            Text(message)
                 .font(.callout)
                 .padding(10)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -142,9 +149,15 @@ struct PairingScanSheet: View {
 /// so startScanning() can't fail on permissions.
 private struct QRScannerRepresentable: UIViewControllerRepresentable {
     let onScan: (String) -> Void
+    let onStartupError: (Error) -> Void
+    let onStartupSuccess: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onScan: onScan)
+        Coordinator(
+            onScan: onScan,
+            onStartupError: onStartupError,
+            onStartupSuccess: onStartupSuccess
+        )
     }
 
     func makeUIViewController(context: Context) -> DataScannerViewController {
@@ -160,7 +173,12 @@ private struct QRScannerRepresentable: UIViewControllerRepresentable {
 
     func updateUIViewController(_ scanner: DataScannerViewController, context: Context) {
         guard !scanner.isScanning else { return }
-        try? scanner.startScanning()
+        do {
+            try scanner.startScanning()
+            context.coordinator.reportStartupSuccessIfNeeded()
+        } catch {
+            context.coordinator.reportStartupError(error)
+        }
     }
 
     static func dismantleUIViewController(_ scanner: DataScannerViewController, coordinator: Coordinator) {
@@ -169,9 +187,34 @@ private struct QRScannerRepresentable: UIViewControllerRepresentable {
 
     final class Coordinator: NSObject, DataScannerViewControllerDelegate {
         let onScan: (String) -> Void
+        let onStartupError: (Error) -> Void
+        let onStartupSuccess: () -> Void
+        var didReportStartupError = false
 
-        init(onScan: @escaping (String) -> Void) {
+        init(
+            onScan: @escaping (String) -> Void,
+            onStartupError: @escaping (Error) -> Void,
+            onStartupSuccess: @escaping () -> Void
+        ) {
             self.onScan = onScan
+            self.onStartupError = onStartupError
+            self.onStartupSuccess = onStartupSuccess
+        }
+
+        func reportStartupError(_ error: Error) {
+            guard !didReportStartupError else { return }
+            didReportStartupError = true
+            DispatchQueue.main.async { [onStartupError] in
+                onStartupError(error)
+            }
+        }
+
+        func reportStartupSuccessIfNeeded() {
+            guard didReportStartupError else { return }
+            didReportStartupError = false
+            DispatchQueue.main.async { [onStartupSuccess] in
+                onStartupSuccess()
+            }
         }
 
         func dataScanner(

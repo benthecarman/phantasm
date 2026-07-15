@@ -5,14 +5,17 @@ import PhantasmKit
 /// EventKit-backed `CalendarProviding` for the app-hosted Calendar tools. Lives
 /// in the app target (EventKit is kept out of `PhantasmKit` so the package stays
 /// host-testable); the pure tool types hold this behind the protocol.
-@MainActor
-final class CalendarProvider: CalendarProviding {
+actor CalendarProvider: CalendarProviding {
     private let store = EKEventStore()
 
     /// Prompt for full calendar access now, if the user hasn't been asked. Called
     /// when the calendar tool is enabled for a chat so the system sheet appears on
     /// that tap rather than on the model's first call.
-    func requestAuthorization() {
+    nonisolated func requestAuthorization() {
+        Task { await requestAuthorizationIfNeeded() }
+    }
+
+    private func requestAuthorizationIfNeeded() {
         guard EKEventStore.authorizationStatus(for: .event) == .notDetermined else { return }
         store.requestFullAccessToEvents { _, _ in }
     }
@@ -38,23 +41,19 @@ final class CalendarProvider: CalendarProviding {
             end: query.end,
             calendars: matchedCalendars
         )
-        // events(matching:) is a synchronous fetch Apple documents as
-        // background-thread work, and the range is model-controlled — a large
-        // calendar window must not stall the main actor mid-turn. EKEventStore
-        // is thread-safe; only value types cross back.
-        let store = self.store
-        let events = await Task.detached(priority: .userInitiated) {
-            Array(
-                store.events(matching: predicate)
-                    .filter { Self.eventMatchesText($0, query: query) }
-                    .sorted {
-                        if $0.startDate != $1.startDate { return $0.startDate < $1.startDate }
-                        return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
-                    }
-                    .prefix(query.maxResults)
-                    .map { Self.calendarEvent(from: $0, includeNotes: query.includeNotes) }
-            )
-        }.value
+        // Keep every operation on this actor. In particular, never capture the
+        // actor-owned EKEventStore in detached work while another call may save
+        // through the same instance.
+        let events = Array(
+            store.events(matching: predicate)
+                .filter { Self.eventMatchesText($0, query: query) }
+                .sorted {
+                    if $0.startDate != $1.startDate { return $0.startDate < $1.startDate }
+                    return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+                }
+                .prefix(query.maxResults)
+                .map { Self.calendarEvent(from: $0, includeNotes: query.includeNotes) }
+        )
         return .success(events)
     }
 

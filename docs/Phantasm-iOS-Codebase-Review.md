@@ -1,12 +1,12 @@
 # Phantasm iOS Codebase Review
 
-Correctness, lifecycle, performance, security, architecture, accessibility, and UX review of the `ios/` application and `PhantasmKit`.
+Lifecycle, performance, security, architecture, accessibility, and UX review of the `ios/` application and `PhantasmKit`.
 
 Review date: July 14, 2026
 
 ## Review outcome
 
-The iOS app has a strong foundation—good protocol seams, extensive `PhantasmKit` tests, buffer-then-commit persistence, bounded attachment processing, and generally modern SwiftUI—but several correctness, privacy, and performance issues deserve attention before the next release.
+The iOS app has a strong foundation—good protocol seams, extensive `PhantasmKit` tests, buffer-then-commit persistence, bounded attachment processing, and generally modern SwiftUI—but several lifecycle, privacy, and performance issues deserve attention before the next release.
 
 The most urgent findings are:
 
@@ -14,38 +14,6 @@ The most urgent findings are:
 2. HealthKit-derived chat content is eligible for iCloud backup.
 3. Dictation can continue across chats/background transitions and its privacy copy overpromises.
 4. Several core controls are inaccessible to VoiceOver and other assistive technologies.
-
-## Correctness and Swift-specific bugs
-
-### Medium severity
-
-- **One-shot SSE consumers accept truncated streams.** `complete()` returns accumulated text without requiring `.done`; native Ollama also finishes on premature EOF. Broken connections can therefore produce truncated Siri answers or titles as successful responses. See [SSEStream.swift:243](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Networking/SSEStream.swift#L243) and [OllamaNativeChatClient.swift:77](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Networking/OllamaNativeChatClient.swift#L77).
-
-- **A Calendar side effect can succeed while its durable result is lost.** After event creation, `updateMessage` uses `try?`, and the model continues with the placeholder “outcome pending.” Require the update before continuation and persist an idempotent side-effect state. See [ChatViewModel.swift:948](../ios/ViewModels/ChatViewModel.swift#L948).
-
-- **Stale dictation startup tasks can overwrite a newer readiness state.** Generation checks happen after some `.ready`/`.failed` writes. Check the generation before every state mutation. See [DictationController.swift:55](../ios/App/Speech/DictationController.swift#L55).
-
-- **Dictation engine lifecycle state can race recognition/audio callbacks.** Teardown mutates request, converter, and engine state while callbacks can still read it. Confine lifecycle state to an actor or serial executor. See [LegacySpeechDictationEngine.swift:45](../ios/App/Speech/Dictation/LegacySpeechDictationEngine.swift#L45) and [SpeechAnalyzerDictationEngine.swift:49](../ios/App/Speech/Dictation/SpeechAnalyzerDictationEngine.swift#L49).
-
-- **EventKit crosses executors unsafely.** A main-actor-owned `EKEventStore` is captured by `Task.detached` while saves use the same instance elsewhere. Put EventKit access on one actor/serial executor. See [CalendarProvider.swift:36](../ios/App/CalendarProvider.swift#L36).
-
-- **The Now Playing coordinator has unisolated global mutation.** Playback state and callbacks are accessed from UI and remote-command callbacks without actor isolation. Make it `@MainActor` and marshal remote callbacks explicitly. See [GeneratedAudioNowPlayingCoordinator.swift:8](../ios/Views/Chat/GeneratedAudioNowPlayingCoordinator.swift#L8).
-
-- **Maple URLProtocol task cancellation is unsynchronized.** `startLoading` and `stopLoading` can race around `loadingTask`, despite the class being declared `@unchecked Sendable`. Protect it with a state machine or lock. See [MapleEncryptedTransport.swift:70](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Networking/MapleEncryptedTransport.swift#L70).
-
-- **Malformed Maple CBOR can drive excessive allocation or recursion.** Attacker-controlled collection counts reach `reserveCapacity` without input, count, or nesting limits. Add response-size, recursion-depth, and collection-count bounds. See [MapleEncryptedTransport.swift:422](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Networking/MapleEncryptedTransport.swift#L422).
-
-- **HealthKit query errors are converted to “no data.”** Operational failures become indistinguishable from genuine absence or privacy-preserving denial. Preserve the denial behavior, but surface other query failures to the tool result. See [HealthKitProvider.swift:268](../ios/App/HealthKitProvider.swift#L268).
-
-- **Shared ISO8601 formatters are Swift 6 concurrency debt.** Replace static mutable `ISO8601DateFormatter` instances with `Date.ISO8601FormatStyle` or synchronize them. See [ChartSpec.swift:170](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Charts/ChartSpec.swift#L170).
-
-### Lower-priority correctness work
-
-- Tool/model settings launch independent `try?` persistence tasks that can complete out of order. Serialize or coalesce latest-wins writes. See [ChatViewModel.swift:281](../ios/ViewModels/ChatViewModel.swift#L281).
-
-- Scanner startup errors are swallowed. See [PairingScanSheet.swift:161](../ios/Views/Pairing/PairingScanSheet.swift#L161).
-
-No unsafe production force casts from network/user data were found. No definite closure retain cycle, strong delegate leak, unremoved observer, or leaked timer was found.
 
 ## Lifecycle and state
 

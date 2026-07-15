@@ -6,6 +6,17 @@ import XCTest
 /// including the leading `delta.role=assistant` open chunk and the `[DONE]`
 /// sentinel. This is the path that has no other coverage.
 final class ChatClientStreamTests: XCTestCase {
+    private struct ImmediatelyFinishedClient: ChatClienting {
+        func stream(
+            _ request: ChatRequest,
+            base: URL,
+            token: String,
+            turnID: String?
+        ) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+            AsyncThrowingStream { $0.finish() }
+        }
+    }
+
     final class SSEProtocol: URLProtocol {
         // Whole SSE body, captured from the live orchestrator.
         nonisolated(unsafe) static var body = ""
@@ -98,6 +109,55 @@ final class ChatClientStreamTests: XCTestCase {
             guard case .modelError = error else {
                 return XCTFail("expected modelError, got \(error)")
             }
+        }
+    }
+
+    func testOneShotCompletionRejectsTruncatedStream() async throws {
+        SSEProtocol.body = [
+            #"data: {"choices":[{"delta":{"content":"partial"}}]}"#,
+            "",
+        ].joined(separator: "\n")
+
+        let request = ChatRequest(
+            model: "m",
+            messages: [WireMessage(role: "user", content: "title this")]
+        )
+        do {
+            _ = try await ChatClient(session: session()).complete(
+                request,
+                base: URL(string: "https://backend.example")!,
+                token: "k"
+            )
+            XCTFail("expected premature EOF to throw")
+        } catch let error as AppError {
+            XCTAssertEqual(
+                error,
+                .modelError("The connection closed before the response finished.")
+            )
+        }
+    }
+
+    func testOneShotCompletionPreservesCancellationAtEOF() async throws {
+        let request = ChatRequest(
+            model: "m",
+            messages: [WireMessage(role: "user", content: "title this")]
+        )
+        let task = Task {
+            try await ImmediatelyFinishedClient().complete(
+                request,
+                base: URL(string: "https://backend.example")!,
+                token: "k"
+            )
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected: cancellation must not be translated to premature EOF.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
         }
     }
 }

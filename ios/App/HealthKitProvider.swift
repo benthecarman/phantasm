@@ -17,6 +17,10 @@ import PhantasmKit
 final class HealthKitProvider: HealthProviding, @unchecked Sendable {
     private let store = HKHealthStore()
 
+    private struct QueryFailure: Error {
+        let underlying: Error
+    }
+
     /// Every type the tool may read, used for a single up-front authorization
     /// request that covers all metrics.
     private var readTypes: Set<HKObjectType> {
@@ -265,16 +269,28 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
         let predicate = HKQuery.predicateForSamples(
             withStart: query.start, end: query.end, options: .strictStartDate)
 
-        let statistics: HKStatistics? = await withCheckedContinuation { continuation in
+        let statisticsResult: Result<HKStatistics?, QueryFailure> = await withCheckedContinuation {
+            continuation in
             let statsQuery = HKStatisticsQuery(
                 quantityType: spec.type, quantitySamplePredicate: predicate,
                 options: spec.options
-            ) { _, statistics, _ in
-                continuation.resume(returning: statistics)
+            ) { _, statistics, error in
+                if let error {
+                    continuation.resume(returning: .failure(QueryFailure(underlying: error)))
+                } else {
+                    continuation.resume(returning: .success(statistics))
+                }
             }
             store.execute(statsQuery)
         }
 
+        let statistics: HKStatistics?
+        switch statisticsResult {
+        case .success(let value):
+            statistics = value
+        case .failure(let failure):
+            return Self.queryFailureReading(failure.underlying, metric: metric)
+        }
         guard let statistics else { return .noData }
         func value(_ quantity: HKQuantity?) -> Double? {
             quantity.map { $0.doubleValue(for: spec.unit) * spec.scale }
@@ -283,11 +299,21 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
         switch metric.kind {
         case .cumulative:
             guard let sum = value(statistics.sumQuantity()) else { return .noData }
-            let daily = await quantityDailyBuckets(metric, spec: spec, query: query)
+            let daily: [HealthQuantityBucket]
+            switch await quantityDailyBuckets(metric, spec: spec, query: query) {
+            case .success(let buckets): daily = buckets
+            case .failure(let failure):
+                return Self.queryFailureReading(failure.underlying, metric: metric)
+            }
             return .quantity(HealthSummary(unit: spec.displayUnit, sum: sum, daily: daily))
         case .discrete:
             guard let average = value(statistics.averageQuantity()) else { return .noData }
-            let daily = await quantityDailyBuckets(metric, spec: spec, query: query)
+            let daily: [HealthQuantityBucket]
+            switch await quantityDailyBuckets(metric, spec: spec, query: query) {
+            case .success(let buckets): daily = buckets
+            case .failure(let failure):
+                return Self.queryFailureReading(failure.underlying, metric: metric)
+            }
             return .quantity(HealthSummary(
                 unit: spec.displayUnit, average: average,
                 minimum: value(statistics.minimumQuantity()),
@@ -295,7 +321,12 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
                 daily: daily))
         case .latest:
             guard let latest = value(statistics.mostRecentQuantity()) else { return .noData }
-            let daily = await quantityDailyBuckets(metric, spec: spec, query: query)
+            let daily: [HealthQuantityBucket]
+            switch await quantityDailyBuckets(metric, spec: spec, query: query) {
+            case .success(let buckets): daily = buckets
+            case .failure(let failure):
+                return Self.queryFailureReading(failure.underlying, metric: metric)
+            }
             return .quantity(HealthSummary(
                 unit: spec.displayUnit, latest: latest,
                 latestDate: statistics.mostRecentQuantityDateInterval()?.start,
@@ -307,8 +338,8 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
 
     private func quantityDailyBuckets(
         _ metric: HealthMetric, spec: QuantitySpec, query: HealthQuery
-    ) async -> [HealthQuantityBucket] {
-        guard query.granularity == .daily else { return [] }
+    ) async -> Result<[HealthQuantityBucket], QueryFailure> {
+        guard query.granularity == .daily else { return .success([]) }
         let predicate = HKQuery.predicateForSamples(
             withStart: query.start, end: query.end, options: .strictStartDate)
         return await withCheckedContinuation { continuation in
@@ -319,9 +350,13 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
                 anchorDate: query.start,
                 intervalComponents: DateComponents(day: 1)
             )
-            collectionQuery.initialResultsHandler = { _, collection, _ in
+            collectionQuery.initialResultsHandler = { _, collection, error in
+                if let error {
+                    continuation.resume(returning: .failure(QueryFailure(underlying: error)))
+                    return
+                }
                 guard let collection else {
-                    continuation.resume(returning: [])
+                    continuation.resume(returning: .success([]))
                     return
                 }
                 var buckets: [HealthQuantityBucket] = []
@@ -330,7 +365,7 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
                         buckets.append(bucket)
                     }
                 }
-                continuation.resume(returning: buckets)
+                continuation.resume(returning: .success(buckets))
             }
             store.execute(collectionQuery)
         }
@@ -367,14 +402,27 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
     private func sleepReading(query: HealthQuery) async -> HealthReading {
         let predicate = HKQuery.predicateForSamples(
             withStart: query.start, end: query.end, options: .strictStartDate)
-        let samples: [HKCategorySample] = await withCheckedContinuation { continuation in
+        let samplesResult: Result<[HKCategorySample], QueryFailure> = await withCheckedContinuation {
+            continuation in
             let sampleQuery = HKSampleQuery(
                 sampleType: HKCategoryType(.sleepAnalysis), predicate: predicate,
                 limit: HKObjectQueryNoLimit, sortDescriptors: nil
-            ) { _, samples, _ in
-                continuation.resume(returning: (samples as? [HKCategorySample]) ?? [])
+            ) { _, samples, error in
+                if let error {
+                    continuation.resume(returning: .failure(QueryFailure(underlying: error)))
+                } else {
+                    continuation.resume(returning: .success(
+                        (samples as? [HKCategorySample]) ?? []
+                    ))
+                }
             }
             store.execute(sampleQuery)
+        }
+        let samples: [HKCategorySample]
+        switch samplesResult {
+        case .success(let value): samples = value
+        case .failure(let failure):
+            return Self.queryFailureReading(failure.underlying, metric: .sleep)
         }
         guard !samples.isEmpty else { return .noData }
 
@@ -550,14 +598,27 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
         guard let spec = Self.categorySpec(for: metric) else { return .noData }
         let predicate = HKQuery.predicateForSamples(
             withStart: query.start, end: query.end, options: .strictStartDate)
-        let samples: [HKCategorySample] = await withCheckedContinuation { continuation in
+        let samplesResult: Result<[HKCategorySample], QueryFailure> = await withCheckedContinuation {
+            continuation in
             let sampleQuery = HKSampleQuery(
                 sampleType: spec.type, predicate: predicate,
                 limit: HKObjectQueryNoLimit, sortDescriptors: nil
-            ) { _, samples, _ in
-                continuation.resume(returning: (samples as? [HKCategorySample]) ?? [])
+            ) { _, samples, error in
+                if let error {
+                    continuation.resume(returning: .failure(QueryFailure(underlying: error)))
+                } else {
+                    continuation.resume(returning: .success(
+                        (samples as? [HKCategorySample]) ?? []
+                    ))
+                }
             }
             store.execute(sampleQuery)
+        }
+        let samples: [HKCategorySample]
+        switch samplesResult {
+        case .success(let value): samples = value
+        case .failure(let failure):
+            return Self.queryFailureReading(failure.underlying, metric: metric)
         }
         guard !samples.isEmpty else { return .noData }
 
@@ -698,14 +759,25 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
         let predicate = HKQuery.predicateForSamples(
             withStart: query.start, end: query.end, options: .strictStartDate)
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: false)
-        let workouts: [HKWorkout] = await withCheckedContinuation { continuation in
+        let workoutsResult: Result<[HKWorkout], QueryFailure> = await withCheckedContinuation {
+            continuation in
             let sampleQuery = HKSampleQuery(
                 sampleType: HKObjectType.workoutType(), predicate: predicate,
                 limit: 20, sortDescriptors: [sort]
-            ) { _, samples, _ in
-                continuation.resume(returning: (samples as? [HKWorkout]) ?? [])
+            ) { _, samples, error in
+                if let error {
+                    continuation.resume(returning: .failure(QueryFailure(underlying: error)))
+                } else {
+                    continuation.resume(returning: .success((samples as? [HKWorkout]) ?? []))
+                }
             }
             store.execute(sampleQuery)
+        }
+        let workouts: [HKWorkout]
+        switch workoutsResult {
+        case .success(let value): workouts = value
+        case .failure(let failure):
+            return Self.queryFailureReading(failure.underlying, metric: .workouts)
         }
         guard !workouts.isEmpty else { return .noData }
 
@@ -736,6 +808,27 @@ final class HealthKitProvider: HealthProviding, @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    /// HealthKit intentionally hides read authorization denial by returning no
+    /// samples. Preserve that privacy behavior if a denial code does surface,
+    /// while distinguishing real query failures from an empty data set.
+    private static func queryFailureReading(
+        _ error: Error,
+        metric: HealthMetric
+    ) -> HealthReading {
+        let nsError = error as NSError
+        let isAuthorizationDenial = nsError.domain == HKErrorDomain
+            && (
+                nsError.code == HKError.Code.errorAuthorizationDenied.rawValue
+                    || nsError.code == HKError.Code.errorAuthorizationNotDetermined.rawValue
+            )
+        if isAuthorizationDenial {
+            return .noData
+        }
+        return .unavailable(
+            "couldn't read \(metric.rawValue) from Apple Health: \(error.localizedDescription)"
+        )
     }
 
     /// A short, human-readable name for the common workout activity types; the

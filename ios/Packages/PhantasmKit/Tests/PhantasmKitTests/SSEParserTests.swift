@@ -317,6 +317,33 @@ final class OllamaNativeChatClientTests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(json["think"] as? Bool, true)
     }
+
+    func testNativeClientRejectsPrematureEOF() async throws {
+        NativeProtocol.responseBody = """
+        {"model":"native-model","created_at":"2026-06-24T07:17:27Z","message":{"role":"assistant","content":"partial"},"done":false}
+
+        """
+        let request = ChatRequest(
+            model: "native-model",
+            messages: [WireMessage(role: "user", content: "hi")]
+        )
+
+        do {
+            _ = try await collect(
+                OllamaNativeChatClient(session: session()).stream(
+                    request,
+                    base: URL(string: "https://backend.example")!,
+                    token: ""
+                )
+            )
+            XCTFail("expected premature EOF to throw")
+        } catch let error as AppError {
+            XCTAssertEqual(
+                error,
+                .modelError("The connection closed before the response finished.")
+            )
+        }
+    }
 }
 
 private extension InputStream {

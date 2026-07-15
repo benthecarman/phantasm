@@ -253,6 +253,121 @@ final class MapleEncryptedTransportTests: XCTestCase {
         XCTAssertThrowsError(try MapleAttestationKeyExtractor.extract(from: cose))
     }
 
+    func testAttestationParserRejectsOversizedDocument() {
+        let document = Data(
+            repeating: 0,
+            count: MapleAttestationKeyExtractor.maximumDocumentBytes + 1
+        )
+
+        XCTAssertThrowsError(try MapleAttestationKeyExtractor.extract(from: document)) { error in
+            XCTAssertEqual(error as? MapleTransportError, .responseTooLarge)
+        }
+    }
+
+    func testBoundedResponseRejectsDeclaredLengthBeforeReading() async throws {
+        let response = URLResponse(
+            url: URL(string: "https://enclave.example/attestation")!,
+            mimeType: "application/json",
+            expectedContentLength: 5,
+            textEncodingName: nil
+        )
+        let bytes = AsyncStream<UInt8> { continuation in
+            continuation.yield(0x7b)
+            continuation.finish()
+        }
+
+        do {
+            _ = try await MapleBoundedResponse.collect(bytes, response: response, limit: 4)
+            XCTFail("expected declared oversized response to fail")
+        } catch {
+            XCTAssertEqual(error as? MapleTransportError, .responseTooLarge)
+        }
+    }
+
+    func testBoundedResponseRejectsChunkedBodyAtCap() async throws {
+        let response = URLResponse(
+            url: URL(string: "https://enclave.example/key_exchange")!,
+            mimeType: "application/json",
+            expectedContentLength: -1,
+            textEncodingName: nil
+        )
+        let bytes = AsyncStream<UInt8> { continuation in
+            for byte in [UInt8](repeating: 0x61, count: 5) {
+                continuation.yield(byte)
+            }
+            continuation.finish()
+        }
+
+        do {
+            _ = try await MapleBoundedResponse.collect(bytes, response: response, limit: 4)
+            XCTFail("expected chunked oversized response to fail")
+        } catch {
+            XCTAssertEqual(error as? MapleTransportError, .responseTooLarge)
+        }
+    }
+
+    func testAttestationBase64IsBoundedBeforeDecode() {
+        let oversized = String(
+            repeating: "A",
+            count: MapleAttestationDocumentDecoder.maximumEncodedBytes + 1
+        )
+
+        XCTAssertThrowsError(try MapleAttestationDocumentDecoder.decode(oversized)) { error in
+            XCTAssertEqual(error as? MapleTransportError, .responseTooLarge)
+        }
+    }
+
+    func testURLProtocolCallbackGateWaitsForDeliveryThenStopsFutureCallbacks() {
+        let gate = MapleURLProtocolCallbackGate()
+        let callbackEntered = DispatchSemaphore(value: 0)
+        let releaseCallback = DispatchSemaphore(value: 0)
+        let callbackReturned = DispatchSemaphore(value: 0)
+        let stopReturned = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global().async {
+            _ = gate.perform {
+                callbackEntered.signal()
+                releaseCallback.wait()
+            }
+            callbackReturned.signal()
+        }
+        XCTAssertEqual(callbackEntered.wait(timeout: .now() + 1), .success)
+
+        DispatchQueue.global().async {
+            gate.stop()
+            stopReturned.signal()
+        }
+        XCTAssertEqual(
+            stopReturned.wait(timeout: .now() + 0.05),
+            .timedOut,
+            "stop must not return while a client callback is still running"
+        )
+
+        releaseCallback.signal()
+        XCTAssertEqual(callbackReturned.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(stopReturned.wait(timeout: .now() + 1), .success)
+        XCTAssertFalse(gate.perform { XCTFail("callback ran after stop") })
+    }
+
+    func testAttestationParserRejectsExcessiveNesting() {
+        // Tag 0 wrapped deeply around an otherwise valid empty map.
+        var document = Data(repeating: 0xc0, count: 34)
+        document.append(0xa0)
+
+        XCTAssertThrowsError(try MapleAttestationKeyExtractor.extract(from: document)) { error in
+            XCTAssertEqual(error as? MapleTransportError, .invalidCBOR)
+        }
+    }
+
+    func testAttestationParserRejectsOversizedCollectionBeforeAllocating() {
+        // array(4097), encoded as a 32-bit collection length with no payload.
+        let document = Data([0x9a, 0x00, 0x00, 0x10, 0x01])
+
+        XCTAssertThrowsError(try MapleAttestationKeyExtractor.extract(from: document)) { error in
+            XCTAssertEqual(error as? MapleTransportError, .invalidCBOR)
+        }
+    }
+
     private func cborText(_ text: String) -> Data {
         cbor(major: 3, data: Data(text.utf8))
     }

@@ -170,28 +170,38 @@ public extension ChartSpec {
     static func parseISODate(_ string: String) -> Date? {
         let trimmed = string.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-        if let date = isoDateTime.date(from: trimmed) { return date }
-        if let date = isoDateTimeFractional.date(from: trimmed) { return date }
-        return isoDateOnly.date(from: trimmed)
+        if let date = try? isoDateTime.parse(trimmed) { return date }
+        if let date = try? isoDateTimeFractional.parse(trimmed) { return date }
+        return parseISODateOnly(trimmed)
     }
 
-    private static let isoDateTime: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
+    private static let isoDateTime = Date.ISO8601FormatStyle(
+        includingFractionalSeconds: false,
+        timeZone: .gmt
+    )
 
-    private static let isoDateTimeFractional: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
+    private static let isoDateTimeFractional = Date.ISO8601FormatStyle(
+        includingFractionalSeconds: true,
+        timeZone: .gmt
+    )
 
-    private static let isoDateOnly: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd"
-        return f
-    }()
+    private static func parseISODateOnly(_ value: String) -> Date? {
+        let parts = value.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              parts[0].count == 4, parts[1].count == 2, parts[2].count == 2,
+              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2])
+        else { return nil }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        var components = DateComponents()
+        components.calendar = calendar
+        components.timeZone = calendar.timeZone
+        components.year = year
+        components.month = month
+        components.day = day
+        guard components.isValidDate(in: calendar) else { return nil }
+        return calendar.date(from: components)
+    }
 }

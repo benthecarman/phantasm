@@ -246,8 +246,23 @@ public extension ChatClienting {
     /// Intended for short side-queries such as title generation.
     func complete(_ request: ChatRequest, base: URL, token: String) async throws -> String {
         var text = ""
+        var sawDone = false
         for try await event in stream(request, base: base, token: token) {
-            if case .token(let t) = event { text += t }
+            switch event {
+            case .token(let token):
+                text += token
+            case .done:
+                sawDone = true
+            default:
+                break
+            }
+        }
+        // Some stream producers translate cancellation into an ordinary EOF.
+        // Preserve cancellation semantics instead of misclassifying that EOF as
+        // a truncated backend response.
+        try Task.checkCancellation()
+        guard sawDone else {
+            throw AppError.modelError("The connection closed before the response finished.")
         }
         return text
     }

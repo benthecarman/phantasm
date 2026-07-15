@@ -63,11 +63,14 @@ final class DictationController {
                 })
             } catch {
                 await engine.cancel()
+                guard gen == generation else { return }
                 readyState = .failed(Self.message(for: error))
-                if gen == generation {
-                    isRecording = false
-                    errorMessage = Self.message(for: error)
-                }
+                isRecording = false
+                errorMessage = Self.message(for: error)
+                return
+            }
+            guard gen == generation else {
+                await engine.cancel()
                 return
             }
             // Permissions + language model are confirmed available.
@@ -75,7 +78,7 @@ final class DictationController {
             // The user may have released (stop) or cancelled while we were
             // starting up. Both run on the main actor, so by the time we resume
             // here `isRecording`/`generation` reflect that — tear down if so.
-            guard gen == generation, isRecording else {
+            guard isRecording else {
                 await engine.cancel()
                 return
             }

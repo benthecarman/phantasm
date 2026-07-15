@@ -2,22 +2,18 @@ import AVFoundation
 import Foundation
 import Speech
 
-/// iOS 26+ dictation via `SpeechAnalyzer` + `SpeechTranscriber`. Captures mic
-/// audio with `AVAudioEngine`, converts it to the analyzer's preferred format,
-/// streams it in, and accumulates finalized transcript segments.
+/// iOS 26+ dictation via `SpeechAnalyzer` + `SpeechTranscriber`. Session
+/// lifecycle and transcript state are actor-confined; the real-time audio
+/// callback owns only a synchronized conversion sink.
 @available(iOS 26.0, *)
-final class SpeechAnalyzerDictationEngine: DictationEngine {
+actor SpeechAnalyzerDictationEngine: DictationEngine {
     private let audioEngine = AVAudioEngine()
     private var analyzer: SpeechAnalyzer?
     private var transcriber: SpeechTranscriber?
-    private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
     private var resultsTask: Task<Void, Never>?
-    private var converter: AVAudioConverter?
-    private var analyzerFormat: AVAudioFormat?
-
-    /// Accumulated finalized transcript. Mutated from the results task and read
-    /// when finishing, so guard it with a lock.
-    private let lock = NSLock()
+    private var audioSink: AnalyzerAudioInputSink?
+    private var tapInstalled = false
+    private var acceptsResults = false
     private var finalizedText = ""
 
     private let desiredLocale: Locale
@@ -29,7 +25,8 @@ final class SpeechAnalyzerDictationEngine: DictationEngine {
     // MARK: - DictationEngine
 
     func start(onPartial: @escaping @Sendable (String) -> Void) async throws {
-        lock.withLock { finalizedText = "" }
+        finalizedText = ""
+        acceptsResults = true
         guard await requestMicrophonePermission() else { throw DictationError.microphoneDenied }
 
         let (transcriber, locale) = try await makeTranscriber()
@@ -39,27 +36,32 @@ final class SpeechAnalyzerDictationEngine: DictationEngine {
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         self.analyzer = analyzer
 
-        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-            throw DictationError.unavailable("Couldn't find a compatible audio format for dictation.")
+        guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(
+            compatibleWith: [transcriber]
+        ) else {
+            throw DictationError.unavailable(
+                "Couldn't find a compatible audio format for dictation."
+            )
         }
-        analyzerFormat = format
 
         // Consume results as they stream in: commit finalized segments and track
         // the in-progress (volatile) tail, emitting the running transcript.
-        resultsTask = Task { [weak self] in
-            guard let self, let transcriber = self.transcriber else { return }
+        resultsTask = Task { [weak self, transcriber] in
             var volatileText = ""
             do {
                 for try await result in transcriber.results {
                     let text = String(result.text.characters)
                     if result.isFinal {
-                        self.lock.withLock { self.finalizedText += text }
                         volatileText = ""
                     } else {
                         volatileText = text
                     }
-                    let finalized = self.lock.withLock { self.finalizedText }
-                    onPartial((finalized + volatileText).trimmingCharacters(in: .whitespacesAndNewlines))
+                    await self?.receiveResult(
+                        text: text,
+                        isFinal: result.isFinal,
+                        volatileText: volatileText,
+                        onPartial: onPartial
+                    )
                 }
             } catch {
                 // Stream ended (or errored); finishTranscript returns what we have.
@@ -67,58 +69,78 @@ final class SpeechAnalyzerDictationEngine: DictationEngine {
         }
 
         let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-        self.inputBuilder = inputBuilder
         try await analyzer.start(inputSequence: inputSequence)
 
-        // Mic capture → convert to the analyzer format → feed the input stream.
+        // Activating the recording session can change the hardware input format,
+        // so resolve that format only after activation.
         try activateDictationAudioSession()
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
-        converter = AVAudioConverter(from: inputFormat, to: format)
-        // Small buffer → audio reaches the analyzer sooner (lower latency).
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            guard let self, let converted = self.convert(buffer) else { return }
-            self.inputBuilder?.yield(AnalyzerInput(buffer: converted))
+        let sink = try AnalyzerAudioInputSink(
+            inputFormat: inputFormat,
+            analyzerFormat: format,
+            continuation: inputBuilder
+        )
+        audioSink = sink
+
+        // Mic capture -> convert to the analyzer format -> feed the input stream.
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { buffer, _ in
+            sink.consume(buffer)
         }
+        tapInstalled = true
         audioEngine.prepare()
         try audioEngine.start()
     }
 
     func finishTranscript() async -> String {
         teardownAudio()
-        inputBuilder?.finish()
-        inputBuilder = nil
+        audioSink?.finish()
         // Flush the trailing (volatile) audio into a final result, then wait for
         // the results task to drain it before reading the transcript.
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
         await resultsTask?.value
-        let text = lock.withLock { finalizedText }
+        let text = finalizedText
         releaseModules()
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func cancel() async {
+        acceptsResults = false
         teardownAudio()
         resultsTask?.cancel()
-        resultsTask = nil
-        inputBuilder?.finish()
-        inputBuilder = nil
+        audioSink?.finish()
+        await resultsTask?.value
         releaseModules()
     }
 
     // MARK: - Helpers
 
+    private func receiveResult(
+        text: String,
+        isFinal: Bool,
+        volatileText: String,
+        onPartial: @escaping @Sendable (String) -> Void
+    ) {
+        guard acceptsResults else { return }
+        if isFinal { finalizedText += text }
+        onPartial((finalizedText + volatileText).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     private func teardownAudio() {
-        audioEngine.inputNode.removeTap(onBus: 0)
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
         if audioEngine.isRunning { audioEngine.stop() }
-        converter = nil
         deactivateDictationAudioSession()
     }
 
     private func releaseModules() {
+        acceptsResults = false
+        resultsTask = nil
+        audioSink = nil
         analyzer = nil
         transcriber = nil
-        analyzerFormat = nil
     }
 
     /// Build a transcriber for the best supported locale, preferring the user's.
@@ -129,8 +151,7 @@ final class SpeechAnalyzerDictationEngine: DictationEngine {
             throw DictationError.localeUnsupported
         }
         // Tuned for real-time feel: `.volatileResults` streams in-progress
-        // guesses as you speak, and `.fastResults` lowers latency (trading a
-        // little accuracy) so text appears with minimal delay.
+        // guesses as you speak, and `.fastResults` lowers latency.
         let transcriber = SpeechTranscriber(
             locale: locale,
             transcriptionOptions: [],
@@ -145,9 +166,11 @@ final class SpeechAnalyzerDictationEngine: DictationEngine {
         if let exact = supported.first(where: { $0.identifier(.bcp47) == desiredID }) {
             return exact
         }
-        // Same language, different region (e.g. desired en-GB, available en-US).
-        let lang = desired.language.languageCode?.identifier
-        if let lang, let sameLanguage = supported.first(where: { $0.language.languageCode?.identifier == lang }) {
+        let language = desired.language.languageCode?.identifier
+        if let language,
+           let sameLanguage = supported.first(where: {
+               $0.language.languageCode?.identifier == language
+           }) {
             return sameLanguage
         }
         return supported.first { $0.identifier(.bcp47) == "en-US" } ?? supported.first
@@ -155,22 +178,71 @@ final class SpeechAnalyzerDictationEngine: DictationEngine {
 
     /// Download + install the on-device model for this locale if iOS doesn't
     /// already have it. The asset is OS-managed and shared across apps.
-    private func ensureModelInstalled(for transcriber: SpeechTranscriber, locale: Locale) async throws {
-        let installed = await Set(SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) })
+    private func ensureModelInstalled(
+        for transcriber: SpeechTranscriber,
+        locale: Locale
+    ) async throws {
+        let installed = await Set(
+            SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) }
+        )
         if installed.contains(locale.identifier(.bcp47)) { return }
-        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+        if let request = try await AssetInventory.assetInstallationRequest(
+            supporting: [transcriber]
+        ) {
             try await request.downloadAndInstall()
         }
     }
+}
 
-    /// Convert a mic buffer to the analyzer's format (handles sample-rate change).
-    private func convert(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let converter, let analyzerFormat else { return nil }
+/// Synchronous bridge used only by AVAudioEngine's real-time callback. The lock
+/// serializes conversion/yield with `finish`, so the callback never observes a
+/// converter or continuation being torn down underneath it.
+@available(iOS 26.0, *)
+private final class AnalyzerAudioInputSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var converter: AVAudioConverter?
+    private let analyzerFormat: AVAudioFormat
+    private var continuation: AsyncStream<AnalyzerInput>.Continuation?
+
+    init(
+        inputFormat: AVAudioFormat,
+        analyzerFormat: AVAudioFormat,
+        continuation: AsyncStream<AnalyzerInput>.Continuation
+    ) throws {
+        guard let converter = AVAudioConverter(from: inputFormat, to: analyzerFormat) else {
+            throw DictationError.unavailable("Couldn't prepare audio conversion for dictation.")
+        }
+        self.converter = converter
+        self.analyzerFormat = analyzerFormat
+        self.continuation = continuation
+    }
+
+    func consume(_ buffer: AVAudioPCMBuffer) {
+        lock.withLock {
+            guard let converter, let continuation,
+                  let converted = convert(buffer, using: converter) else { return }
+            continuation.yield(AnalyzerInput(buffer: converted))
+        }
+    }
+
+    func finish() {
+        lock.withLock {
+            continuation?.finish()
+            continuation = nil
+            converter = nil
+        }
+    }
+
+    private func convert(
+        _ buffer: AVAudioPCMBuffer,
+        using converter: AVAudioConverter
+    ) -> AVAudioPCMBuffer? {
         let ratio = analyzerFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
-        guard let output = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: capacity) else {
-            return nil
-        }
+        guard let output = AVAudioPCMBuffer(
+            pcmFormat: analyzerFormat,
+            frameCapacity: capacity
+        ) else { return nil }
         var fed = false
         var error: NSError?
         let status = converter.convert(to: output, error: &error) { _, inputStatus in

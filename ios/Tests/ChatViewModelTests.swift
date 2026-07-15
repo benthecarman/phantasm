@@ -1081,9 +1081,182 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNil(vm.pendingPrompt)
     }
 
+    func testCalendarOutcomeCommitsAfterStopAndDeletionPreparationWaits() async throws {
+        let created = CalendarEvent(
+            title: "Lunch",
+            start: Self.date(2026, 6, 29, hour: 12),
+            end: Self.date(2026, 6, 29, hour: 13),
+            calendarTitle: "Work"
+        )
+        let provider = DelayedCalendarProvider()
+        AppToolRegistry.configureCalendar(provider: provider)
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        env.backendMode = .full(Self.fullCapabilities())
+        var conversation = Conversation()
+        conversation.calendarEnabled = true
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        let calls = [WireToolCall(
+            index: 0,
+            id: "create_cal_stop",
+            function: .init(
+                name: ToolName.createCalendarEvent,
+                arguments: #"{"title":"Lunch","start_date":"2026-06-29T12:00:00"}"#
+            )
+        )]
+        client.enqueue(events: [.toolCalls(calls), .done])
+
+        XCTAssertTrue(vm.send("add lunch"))
+        try await waitUntil {
+            if case .calendarEvent = vm.pendingPrompt { return !vm.isStreaming }
+            return false
+        }
+
+        vm.answerPendingCalendarEvent(confirm: true)
+        await provider.waitUntilCreateStarted()
+        vm.stop()
+
+        let deletionFinished = TestAsyncFlag()
+        let deletionPreparation = Task {
+            await vm.prepareForDeletion()
+            await deletionFinished.set()
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let returnedEarly = await deletionFinished.value
+        XCTAssertFalse(
+            returnedEarly,
+            "deletion preparation returned before the durable outcome commit"
+        )
+        await provider.completeCreate(with: .success(created))
+        await deletionPreparation.value
+        let didFinish = await deletionFinished.value
+        XCTAssertTrue(didFinish)
+
+        let persisted = try await detail(store, conversation.id)
+        let result = try XCTUnwrap(persisted.messages.last?.message)
+        XCTAssertEqual(result.role, "tool")
+        XCTAssertTrue(result.content.hasPrefix("create_calendar_event succeeded:"))
+        XCTAssertFalse(result.content.contains("outcome pending"))
+    }
+
+    func testCalendarOutcomeMarkerNeverReachesModelAfterCommitFailure() async throws {
+        let created = CalendarEvent(
+            title: "Lunch",
+            start: Self.date(2026, 6, 29, hour: 12),
+            end: Self.date(2026, 6, 29, hour: 13),
+            calendarTitle: "Work"
+        )
+        AppToolRegistry.configureCalendar(
+            provider: TestCalendarProvider(createResult: .success(created))
+        )
+        let database = try AppDatabase.empty()
+        let gate = TestAsyncGate()
+        await gate.open()
+        let store = BlockingOptionsStore(
+            base: database,
+            gate: gate,
+            failToolOutcomeUpdate: true
+        )
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        env.backendMode = .full(Self.fullCapabilities())
+        var conversation = Conversation()
+        conversation.calendarEnabled = true
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        let calls = [WireToolCall(
+            index: 0,
+            id: "create_cal_failed_commit",
+            function: .init(
+                name: ToolName.createCalendarEvent,
+                arguments: #"{"title":"Lunch","start_date":"2026-06-29T12:00:00"}"#
+            )
+        )]
+        client.enqueue(events: [.toolCalls(calls), .done])
+
+        XCTAssertTrue(vm.send("add lunch"))
+        try await waitUntil {
+            if case .calendarEvent = vm.pendingPrompt { return !vm.isStreaming }
+            return false
+        }
+        vm.answerPendingCalendarEvent(confirm: true)
+        try await waitUntil { !vm.isStreaming && vm.errorMessage != nil }
+
+        let persisted = try await detail(database, conversation.id)
+        XCTAssertEqual(
+            persisted.messages.last?.message.content,
+            "(confirmed — outcome pending; do not retry automatically)"
+        )
+
+        client.enqueue(events: [.token("must not be used"), .done])
+        XCTAssertTrue(vm.send("what happened?"))
+        try await waitUntil { !vm.isStreaming }
+        XCTAssertEqual(
+            client.invocations.count,
+            1,
+            "a durable uncertainty marker must never be forwarded as a tool result"
+        )
+    }
+
+    func testSendWaitsForLatestToolSettingsPersistence() async throws {
+        let database = try AppDatabase.empty()
+        let gate = TestAsyncGate()
+        let store = BlockingOptionsStore(base: database, gate: gate)
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        env.backendMode = .full(Self.fullCapabilities())
+        var conversation = Conversation(profileID: env.primaryProfileID)
+        conversation.webSearchEnabled = true
+        try await database.insertConversation(conversation)
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        client.enqueue(events: [.token("done"), .done])
+
+        vm.setWebSearchEnabled(false)
+        XCTAssertTrue(vm.send("private request"))
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(
+            client.invocations.isEmpty,
+            "the request must wait for the just-disabled tool to reach storage"
+        )
+
+        await gate.open()
+        try await waitUntil { client.invocations.count == 1 }
+        XCTAssertFalse(client.requests[0].tools?.contains {
+            $0.function.name == ToolName.webSearch
+        } ?? false)
+    }
+
+    func testSendFailsClosedWhenToolSettingsPersistenceFails() async throws {
+        let database = try AppDatabase.empty()
+        let gate = TestAsyncGate()
+        await gate.open()
+        let store = BlockingOptionsStore(
+            base: database,
+            gate: gate,
+            failOptionsWrite: true
+        )
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        env.backendMode = .full(Self.fullCapabilities())
+        var conversation = Conversation(profileID: env.primaryProfileID)
+        conversation.webSearchEnabled = true
+        try await database.insertConversation(conversation)
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        client.enqueue(events: [.token("must not be used"), .done])
+
+        vm.setWebSearchEnabled(false)
+        XCTAssertTrue(vm.send("private request"))
+        try await waitUntil { !vm.isStreaming && vm.errorMessage != nil }
+
+        XCTAssertTrue(
+            client.invocations.isEmpty,
+            "the request must not use stale persisted tool settings"
+        )
+    }
+
     private func makeViewModel(
         env: FakeChatEnvironment,
-        store: AppDatabase,
+        store: any ChatStore,
         conversation: Conversation,
         imageFetcher: any ImageFetching = FakeImageFetcher(),
         bindDefaultProfile: Bool = true
@@ -1163,6 +1336,190 @@ final class ChatViewModelTests: XCTestCase {
         components.day = day
         components.hour = hour
         return components.date!
+    }
+}
+
+private actor DelayedCalendarProvider: CalendarProviding {
+    private var createContinuation:
+        CheckedContinuation<Result<CalendarEvent, CalendarLookupError>, Never>?
+    private var didStartCreate = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func events(
+        matching query: CalendarEventQuery
+    ) async -> Result<[CalendarEvent], CalendarLookupError> {
+        .success([])
+    }
+
+    func createEvent(
+        _ draft: CalendarEventDraft
+    ) async -> Result<CalendarEvent, CalendarLookupError> {
+        didStartCreate = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        return await withCheckedContinuation { continuation in
+            createContinuation = continuation
+        }
+    }
+
+    func waitUntilCreateStarted() async {
+        if didStartCreate { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func completeCreate(
+        with result: Result<CalendarEvent, CalendarLookupError>
+    ) {
+        createContinuation?.resume(returning: result)
+        createContinuation = nil
+    }
+}
+
+private actor TestAsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+}
+
+private actor TestAsyncFlag {
+    private(set) var value = false
+
+    func set() { value = true }
+}
+
+private struct BlockingOptionsStore: ChatStore {
+    let base: AppDatabase
+    let gate: TestAsyncGate
+    var failOptionsWrite = false
+    var failToolOutcomeUpdate = false
+
+    func insertConversation(_ conversation: Conversation) async throws {
+        try await base.insertConversation(conversation)
+    }
+
+    func insertMessage(_ message: Message, attachments: [Attachment]) async throws {
+        try await base.insertMessage(message, attachments: attachments)
+    }
+
+    func updateMessage(
+        id: UUID,
+        content: String,
+        reasoning: String,
+        reasoningDuration: TimeInterval?,
+        isComplete: Bool,
+        createdAt: Date?
+    ) async throws {
+        if failToolOutcomeUpdate {
+            throw AppError.modelError("simulated tool outcome persistence failure")
+        }
+        try await base.updateMessage(
+            id: id,
+            content: content,
+            reasoning: reasoning,
+            reasoningDuration: reasoningDuration,
+            isComplete: isComplete,
+            createdAt: createdAt
+        )
+    }
+
+    func addAttachments(messageID: UUID, attachments: [Attachment]) async throws {
+        try await base.addAttachments(messageID: messageID, attachments: attachments)
+    }
+
+    func completeToolCallMessage(id: UUID, toolCalls: String, content: String) async throws {
+        try await base.completeToolCallMessage(id: id, toolCalls: toolCalls, content: content)
+    }
+
+    func deleteMessage(id: UUID) async throws { try await base.deleteMessage(id: id) }
+
+    func updateConversation(
+        id: UUID,
+        title: String?,
+        modelID: String?,
+        updatedAt: Date?
+    ) async throws {
+        try await base.updateConversation(
+            id: id, title: title, modelID: modelID, updatedAt: updatedAt
+        )
+    }
+
+    func bindConversation(id: UUID, toProfileID profileID: UUID) async throws {
+        try await base.bindConversation(id: id, toProfileID: profileID)
+    }
+
+    func setConversationOptions(
+        id: UUID,
+        toolSettings: ToolSettings,
+        turnModeID: String?
+    ) async throws {
+        await gate.wait()
+        if failOptionsWrite {
+            throw AppError.modelError("simulated settings persistence failure")
+        }
+        try await base.setConversationOptions(
+            id: id, toolSettings: toolSettings, turnModeID: turnModeID
+        )
+    }
+
+    func editUserMessage(id: UUID, newContent: String) async throws {
+        try await base.editUserMessage(id: id, newContent: newContent)
+    }
+
+    func deleteMessagesFrom(id: UUID) async throws {
+        try await base.deleteMessagesFrom(id: id)
+    }
+
+    func deleteMessagesAfter(id: UUID) async throws {
+        try await base.deleteMessagesAfter(id: id)
+    }
+
+    func deleteConversation(id: UUID) async throws {
+        try await base.deleteConversation(id: id)
+    }
+
+    func deleteAllConversations() async throws { try await base.deleteAllConversations() }
+
+    func allConversationDetails(
+        attachmentData: AttachmentDataScope
+    ) async throws -> [ConversationDetail] {
+        try await base.allConversationDetails(attachmentData: attachmentData)
+    }
+
+    func conversationDetail(
+        id: UUID,
+        attachmentData: AttachmentDataScope
+    ) async throws -> ConversationDetail? {
+        try await base.conversationDetail(id: id, attachmentData: attachmentData)
+    }
+
+    func attachmentPayloads(ids: [UUID]) async throws -> [UUID: Data] {
+        try await base.attachmentPayloads(ids: ids)
+    }
+
+    func conversation(id: UUID) async throws -> Conversation? {
+        try await base.conversation(id: id)
+    }
+
+    func searchConversations(
+        matching query: String
+    ) async throws -> [ConversationSearchResult] {
+        try await base.searchConversations(matching: query)
     }
 }
 

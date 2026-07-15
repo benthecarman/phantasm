@@ -83,7 +83,9 @@ public struct OllamaNativeChatClient: ChatClienting {
                             return
                         }
                     }
-                    continuation.finish()
+                    throw AppError.modelError(
+                        "The connection closed before the response finished."
+                    )
                 } catch is CancellationError {
                     continuation.finish()
                 } catch {

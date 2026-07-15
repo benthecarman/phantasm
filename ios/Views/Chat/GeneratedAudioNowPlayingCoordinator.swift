@@ -5,9 +5,10 @@ import UIKit
 
 /// Owns the system media session for generated audio, including lock-screen
 /// metadata, progress, artwork, and remote playback controls.
+@MainActor
 final class GeneratedAudioNowPlayingCoordinator {
     static let shared = GeneratedAudioNowPlayingCoordinator()
-    private static let logger = Logger(
+    nonisolated private static let logger = Logger(
         subsystem: "com.phantasm.app",
         category: "GeneratedAudioNowPlaying"
     )
@@ -108,53 +109,100 @@ final class GeneratedAudioNowPlayingCoordinator {
         commandsConfigured = true
 
         commandCenter.playCommand.addTarget { [weak self] _ in
-            guard let self, let player = self.player else { return .noSuchContent }
-            try? AVAudioSession.sharedInstance().setActive(true)
-            player.play()
-            self.isPlaying = true
-            self.publishNowPlayingInfo()
-            self.notifyPlaybackChanged(true)
-            return .success
+            self?.performOnMainActor { $0.handlePlayCommand() } ?? .noSuchContent
         }
 
         commandCenter.pauseCommand.addTarget { [weak self] _ in
-            guard let self, let player = self.player else { return .noSuchContent }
-            player.pause()
-            self.isPlaying = false
-            self.publishNowPlayingInfo()
-            self.notifyPlaybackChanged(false)
-            return .success
+            self?.performOnMainActor { $0.handlePauseCommand() } ?? .noSuchContent
         }
 
         commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
-            guard let self, let player = self.player else { return .noSuchContent }
-            self.isPlaying.toggle()
-            if self.isPlaying {
-                try? AVAudioSession.sharedInstance().setActive(true)
-                player.play()
-            } else {
-                player.pause()
-            }
-            self.publishNowPlayingInfo()
-            self.notifyPlaybackChanged(self.isPlaying)
-            return .success
+            self?.performOnMainActor { $0.handleToggleCommand() } ?? .noSuchContent
         }
 
         commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
-            guard let self,
-                  let player = self.player,
-                  let event = event as? MPChangePlaybackPositionCommandEvent,
-                  self.duration > 0 else { return .noSuchContent }
-            let position = min(max(event.positionTime, 0), self.duration)
-            player.seek(
-                to: CMTime(seconds: position, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            )
-            self.publishNowPlayingInfo(elapsedTime: position)
-            self.notifyPositionChanged(position)
-            return .success
+            guard let event = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            let requestedPosition = event.positionTime
+            return self?.performOnMainActor {
+                $0.handlePositionCommand(requestedPosition)
+            } ?? .noSuchContent
         }
+    }
+
+    /// MPRemoteCommand handlers are synchronous and may arrive off the main
+    /// thread. Execute the actor-isolated operation before returning its status
+    /// so the system never receives a speculative success.
+    nonisolated private func performOnMainActor(
+        _ operation: @escaping @MainActor (GeneratedAudioNowPlayingCoordinator)
+            -> MPRemoteCommandHandlerStatus
+    ) -> MPRemoteCommandHandlerStatus {
+        if Thread.isMainThread {
+            return MainActor.assumeIsolated { operation(self) }
+        }
+        return DispatchQueue.main.sync {
+            MainActor.assumeIsolated { operation(self) }
+        }
+    }
+
+    private func handlePlayCommand() -> MPRemoteCommandHandlerStatus {
+        guard let player else { return .noSuchContent }
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            return .commandFailed
+        }
+        player.play()
+        isPlaying = true
+        publishNowPlayingInfo()
+        notifyPlaybackChanged(true)
+        return .success
+    }
+
+    private func handlePauseCommand() -> MPRemoteCommandHandlerStatus {
+        guard let player else { return .noSuchContent }
+        player.pause()
+        isPlaying = false
+        publishNowPlayingInfo()
+        notifyPlaybackChanged(false)
+        return .success
+    }
+
+    private func handleToggleCommand() -> MPRemoteCommandHandlerStatus {
+        guard let player else { return .noSuchContent }
+        let shouldPlay = !isPlaying
+        if shouldPlay {
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+            } catch {
+                return .commandFailed
+            }
+            player.play()
+        } else {
+            player.pause()
+        }
+        isPlaying = shouldPlay
+        publishNowPlayingInfo()
+        notifyPlaybackChanged(isPlaying)
+        return .success
+    }
+
+    private func handlePositionCommand(
+        _ requestedPosition: Double
+    ) -> MPRemoteCommandHandlerStatus {
+        guard let player, duration > 0, requestedPosition.isFinite else {
+            return .noSuchContent
+        }
+        let position = min(max(requestedPosition, 0), duration)
+        player.seek(
+            to: CMTime(seconds: position, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
+        publishNowPlayingInfo(elapsedTime: position)
+        notifyPositionChanged(position)
+        return .success
     }
 
     private func setRemoteCommandsEnabled(_ enabled: Bool) {
@@ -197,12 +245,10 @@ final class GeneratedAudioNowPlayingCoordinator {
     }
 
     private func notifyPlaybackChanged(_ isPlaying: Bool) {
-        let callback = onPlaybackChanged
-        DispatchQueue.main.async { callback?(isPlaying) }
+        onPlaybackChanged?(isPlaying)
     }
 
     private func notifyPositionChanged(_ position: Double) {
-        let callback = onPositionChanged
-        DispatchQueue.main.async { callback?(position) }
+        onPositionChanged?(position)
     }
 }

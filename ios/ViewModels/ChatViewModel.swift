@@ -66,6 +66,14 @@ final class ChatViewModel {
     /// next turn's history read awaits it so a fast follow-up send can't load
     /// a history that is missing the last reply.
     private var commitTask: Task<Void, Never>?
+    /// Conversation-option/model writes are chained so rapid picker changes
+    /// reach storage in the same order as the in-memory selections.
+    private var settingsPersistenceTask: Task<Result<Void, AppError>, Never>?
+    /// A confirmed interactive-tool result is committed independently from the
+    /// cancellable model turn. In particular, stopping while EventKit is saving
+    /// must not leave the durable row stuck at an outcome-pending placeholder.
+    private var pendingPromptCommitTask: Task<PendingPromptCommitResult, Never>?
+    private var pendingPromptCommitID: UUID?
     /// The active conversation's metadata (a value, not the stored history). For a
     /// new chat this is an in-memory draft that isn't written until the first send.
     private var conversation: Conversation?
@@ -102,6 +110,14 @@ final class ChatViewModel {
         case delete
         case keepForRecovery
     }
+
+    private enum PendingPromptCommitResult {
+        case success
+        case failure(AppError)
+    }
+
+    private static let pendingPromptOutcomeMarker =
+        "(confirmed — outcome pending; do not retry automatically)"
 
     /// The first writes of a turn (conversation + user message), held until
     /// `runTurn` lands them. GRDB honors Task cancellation, so cancelling the
@@ -397,10 +413,18 @@ final class ChatViewModel {
         conversation.turnModeID = modeID
         self.conversation = conversation
         let id = conversation.id
-        Task { [store] in
-            try? await store?.setConversationOptions(
-                id: id, toolSettings: settings, turnModeID: modeID
-            )
+        let priorWrite = settingsPersistenceTask
+        settingsPersistenceTask = Task { [store] in
+            _ = await priorWrite?.value
+            guard let store else { return .success(()) }
+            do {
+                try await store.setConversationOptions(
+                    id: id, toolSettings: settings, turnModeID: modeID
+                )
+                return .success(())
+            } catch {
+                return .failure(AppError.from(error))
+            }
         }
     }
 
@@ -739,6 +763,21 @@ final class ChatViewModel {
         // Wait for the previous turn's row commit (not its follow-up work) so
         // a fast follow-up send can't read a history missing the last reply.
         await commitTask?.value
+        // Tool/mode writes are asynchronous. A send immediately following a
+        // picker change must not build its request from the previous persisted
+        // selection, especially when the user just disabled a sensitive tool.
+        if let settingsResult = await settingsPersistenceTask?.value,
+           case .failure(let error) = settingsResult {
+            finish(generation: generation, error: error)
+            return
+        }
+        // A stopped Calendar confirmation continues committing independently;
+        // never send its temporary idempotency marker to the model.
+        if let promptResult = await pendingPromptCommitTask?.value,
+           case .failure(let error) = promptResult {
+            finish(generation: generation, error: error)
+            return
+        }
         guard ownsTurn(generation) else { return }
         guard let detail = try? await store.conversationDetail(id: conversationId) else {
             finish(
@@ -748,6 +787,18 @@ final class ChatViewModel {
             return
         }
         guard ownsTurn(generation) else { return }
+        guard !detail.messages.contains(where: {
+            $0.message.role == "tool"
+                && $0.message.content == Self.pendingPromptOutcomeMarker
+        }) else {
+            finish(
+                generation: generation,
+                error: .modelError(
+                    "A previously confirmed action has an uncertain outcome. Check the destination before trying it again."
+                )
+            )
+            return
+        }
         // Research is selected by the model id, not a request flag (redesign §2):
         // when this chat has a mode selected AND the backend advertises it AND the
         // base model is tool-capable, the mode rides as a `<base>:<mode>` suffix —
@@ -955,6 +1006,53 @@ final class ChatViewModel {
             return
         }
 
+        // The app may have been suspended or stopped after a confirmed prompt's
+        // result row committed but before its continuation row was inserted.
+        // Resume a fully answered batch explicitly. A surviving outcome marker
+        // is intentionally *not* resumed: after process death its side effect is
+        // uncertain and must never be retried automatically.
+        if let batch = detail.messages.activeToolCallBatch(),
+           batch.calls.allSatisfy({ call in
+               guard let id = call.id else { return false }
+               return batch.answered.contains(id)
+           }),
+           let last = detail.messages.last?.message,
+           last.role == "tool" {
+            if last.content == Self.pendingPromptOutcomeMarker {
+                errorMessage = pendingPromptCommitTask == nil
+                    ? "A previously confirmed action has an uncertain outcome. Check the destination before trying it again."
+                    : "The confirmed action is still being finalized."
+                return
+            }
+            guard let model = session.resolvedModel(
+                conversationModel: detail.conversation.modelID
+            ) else { return }
+            isStreaming = true
+            hasAssistantPreview = true
+            streamingStartedAt = .now
+            resetStreamingBuffers()
+            pendingAssistantMessageID = nil
+            pendingAssistantPreviewMessageID = nil
+            errorMessage = nil
+            let generation = activateTurn(session: session)
+            task = Task { [weak self] in
+                guard let self else { return }
+                guard await self.insertPendingAssistantMessage(
+                    conversationId: conversation.id,
+                    store: store,
+                    generation: generation
+                ) != nil else { return }
+                await self.streamReply(
+                    conversationId: conversation.id,
+                    model: model,
+                    session: session,
+                    store: store,
+                    generation: generation
+                )
+            }
+            return
+        }
+
         guard let pending = detail.messages.last,
               pending.message.role == "assistant",
               !pending.message.isComplete else { return }
@@ -1092,16 +1190,16 @@ final class ChatViewModel {
         errorMessage = nil
         turnSession = session
 
-        task = Task { [weak self] in
-            // Persist the result row first, run the side effect, then record
-            // the outcome in place. Some results are non-idempotent (the
-            // Calendar write): running them before any persistence meant a
-            // failed insert re-raised the prompt on recovery, and a second
-            // confirm duplicated the event.
+        // This task is deliberately separate from `task`: stop/background
+        // cancellation revokes model-turn ownership but must not cancel a
+        // Calendar write after the user confirmed it. It owns the full durable
+        // sequence — marker first, side effect second, actual outcome last.
+        let commitID = UUID()
+        let outcomeCommit = Task { () -> PendingPromptCommitResult in
             let toolMessage = Message(
                 conversationId: conversation.id,
                 role: "tool",
-                content: "(confirmed — outcome pending)",
+                content: Self.pendingPromptOutcomeMarker,
                 isComplete: true,
                 toolCallId: toolCallId,
                 name: toolName
@@ -1109,38 +1207,60 @@ final class ChatViewModel {
             do {
                 try await store.insertMessage(toolMessage, attachments: [])
             } catch {
-                self?.finish(generation: generation, error: AppError.from(error))
+                return .failure(AppError.from(error))
+            }
+            let text = await result()
+            do {
+                try await store.updateMessage(
+                    id: toolMessage.id, content: text, reasoning: "",
+                    isComplete: true, createdAt: nil
+                )
+            } catch {
+                // The pre-effect placeholder is the durable idempotency marker:
+                // recovery treats the call as answered and never repeats the
+                // potentially non-idempotent Calendar write. Do not let the
+                // model continue with that placeholder as though it were the
+                // actual outcome.
+                return .failure(AppError.from(error))
+            }
+            return .success
+        }
+        pendingPromptCommitTask = outcomeCommit
+        pendingPromptCommitID = commitID
+
+        task = Task { [weak self] in
+            let outcome = await outcomeCommit.value
+            guard let self else { return }
+            if self.pendingPromptCommitID == commitID {
+                self.pendingPromptCommitTask = nil
+                self.pendingPromptCommitID = nil
+            }
+            guard self.ownsTurn(generation) else { return }
+            if case .failure(let error) = outcome {
+                self.finish(generation: generation, error: error)
                 return
             }
-            guard self?.ownsTurn(generation) == true else { return }
-            let text = await result()
-            guard self?.ownsTurn(generation) == true else { return }
-            try? await store.updateMessage(
-                id: toolMessage.id, content: text, reasoning: "",
-                isComplete: true, createdAt: nil
-            )
-            guard self?.ownsTurn(generation) == true else { return }
             if Task.isCancelled {
-                self?.finishAfterStreamFailure(
+                self.finishAfterStreamFailure(
                     CancellationError(), generation: generation
                 )
                 return
             }
             // Restamp so the pending row sorts after the tool result just
             // inserted (the async tool work above ran past the turn start).
-            self?.streamingStartedAt = .now
-            guard await self?.insertPendingAssistantMessage(
+            self.streamingStartedAt = .now
+            guard await self.insertPendingAssistantMessage(
                 conversationId: conversation.id,
                 store: store,
                 generation: generation
             ) != nil else { return }
             if Task.isCancelled {
-                self?.finishAfterStreamFailure(
+                self.finishAfterStreamFailure(
                     CancellationError(), generation: generation
                 )
                 return
             }
-            await self?.streamReply(
+            await self.streamReply(
                 conversationId: conversation.id, model: model,
                 session: session, store: store, generation: generation
             )
@@ -1353,6 +1473,9 @@ final class ChatViewModel {
 
         runningTask?.cancel()
         await runningTask?.value
+        // A confirmed Calendar side effect is cancellation-independent. Keep
+        // the conversation alive until its actual outcome is durably recorded.
+        _ = await pendingPromptCommitTask?.value
         // stop() may have replaced the prior commit with a chained rescue, so
         // read the property only after the turn task has fully unwound.
         await commitTask?.value
@@ -1384,8 +1507,18 @@ final class ChatViewModel {
         let id = conversation.id
         // Persist if the conversation already exists; for an unsent draft this is a
         // no-op and the model rides along on the first send instead.
-        Task { [store] in
-            try? await store?.updateConversation(id: id, title: nil, modelID: model, updatedAt: nil)
+        let priorWrite = settingsPersistenceTask
+        settingsPersistenceTask = Task { [store] in
+            _ = await priorWrite?.value
+            guard let store else { return .success(()) }
+            do {
+                try await store.updateConversation(
+                    id: id, title: nil, modelID: model, updatedAt: nil
+                )
+                return .success(())
+            } catch {
+                return .failure(AppError.from(error))
+            }
         }
     }
 
