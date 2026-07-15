@@ -77,6 +77,10 @@ fn entry_from_spec(
             UpstreamKind::NativeOllama => Vec::new(),
             UpstreamKind::OpenAICompatible => spec.reasoning_efforts.clone(),
         },
+        model_capabilities: match kind {
+            UpstreamKind::NativeOllama => Default::default(),
+            UpstreamKind::OpenAICompatible => spec.model_capabilities.clone(),
+        },
         pinned_models: spec.models.clone(),
         probed_models,
     })
@@ -188,11 +192,18 @@ pub async fn probe_capabilities(
         .flat_map(|(entry, models)| {
             models
                 .into_iter()
-                .map(|(id, (capabilities, context_length))| ModelInfo {
-                    id,
-                    capabilities,
-                    context_length,
-                    reasoning_efforts: entry.reasoning_efforts.clone(),
+                .map(|(id, (detected_capabilities, context_length))| {
+                    let capabilities = entry
+                        .model_capabilities
+                        .get(&id)
+                        .map(|names| ModelCapabilities::from_names(names))
+                        .or(detected_capabilities);
+                    ModelInfo {
+                        id,
+                        capabilities,
+                        context_length,
+                        reasoning_efforts: entry.reasoning_efforts.clone(),
+                    }
                 })
                 .collect::<Vec<_>>()
         })

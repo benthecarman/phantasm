@@ -3,6 +3,7 @@
 //! `Config::from_env` fails fast at startup if a required variable is missing,
 //! so a misconfigured deployment never silently serves a broken endpoint.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -10,6 +11,12 @@ use anyhow::{Context, Result};
 use url::Url;
 
 use crate::ollama::UpstreamKind;
+
+/// Explicit per-model capability metadata for an upstream whose discovery API
+/// cannot report it. Keys are exact served model ids; values use the same names
+/// as Ollama's `/api/show` (`completion`, `vision`, `audio`, `tools`, `insert`,
+/// and `embedding`).
+pub type ModelCapabilityOverrides = BTreeMap<String, Vec<String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -62,6 +69,9 @@ pub struct UpstreamSpec {
     /// upstream's models. Native Ollama is intentionally excluded: `/api/show`
     /// reports only thinking support, not a trustworthy per-model levels list.
     pub reasoning_efforts: Vec<String>,
+    /// Explicit capabilities for OpenAI-compatible models, whose standard
+    /// `/v1/models` response does not expose vision/tool metadata.
+    pub model_capabilities: ModelCapabilityOverrides,
     /// Models this upstream serves. Non-empty => pinned: advertised and routed
     /// as-is, never probed. Empty => probed from the upstream.
     pub models: Vec<String>,
@@ -108,6 +118,9 @@ pub struct Config {
     /// upstream is native Ollama; rejected when UPSTREAM_KIND explicitly names
     /// native Ollama.
     pub upstream_reasoning_efforts: Vec<String>,
+    /// Explicit per-model capabilities for the default OpenAI-compatible
+    /// upstream. Native Ollama supplies these through `/api/show` instead.
+    pub upstream_model_capabilities: ModelCapabilityOverrides,
     pub default_model: String,
     /// Models advertised in /v1/capabilities. Empty => probe the upstream at startup.
     pub models: Vec<String>,
@@ -385,6 +398,11 @@ impl Config {
         let upstream_thinking_hint = env_bool("UPSTREAM_THINKING_HINT", true);
         let upstream_reasoning_efforts =
             parse_reasoning_efforts("UPSTREAM_REASONING_EFFORTS", upstream_kind, "UPSTREAM_KIND")?;
+        let upstream_model_capabilities = parse_model_capabilities(
+            "UPSTREAM_MODEL_CAPABILITIES",
+            upstream_kind,
+            "UPSTREAM_KIND",
+        )?;
         let default_model =
             env_or_alias("UPSTREAM_DEFAULT_MODEL", "OLLAMA_DEFAULT_MODEL", "llama3.1");
         let models = csv_alias("UPSTREAM_MODELS", "OLLAMA_MODELS");
@@ -417,6 +435,7 @@ impl Config {
             upstream_api_key,
             upstream_thinking_hint,
             upstream_reasoning_efforts,
+            upstream_model_capabilities,
             default_model,
             models,
             default_upstream_configured,
@@ -598,6 +617,7 @@ impl Config {
                 api_key: self.upstream_api_key.clone(),
                 thinking_hint: self.upstream_thinking_hint,
                 reasoning_efforts: self.upstream_reasoning_efforts.clone(),
+                model_capabilities: self.upstream_model_capabilities.clone(),
                 models: self.models.clone(),
                 concurrency: None,
                 num_ctx_cap: self.upstream_num_ctx_cap,
@@ -870,6 +890,50 @@ fn parse_reasoning_efforts(
     Ok(efforts)
 }
 
+fn parse_model_capabilities(
+    key: &str,
+    kind: Option<UpstreamKind>,
+    kind_key: &str,
+) -> Result<ModelCapabilityOverrides> {
+    let Some(raw) = std::env::var(key).ok().filter(|s| !s.trim().is_empty()) else {
+        return Ok(BTreeMap::new());
+    };
+    if kind == Some(UpstreamKind::NativeOllama) {
+        anyhow::bail!(
+            "{key} is only supported for OpenAI-compatible upstreams; remove it or set \
+             {kind_key}=openai_compatible/vllm"
+        );
+    }
+
+    let mut overrides: ModelCapabilityOverrides =
+        serde_json::from_str(raw.trim()).with_context(|| {
+            format!("{key} must be a JSON object mapping model ids to capability arrays")
+        })?;
+    const ALLOWED: &[&str] = &[
+        "completion",
+        "vision",
+        "audio",
+        "tools",
+        "insert",
+        "embedding",
+    ];
+    for (model, capabilities) in &mut overrides {
+        if model.is_empty() || model.trim() != model {
+            anyhow::bail!("{key} contains an empty or whitespace-padded model id {model:?}");
+        }
+        for capability in capabilities.iter() {
+            if !ALLOWED.contains(&capability.as_str()) {
+                anyhow::bail!(
+                    "{key} gives model {model:?} unsupported capability {capability:?}; \
+                     expected one of {}",
+                    ALLOWED.join(", ")
+                );
+            }
+        }
+    }
+    Ok(overrides)
+}
+
 /// Parse the extra named upstreams: `UPSTREAMS` is a CSV of names, each
 /// configured via `UPSTREAM_<NAME>_*` vars (name uppercased, `-` => `_`).
 /// A declared name missing its `BASE_URL` is a hard startup error — a silently
@@ -920,6 +984,11 @@ fn parse_extra_upstreams(default_num_ctx_cap: u64) -> Result<Vec<UpstreamSpec>> 
             thinking_hint: env_bool(&format!("{prefix}_THINKING_HINT"), true),
             reasoning_efforts: parse_reasoning_efforts(
                 &format!("{prefix}_REASONING_EFFORTS"),
+                kind,
+                &kind_key,
+            )?,
+            model_capabilities: parse_model_capabilities(
+                &format!("{prefix}_MODEL_CAPABILITIES"),
                 kind,
                 &kind_key,
             )?,
@@ -984,6 +1053,7 @@ fn default_upstream_env_present() -> bool {
         "UPSTREAM_BASE_URL",
         "UPSTREAM_API_KEY",
         "UPSTREAM_THINKING_HINT",
+        "UPSTREAM_MODEL_CAPABILITIES",
         "UPSTREAM_DEFAULT_MODEL",
         "UPSTREAM_MODELS",
         "UPSTREAM_MAX_CONCURRENCY",
@@ -1015,6 +1085,7 @@ pub mod tests_support {
             upstream_api_key: None,
             upstream_thinking_hint: true,
             upstream_reasoning_efforts: vec![],
+            upstream_model_capabilities: BTreeMap::new(),
             default_model: "m".into(),
             models: vec![],
             default_upstream_configured: true,
@@ -1143,7 +1214,8 @@ pub mod tests_support {
 mod tests {
     use super::{
         csv_alias, env_node, env_or_alias, env_parse_alias, parse_extra_upstreams,
-        parse_reasoning_efforts, parse_upstream_kind, parse_url_alias, NodeInput,
+        parse_model_capabilities, parse_reasoning_efforts, parse_upstream_kind, parse_url_alias,
+        NodeInput,
     };
     use crate::ollama::UpstreamKind;
     use std::sync::{Mutex, OnceLock};
@@ -1238,6 +1310,45 @@ mod tests {
     }
 
     #[test]
+    fn model_capability_overrides_are_validated() {
+        let _guard = env_lock();
+        const KEY: &str = "UPSTREAM_MODEL_CAPABILITIES";
+
+        std::env::set_var(KEY, r#"{"vision-model":["completion","vision","tools"]}"#);
+        let overrides =
+            parse_model_capabilities(KEY, Some(UpstreamKind::OpenAICompatible), "UPSTREAM_KIND")
+                .unwrap();
+        assert_eq!(overrides["vision-model"], ["completion", "vision", "tools"]);
+
+        std::env::set_var(KEY, r#"{"vision-model":["visoin"]}"#);
+        let err =
+            parse_model_capabilities(KEY, Some(UpstreamKind::OpenAICompatible), "UPSTREAM_KIND")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("visoin") && err.contains(KEY), "got: {err}");
+
+        std::env::set_var(KEY, "not-json");
+        let err = parse_model_capabilities(KEY, None, "UPSTREAM_KIND")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("JSON object") && err.contains(KEY),
+            "got: {err}"
+        );
+
+        std::env::set_var(KEY, r#"{"vision-model":["vision"]}"#);
+        let err = parse_model_capabilities(KEY, Some(UpstreamKind::NativeOllama), "UPSTREAM_KIND")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("OpenAI-compatible") && err.contains(KEY),
+            "got: {err}"
+        );
+
+        std::env::remove_var(KEY);
+    }
+
+    #[test]
     fn upstream_env_aliases_prefer_new_names() {
         let _guard = env_lock();
         const BASE: &str = "UPSTREAM_BASE_URL";
@@ -1311,6 +1422,7 @@ mod tests {
             "UPSTREAM_VLLM_MAX_CONCURRENCY",
             "UPSTREAM_VLLM_THINKING_HINT",
             "UPSTREAM_VLLM_REASONING_EFFORTS",
+            "UPSTREAM_VLLM_MODEL_CAPABILITIES",
             "UPSTREAM_VLLM_NUM_CTX_CAP",
         ];
         for key in keys {
@@ -1333,6 +1445,10 @@ mod tests {
         std::env::set_var("UPSTREAM_VLLM_MAX_CONCURRENCY", "2");
         std::env::set_var("UPSTREAM_VLLM_THINKING_HINT", "false");
         std::env::set_var("UPSTREAM_VLLM_REASONING_EFFORTS", "none, low, medium, high");
+        std::env::set_var(
+            "UPSTREAM_VLLM_MODEL_CAPABILITIES",
+            r#"{"qwen3-32b":["completion","vision","tools"]}"#,
+        );
         let specs = parse_extra_upstreams(32_768).unwrap();
         assert_eq!(specs.len(), 1);
         let spec = &specs[0];
@@ -1346,6 +1462,10 @@ mod tests {
         assert_eq!(spec.num_ctx_cap, 32_768);
         assert!(!spec.thinking_hint);
         assert_eq!(spec.reasoning_efforts, ["none", "low", "medium", "high"]);
+        assert_eq!(
+            spec.model_capabilities["qwen3-32b"],
+            ["completion", "vision", "tools"]
+        );
 
         // A per-upstream cap on an explicitly OpenAI-compatible upstream is
         // rejected — num_ctx injection is native-Ollama only, and silently
@@ -1358,6 +1478,7 @@ mod tests {
         // On a native-Ollama kind it overrides the flat default.
         std::env::set_var("UPSTREAM_VLLM_KIND", "ollama");
         std::env::remove_var("UPSTREAM_VLLM_REASONING_EFFORTS");
+        std::env::remove_var("UPSTREAM_VLLM_MODEL_CAPABILITIES");
         let specs = parse_extra_upstreams(32_768).unwrap();
         assert_eq!(specs[0].num_ctx_cap, 8192);
         std::env::set_var("UPSTREAM_VLLM_KIND", "vllm");
@@ -1416,6 +1537,7 @@ mod tests {
             api_key: None,
             thinking_hint: true,
             reasoning_efforts: vec!["low".into(), "high".into()],
+            model_capabilities: Default::default(),
             models: vec!["big".into()],
             concurrency: None,
             num_ctx_cap: 32_768,
@@ -1439,6 +1561,7 @@ mod tests {
                 api_key: None,
                 thinking_hint: true,
                 reasoning_efforts: vec![],
+                model_capabilities: Default::default(),
                 models: vec!["big".into()],
                 concurrency: None,
                 num_ctx_cap: 32_768,
@@ -1450,6 +1573,7 @@ mod tests {
                 api_key: None,
                 thinking_hint: true,
                 reasoning_efforts: vec![],
+                model_capabilities: Default::default(),
                 models: vec!["small".into()],
                 concurrency: None,
                 num_ctx_cap: 32_768,

@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Semaphore;
 use url::Url;
 
+use crate::config::ModelCapabilityOverrides;
 use crate::ollama::{UpstreamChatBackend, UpstreamKind};
 
 /// One configured upstream: its detected backend, routing model list, and
@@ -39,6 +40,9 @@ pub struct UpstreamEntry {
     /// Optional per-model reasoning effort values advertised for models served
     /// by this upstream. Empty means unknown/not advertised.
     pub reasoning_efforts: Vec<String>,
+    /// Explicit per-model capabilities for OpenAI-compatible discovery APIs,
+    /// which otherwise leave this metadata unknown.
+    pub model_capabilities: ModelCapabilityOverrides,
     /// Config-pinned models; non-empty => authoritative, never re-probed.
     pinned_models: Vec<String>,
     /// Last probed model list (startup detection, then capability refreshes).
@@ -52,6 +56,7 @@ pub struct UpstreamEntryInit {
     pub backend: UpstreamChatBackend,
     pub max_concurrency: usize,
     pub reasoning_efforts: Vec<String>,
+    pub model_capabilities: ModelCapabilityOverrides,
     pub pinned_models: Vec<String>,
     pub probed_models: Vec<String>,
 }
@@ -66,6 +71,7 @@ impl UpstreamEntry {
             sem: Arc::new(Semaphore::new(init.max_concurrency)),
             max_concurrency: init.max_concurrency,
             reasoning_efforts: init.reasoning_efforts,
+            model_capabilities: init.model_capabilities,
             pinned_models: init.pinned_models,
             probed_models: RwLock::new(init.probed_models),
         }
@@ -188,6 +194,7 @@ mod tests {
             backend,
             max_concurrency: 4,
             reasoning_efforts: vec![],
+            model_capabilities: Default::default(),
             pinned_models: pinned.iter().map(|s| s.to_string()).collect(),
             probed_models: probed.iter().map(|s| s.to_string()).collect(),
         })

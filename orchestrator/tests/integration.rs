@@ -411,6 +411,7 @@ fn test_config(upstream_base: &str) -> Config {
         upstream_api_key: None,
         upstream_thinking_hint: true,
         upstream_reasoning_efforts: vec![],
+        upstream_model_capabilities: Default::default(),
         default_model: "m".into(),
         models: vec!["m".into()],
         default_upstream_configured: true,
@@ -1093,6 +1094,7 @@ async fn capability_refresh_uses_fixed_backend_kind() {
         backend: native,
         max_concurrency: 4,
         reasoning_efforts: vec![],
+        model_capabilities: Default::default(),
         pinned_models: vec![],
         probed_models: vec![],
     })]);
@@ -1158,6 +1160,11 @@ async fn multiple_upstreams_union_models_and_route_by_model() {
         api_key: None,
         thinking_hint: true,
         reasoning_efforts: vec!["none".into(), "low".into(), "medium".into(), "high".into()],
+        model_capabilities: [(
+            "big".into(),
+            vec!["completion".into(), "vision".into(), "tools".into()],
+        )]
+        .into(),
         models: vec![], // probed from its /v1/models
         concurrency: Some(2),
         num_ctx_cap: 0,
@@ -1216,11 +1223,10 @@ async fn multiple_upstreams_union_models_and_route_by_model() {
         serde_json::json!(40960),
         "vLLM's max_model_len should surface as context_length"
     );
-    assert_eq!(
-        vllm_model.get("capabilities"),
-        None,
-        "per-model capabilities stay unknown for OpenAI-compatible upstreams"
-    );
+    assert_eq!(vllm_model["capabilities"]["completion"], true);
+    assert_eq!(vllm_model["capabilities"]["vision"], true);
+    assert_eq!(vllm_model["capabilities"]["tools"], true);
+    assert_eq!(vllm_model["capabilities"]["audio"], false);
 
     let chat = |model: &'static str| {
         let base = base.clone();

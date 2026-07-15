@@ -45,11 +45,42 @@ startup loudly rather than silently dropping the backend.
 | `UPSTREAM_<NAME>_BASE_URL` | *(required)* | Where the backend listens. |
 | `UPSTREAM_<NAME>_KIND` | `auto` | `auto`, `ollama`, `vllm`, `llama_cpp`, `openai_compatible`. `auto` probes native Ollama first, then OpenAI `/v1`. Set it explicitly for non-Ollama hosts so a slow startup can't be mis-detected. |
 | `UPSTREAM_<NAME>_MODELS` | *(probed)* | CSV pin of the models this upstream serves. Unset => probed from the backend (`/api/tags` or `/v1/models`). |
+| `UPSTREAM_<NAME>_MODEL_CAPABILITIES` | *(none)* | JSON map of exact model ids to capability arrays for OpenAI-compatible hosts. See [Model capability overrides](#model-capability-overrides). |
 | `UPSTREAM_<NAME>_API_KEY` | *(none)* | Bearer token for OpenAI-compatible backends. |
 | `UPSTREAM_<NAME>_MAX_CONCURRENCY` | global `UPSTREAM_MAX_CONCURRENCY` | Cap on simultaneous generations on this backend. |
 | `UPSTREAM_<NAME>_NUM_CTX_CAP` | global `UPSTREAM_NUM_CTX_CAP` (32768) | Native Ollama only: cap on the `num_ctx` injected from each model's declared context length (`0` disables injection). Size it to this host's VRAM. Rejected when the upstream kind is explicitly OpenAI-compatible (the value would be silently ignored). |
 | `UPSTREAM_<NAME>_THINKING_HINT` | `true` | Send the Qwen-style `enable_thinking` hint (OpenAI-compatible backends only). Set `false` for strict `/v1` servers. |
 | `UPSTREAM_<NAME>_REASONING_EFFORTS` | *(none)* | CSV of reasoning effort values to advertise for this OpenAI-compatible upstream's models, e.g. `none,low,medium,high`. Rejected when the upstream kind is explicitly native Ollama. |
+
+## Model capability overrides
+
+OpenAI-compatible `/v1/models` responses generally do not say whether each
+model supports vision, audio, or tool calling. Declare that metadata explicitly
+when the app should show the corresponding controls and model-picker badges:
+
+```sh
+UPSTREAM_VLLM_MODEL_CAPABILITIES='{"vision-model":["completion","vision","tools"],"embedding-model":["embedding"]}'
+```
+
+Use `UPSTREAM_MODEL_CAPABILITIES` for the flat/default upstream and
+`UPSTREAM_<NAME>_MODEL_CAPABILITIES` for a named upstream. Model ids are exact
+and case-sensitive. Every available capability name is listed below:
+
+| Capability | Meaning in Phantasm |
+|------------|---------------------|
+| `completion` | The model accepts normal chat/completion requests and appears in the chat model picker. |
+| `vision` | The model accepts image input; this enables image attachments and the Vision badge. |
+| `audio` | The model accepts audio input. |
+| `tools` | The model can call functions/tools; this enables server-tool and app-hosted-tool affordances. |
+| `insert` | The model supports fill-in-the-middle/insertion requests. |
+| `embedding` | The model produces embeddings rather than chat completions. |
+
+For a model present in the JSON map, listed capabilities are advertised as
+`true` and every omitted capability is advertised as `false`; include the full
+set that applies. An empty array explicitly marks all capabilities unsupported.
+Malformed JSON and unknown capability names fail startup rather than being
+silently ignored. Do not configure this override for native Ollama: Phantasm
+reads authoritative capabilities from Ollama's `/api/show` endpoint instead.
 
 Two things change meaning slightly in multi-upstream mode:
 
@@ -77,9 +108,10 @@ Two things change meaning slightly in multi-upstream mode:
 - Advertised model metadata comes from the serving upstream: native Ollama
   reports per-model capabilities and context length via `/api/show`, with the
   context length clamped to the upstream's num_ctx cap so the advertised
-  window is the one actually served; OpenAI-compatible upstreams omit
-  capabilities (unknowable) but report `context_length` when the host extends
-  `/v1/models` with one (vLLM's `max_model_len` — exact by construction).
+  window is the one actually served. OpenAI-compatible upstreams omit
+  capabilities unless explicitly supplied through `MODEL_CAPABILITIES`, but
+  report `context_length` when the host extends `/v1/models` with one (vLLM's
+  `max_model_len` — exact by construction).
 
 ## Verifying it works
 
