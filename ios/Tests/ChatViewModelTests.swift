@@ -438,6 +438,85 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(client.requests.isEmpty, "the stopped turn must never reach the backend")
     }
 
+    func testStoppedTurnCannotFinishReplacementTurn() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        vm.setViewVisible(true)
+
+        client.enqueue(
+            events: [.token("stale"), .done],
+            leadingDelayNanoseconds: 800_000_000
+        )
+        client.enqueue(
+            events: [.token("replacement"), .done],
+            leadingDelayNanoseconds: 300_000_000
+        )
+        client.enqueue(events: [.token("Replacement Chat"), .done])
+
+        XCTAssertTrue(vm.send("first"))
+        try await waitUntil { client.invocations.count == 1 }
+
+        vm.stop()
+        XCTAssertTrue(vm.send("second"))
+
+        // The stopped stream's cancellation resumes after the new send. It must
+        // not clear the replacement turn while that turn is waiting for tokens.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(vm.isStreaming)
+        XCTAssertNil(vm.errorMessage)
+
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.messages.last?.message.content == "replacement"
+                && detail?.messages.last?.message.isComplete == true
+        }
+    }
+
+    func testStoppedToolContinuationCannotFinishReplacementTurn() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        env.backendMode = .full(Self.fullCapabilities())
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        vm.setViewVisible(true)
+        let calls = [WireToolCall(
+            index: 0,
+            id: "time_call",
+            function: .init(name: ToolName.currentTime, arguments: "{}")
+        )]
+
+        client.enqueue(events: [.toolCalls(calls), .done])
+        client.enqueue(
+            events: [.token("stale continuation"), .done],
+            leadingDelayNanoseconds: 800_000_000
+        )
+        client.enqueue(
+            events: [.token("replacement"), .done],
+            leadingDelayNanoseconds: 300_000_000
+        )
+        client.enqueue(events: [.token("Replacement Chat"), .done])
+
+        XCTAssertTrue(vm.send("use a tool"))
+        try await waitUntil { client.invocations.count == 2 }
+
+        vm.stop()
+        XCTAssertTrue(vm.send("new turn"))
+
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(vm.isStreaming)
+        XCTAssertNil(vm.errorMessage)
+
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.messages.last?.message.content == "replacement"
+                && detail?.messages.last?.message.isComplete == true
+        }
+    }
+
     func testStreamErrorDeletesPendingAssistantRowAndSurfacesMessage() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()

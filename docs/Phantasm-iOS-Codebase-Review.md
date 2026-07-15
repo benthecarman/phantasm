@@ -10,19 +10,16 @@ The iOS app has a strong foundation—good protocol seams, extensive `PhantasmKi
 
 The most urgent findings are:
 
-1. A cancelled turn can finish after a new turn starts and terminate the new turn.
-2. Keychain replacement can delete a valid credential and silently fail to save its replacement.
-3. “Delete All” races active streams and reports success even if deletion fails.
-4. Maple encryption does not authenticate the enclave and can silently downgrade.
-5. HealthKit-derived chat content is eligible for iCloud backup.
-6. Dictation can continue across chats/background transitions and its privacy copy overpromises.
-7. Several core controls are inaccessible to VoiceOver and other assistive technologies.
+1. Keychain replacement can delete a valid credential and silently fail to save its replacement.
+2. “Delete All” races active streams and reports success even if deletion fails.
+3. Maple encryption does not authenticate the enclave and can silently downgrade.
+4. HealthKit-derived chat content is eligible for iCloud backup.
+5. Dictation can continue across chats/background transitions and its privacy copy overpromises.
+6. Several core controls are inaccessible to VoiceOver and other assistive technologies.
 
 ## Correctness and Swift-specific bugs
 
 ### High severity
-
-- **A stale cancelled task can terminate a newer turn.** Turn tasks share `isStreaming`, pending IDs, and `task` without a turn identity. After stopping turn A and immediately starting B, A’s cancellation path can observe B’s state and call `finish()`. The same pattern affects tool continuations. Add a generation/turn UUID and require it to match before every mutation or completion. See [ChatViewModel.swift:416](../ios/ViewModels/ChatViewModel.swift#L416), [ChatViewModel.swift:846](../ios/ViewModels/ChatViewModel.swift#L846), and [ChatViewModel.swift:1135](../ios/ViewModels/ChatViewModel.swift#L1135).
 
 - **Onboarding can accept credentials that were never tested.** The test request snapshots neither URL nor token, but success records whatever happens to be in the editable fields after the request completes. Snapshot inputs and discard stale results, or disable editing during validation. The profile editor checks URL changes but not token changes. See [OnboardingView.swift:263](../ios/Views/Settings/OnboardingView.swift#L263) and [ProfileEditView.swift:231](../ios/Views/Settings/ProfileEditView.swift#L231).
 

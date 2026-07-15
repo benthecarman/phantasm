@@ -61,6 +61,13 @@ final class ChatViewModel {
     /// new chat this is an in-memory draft that isn't written until the first send.
     private var conversation: Conversation?
     private var task: Task<Void, Never>?
+    /// Identifies the logical turn allowed to mutate streaming state. A stopped
+    /// task can resume from cancellation after a replacement turn starts; every
+    /// async continuation carries its generation and must still own the VM.
+    private var activeTurnGeneration: UUID?
+    /// Retained after a turn finishes so its asynchronous row commit may report
+    /// an error, but only until a newer turn supersedes it.
+    private var currentTurnGeneration: UUID?
     /// Immutable backend snapshot captured for the active turn (and retained
     /// while an interactive tool prompt is parked). Profile selection changes
     /// elsewhere in the app cannot retarget this work.
@@ -72,6 +79,7 @@ final class ChatViewModel {
     private var isViewVisible = false
     private var suspendedByScene = false
     private var backgroundTaskID: UIBackgroundTaskIdentifier
+    private var backgroundTaskGeneration: UUID?
     private let backgroundTasks: any BackgroundTaskManaging
     private let notifications: any NotificationManaging
     private let imageFetcher: any ImageFetching
@@ -154,24 +162,43 @@ final class ChatViewModel {
     }
 
     private func beginBackgroundStreamingTaskIfNeeded() {
-        guard backgroundTaskID == backgroundTasks.invalidTaskID else { return }
+        guard backgroundTaskID == backgroundTasks.invalidTaskID,
+              let generation = activeTurnGeneration else { return }
+        backgroundTaskGeneration = generation
         backgroundTaskID = backgroundTasks.beginBackgroundTask(named: "Chat response") { [weak self] in
             self?.expireBackgroundStreamingTask()
         }
     }
 
     private func expireBackgroundStreamingTask() {
-        guard backgroundTaskID != backgroundTasks.invalidTaskID else { return }
+        guard backgroundTaskID != backgroundTasks.invalidTaskID,
+              let generation = backgroundTaskGeneration,
+              ownsTurn(generation) else { return }
         suspendedByScene = true
         task?.cancel()
-        endBackgroundStreamingTask()
+        endBackgroundStreamingTask(for: generation)
     }
 
-    private func endBackgroundStreamingTask() {
+    private func endBackgroundStreamingTask(for generation: UUID? = nil) {
         guard backgroundTaskID != backgroundTasks.invalidTaskID else { return }
+        if let generation, backgroundTaskGeneration != generation { return }
         let id = backgroundTaskID
         backgroundTaskID = backgroundTasks.invalidTaskID
+        backgroundTaskGeneration = nil
         backgroundTasks.endBackgroundTask(id)
+    }
+
+    @discardableResult
+    private func activateTurn(session: BackendSession) -> UUID {
+        let generation = UUID()
+        activeTurnGeneration = generation
+        currentTurnGeneration = generation
+        turnSession = session
+        return generation
+    }
+
+    private func ownsTurn(_ generation: UUID) -> Bool {
+        activeTurnGeneration == generation
     }
 
     /// The model the composer should display / preselect for this conversation.
@@ -448,7 +475,7 @@ final class ChatViewModel {
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
         errorMessage = nil
-        turnSession = session
+        let generation = activateTurn(session: session)
         startingTurn = StartingTurn(
             conversation: conversation,
             userMessage: userMessage,
@@ -466,7 +493,8 @@ final class ChatViewModel {
                 attachments: messageAttachments,
                 model: model,
                 session: session,
-                store: store
+                store: store,
+                generation: generation
             )
         }
         return true
@@ -480,7 +508,8 @@ final class ChatViewModel {
         attachments: [Attachment],
         model: String,
         session: BackendSession,
-        store: ChatStore
+        store: ChatStore,
+        generation: UUID
     ) async {
         do {
             // Lazy create (idempotent) + refresh metadata + persist the user
@@ -498,19 +527,21 @@ final class ChatViewModel {
             if startingTurn?.userMessage.id == userMessage.id {
                 startingTurn = nil
             }
+            guard ownsTurn(generation) else { return }
             guard await insertPendingAssistantMessage(
                 conversationId: conversation.id,
-                store: store
+                store: store,
+                generation: generation
             ) != nil else { return }
             try Task.checkCancellation()
         } catch {
-            finishAfterStreamFailure(error)
+            finishAfterStreamFailure(error, generation: generation)
             return
         }
 
         await streamReply(
             conversationId: conversation.id, model: model,
-            session: session, store: store
+            session: session, store: store, generation: generation
         )
     }
 
@@ -569,6 +600,7 @@ final class ChatViewModel {
         let model: String
         let session: BackendSession
         let store: ChatStore
+        let generation: UUID
 
         /// Run `mutate` (truncate/edit the history), then stream a fresh reply.
         @MainActor
@@ -578,20 +610,24 @@ final class ChatViewModel {
                 do {
                     try await mutate(store)
                 } catch {
-                    vm.finish(error: AppError.from(error))
+                    vm.finish(generation: generation, error: AppError.from(error))
                     return
                 }
+                guard vm.ownsTurn(generation) else { return }
                 guard await vm.insertPendingAssistantMessage(
                     conversationId: convoID,
-                    store: store
+                    store: store,
+                    generation: generation
                 ) != nil else { return }
                 if Task.isCancelled {
-                    vm.finishAfterStreamFailure(CancellationError())
+                    vm.finishAfterStreamFailure(
+                        CancellationError(), generation: generation
+                    )
                     return
                 }
                 await vm.streamReply(
                     conversationId: convoID, model: model,
-                    session: session, store: store
+                    session: session, store: store, generation: generation
                 )
             }
         }
@@ -628,12 +664,12 @@ final class ChatViewModel {
         pendingPrompt = nil
         suspendedByScene = false
         errorMessage = nil
-        turnSession = session
+        let generation = activateTurn(session: session)
         Task { await notifications.requestAuthorizationIfNeeded() }
 
         return TurnContext(
             vm: self, convoID: conversation.id, model: model,
-            session: session, store: store
+            session: session, store: store, generation: generation
         )
     }
 
@@ -645,16 +681,22 @@ final class ChatViewModel {
         model: String,
         session: BackendSession,
         store: ChatStore,
+        generation: UUID,
         measuresThroughput: Bool = true,
         measuresReasoningDuration: Bool = true
     ) async {
         // Wait for the previous turn's row commit (not its follow-up work) so
         // a fast follow-up send can't read a history missing the last reply.
         await commitTask?.value
+        guard ownsTurn(generation) else { return }
         guard let detail = try? await store.conversationDetail(id: conversationId) else {
-            finish(error: .modelError("Could not load the conversation history."))
+            finish(
+                generation: generation,
+                error: .modelError("Could not load the conversation history.")
+            )
             return
         }
+        guard ownsTurn(generation) else { return }
         // Research is selected by the model id, not a request flag (redesign §2):
         // when this chat has a mode selected AND the backend advertises it AND the
         // base model is tool-capable, the mode rides as a `<base>:<mode>` suffix —
@@ -723,6 +765,7 @@ final class ChatViewModel {
         var sawDone = false
         do {
             for try await event in stream {
+                guard ownsTurn(generation) else { return }
                 switch event {
                 case .token(let t):
                     statusText = nil
@@ -758,10 +801,11 @@ final class ChatViewModel {
             if sawDone, let calls = batchedCalls, !calls.isEmpty {
                 resolveToolBatch(
                     calls, conversationId: conversationId, model: model,
-                    session: session, store: store
+                    session: session, store: store, generation: generation
                 )
                 return
             }
+            guard ownsTurn(generation) else { return }
             let backgrounded = !isSceneActive || suspendedByScene || !isViewVisible
             if sawDone, measuresReasoningDuration,
                streamingReasoningDuration == nil,
@@ -778,7 +822,11 @@ final class ChatViewModel {
             let reasoningOnlyResponse = sawDone && emptyResponse && !streamingReasoning.isEmpty
             if interruptedInBackground || (emptyResponse && !reasoningOnlyResponse && backgrounded) {
                 suspendedByScene = false
-                finish(error: nil, emptyPendingDisposition: .keepForRecovery)
+                finish(
+                    generation: generation,
+                    error: nil,
+                    emptyPendingDisposition: .keepForRecovery
+                )
             } else {
                 let completionError: AppError?
                 if !sawDone {
@@ -796,10 +844,10 @@ final class ChatViewModel {
                         duration: Date.now.timeIntervalSince(firstAnswerTokenAt)
                     )
                 }
-                finish(error: completionError)
+                finish(generation: generation, error: completionError)
             }
         } catch {
-            finishAfterStreamFailure(error)
+            finishAfterStreamFailure(error, generation: generation)
         }
     }
 
@@ -823,12 +871,15 @@ final class ChatViewModel {
         guard !isStreaming, isSceneActive, isViewVisible,
               let store, let conversation,
               let session = backendSession else { return }
-        turnSession = session
         // A commit from the just-finished turn may still be landing; reading
         // before it does would mistake the not-yet-completed row for a
         // resumable turn and stream it a second time.
         await commitTask?.value
+        guard !isStreaming else { return }
         guard let detail = try? await store.conversationDetail(id: conversation.id) else { return }
+        // A send may have started while either awaited read was in flight. Its
+        // generation owns the VM now, so abandon this stale recovery attempt.
+        guard !isStreaming else { return }
 
         // Restore an unanswered interactive prompt from the active tool-call batch.
         // Its rows are *complete* (the assistant tool_call row + any auto-resolved
@@ -839,6 +890,7 @@ final class ChatViewModel {
            let prompt = AppToolRegistry.firstUnansweredPrompt(
                calls: batch.calls, answered: batch.answered
            ) {
+            _ = activateTurn(session: session)
             pendingPrompt = prompt
             return
         }
@@ -869,20 +921,22 @@ final class ChatViewModel {
         pendingAssistantMessageID = pending.id
         pendingAssistantPreviewMessageID = nil
         errorMessage = nil
+        let generation = activateTurn(session: session)
         task = Task { [weak self] in
             await self?.streamReply(
                 conversationId: conversation.id,
                 model: model,
                 session: session,
                 store: store,
+                generation: generation,
                 measuresThroughput: false,
                 measuresReasoningDuration: false
             )
         }
     }
 
-    private func finishAfterStreamFailure(_ error: Error) {
-        guard isStreaming else { return }
+    private func finishAfterStreamFailure(_ error: Error, generation: UUID) {
+        guard isStreaming, ownsTurn(generation) else { return }
         let appError = AppError.from(error)
         let shouldRecover = appError == .cancelled
             || !isSceneActive
@@ -890,6 +944,7 @@ final class ChatViewModel {
             || !isViewVisible
         suspendedByScene = false
         finish(
+            generation: generation,
             error: shouldRecover ? nil : appError,
             emptyPendingDisposition: shouldRecover ? .keepForRecovery : .delete
         )
@@ -900,13 +955,14 @@ final class ChatViewModel {
 
     private func insertPendingAssistantMessage(
         conversationId: UUID,
-        store: ChatStore
+        store: ChatStore,
+        generation: UUID
     ) async -> UUID? {
         // stop() may have run while an earlier await was in flight: the VM
         // already finished, so a row inserted now would be an orphan nobody
         // owns — and the recovery path would silently restart the turn the
         // user explicitly stopped.
-        guard isStreaming, !Task.isCancelled else { return nil }
+        guard isStreaming, ownsTurn(generation), !Task.isCancelled else { return nil }
         let assistant = Message(
             conversationId: conversationId,
             role: "assistant",
@@ -916,7 +972,7 @@ final class ChatViewModel {
         )
         do {
             try await store.insertMessage(assistant, attachments: [])
-            if !isStreaming || Task.isCancelled {
+            if !isStreaming || !ownsTurn(generation) || Task.isCancelled {
                 // stop() raced the insert itself: remove the orphan.
                 try? await store.deleteMessage(id: assistant.id)
                 return nil
@@ -924,7 +980,7 @@ final class ChatViewModel {
             pendingAssistantMessageID = assistant.id
             return assistant.id
         } catch {
-            finish(error: AppError.from(error))
+            finish(generation: generation, error: AppError.from(error))
             return nil
         }
     }
@@ -960,6 +1016,8 @@ final class ChatViewModel {
         guard let prompt = pendingPrompt, !isStreaming,
               let store, let conversation,
               let session = turnSession ?? backendSession else { return }
+        let generation = activeTurnGeneration ?? activateTurn(session: session)
+        guard ownsTurn(generation) else { return }
         guard let model = session.resolvedModel(
             conversationModel: conversation.modelID
         ) else { return }
@@ -999,16 +1057,21 @@ final class ChatViewModel {
             do {
                 try await store.insertMessage(toolMessage, attachments: [])
             } catch {
-                self?.finish(error: AppError.from(error))
+                self?.finish(generation: generation, error: AppError.from(error))
                 return
             }
+            guard self?.ownsTurn(generation) == true else { return }
             let text = await result()
+            guard self?.ownsTurn(generation) == true else { return }
             try? await store.updateMessage(
                 id: toolMessage.id, content: text, reasoning: "",
                 isComplete: true, createdAt: nil
             )
+            guard self?.ownsTurn(generation) == true else { return }
             if Task.isCancelled {
-                self?.finishAfterStreamFailure(CancellationError())
+                self?.finishAfterStreamFailure(
+                    CancellationError(), generation: generation
+                )
                 return
             }
             // Restamp so the pending row sorts after the tool result just
@@ -1016,15 +1079,18 @@ final class ChatViewModel {
             self?.streamingStartedAt = .now
             guard await self?.insertPendingAssistantMessage(
                 conversationId: conversation.id,
-                store: store
+                store: store,
+                generation: generation
             ) != nil else { return }
             if Task.isCancelled {
-                self?.finishAfterStreamFailure(CancellationError())
+                self?.finishAfterStreamFailure(
+                    CancellationError(), generation: generation
+                )
                 return
             }
             await self?.streamReply(
                 conversationId: conversation.id, model: model,
-                session: session, store: store
+                session: session, store: store, generation: generation
             )
         }
     }
@@ -1042,8 +1108,10 @@ final class ChatViewModel {
         conversationId: UUID,
         model: String,
         session: BackendSession,
-        store: ChatStore
+        store: ChatStore,
+        generation: UUID
     ) {
+        guard ownsTurn(generation) else { return }
         let json = Self.encodeToolCalls(calls)
         let pendingID = pendingAssistantMessageID
         pendingAssistantMessageID = nil
@@ -1067,12 +1135,14 @@ final class ChatViewModel {
                     )
                 }
             } catch {
-                self?.finish(error: AppError.from(error))
+                self?.finish(generation: generation, error: AppError.from(error))
                 return
             }
+            guard self?.ownsTurn(generation) == true else { return }
 
             var prompt: AppToolPrompt?
             for call in calls {
+                guard self?.ownsTurn(generation) == true else { return }
                 guard let id = call.id else { continue }
                 let result: String?
                 switch AppToolRegistry.match(call) {
@@ -1080,6 +1150,7 @@ final class ChatViewModel {
                     self?.statusText = tool.statusText
                     self?.statusProgress = nil
                     result = await tool.resolve(call)
+                    guard self?.ownsTurn(generation) == true else { return }
                 case .interactive(let tool):
                     if prompt == nil, let raised = tool.prompt(for: call) {
                         prompt = raised
@@ -1098,20 +1169,28 @@ final class ChatViewModel {
                     do {
                         try await store.insertMessage(message, attachments: [])
                     } catch {
-                        self?.finish(error: AppError.from(error))
+                        self?.finish(generation: generation, error: AppError.from(error))
                         return
                     }
+                    guard self?.ownsTurn(generation) == true else { return }
                 }
                 if Task.isCancelled {
-                    self?.finishAfterStreamFailure(CancellationError())
+                    self?.finishAfterStreamFailure(
+                        CancellationError(), generation: generation
+                    )
                     return
                 }
             }
 
             // An interactive prompt remains: park the turn and wait for the user.
             if let prompt {
+                guard self?.ownsTurn(generation) == true else { return }
                 self?.pendingPrompt = prompt
-                self?.enterPromptWait(conversationId: conversationId, store: store)
+                self?.enterPromptWait(
+                    conversationId: conversationId,
+                    store: store,
+                    generation: generation
+                )
                 return
             }
 
@@ -1123,15 +1202,19 @@ final class ChatViewModel {
             // continuation.
             self?.streamingStartedAt = .now
             guard await self?.insertPendingAssistantMessage(
-                conversationId: conversationId, store: store
+                conversationId: conversationId,
+                store: store,
+                generation: generation
             ) != nil else { return }
             if Task.isCancelled {
-                self?.finishAfterStreamFailure(CancellationError())
+                self?.finishAfterStreamFailure(
+                    CancellationError(), generation: generation
+                )
                 return
             }
             await self?.streamReply(
                 conversationId: conversationId, model: model,
-                session: session, store: store
+                session: session, store: store, generation: generation
             )
         }
     }
@@ -1140,7 +1223,12 @@ final class ChatViewModel {
     /// prompt. The assistant tool_call row and any auto-resolved results are
     /// already committed, so this only parks the streaming state — it commits no
     /// row (unlike `finish`, which would try to flush empty streamed text).
-    private func enterPromptWait(conversationId: UUID, store: ChatStore) {
+    private func enterPromptWait(
+        conversationId: UUID,
+        store: ChatStore,
+        generation: UUID
+    ) {
+        guard ownsTurn(generation) else { return }
         isStreaming = false
         hasAssistantPreview = false
         statusText = nil
@@ -1157,7 +1245,7 @@ final class ChatViewModel {
                 id: conversationId, title: nil, modelID: nil, updatedAt: .now
             )
         }
-        endBackgroundStreamingTask()
+        endBackgroundStreamingTask(for: generation)
     }
 
     /// JSON-encode forwarded tool calls for durable storage on the assistant row.
@@ -1169,6 +1257,7 @@ final class ChatViewModel {
 
     /// Stop button (FR-A9): abort the SSE connection; keep whatever streamed.
     func stop() {
+        guard let generation = activeTurnGeneration, isStreaming else { return }
         // A resumable turn no longer cancels on disconnect, so explicitly tell the
         // orchestrator to cancel it — freeing server resources and any running
         // image generation immediately rather than letting it finish unseen.
@@ -1182,8 +1271,16 @@ final class ChatViewModel {
                 )
             }
         }
-        task?.cancel()
-        finish(error: nil, emptyPendingDisposition: .delete)
+        let stoppedTask = task
+        // Revoke ownership before delivering cancellation. The cancelled task
+        // may resume after another send starts, but it can no longer finish or
+        // mutate that replacement turn.
+        finish(
+            generation: generation,
+            error: nil,
+            emptyPendingDisposition: .delete
+        )
+        stoppedTask?.cancel()
     }
 
     func setModel(_ model: String) {
@@ -1202,11 +1299,13 @@ final class ChatViewModel {
     }
 
     private func finish(
+        generation: UUID,
         error: AppError?,
         emptyPendingDisposition: EmptyPendingDisposition = .delete
     ) {
-        guard isStreaming else { return }
+        guard isStreaming, ownsTurn(generation) else { return }
         isStreaming = false
+        activeTurnGeneration = nil
         let completedSession = turnSession
         turnSession = nil
         statusText = nil
@@ -1231,6 +1330,7 @@ final class ChatViewModel {
                         store: startingTurn.store
                     )
                 } catch {
+                    guard self?.currentTurnGeneration == generation else { return }
                     self?.errorMessage = AppError.from(error).userMessage
                 }
             }
@@ -1264,7 +1364,7 @@ final class ChatViewModel {
             streamingReasoningDuration = nil
             pendingAssistantPreviewMessageID = nil
             hasAssistantPreview = false
-            endBackgroundStreamingTask()
+            endBackgroundStreamingTask(for: generation)
         } else if let store, let conversation, hasAssistantPayload {
             // The preview stays visible (hasAssistantPreview remains true) until
             // the committed row lands and reconcileAssistantPreview clears it.
@@ -1278,7 +1378,8 @@ final class ChatViewModel {
                     content: committed,
                     notifyInBackground: shouldNotifyWhenCommitted,
                     isCleanCompletion: error == nil,
-                    session: completedSession
+                    session: completedSession,
+                    generation: generation
                 ) {
                     try await store.updateMessage(
                         id: pendingID,
@@ -1305,7 +1406,8 @@ final class ChatViewModel {
                     content: committed,
                     notifyInBackground: shouldNotifyWhenCommitted,
                     isCleanCompletion: error == nil,
-                    session: completedSession
+                    session: completedSession,
+                    generation: generation
                 ) {
                     try await store.insertMessage(assistant, attachments: [])
                 }
@@ -1319,7 +1421,7 @@ final class ChatViewModel {
             streamingReasoningDuration = nil
             pendingAssistantPreviewMessageID = nil
             hasAssistantPreview = false
-            endBackgroundStreamingTask()
+            endBackgroundStreamingTask(for: generation)
         }
 
         if let error, error != .cancelled {
@@ -1339,6 +1441,7 @@ final class ChatViewModel {
         notifyInBackground: Bool,
         isCleanCompletion: Bool,
         session: BackendSession?,
+        generation: UUID,
         write: @escaping @Sendable () async throws -> Void
     ) {
         let rowCommit = Task { [weak self] () -> Bool in
@@ -1346,8 +1449,12 @@ final class ChatViewModel {
                 try await write()
                 return true
             } catch {
-                self?.handleAssistantCommitFailure(messageID: messageID, error: error)
-                self?.endBackgroundStreamingTask()
+                self?.handleAssistantCommitFailure(
+                    messageID: messageID,
+                    generation: generation,
+                    error: error
+                )
+                self?.endBackgroundStreamingTask(for: generation)
                 return false
             }
         }
@@ -1373,12 +1480,17 @@ final class ChatViewModel {
             } else if isCleanCompletion && !content.isEmpty {
                 await self?.maybeGenerateTitle(session: session)
             }
-            self?.endBackgroundStreamingTask()
+            self?.endBackgroundStreamingTask(for: generation)
         }
     }
 
-    private func handleAssistantCommitFailure(messageID: UUID, error: Error) {
-        guard pendingAssistantPreviewMessageID == messageID else { return }
+    private func handleAssistantCommitFailure(
+        messageID: UUID,
+        generation: UUID,
+        error: Error
+    ) {
+        guard currentTurnGeneration == generation,
+              pendingAssistantPreviewMessageID == messageID else { return }
         pendingAssistantPreviewMessageID = nil
         streamingText = ""
         streamingReasoning = ""
