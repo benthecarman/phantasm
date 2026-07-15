@@ -145,8 +145,9 @@ struct OnboardingView: View {
 
             Section {
                 Button("Continue") {
-                    saveBackend()
-                    step = .tools
+                    if saveBackend() {
+                        step = .tools
+                    }
                 }
                 .disabled(!canContinue)
             }
@@ -286,7 +287,7 @@ struct OnboardingView: View {
         }
     }
 
-    private func saveBackend() {
+    private func saveBackend() -> Bool {
         let profile = BackendProfile(
             name: name.trimmingCharacters(in: .whitespacesAndNewlines),
             baseURLString: normalizedURLString,
@@ -296,8 +297,20 @@ struct OnboardingView: View {
                 : BackendProfile.defaultTransport(for: normalizedURLString),
             autoWarm: autoWarm
         )
-        env.upsert(profile, token: normalizedToken.isEmpty ? nil : normalizedToken)
+        do {
+            try env.upsert(
+                profile,
+                token: normalizedToken.isEmpty ? nil : normalizedToken
+            )
+        } catch {
+            Haptics.notify(.error)
+            testResult = .failure(
+                "Couldn’t save the credential securely. Your backend settings were not changed."
+            )
+            return false
+        }
         env.setActive(profile.id)
+        return true
     }
 
     private func requestPermissionIfNeeded(title: String, enabled: Bool) {

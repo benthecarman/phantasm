@@ -321,18 +321,22 @@ final class AppEnvironment {
         return profileStore.cachedModels(for: id)
     }
 
-    func upsert(_ profile: BackendProfile, token: String?) {
+    func upsert(_ profile: BackendProfile, token: String?) throws {
+        // Commit the credential first. If secure storage is unavailable, keep
+        // both the existing token and all profile metadata unchanged so the UI
+        // can report the failure without leaving a half-saved backend.
+        let normalizedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if normalizedToken.isEmpty {
+            try keychain.delete(for: profile.id)
+        } else {
+            try keychain.setToken(normalizedToken, for: profile.id)
+        }
+
         backendStates[profile.id] = nil
         if let idx = profiles.firstIndex(where: { $0.id == profile.id }) {
             profiles[idx] = profile
         } else {
             profiles.append(profile)
-        }
-        let normalizedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if normalizedToken.isEmpty {
-            try? keychain.delete(for: profile.id)
-        } else {
-            try? keychain.setToken(normalizedToken, for: profile.id)
         }
         profileStore.save(profiles)
         if activeProfileID == nil {

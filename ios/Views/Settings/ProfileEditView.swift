@@ -295,7 +295,15 @@ struct ProfileEditView: View {
             autoWarm: autoWarm
         )
         let token = normalizedToken
-        env.upsert(profile, token: token.isEmpty ? nil : token)
+        do {
+            try env.upsert(profile, token: token.isEmpty ? nil : token)
+        } catch {
+            testResult = .failure(
+                "Couldn’t save the credential securely. Your backend settings were not changed."
+            )
+            Haptics.notify(.error)
+            return
+        }
         // A pairing is an explicit "use this backend"; manual adds keep the
         // current selection. upsert already activates (and refreshes) when
         // nothing was active or this is the active profile, so only an actual

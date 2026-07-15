@@ -5,9 +5,27 @@ import Security
 /// token is stored here, keyed by profile id; profile metadata lives elsewhere.
 public struct KeychainStore: Sendable {
     private let service: String
+    private let updateItem: @Sendable (CFDictionary, CFDictionary) -> OSStatus
+    private let addItem: @Sendable (CFDictionary) -> OSStatus
 
     public init(service: String = "com.phantasm.tokens") {
         self.service = service
+        self.updateItem = { query, attributes in
+            SecItemUpdate(query, attributes)
+        }
+        self.addItem = { query in
+            SecItemAdd(query, nil)
+        }
+    }
+
+    init(
+        service: String,
+        updateItem: @escaping @Sendable (CFDictionary, CFDictionary) -> OSStatus,
+        addItem: @escaping @Sendable (CFDictionary) -> OSStatus
+    ) {
+        self.service = service
+        self.updateItem = updateItem
+        self.addItem = addItem
     }
 
     public enum KeychainError: Error, Equatable {
@@ -16,16 +34,32 @@ public struct KeychainStore: Sendable {
 
     public func setToken(_ token: String, for profileID: UUID) throws {
         let account = profileID.uuidString
-        try? delete(for: profileID) // upsert
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
+        ]
+        let attributes: [String: Any] = [
             kSecValueData as String: Data(token.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
         ]
-        let status = SecItemAdd(query as CFDictionary, nil)
-        guard status == errSecSuccess else { throw KeychainError.unhandled(status) }
+        let updateStatus = updateItem(
+            query as CFDictionary,
+            attributes as CFDictionary
+        )
+        switch updateStatus {
+        case errSecSuccess:
+            return
+        case errSecItemNotFound:
+            let item = query.merging(attributes) { _, new in new }
+            let addStatus = addItem(item as CFDictionary)
+            guard addStatus == errSecSuccess else {
+                throw KeychainError.unhandled(addStatus)
+            }
+        default:
+            // The existing item remains untouched when an update fails.
+            throw KeychainError.unhandled(updateStatus)
+        }
     }
 
     public func token(for profileID: UUID) -> String? {

@@ -10,20 +10,17 @@ The iOS app has a strong foundation—good protocol seams, extensive `PhantasmKi
 
 The most urgent findings are:
 
-1. Keychain replacement can delete a valid credential and silently fail to save its replacement.
-2. “Delete All” races active streams and reports success even if deletion fails.
-3. Maple encryption does not authenticate the enclave and can silently downgrade.
-4. HealthKit-derived chat content is eligible for iCloud backup.
-5. Dictation can continue across chats/background transitions and its privacy copy overpromises.
-6. Several core controls are inaccessible to VoiceOver and other assistive technologies.
+1. “Delete All” races active streams and reports success even if deletion fails.
+2. Maple encryption does not authenticate the enclave and can silently downgrade.
+3. HealthKit-derived chat content is eligible for iCloud backup.
+4. Dictation can continue across chats/background transitions and its privacy copy overpromises.
+5. Several core controls are inaccessible to VoiceOver and other assistive technologies.
 
 ## Correctness and Swift-specific bugs
 
 ### High severity
 
 - **Onboarding can accept credentials that were never tested.** The test request snapshots neither URL nor token, but success records whatever happens to be in the editable fields after the request completes. Snapshot inputs and discard stale results, or disable editing during validation. The profile editor checks URL changes but not token changes. See [OnboardingView.swift:263](../ios/Views/Settings/OnboardingView.swift#L263) and [ProfileEditView.swift:231](../ios/Views/Settings/ProfileEditView.swift#L231).
-
-- **Keychain updates are destructive and errors disappear.** `setToken` deletes first and then adds; a failed add loses the valid old token. `AppEnvironment` ignores the error, persists the profile, and dismisses the form. Use `SecItemUpdate`, add only for item-not-found, and propagate failure before committing profile metadata. See [KeychainStore.swift:17](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Security/KeychainStore.swift#L17) and [AppEnvironment.swift:238](../ios/App/AppEnvironment.swift#L238).
 
 - **“Delete All” is not coordinated with live turns.** Cached view models can continue network/tool work and recreate messages after deletion. Database errors are swallowed while the UI unconditionally starts a new chat. Stop and await every live turn and commit, then delete with visible failure handling. See [SettingsView.swift:137](../ios/Views/Settings/SettingsView.swift#L137) and [RootView.swift:317](../ios/Views/RootView.swift#L317).
 
@@ -131,7 +128,7 @@ These are static findings; Instruments profiling was not performed.
 
 - A scanned QR triggers model/network probing before confirmation. Wait for an explicit Test/Continue action and add extra confirmation for loopback, link-local, and private targets. See [ProfileEditView.swift:189](../ios/Views/Settings/ProfileEditView.swift#L189).
 
-- Keychain accessibility is `AfterFirstUnlock`, and replacement is non-atomic. Consider `AfterFirstUnlockThisDeviceOnly` unless backup migration is intentional. See [KeychainStore.swift:25](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Security/KeychainStore.swift#L25).
+- Keychain accessibility is `AfterFirstUnlock`. Consider `AfterFirstUnlockThisDeviceOnly` unless backup migration is intentional. See [KeychainStore.swift:25](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Security/KeychainStore.swift#L25).
 
 - “Approximate location” does not match six-decimal latitude/longitude output. Round coordinates if approximation is intended, or disclose precise location. See [LocationProvider.swift:27](../ios/App/LocationProvider.swift#L27) and [LocationTool.swift:113](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Tools/LocationTool.swift#L113).
 
