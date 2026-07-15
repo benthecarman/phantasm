@@ -27,7 +27,9 @@ actor LegacySpeechDictationEngine: DictationEngine {
     // MARK: - DictationEngine
 
     func start(onPartial: @escaping @Sendable (String) -> Void) async throws {
+        try Task.checkCancellation()
         try await ensureAuthorized()
+        try Task.checkCancellation()
         guard let recognizer else {
             throw DictationError.unavailable("Speech recognition isn't available.")
         }
@@ -47,6 +49,9 @@ actor LegacySpeechDictationEngine: DictationEngine {
         let sink = LegacyAudioBufferSink(request: request)
         audioSink = sink
 
+        // Permissions can outlive the owning chat/scene. Never activate the
+        // microphone after the controller has cancelled this startup task.
+        try Task.checkCancellation()
         try activateDictationAudioSession()
         let inputNode = audioEngine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
@@ -56,6 +61,7 @@ actor LegacySpeechDictationEngine: DictationEngine {
         tapInstalled = true
         audioEngine.prepare()
         try audioEngine.start()
+        try Task.checkCancellation()
 
         recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
             let text = result?.bestTranscription.formattedString
@@ -135,7 +141,9 @@ actor LegacySpeechDictationEngine: DictationEngine {
     /// Ensure mic + speech-recognition permission and that a recognizer exists.
     private func ensureAuthorized() async throws {
         guard await requestMicrophonePermission() else { throw DictationError.microphoneDenied }
+        try Task.checkCancellation()
         try await requestSpeechAuthorization()
+        try Task.checkCancellation()
         guard let recognizer, recognizer.isAvailable else {
             throw DictationError.unavailable("Speech recognition isn't available right now.")
         }

@@ -35,7 +35,9 @@ protocol DictationEngine: AnyObject {
     ///
     /// `onPartial` is called as recognition progresses with the running
     /// transcript so far (finalized text plus the in-progress tail). It may be
-    /// invoked off the main thread and any number of times.
+    /// invoked off the main thread and any number of times. Implementations must
+    /// honor task cancellation after permission/model awaits and before
+    /// activating microphone capture.
     func start(onPartial: @escaping @Sendable (String) -> Void) async throws
 
     /// Stop capture, finalize, and return the trimmed transcript (best effort —

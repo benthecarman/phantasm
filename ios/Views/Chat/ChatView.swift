@@ -1,3 +1,4 @@
+import AVFoundation
 import GRDBQuery
 import PhantasmKit
 import SwiftUI
@@ -175,6 +176,7 @@ struct ChatView: View {
                     canSend: vm.canSend && (vm.pendingPrompt?.acceptsFreeTextAnswer ?? true),
                     focus: $composerFocused,
                     dictation: env.dictationController,
+                    dictationOwnerID: conversation.id,
                     availableModels: backendSession?.availableModels ?? [],
                     modelName: currentModelName,
                     modelSelection: modelBinding,
@@ -281,9 +283,25 @@ struct ChatView: View {
             if isEmpty && autoFocusComposer { composerFocused = true }
         }
         .onChange(of: scenePhase) { _, phase in
+            if phase != .active {
+                env.dictationController.relinquish(ownerID: conversation.id)
+            }
             vm.setSceneActive(phase == .active)
         }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: AVAudioSession.interruptionNotification
+            )
+        ) { notification in
+            guard let rawValue = (
+                notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? NSNumber
+            )?.uintValue,
+                  let type = AVAudioSession.InterruptionType(rawValue: rawValue),
+                  type == .began else { return }
+            env.dictationController.interrupt(ownerID: conversation.id)
+        }
         .onDisappear {
+            env.dictationController.relinquish(ownerID: conversation.id)
             vm.setViewVisible(false)
         }
         .alert("Error", isPresented: Binding(
@@ -537,7 +555,7 @@ struct ChatView: View {
     }
 
     private func send() {
-        env.dictationController.stop()
+        env.dictationController.stop(ownerID: conversation.id)
         Haptics.impact(.medium)
         let animateLogo = isEmpty
         let text = input
@@ -637,6 +655,8 @@ struct ComposerView: View {
     /// On-device dictation; the mic button drives it and its transcript is
     /// mirrored into `input`.
     let dictation: DictationController
+    /// Conversation whose composer is allowed to observe/control this session.
+    let dictationOwnerID: UUID
     let availableModels: [String]
     let modelName: String
     let modelSelection: Binding<String>
@@ -700,6 +720,24 @@ struct ComposerView: View {
     private var sendEnabled: Bool {
         canSend && (!trimmed.isEmpty || !attachments.isEmpty)
     }
+    private var ownsDictationState: Bool {
+        dictation.ownerID == dictationOwnerID
+    }
+    private var isDictationRecording: Bool {
+        ownsDictationState && dictation.isRecording
+    }
+    private var isDictationPreparing: Bool {
+        ownsDictationState && dictation.isPreparing
+    }
+    private var isDictationActive: Bool {
+        isDictationPreparing || isDictationRecording
+    }
+    private var isDictationTranscribing: Bool {
+        ownsDictationState && dictation.isTranscribing
+    }
+    private var dictationError: String? {
+        ownsDictationState ? dictation.errorMessage : nil
+    }
 
     var body: some View {
         VStack(spacing: 4) {
@@ -707,7 +745,7 @@ struct ComposerView: View {
                 attachmentStrip
             }
 
-            if let error = dictation.errorMessage {
+            if let error = dictationError {
                 Text(error)
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -725,7 +763,7 @@ struct ComposerView: View {
                 .submitLabel(.return)
 
             HStack(spacing: 8) {
-                if dictation.isRecording && dictationLocked {
+                if isDictationRecording && dictationLocked {
                     // Hands-free: tap to discard or stop.
                     cancelRecordingButton
                     RecordingIndicator()
@@ -734,29 +772,30 @@ struct ComposerView: View {
                 } else {
                     // Idle + held-recording share this row so the mic's UIKit
                     // gesture view is never torn down mid-press.
-                    addButton.opacity(dictation.isRecording ? 0 : 1)
-                    modelPicker.opacity(dictation.isRecording ? 0 : 1)
+                    addButton.opacity(isDictationActive ? 0 : 1)
+                    modelPicker.opacity(isDictationActive ? 0 : 1)
                     Spacer(minLength: 8)
                     control
                 }
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 8)
-            .animation(.easeInOut(duration: 0.2), value: dictation.isRecording)
+            .animation(.easeInOut(duration: 0.2), value: isDictationActive)
             .animation(.easeInOut(duration: 0.2), value: dictationLocked)
         }
         // Slide-to-lock and slide-to-cancel affordances, shown while holding.
         .overlay(alignment: .bottomTrailing) {
-            if dictation.isRecording && !dictationLocked {
+            if isDictationRecording && !dictationLocked {
                 lockHint.padding(.trailing, 13).offset(y: -52).transition(.opacity)
             }
         }
         .overlay(alignment: .bottomLeading) {
-            if dictation.isRecording && !dictationLocked {
+            if isDictationRecording && !dictationLocked {
                 cancelHint.padding(.leading, 18).padding(.bottom, 16).transition(.opacity)
             }
         }
         .onChange(of: dictation.liveTranscript) { _, transcript in
+            guard ownsDictationState else { return }
             // Mirror the live transcript into the composer, appended to whatever
             // was already typed when dictation started. Empty transcript (start /
             // cancel) reverts to that base text.
@@ -765,10 +804,13 @@ struct ComposerView: View {
                 : (dictationBase.isEmpty ? transcript : dictationBase + " " + transcript)
         }
         .onChange(of: dictation.isRecording) { _, recording in
-            if !recording {
-                dictationLocked = false
-                dictationLockProgress = 0
-                dictationCancelProgress = 0
+            if !recording || !ownsDictationState {
+                resetDictationGestureState()
+            }
+        }
+        .onChange(of: dictation.isPreparing) { _, preparing in
+            if !preparing && !isDictationRecording {
+                resetDictationGestureState()
             }
         }
         .background(
@@ -885,11 +927,11 @@ struct ComposerView: View {
     private var control: some View {
         if isStreaming {
             stopButton
-        } else if dictation.isTranscribing {
+        } else if isDictationTranscribing {
             ProgressView()
                 .frame(width: 34, height: 34)
                 .accessibilityLabel("Transcribing")
-        } else if sendEnabled && !dictation.isRecording {
+        } else if sendEnabled && !isDictationActive {
             sendButton
         } else {
             micButton
@@ -915,9 +957,12 @@ struct ComposerView: View {
     /// as the transcript streams in. Hold to record, release to keep the result,
     /// slide up to lock hands-free, slide sideways to cancel.
     private var micButton: some View {
-        controlIcon("mic", background: dictation.isRecording ? Color.red : Color.accentColor)
-            .scaleEffect(dictation.isRecording ? 1.1 : 1)
-            .animation(.easeOut(duration: 0.15), value: dictation.isRecording)
+        controlIcon(
+            isDictationPreparing ? "hourglass" : "mic",
+            background: isDictationRecording ? Color.red : Color.accentColor
+        )
+            .scaleEffect(isDictationRecording ? 1.1 : 1)
+            .animation(.easeOut(duration: 0.15), value: isDictationRecording)
             .overlay {
                 HoldToRecordGesture(
                     onStart: beginHeldRecording,
@@ -930,17 +975,22 @@ struct ComposerView: View {
                     onComplete: completeHeldRecording
                 )
             }
-            .accessibilityLabel("Hold to dictate")
-            .accessibilityHint("Hold to record, slide up to lock, slide sideways to cancel")
+            .accessibilityLabel(isDictationPreparing ? "Preparing dictation" : "Hold to dictate")
+            .accessibilityHint(
+                isDictationPreparing
+                    ? "Keep holding while dictation prepares"
+                    : "Hold to record, slide up to lock, slide sideways to cancel"
+            )
     }
 
     // MARK: Dictation gesture handlers
 
     private func beginHeldRecording() {
         dictationBase = trimmed
+        dictationLocked = false
         dictationLockProgress = 0
         dictationCancelProgress = 0
-        dictation.start()
+        dictation.start(ownerID: dictationOwnerID)
     }
 
     private func lockRecording() {
@@ -951,12 +1001,18 @@ struct ComposerView: View {
 
     /// Release while held → stop and transcribe; the result lands in the composer.
     private func completeHeldRecording() {
-        dictation.stop()
+        dictation.stop(ownerID: dictationOwnerID)
     }
 
     /// Slide-to-cancel → stop and discard, no transcription.
     private func cancelHeldRecording() {
-        dictation.cancel()
+        dictation.cancel(ownerID: dictationOwnerID)
+    }
+
+    private func resetDictationGestureState() {
+        dictationLocked = false
+        dictationLockProgress = 0
+        dictationCancelProgress = 0
     }
 
     /// "Slide up to lock" affordance shown above the mic while holding; fills in
@@ -990,7 +1046,7 @@ struct ComposerView: View {
 
     /// Stop recording and keep the transcript in the composer for review/sending.
     private var recordingStopButton: some View {
-        Button { dictation.stop() } label: {
+        Button { dictation.stop(ownerID: dictationOwnerID) } label: {
             controlIcon("stop.fill", background: Color.red)
         }
         .accessibilityLabel("Stop dictation")
@@ -999,7 +1055,7 @@ struct ComposerView: View {
     /// Discard the recording — no transcription.
     private var cancelRecordingButton: some View {
         Button {
-            dictation.cancel()
+            dictation.cancel(ownerID: dictationOwnerID)
         } label: {
             Image(systemName: "xmark")
                 .font(.system(size: 15, weight: .semibold))

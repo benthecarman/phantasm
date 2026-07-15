@@ -25,12 +25,16 @@ actor SpeechAnalyzerDictationEngine: DictationEngine {
     // MARK: - DictationEngine
 
     func start(onPartial: @escaping @Sendable (String) -> Void) async throws {
+        try Task.checkCancellation()
         finalizedText = ""
         acceptsResults = true
         guard await requestMicrophonePermission() else { throw DictationError.microphoneDenied }
+        try Task.checkCancellation()
 
         let (transcriber, locale) = try await makeTranscriber()
+        try Task.checkCancellation()
         try await ensureModelInstalled(for: transcriber, locale: locale)
+        try Task.checkCancellation()
         self.transcriber = transcriber
 
         let analyzer = SpeechAnalyzer(modules: [transcriber])
@@ -43,6 +47,7 @@ actor SpeechAnalyzerDictationEngine: DictationEngine {
                 "Couldn't find a compatible audio format for dictation."
             )
         }
+        try Task.checkCancellation()
 
         // Consume results as they stream in: commit finalized segments and track
         // the in-progress (volatile) tail, emitting the running transcript.
@@ -70,6 +75,7 @@ actor SpeechAnalyzerDictationEngine: DictationEngine {
 
         let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
         try await analyzer.start(inputSequence: inputSequence)
+        try Task.checkCancellation()
 
         // Activating the recording session can change the hardware input format,
         // so resolve that format only after activation.
@@ -90,6 +96,7 @@ actor SpeechAnalyzerDictationEngine: DictationEngine {
         tapInstalled = true
         audioEngine.prepare()
         try audioEngine.start()
+        try Task.checkCancellation()
     }
 
     func finishTranscript() async -> String {

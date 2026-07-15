@@ -12,12 +12,10 @@ The most urgent findings are:
 
 1. Maple encryption does not authenticate the enclave and can silently downgrade.
 2. HealthKit-derived chat content is eligible for iCloud backup.
-3. Dictation can continue across chats/background transitions and its privacy copy overpromises.
+3. Dictation privacy copy overpromises where on-device recognition is unavailable.
 4. Several core controls are inaccessible to VoiceOver and other assistive technologies.
 
 ## Lifecycle and state
-
-- **Global dictation is not owned by a conversation.** `DictationController` is process-global while each composer observes it. Changing chats during recording/finalization can place chat A’s transcript in chat B, and backgrounding does not stop capture. `cancel()` also cannot invalidate an already-finalizing session because it only operates while recording. Scope dictation to the composer/conversation, cancel on scene inactivity and ownership changes, and handle AVAudioSession interruptions. See [AppEnvironment.swift:29](../ios/App/AppEnvironment.swift#L29), [ChatView.swift:167](../ios/Views/Chat/ChatView.swift#L167), and [DictationController.swift:86](../ios/App/Speech/DictationController.swift#L86).
 
 - **Unsent drafts and attachments do not survive navigation or termination.** They are view-local state, and `.id(selection.id)` destroys the subtree on chat changes. Add a bounded per-conversation draft store, optionally persisted, and clear it only after send acceptance. See [ChatView.swift:19](../ios/Views/Chat/ChatView.swift#L19) and [RootView.swift:164](../ios/Views/RootView.swift#L164).
 
