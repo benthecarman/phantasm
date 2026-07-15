@@ -56,6 +56,39 @@ pub fn select_schemas(schemas: Vec<Value>, enabled: &Option<Vec<String>>) -> Vec
         .collect()
 }
 
+/// The exact ordinary-turn tool surface after applying the client's server-tool
+/// selection and merging app-hosted schemas. Keeping this merge in one helper
+/// lets request logging describe the same surface that is sent upstream.
+pub(crate) struct OfferedToolSchemas {
+    pub schemas: Vec<Value>,
+    pub server_names: HashSet<String>,
+    pub app_names: HashSet<String>,
+}
+
+pub(crate) fn merge_tool_schemas(
+    server_schemas: Vec<Value>,
+    enabled: &Option<Vec<String>>,
+    app_tools: Vec<Value>,
+) -> OfferedToolSchemas {
+    let mut schemas = select_schemas(server_schemas, enabled);
+    let server_names: HashSet<String> = schemas.iter().filter_map(schema_name).collect();
+    let mut app_names = HashSet::new();
+    for tool in app_tools {
+        match schema_name(&tool) {
+            Some(name) if !server_names.contains(&name) => {
+                app_names.insert(name);
+                schemas.push(tool);
+            }
+            _ => {} // unnamed, or collides with a server tool — drop it
+        }
+    }
+    OfferedToolSchemas {
+        schemas,
+        server_names,
+        app_names,
+    }
+}
+
 /// Server tools that reach the internet and are gated by the app's "Web access"
 /// toggle. Their presence in a turn's selection is the signal that web access is
 /// on — which is what upgrades the single `code_exec` tool to its internet-capable
@@ -190,18 +223,11 @@ pub async fn run_turn<B, T>(
     // any app-hosted tools the request defined. On a name collision the server
     // tool wins (the app entry is dropped); `app_names` records which offered
     // tools must be forwarded to the app rather than executed here.
-    let mut schemas = select_schemas(tools.schemas(), &enabled_tools);
-    let server_names: HashSet<String> = schemas.iter().filter_map(schema_name).collect();
-    let mut app_names: HashSet<String> = HashSet::new();
-    for tool in app_tools {
-        match schema_name(&tool) {
-            Some(name) if !server_names.contains(&name) => {
-                app_names.insert(name);
-                schemas.push(tool);
-            }
-            _ => {} // unnamed, or collides with a server tool — drop it
-        }
-    }
+    let OfferedToolSchemas {
+        schemas,
+        server_names,
+        app_names,
+    } = merge_tool_schemas(tools.schemas(), &enabled_tools, app_tools);
 
     // Vision projection (FR/#2): the images the model *sees* are downscaled to a
     // bounded resolution — models cap resolution internally, so anything larger
@@ -1775,6 +1801,41 @@ mod tests {
     fn select_schemas_empty_list_keeps_none() {
         let schemas = vec![named_schema("web_search")];
         assert!(select_schemas(schemas, &Some(vec![])).is_empty());
+    }
+
+    #[test]
+    fn merge_tool_schemas_tracks_server_and_app_tools() {
+        let offered = merge_tool_schemas(
+            vec![named_schema("web_search"), named_schema("calculator")],
+            &Some(vec!["web_search".into(), "get_current_location".into()]),
+            vec![app_schema("get_current_location")],
+        );
+
+        assert_eq!(
+            offered.schemas,
+            vec![
+                named_schema("web_search"),
+                app_schema("get_current_location")
+            ]
+        );
+        assert_eq!(offered.server_names, HashSet::from(["web_search".into()]));
+        assert_eq!(
+            offered.app_names,
+            HashSet::from(["get_current_location".into()])
+        );
+    }
+
+    #[test]
+    fn merge_tool_schemas_drops_app_name_collision() {
+        let offered = merge_tool_schemas(
+            vec![named_schema("calculator")],
+            &None,
+            vec![app_schema("calculator")],
+        );
+
+        assert_eq!(offered.schemas, vec![named_schema("calculator")]);
+        assert_eq!(offered.server_names, HashSet::from(["calculator".into()]));
+        assert!(offered.app_names.is_empty());
     }
 
     /// The text content of the first `tool`-role message the backend saw on its

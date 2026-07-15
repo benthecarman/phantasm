@@ -257,10 +257,31 @@ async fn spawn_turn(
     // Per-turn structured logging (NFR-O7). Message content is never logged
     // unless explicitly enabled.
     let turn_id = uuid::Uuid::new_v4().simple().to_string();
-    // Count what's actually offered after the client's per-request selection,
-    // so the log reflects the real tool surface for this turn.
-    let tools_offered =
-        crate::orchestrator::turn::select_schemas(tools.schemas(), &enabled_tools).len();
+    // Summarize the exact upstream tool surface without logging schemas,
+    // arguments, or message content. Research deliberately offers only its
+    // preset's server tools; ordinary turns merge app-hosted definitions after
+    // applying the client's server-tool selection.
+    let (tools_offered, server_tools_offered, app_tool_names) = if let Some(preset) = preset {
+        let allow = Some(
+            preset
+                .tools
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        );
+        let server = crate::orchestrator::turn::select_schemas(tools.schemas(), &allow);
+        (server.len(), server.len(), Vec::new())
+    } else {
+        let offered = crate::orchestrator::turn::merge_tool_schemas(
+            tools.schemas(),
+            &enabled_tools,
+            app_tools.clone(),
+        );
+        let mut app_names: Vec<String> = offered.app_names.into_iter().collect();
+        app_names.sort_unstable();
+        (offered.schemas.len(), offered.server_names.len(), app_names)
+    };
+    let app_tools_offered = app_tool_names.len();
     let log_model = model.clone();
     // Resolved research mode id (if any) for per-turn logging.
     let mode = preset.map(|p| p.id);
@@ -293,7 +314,18 @@ async fn spawn_turn(
 
     tokio::spawn(async move {
         let started = std::time::Instant::now();
-        tracing::info!(turn_id, model = %log_model, upstream = %upstream_name, stream, tools_offered, mode, "turn started");
+        tracing::info!(
+            turn_id,
+            model = %log_model,
+            upstream = %upstream_name,
+            stream,
+            tools_offered,
+            server_tools_offered,
+            app_tools_offered,
+            app_tools = ?app_tool_names,
+            mode,
+            "turn started"
+        );
         run_turn(
             cfg,
             backend,
