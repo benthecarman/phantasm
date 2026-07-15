@@ -306,15 +306,25 @@ struct ChatView: View {
     /// conversation's images available to swipe through. Falls back to showing
     /// just the tapped image if it isn't in the gallery (e.g. a not-yet-cached
     /// remote image).
-    private func openImageViewer(messageID: UUID, index: Int, image: UIImage) {
+    private func openImageViewer(messageID: UUID, index: Int, image: UIImage?) {
         Haptics.selection()
-        let gallery = ConversationImages.gallery(from: visibleMessages)
-        let targetID = "\(messageID):\(index)"
-        if gallery.contains(where: { $0.id == targetID }) {
-            imageViewer = ImageViewerPresentation(images: gallery, startID: targetID)
-        } else {
-            let solo = GalleryImage(id: targetID, image: image)
-            imageViewer = ImageViewerPresentation(images: [solo], startID: targetID)
+        let snapshot = visibleMessages
+        Task {
+            let ids: [UUID] = snapshot.flatMap(\.attachments).compactMap { attachment -> UUID? in
+                guard attachment.data.isEmpty,
+                      attachment.kind != AttachmentKind.text.rawValue else { return nil }
+                return attachment.id
+            }
+            let payloads = (try? await env.store.attachmentPayloads(ids: ids)) ?? [:]
+            guard !Task.isCancelled else { return }
+            let gallery = ConversationImages.gallery(from: snapshot, payloads: payloads)
+            let targetID = "\(messageID):\(index)"
+            if gallery.contains(where: { $0.id == targetID }) {
+                imageViewer = ImageViewerPresentation(images: gallery, startID: targetID)
+            } else if let image {
+                let solo = GalleryImage(id: targetID, image: image)
+                imageViewer = ImageViewerPresentation(images: [solo], startID: targetID)
+            }
         }
     }
 
@@ -576,16 +586,15 @@ struct ChatView: View {
 /// visible transcript — every bubble re-ran chart decoding and image extraction
 /// on the main actor, dropping frames exactly during streaming (NFR-A4).
 ///
-/// The tail-follow scrolling rides along here for the same reason: an
-/// `.onChange(of: vm.streamingText)` in the parent would re-register the
-/// parent's dependency on the per-token property.
+/// The tail-follow scrolling rides along here for the same reason. The VM's
+/// `streamingRevision` advances once per frame-cadenced snapshot, so scrolling
+/// is coalesced with Markdown rendering instead of firing for each network delta.
 private struct StreamingPreviewSection: View {
     let vm: ChatViewModel
     let messages: [ChatMessage]
     let trustedImageBase: URL?
-    /// Called when streamed content grows (token/reasoning): the parent scrolls
-    /// the tail into view. Tokens arrive many-per-second; the parent follows
-    /// without animation so overlapping animations don't jank.
+    /// Called when the published stream snapshot grows: the parent follows the
+    /// tail without animation so overlapping animations don't jank.
     let onGrow: () -> Void
 
     var body: some View {
@@ -602,8 +611,7 @@ private struct StreamingPreviewSection: View {
                 )
             }
         }
-        .onChange(of: vm.streamingText) { _, _ in onGrow() }
-        .onChange(of: vm.streamingReasoning) { _, _ in onGrow() }
+        .onChange(of: vm.streamingRevision) { _, _ in onGrow() }
     }
 }
 

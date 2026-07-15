@@ -74,12 +74,6 @@ These are static findings; Instruments profiling was not performed.
 
 ### Highest impact
 
-- **Streaming reparses the entire growing Markdown answer for every delta** and issues repeated tail scrolls. Coalesce observable snapshots and scrolling at roughly frame cadence; consider plain/completed-block rendering during streaming and one full parse at completion. See [ChatViewModel.swift:684](../ios/ViewModels/ChatViewModel.swift#L684), [MarkdownMessageView.swift:32](../ios/Views/Chat/MarkdownMessageView.swift#L32), and [ChatView.swift:528](../ios/Views/Chat/ChatView.swift#L528).
-
-- **Every transcript load eagerly materializes all attachment BLOBs.** The same full-detail path is used for normal rendering, notification routing, image cleanup, bulk deletion, and cache healing. Split metadata from BLOB access, load thumbnails/full bytes on demand, and paginate long transcripts. See [AppDatabase.swift:566](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Persistence/AppDatabase.swift#L566).
-
-- **Full image decoding and JPEG preparation occur synchronously in main/UI paths.** Move decoding/downsampling to a worker, cache thumbnails by attachment ID with decoded-byte costs, and load full resolution only in the viewer. See [AttachmentViews.swift:115](../ios/Views/Chat/AttachmentViews.swift#L115), [ImageViewer.swift:102](../ios/Views/Chat/ImageViewer.swift#L102), and [ComposerOptionsSheet.swift:164](../ios/Views/Chat/ComposerOptionsSheet.swift#L164).
-
 - **Every send builds the complete wire history on `@MainActor`, including base64 images.** Build immutable wire snapshots off-main and consider deliberate context compaction for old binary content. See [ChatViewModel.swift:603](../ios/ViewModels/ChatViewModel.swift#L603) and [Models.swift:329](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Persistence/Models.swift#L329).
 
 ### Scalability and polish

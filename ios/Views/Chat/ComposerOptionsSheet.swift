@@ -163,10 +163,12 @@ struct ComposerOptionsSheet: View {
         ) { result in loadFiles(result) }
         .fullScreenCover(isPresented: $showCamera) {
             CameraPicker { image in
-                if let attachment = AttachmentLoader.image(from: image) {
-                    attachments.append(attachment)
-                    Haptics.notify(.success)
-                    dismiss()
+                Task {
+                    if let attachment = await AttachmentLoader.image(from: image) {
+                        attachments.append(attachment)
+                        Haptics.notify(.success)
+                        dismiss()
+                    }
                 }
             }
             .ignoresSafeArea()

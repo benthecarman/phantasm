@@ -22,6 +22,15 @@ final class ChatViewModel {
     private var isRecovering = false
     private(set) var streamingText = ""
     private(set) var streamingReasoning = ""
+    /// Advances once per published stream snapshot. The transcript follows this
+    /// cadence instead of separately scrolling for every token/reasoning delta.
+    private(set) var streamingRevision = 0
+    /// Lossless accumulators are deliberately unobserved: network deltas append
+    /// here immediately, while the rendered properties above update at most once
+    /// per display frame. `finish` commits these buffers, never the throttled UI.
+    @ObservationIgnored private var bufferedStreamingText = ""
+    @ObservationIgnored private var bufferedStreamingReasoning = ""
+    @ObservationIgnored private var streamPublicationTask: Task<Void, Never>?
     /// Finalized once answer text starts (or the reasoning-only stream ends), so
     /// the collapsed pill can settle before the whole response is committed.
     private(set) var streamingReasoningDuration: TimeInterval?
@@ -199,6 +208,55 @@ final class ChatViewModel {
 
     private func ownsTurn(_ generation: UUID) -> Bool {
         activeTurnGeneration == generation
+    }
+
+    /// Reset both the lossless accumulator and its rendered snapshot at a turn
+    /// boundary. Cancelling the delayed publisher prevents a prior generation
+    /// from painting over a replacement turn.
+    private func resetStreamingBuffers(status: String? = nil) {
+        streamPublicationTask?.cancel()
+        streamPublicationTask = nil
+        bufferedStreamingText = ""
+        bufferedStreamingReasoning = ""
+        streamingText = ""
+        streamingReasoning = ""
+        streamingReasoningDuration = nil
+        statusText = status
+        statusProgress = nil
+        streamingRevision = 0
+    }
+
+    /// Schedule one UI publication at roughly 60 Hz. Repeated deltas reuse the
+    /// same task, so Markdown parsing and tail scrolling happen once per frame.
+    private func scheduleStreamingPublication(generation: UUID) {
+        guard streamPublicationTask == nil else { return }
+        streamPublicationTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 16_666_667)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            self.streamPublicationTask = nil
+            self.publishStreamingBuffers(generation: generation)
+        }
+    }
+
+    private func publishStreamingBuffers(generation: UUID) {
+        guard ownsTurn(generation) else { return }
+        guard streamingText != bufferedStreamingText
+                || streamingReasoning != bufferedStreamingReasoning else { return }
+        streamingText = bufferedStreamingText
+        streamingReasoning = bufferedStreamingReasoning
+        streamingRevision &+= 1
+    }
+
+    /// Terminal events, stop, and failures bypass the cadence delay so the last
+    /// buffered characters are visible and committed immediately.
+    private func flushStreamingBuffers(generation: UUID) {
+        streamPublicationTask?.cancel()
+        streamPublicationTask = nil
+        publishStreamingBuffers(generation: generation)
     }
 
     /// The model the composer should display / preselect for this conversation.
@@ -391,11 +449,7 @@ final class ChatViewModel {
               })
         else { return }
         self.pendingAssistantPreviewMessageID = nil
-        streamingText = ""
-        streamingReasoning = ""
-        streamingReasoningDuration = nil
-        statusText = nil
-        statusProgress = nil
+        resetStreamingBuffers()
         hasAssistantPreview = false
     }
 
@@ -466,11 +520,7 @@ final class ChatViewModel {
         hasAssistantPreview = true
         streamingStartedAt = .now
         latestTokensPerSecond = nil
-        streamingText = ""
-        streamingReasoning = ""
-        streamingReasoningDuration = nil
-        statusText = nil
-        statusProgress = nil
+        resetStreamingBuffers()
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
@@ -651,11 +701,7 @@ final class ChatViewModel {
         isStreaming = true
         hasAssistantPreview = true
         streamingStartedAt = .now
-        streamingText = ""
-        streamingReasoning = ""
-        streamingReasoningDuration = nil
-        statusText = nil
-        statusProgress = nil
+        resetStreamingBuffers()
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
         // Resend/regenerate truncates the history, deleting the tool_calls row a
@@ -768,8 +814,8 @@ final class ChatViewModel {
                 guard ownsTurn(generation) else { return }
                 switch event {
                 case .token(let t):
-                    statusText = nil
-                    statusProgress = nil
+                    if statusText != nil { statusText = nil }
+                    if statusProgress != nil { statusProgress = nil }
                     if measuresReasoningDuration,
                        streamingReasoningDuration == nil,
                        let firstReasoningTokenAt {
@@ -777,10 +823,12 @@ final class ChatViewModel {
                     }
                     if firstAnswerTokenAt == nil { firstAnswerTokenAt = .now }
                     generatedCharacterCount += t.count
-                    streamingText += t
+                    bufferedStreamingText += t
+                    scheduleStreamingPublication(generation: generation)
                 case .reasoning(let r):
                     if firstReasoningTokenAt == nil { firstReasoningTokenAt = .now }
-                    streamingReasoning += r
+                    bufferedStreamingReasoning += r
+                    scheduleStreamingPublication(generation: generation)
                 case .status(let s):
                     statusText = s
                     statusProgress = nil
@@ -788,13 +836,14 @@ final class ChatViewModel {
                     statusText = s
                     statusProgress = progress
                 case .toolCalls(let calls):
-                    statusText = nil
-                    statusProgress = nil
+                    if statusText != nil { statusText = nil }
+                    if statusProgress != nil { statusProgress = nil }
                     batchedCalls = calls
                 case .done:
                     sawDone = true
                 }
             }
+            flushStreamingBuffers(generation: generation)
             // The model called app-hosted tools: resolve the batch (auto tools on
             // device, interactive ones via a prompt) and either continue the turn
             // or wait for the user.
@@ -818,8 +867,10 @@ final class ChatViewModel {
             // answer (e.g. a still-generating image) AND race recovery, leaving a
             // duplicate. The resumable server turn replays in full on reconnect.
             let interruptedInBackground = !sawDone && backgrounded
-            let emptyResponse = streamingText.isEmpty
-            let reasoningOnlyResponse = sawDone && emptyResponse && !streamingReasoning.isEmpty
+            let emptyResponse = bufferedStreamingText.isEmpty
+            let reasoningOnlyResponse = sawDone
+                && emptyResponse
+                && !bufferedStreamingReasoning.isEmpty
             if interruptedInBackground || (emptyResponse && !reasoningOnlyResponse && backgrounded) {
                 suspendedByScene = false
                 finish(
@@ -876,7 +927,10 @@ final class ChatViewModel {
         // resumable turn and stream it a second time.
         await commitTask?.value
         guard !isStreaming else { return }
-        guard let detail = try? await store.conversationDetail(id: conversation.id) else { return }
+        guard let detail = try? await store.conversationDetail(
+            id: conversation.id,
+            attachmentData: .metadataOnly
+        ) else { return }
         // A send may have started while either awaited read was in flight. Its
         // generation owns the VM now, so abandon this stale recovery attempt.
         guard !isStreaming else { return }
@@ -913,11 +967,7 @@ final class ChatViewModel {
         // Start empty: the orchestrator replays the resumed turn from the start
         // (we omit `Last-Event-ID`), so the replayed tokens rebuild the message —
         // preseeding the persisted partial here would double-count them.
-        streamingText = ""
-        streamingReasoning = ""
-        streamingReasoningDuration = nil
-        statusText = nil
-        statusProgress = nil
+        resetStreamingBuffers()
         pendingAssistantMessageID = pending.id
         pendingAssistantPreviewMessageID = nil
         errorMessage = nil
@@ -1029,11 +1079,7 @@ final class ChatViewModel {
         isStreaming = true
         hasAssistantPreview = true
         streamingStartedAt = .now
-        streamingText = ""
-        streamingReasoning = ""
-        streamingReasoningDuration = nil
-        statusText = status
-        statusProgress = nil
+        resetStreamingBuffers(status: status)
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
@@ -1120,10 +1166,8 @@ final class ChatViewModel {
         // generated in an earlier iteration, flushed ahead of the batch) belongs
         // to this row — commit it, or it vanishes from history and the model's
         // context on resume.
-        let streamedContent = streamingText
-        streamingText = ""
-        streamingReasoning = ""
-        streamingReasoningDuration = nil
+        let streamedContent = bufferedStreamingText
+        resetStreamingBuffers()
 
         task = Task { [weak self] in
             // Commit the assistant tool_call row first, so every result that
@@ -1234,9 +1278,7 @@ final class ChatViewModel {
         statusText = nil
         statusProgress = nil
         task = nil
-        streamingText = ""
-        streamingReasoning = ""
-        streamingReasoningDuration = nil
+        resetStreamingBuffers()
         pendingAssistantMessageID = nil
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
@@ -1304,6 +1346,7 @@ final class ChatViewModel {
         emptyPendingDisposition: EmptyPendingDisposition = .delete
     ) {
         guard isStreaming, ownsTurn(generation) else { return }
+        flushStreamingBuffers(generation: generation)
         isStreaming = false
         activeTurnGeneration = nil
         let completedSession = turnSession
@@ -1344,8 +1387,8 @@ final class ChatViewModel {
         // via `enterPromptWait`.
 
         // Commit any streamed text as one complete assistant message.
-        let committed = streamingText
-        let committedReasoning = streamingReasoning
+        let committed = bufferedStreamingText
+        let committedReasoning = bufferedStreamingReasoning
         let committedReasoningDuration = streamingReasoningDuration
         let hasAssistantPayload = !committed.isEmpty || !committedReasoning.isEmpty
         let pendingID = pendingAssistantMessageID
@@ -1359,9 +1402,7 @@ final class ChatViewModel {
             && !committed.isEmpty && env?.autoSpeakEnabled == true
 
         if shouldKeepPendingForRecovery {
-            streamingText = ""
-            streamingReasoning = ""
-            streamingReasoningDuration = nil
+            resetStreamingBuffers()
             pendingAssistantPreviewMessageID = nil
             hasAssistantPreview = false
             endBackgroundStreamingTask(for: generation)
@@ -1416,9 +1457,7 @@ final class ChatViewModel {
             if let store, let pendingID, emptyPendingDisposition == .delete {
                 Task { try? await store.deleteMessage(id: pendingID) }
             }
-            streamingText = ""
-            streamingReasoning = ""
-            streamingReasoningDuration = nil
+            resetStreamingBuffers()
             pendingAssistantPreviewMessageID = nil
             hasAssistantPreview = false
             endBackgroundStreamingTask(for: generation)
@@ -1492,9 +1531,7 @@ final class ChatViewModel {
         guard currentTurnGeneration == generation,
               pendingAssistantPreviewMessageID == messageID else { return }
         pendingAssistantPreviewMessageID = nil
-        streamingText = ""
-        streamingReasoning = ""
-        streamingReasoningDuration = nil
+        resetStreamingBuffers()
         hasAssistantPreview = false
         errorMessage = AppError.from(error).userMessage
     }
@@ -1554,7 +1591,10 @@ final class ChatViewModel {
               let session = backendSession else { return }
         let conversationID = conversation.id
         Task { [weak self] in
-            guard let detail = try? await store.conversationDetail(id: conversationID) else {
+            guard let detail = try? await store.conversationDetail(
+                id: conversationID,
+                attachmentData: .metadataOnly
+            ) else {
                 return
             }
             for cm in detail.messages where cm.message.role == "assistant" {
@@ -1581,7 +1621,10 @@ final class ChatViewModel {
     private func maybeGenerateTitle(session: BackendSession?) async {
         guard let session else { return }
         guard let store, let conversation,
-              let detail = try? await store.conversationDetail(id: conversation.id) else { return }
+              let detail = try? await store.conversationDetail(
+                  id: conversation.id,
+                  attachmentData: .metadataOnly
+              ) else { return }
         let assistantReplies = detail.messages.filter { $0.message.role == "assistant" }.count
         guard assistantReplies == 1 else { return }
         await generateTitle(
@@ -1698,10 +1741,13 @@ private extension String {
 
 private extension ChatStore {
     /// Membership check used only when `insertMessage` fails, to tell a benign
-    /// duplicate-key race from a real write error. It loads the full
-    /// conversation (messages + attachment data), so keep it off hot paths.
+    /// duplicate-key race from a real write error. Metadata is sufficient; no
+    /// attachment payloads are materialized for this recovery check.
     func hasMessage(id: UUID, in conversationID: UUID) async throws -> Bool {
-        let detail = try await conversationDetail(id: conversationID)
+        let detail = try await conversationDetail(
+            id: conversationID,
+            attachmentData: .metadataOnly
+        )
         return detail?.messages.contains { $0.message.id == id } == true
     }
 }

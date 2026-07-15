@@ -286,8 +286,8 @@ struct RootView: View {
     private func openConversation(id: UUID) {
         Task {
             defer { notificationRouter.pendingConversationID = nil }
-            guard let detail = try? await env.store.conversationDetail(id: id) else { return }
-            selection = detail.conversation
+            guard let conversation = try? await env.store.conversation(id: id) else { return }
+            selection = conversation
             closeDrawer()
         }
     }

@@ -1,3 +1,4 @@
+import ImageIO
 import PhantasmKit
 @testable import Phantasm
 import UIKit
@@ -203,6 +204,39 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertLessThan(rate, 65)
     }
 
+    func testRapidStreamCoalescesPublicationsWithoutLosingText() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        let tokenCount = 120
+        let expected = String(repeating: "x", count: tokenCount)
+
+        client.enqueue(
+            events: Array(repeating: ChatStreamEvent.token("x"), count: tokenCount) + [.done],
+            pauseAfterEventNanoseconds: 1_000_000
+        )
+        client.enqueue(events: [.token("Coalesced Stream"), .done])
+
+        XCTAssertTrue(vm.send("hello"))
+        try await waitUntil {
+            guard !vm.isStreaming,
+                  let detail = try await store.conversationDetail(id: conversation.id) else {
+                return false
+            }
+            return detail.messages.last?.message.content == expected
+        }
+
+        XCTAssertEqual(vm.streamingText, expected)
+        XCTAssertGreaterThan(vm.streamingRevision, 0)
+        XCTAssertLessThan(
+            vm.streamingRevision,
+            tokenCount / 2,
+            "rapid network deltas should publish in frame-cadenced batches"
+        )
+    }
+
     func testTextAttachmentCapsReadWithoutCorruptingSplitUTF8Scalar() async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("txt")
@@ -215,6 +249,51 @@ final class ChatViewModelTests: XCTestCase {
 
         XCTAssertEqual(attachment?.text.count, AttachmentLoader.maxFileCharacters)
         XCTAssertFalse(attachment?.text.contains("â") ?? true, "UTF-8 prefix became Latin-1 mojibake")
+    }
+
+    func testImagePreparationDownsamplesAndThumbnailCacheReusesDecodedImage() async throws {
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        let original = UIGraphicsImageRenderer(
+            size: CGSize(width: 2_400, height: 1_200),
+            format: format
+        ).image { context in
+            UIColor.systemPurple.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 2_400, height: 1_200))
+        }
+
+        let preparedAttachment = await AttachmentLoader.image(from: original)
+        let attachment = try XCTUnwrap(preparedAttachment)
+        XCTAssertEqual(attachment.mimeType, "image/jpeg")
+        XCTAssertFalse(attachment.imageData.isEmpty)
+
+        let source = try XCTUnwrap(
+            CGImageSourceCreateWithData(attachment.imageData as CFData, nil)
+        )
+        let properties = try XCTUnwrap(
+            CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        )
+        let width = try XCTUnwrap(properties[kCGImagePropertyPixelWidth] as? NSNumber).intValue
+        let height = try XCTUnwrap(properties[kCGImagePropertyPixelHeight] as? NSNumber).intValue
+        XCTAssertEqual(max(width, height), Int(AttachmentLoader.maxImageDimension))
+
+        let cache = AttachmentThumbnailCache(totalCostLimit: 8 * 1024 * 1024, countLimit: 2)
+        let id = UUID()
+        let firstResult = await cache.image(for: id, data: attachment.imageData)
+        let first = try XCTUnwrap(firstResult)
+        let secondResult = await cache.image(for: id, data: attachment.imageData)
+        let second = try XCTUnwrap(secondResult)
+        XCTAssertTrue(first === second, "stable attachment IDs should reuse the decoded thumbnail")
+        XCTAssertLessThanOrEqual(
+            max(first.cgImage?.width ?? 0, first.cgImage?.height ?? 0),
+            AttachmentThumbnailCache.maxPixelSize
+        )
+        XCTAssertGreaterThan(ImageProcessing.decodedByteCost(first), 0)
+
+        let fullResult = await ImageProcessing.fullResolutionImage(data: attachment.imageData)
+        let full = try XCTUnwrap(fullResult)
+        XCTAssertEqual(full.cgImage?.width, width)
+        XCTAssertEqual(full.cgImage?.height, height)
     }
 
     func testSendStreamsCommitsTitleSpeaksAndCachesServerImage() async throws {

@@ -346,19 +346,51 @@ extension AppDatabase: ChatStore {
         }
     }
 
-    public func allConversationDetails() async throws -> [ConversationDetail] {
+    public func allConversationDetails(
+        attachmentData: AttachmentDataScope
+    ) async throws -> [ConversationDetail] {
         try await dbWriter.read { db in
             try Self.recentConversations(db).map { conversation in
                 ConversationDetail(
                     conversation: conversation,
-                    messages: try Self.messages(db, conversationId: conversation.id)
+                    messages: try Self.messages(
+                        db,
+                        conversationId: conversation.id,
+                        attachmentData: attachmentData
+                    )
                 )
             }
         }
     }
 
-    public func conversationDetail(id: UUID) async throws -> ConversationDetail? {
-        try await dbWriter.read { db in try Self.conversationDetail(db, id: id) }
+    public func conversationDetail(
+        id: UUID,
+        attachmentData: AttachmentDataScope
+    ) async throws -> ConversationDetail? {
+        try await dbWriter.read { db in
+            try Self.conversationDetail(db, id: id, attachmentData: attachmentData)
+        }
+    }
+
+    public func attachmentPayloads(ids: [UUID]) async throws -> [UUID: Data] {
+        guard !ids.isEmpty else { return [:] }
+        return try await dbWriter.read { db in
+            let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT id, data FROM attachment WHERE id IN (\(placeholders))",
+                arguments: StatementArguments(ids)
+            )
+            return Dictionary(uniqueKeysWithValues: rows.map { row in
+                let id: UUID = row["id"]
+                let data: Data = row["data"]
+                return (id, data)
+            })
+        }
+    }
+
+    public func conversation(id: UUID) async throws -> Conversation? {
+        try await dbWriter.read { db in try Self.conversation(db, id: id) }
     }
 
     /// Messages at or after `message` in its conversation, by `position`.
@@ -582,27 +614,51 @@ public extension AppDatabase {
     /// A conversation's messages in conversation order (`position`), each with
     /// its ordered attachments. Empty when the conversation is missing or
     /// tombstoned.
-    static func messages(_ db: Database, conversationId: UUID) throws -> [ChatMessage] {
+    static func messages(
+        _ db: Database,
+        conversationId: UUID,
+        attachmentData: AttachmentDataScope = .full
+    ) throws -> [ChatMessage] {
         let messages = try Message
             .filter(Col.conversationId == conversationId)
             .order(Col.position)
             .fetchAll(db)
         let messageIDs = messages.map(\.id)
-        let attachments = try Attachment
+        var attachmentRequest = Attachment
             .filter(messageIDs.contains(Column("messageId")))
             .order(Col.createdAt, Column.rowID)
-            .fetchAll(db)
+        if attachmentData == .metadataOnly {
+            // Supply the record's non-optional `data` property without reading
+            // the BLOB column from SQLite. Everything needed to lay out the row
+            // and decide what to load remains present.
+            attachmentRequest = attachmentRequest.select(sql: """
+                id, messageId, kind, name, zeroblob(0) AS data,
+                mimeType, text, createdAt, updatedAt
+                """)
+        }
+        let attachments = try attachmentRequest.fetchAll(db)
         let grouped = Dictionary(grouping: attachments, by: \.messageId)
         return messages.map { ChatMessage(message: $0, attachments: grouped[$0.id] ?? []) }
     }
 
-    static func conversationDetail(_ db: Database, id: UUID) throws -> ConversationDetail? {
+    static func conversationDetail(
+        _ db: Database,
+        id: UUID,
+        attachmentData: AttachmentDataScope = .full
+    ) throws -> ConversationDetail? {
         guard let convo = try Conversation
             .filter(key: id)
             .filter(Col.deletedAt == nil)
             .fetchOne(db)
         else { return nil }
-        return ConversationDetail(conversation: convo, messages: try messages(db, conversationId: id))
+        return ConversationDetail(
+            conversation: convo,
+            messages: try messages(
+                db,
+                conversationId: id,
+                attachmentData: attachmentData
+            )
+        )
     }
 
     /// Live conversation row (nil if missing or tombstoned) — for observing the title.

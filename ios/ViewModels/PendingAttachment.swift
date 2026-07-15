@@ -48,29 +48,34 @@ enum AttachmentLoader {
 
     static func image(from item: PhotosPickerItem) async -> PendingAttachment? {
         guard let data = try? await item.loadTransferable(type: Data.self),
-              let original = UIImage(data: data) else { return nil }
-        let scaled = downscale(original)
-        guard let jpeg = scaled.jpegData(compressionQuality: jpegQuality) else { return nil }
+              let prepared = await ImageProcessing.prepareJPEG(
+                data: data,
+                maxPixelSize: Int(maxImageDimension),
+                quality: jpegQuality
+              ) else { return nil }
         return PendingAttachment(
             kind: .image,
             name: "Photo",
-            imageData: jpeg,
+            imageData: prepared.data,
             mimeType: "image/jpeg",
-            thumbnail: scaled
+            thumbnail: prepared.preview
         )
     }
 
-    /// Builds an attachment from an image captured with the camera (already a
-    /// `UIImage`, so no async `Transferable` load is needed).
-    static func image(from original: UIImage) -> PendingAttachment? {
-        let scaled = downscale(original)
-        guard let jpeg = scaled.jpegData(compressionQuality: jpegQuality) else { return nil }
+    /// Builds an attachment from a camera image. Drawing, downscaling, and JPEG
+    /// encoding still run on a worker even though capture supplies a `UIImage`.
+    static func image(from original: UIImage) async -> PendingAttachment? {
+        guard let prepared = await ImageProcessing.prepareJPEG(
+            image: original,
+            maxPixelSize: Int(maxImageDimension),
+            quality: jpegQuality
+        ) else { return nil }
         return PendingAttachment(
             kind: .image,
             name: "Photo",
-            imageData: jpeg,
+            imageData: prepared.data,
             mimeType: "image/jpeg",
-            thumbnail: scaled
+            thumbnail: prepared.preview
         )
     }
 
@@ -127,15 +132,4 @@ enum AttachmentLoader {
         return String(data: data, encoding: .isoLatin1)
     }
 
-    private static func downscale(_ image: UIImage) -> UIImage {
-        let longest = max(image.size.width, image.size.height)
-        guard longest > maxImageDimension else { return image }
-        let scale = maxImageDimension / longest
-        let target = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-        let format = UIGraphicsImageRendererFormat.default()
-        format.scale = 1
-        return UIGraphicsImageRenderer(size: target, format: format).image { _ in
-            image.draw(in: CGRect(origin: .zero, size: target))
-        }
-    }
 }

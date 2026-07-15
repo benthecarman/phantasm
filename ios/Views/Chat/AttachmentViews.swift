@@ -109,8 +109,9 @@ struct FileChipLabel: View {
 struct MessageAttachmentsView: View {
     let attachments: [Attachment]
     /// Tapping an image opens the full-screen viewer; reports its ordinal among
-    /// this message's images (matching the gallery's ordering) and decoded bytes.
-    var onTapImage: (Int, UIImage) -> Void = { _, _ in }
+    /// this message's images (matching the gallery's ordering). The thumbnail
+    /// is deliberately not reused as the viewer's full-resolution image.
+    var onTapImage: (Int) -> Void = { _ in }
 
     var body: some View {
         let images = attachments.filter { $0.kind == AttachmentKind.image.rawValue }
@@ -119,14 +120,8 @@ struct MessageAttachmentsView: View {
             if !images.isEmpty {
                 HStack(spacing: 6) {
                     ForEach(Array(images.enumerated()), id: \.element.id) { index, att in
-                        if let ui = UIImage(data: att.data) {
-                            Image(uiImage: ui)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 120, height: 120)
-                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                                .contentShape(Rectangle())
-                                .onTapGesture { onTapImage(index, ui) }
+                        MessageAttachmentThumbnail(attachment: att) {
+                            onTapImage(index)
                         }
                     }
                 }
@@ -134,6 +129,45 @@ struct MessageAttachmentsView: View {
             ForEach(files) { att in
                 FileChipLabel(name: att.name)
             }
+        }
+    }
+}
+
+/// A transcript-sized image decoded away from the main actor. Recreating a
+/// lazy message row reuses the cost-accounted process cache by attachment ID.
+private struct MessageAttachmentThumbnail: View {
+    let attachment: Attachment
+    let onTap: () -> Void
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onTap)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(width: 120, height: 120)
+        .background(
+            Color.primary.opacity(0.04),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .task(id: attachment.data.count) {
+            guard !attachment.data.isEmpty else {
+                image = nil
+                return
+            }
+            image = await AttachmentThumbnailCache.shared.image(
+                for: attachment.id,
+                data: attachment.data
+            )
         }
     }
 }

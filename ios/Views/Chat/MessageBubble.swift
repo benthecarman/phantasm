@@ -23,28 +23,64 @@ struct MessageBubble: View {
     var onResend: () -> Void = {}
     var onRegenerate: () -> Void = {}
     /// Tapping an image (attached or generated) opens the full-screen viewer,
-    /// reporting the source message, the image's ordinal within it, and bytes.
-    var onTapImage: (UUID, Int, UIImage) -> Void = { _, _, _ in }
+    /// reporting the source message and image ordinal. Generated images may
+    /// include a decoded fallback when no persisted gallery payload exists.
+    var onTapImage: (UUID, Int, UIImage?) -> Void = { _, _, _ in }
 
     @Environment(AppEnvironment.self) private var env
     @FocusState private var editorFocused: Bool
+    /// Payloads are absent from the transcript query and arrive only while this
+    /// lazy row is alive. This keeps a long conversation's image BLOBs out of
+    /// the initial SQLite read and out of memory when the row scrolls away.
+    @State private var attachmentPayloads: [UUID: Data] = [:]
 
     private var isUser: Bool { message.message.role == "user" }
     /// Menu visibility only depends on persisted text. Restoring extracted
     /// images here would rebuild multi-megabyte base64 strings on every layout;
     /// the full content is reconstructed only if the user copies or speaks it.
     private var hasMessageActions: Bool { !message.message.content.isEmpty }
+    private var payloadAttachmentIDs: [UUID] {
+        message.attachments.compactMap { attachment in
+            guard attachment.data.isEmpty,
+                  attachment.kind != AttachmentKind.text.rawValue else { return nil }
+            return attachment.id
+        }
+    }
+    private var hydratedAttachments: [Attachment] {
+        message.attachments.map { attachment in
+            guard attachment.data.isEmpty,
+                  let data = attachmentPayloads[attachment.id] else { return attachment }
+            var hydrated = attachment
+            hydrated.data = data
+            return hydrated
+        }
+    }
+    private var inlineImages: [String: ServerImageRef.CachedImage] {
+        var out: [String: ServerImageRef.CachedImage] = [:]
+        for attachment in hydratedAttachments
+            where attachment.kind == AttachmentKind.inlineImage.rawValue
+                && !attachment.data.isEmpty
+        {
+            out[attachment.name] = ServerImageRef.CachedImage(
+                data: attachment.data,
+                mime: attachment.mimeType
+            )
+        }
+        return out
+    }
     /// Persisted content with extracted inline images restored to data URIs
     /// (memoized), so the markdown pipeline sees what the model produced.
     private var content: String {
-        InlineImageRef.restore(message.message.content, images: message.inlineImages)
+        InlineImageRef.restore(message.message.content, images: inlineImages)
     }
 
     /// Locally-cached server images for this message, keyed by file id, so
     /// references render from local bytes once fetched.
     private var cachedImages: [String: ServerImageRef.CachedImage] {
         var out: [String: ServerImageRef.CachedImage] = [:]
-        for a in message.attachments where a.kind == AttachmentKind.remoteImage.rawValue {
+        for a in hydratedAttachments
+            where a.kind == AttachmentKind.remoteImage.rawValue && !a.data.isEmpty
+        {
             out[a.name] = ServerImageRef.CachedImage(data: a.data, mime: a.mimeType)
         }
         return out
@@ -80,7 +116,7 @@ struct MessageBubble: View {
                     if !message.message.content.isEmpty {
                         MarkdownMessageView(
                             text: message.message.content,
-                            storedImages: message.inlineImages,
+                            storedImages: inlineImages,
                             cachedImages: cachedImages,
                             trustedImageBase: trustedImageBase
                         ) { index, image in
@@ -92,6 +128,20 @@ struct MessageBubble: View {
             }
             if !isUser { Spacer(minLength: 40) }
         }
+        .task(id: payloadAttachmentIDs) {
+            await loadAttachmentPayloads()
+        }
+        .onDisappear {
+            attachmentPayloads.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private func loadAttachmentPayloads() async {
+        let ids = payloadAttachmentIDs.filter { attachmentPayloads[$0] == nil }
+        guard !ids.isEmpty,
+              let loaded = try? await env.store.attachmentPayloads(ids: ids),
+              !Task.isCancelled else { return }
+        attachmentPayloads.merge(loaded) { _, refreshed in refreshed }
     }
 
     /// Shown in place of a chart when the model's `render_chart` data can't be
@@ -109,8 +159,11 @@ struct MessageBubble: View {
 
     private var copyButton: some View {
         Button {
-            UIPasteboard.general.string = content
-            Haptics.notify(.success)
+            Task {
+                await loadAttachmentPayloads()
+                UIPasteboard.general.string = content
+                Haptics.notify(.success)
+            }
         } label: {
             Label("Copy", systemImage: "doc.on.doc")
         }
@@ -135,8 +188,8 @@ struct MessageBubble: View {
     private var userBubble: some View {
         VStack(alignment: .trailing, spacing: 6) {
             if !message.attachments.isEmpty {
-                MessageAttachmentsView(attachments: message.attachments) { index, image in
-                    onTapImage(message.message.id, index, image)
+                MessageAttachmentsView(attachments: hydratedAttachments) { index in
+                    onTapImage(message.message.id, index, nil)
                 }
             }
             if !content.isEmpty {
@@ -210,7 +263,7 @@ struct MessageBubble: View {
     private var editor: some View {
         VStack(alignment: .trailing, spacing: 8) {
             if !message.attachments.isEmpty {
-                MessageAttachmentsView(attachments: message.attachments)
+                MessageAttachmentsView(attachments: hydratedAttachments)
             }
             TextField("Message", text: editText, axis: .vertical)
                 .lineLimit(1...10)

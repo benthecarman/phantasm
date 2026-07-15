@@ -226,6 +226,41 @@ final class SchemaImprovementTests: XCTestCase {
         XCTAssertEqual(columns, ["messageId", "createdAt"])
     }
 
+    func testMetadataOnlyTranscriptDefersAttachmentPayload() async throws {
+        let db = try AppDatabase.empty()
+        let conversation = Conversation()
+        let message = Message(
+            conversationId: conversation.id,
+            role: "user",
+            content: "photo"
+        )
+        let bytes = Data(repeating: 0xA5, count: 2 * 1024 * 1024)
+        let attachment = Attachment(
+            messageId: message.id,
+            kind: .image,
+            name: "large.jpg",
+            data: bytes,
+            mimeType: "image/jpeg"
+        )
+        try await db.insertConversation(conversation)
+        try await db.insertMessage(message, attachments: [attachment])
+
+        let metadata = try await db.conversationDetail(
+            id: conversation.id,
+            attachmentData: .metadataOnly
+        )
+        let deferred = try XCTUnwrap(metadata?.messages.first?.attachments.first)
+        XCTAssertEqual(deferred.id, attachment.id)
+        XCTAssertEqual(deferred.name, "large.jpg")
+        XCTAssertEqual(deferred.mimeType, "image/jpeg")
+        XCTAssertTrue(deferred.data.isEmpty)
+
+        let payloads = try await db.attachmentPayloads(ids: [attachment.id])
+        XCTAssertEqual(payloads[attachment.id], bytes)
+        let full = try await db.conversationDetail(id: conversation.id)
+        XCTAssertEqual(full?.messages.first?.attachments.first?.data, bytes)
+    }
+
     // MARK: - Tool settings forward compatibility
 
     func testToolSettingsDecodeDefaultsMissingKeys() throws {

@@ -16,6 +16,15 @@ public struct ConversationDetail: Equatable, Sendable {
     public func wireHistory() -> [WireMessage] { messages.wireHistory() }
 }
 
+/// Controls whether attachment BLOBs ride with a conversation/message fetch.
+/// Metadata-only reads retain ids, kinds, names, MIME types, extracted text,
+/// and timestamps while returning an empty `Attachment.data`. The UI uses that
+/// light shape and asks for payloads only as image rows become visible.
+public enum AttachmentDataScope: Equatable, Sendable {
+    case metadataOnly
+    case full
+}
+
 /// One full-text search hit: the matching conversation plus an optional snippet
 /// from the best-matching message (nil when only the title matched).
 public struct ConversationSearchResult: Identifiable, Equatable, Sendable {
@@ -130,11 +139,23 @@ public protocol ChatStore: Sendable {
     /// One-shot fetch of all live conversations and their messages. Used by
     /// destructive data controls to discover server-hosted image references
     /// before the local rows are removed.
-    func allConversationDetails() async throws -> [ConversationDetail]
+    func allConversationDetails(
+        attachmentData: AttachmentDataScope
+    ) async throws -> [ConversationDetail]
 
     /// One-shot fetch of a conversation with its ordered message history. Returns
     /// nil if the conversation is missing or tombstoned.
-    func conversationDetail(id: UUID) async throws -> ConversationDetail?
+    func conversationDetail(
+        id: UUID,
+        attachmentData: AttachmentDataScope
+    ) async throws -> ConversationDetail?
+
+    /// Fetch only the attachment BLOBs explicitly requested by a visible image
+    /// row or the full-screen gallery. Missing ids are omitted.
+    func attachmentPayloads(ids: [UUID]) async throws -> [UUID: Data]
+
+    /// Fetch one live conversation row without walking its messages.
+    func conversation(id: UUID) async throws -> Conversation?
 
     /// Full-text search over conversation titles + message content, ranked by
     /// relevance. Tombstoned conversations are excluded. Empty query → no results.
@@ -142,6 +163,18 @@ public protocol ChatStore: Sendable {
 }
 
 public extension ChatStore {
+    /// Full-detail compatibility overload for wire-history and callers that
+    /// genuinely need attachment bytes.
+    func conversationDetail(id: UUID) async throws -> ConversationDetail? {
+        try await conversationDetail(id: id, attachmentData: .full)
+    }
+
+    /// Full-detail compatibility overload. Maintenance callers should request
+    /// `.metadataOnly` explicitly so bulk cleanup never materializes BLOBs.
+    func allConversationDetails() async throws -> [ConversationDetail] {
+        try await allConversationDetails(attachmentData: .full)
+    }
+
     /// Compatibility overload for updates that carry no measured reasoning time.
     func updateMessage(
         id: UUID,

@@ -26,9 +26,9 @@ struct GalleryImage: Identifiable, Equatable {
         self.source = .decoded(image)
     }
 
-    func load() -> UIImage? {
+    func load() async -> UIImage? {
         switch source {
-        case .encoded(let data): return UIImage(data: data)
+        case .encoded(let data): return await ImageProcessing.fullResolutionImage(data: data)
         case .decoded(let image): return image
         }
     }
@@ -41,12 +41,25 @@ struct GalleryImage: Identifiable, Equatable {
 /// inline/cached images are gathered with the same ordinals the renderers use,
 /// so a tapped image maps to its gallery position by id.
 enum ConversationImages {
-    static func gallery(from messages: [ChatMessage]) -> [GalleryImage] {
+    static func gallery(
+        from messages: [ChatMessage],
+        payloads: [UUID: Data] = [:]
+    ) -> [GalleryImage] {
         var out: [GalleryImage] = []
         for cm in messages {
             let m = cm.message
+            let hydratedAttachments = cm.attachments.map { attachment in
+                guard attachment.data.isEmpty,
+                      let data = payloads[attachment.id] else { return attachment }
+                var hydrated = attachment
+                hydrated.data = data
+                return hydrated
+            }
+            let hydrated = ChatMessage(message: m, attachments: hydratedAttachments)
             if m.role == "user" {
-                let images = cm.attachments.filter { $0.kind == AttachmentKind.image.rawValue }
+                let images = hydratedAttachments.filter {
+                    $0.kind == AttachmentKind.image.rawValue && !$0.data.isEmpty
+                }
                 for (i, att) in images.enumerated() {
                     out.append(GalleryImage(id: "\(m.id):\(i)", data: att.data))
                 }
@@ -54,13 +67,15 @@ enum ConversationImages {
                 // Mirror MarkdownMessageView's no-base64 renderer pipeline so
                 // tap ordinals remain stable without encoding stored bytes.
                 var cache: [String: ServerImageRef.CachedImage] = [:]
-                for a in cm.attachments where a.kind == AttachmentKind.remoteImage.rawValue {
+                for a in hydratedAttachments
+                    where a.kind == AttachmentKind.remoteImage.rawValue && !a.data.isEmpty
+                {
                     cache[a.name] = ServerImageRef.CachedImage(data: a.data, mime: a.mimeType)
                 }
                 let base64 = Base64ImageExtractor().extractCached(m.content)
                 let next = (base64.images.keys.max() ?? -1) + 1
                 let stored = InlineImageRef.placeholders(
-                    in: base64.markdown, images: cm.inlineImages, startingAt: next
+                    in: base64.markdown, images: hydrated.inlineImages, startingAt: next
                 )
                 let server = ServerImageRef.cachedPlaceholders(
                     in: stored.markdown,
@@ -92,6 +107,7 @@ struct ImageViewerPresentation: Identifiable {
 struct ImageViewerView: View {
     let images: [GalleryImage]
     @State private var selection: String
+    @State private var loadedImages: [String: UIImage] = [:]
     @Environment(\.dismiss) private var dismiss
 
     init(images: [GalleryImage], startID: String) {
@@ -100,7 +116,7 @@ struct ImageViewerView: View {
     }
 
     private var current: UIImage? {
-        images.first { $0.id == selection }?.load()
+        loadedImages[selection]
     }
 
     private var selectedIndex: Int? {
@@ -118,7 +134,8 @@ struct ImageViewerView: View {
                 ForEach(Array(images.enumerated()), id: \.element.id) { index, item in
                     GalleryPage(
                         item: item,
-                        isActive: selectedIndex.map { abs(index - $0) <= 1 } ?? false
+                        isActive: selectedIndex.map { abs(index - $0) <= 1 } ?? false,
+                        onLoad: { image in loadedImages[item.id] = image }
                     )
                     .tag(item.id)
                 }
@@ -155,6 +172,7 @@ struct ImageViewerView: View {
 private struct GalleryPage: View {
     let item: GalleryImage
     let isActive: Bool
+    let onLoad: (UIImage) -> Void
     @State private var image: UIImage?
 
     var body: some View {
@@ -166,9 +184,11 @@ private struct GalleryPage: View {
                 Color.clear
             }
         }
-        .onChange(of: isActive, initial: true) { _, active in
-            guard active, image == nil else { return }
-            image = item.load()
+        .task(id: isActive) {
+            guard isActive, image == nil,
+                  let loaded = await item.load(), !Task.isCancelled else { return }
+            image = loaded
+            onLoad(loaded)
         }
     }
 }

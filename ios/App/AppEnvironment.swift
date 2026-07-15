@@ -254,7 +254,10 @@ final class AppEnvironment {
     /// backstop. Uses only the conversation's own backend profile; an unbound
     /// legacy conversation fails closed rather than contacting an unrelated one.
     func purgeServerImages(conversationID: UUID) async {
-        guard let detail = try? await store.conversationDetail(id: conversationID) else { return }
+        guard let detail = try? await store.conversationDetail(
+            id: conversationID,
+            attachmentData: .metadataOnly
+        ) else { return }
         let ids = detail.messages.flatMap { ServerImageRef.ids(in: $0.message.content) }
         guard !ids.isEmpty else { return }
         guard let profileID = detail.conversation.profileID else { return }
@@ -268,7 +271,9 @@ final class AppEnvironment {
     /// grouped by their owning backend so tokenless and authenticated profiles
     /// both work, and no request is sent to an unrelated active backend.
     func purgeAllServerImages() async {
-        guard let details = try? await store.allConversationDetails() else { return }
+        guard let details = try? await store.allConversationDetails(
+            attachmentData: .metadataOnly
+        ) else { return }
         var idsByProfile: [UUID: Set<String>] = [:]
         for detail in details {
             guard let profileID = detail.conversation.profileID,

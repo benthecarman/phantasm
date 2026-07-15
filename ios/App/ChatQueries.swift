@@ -33,7 +33,11 @@ struct MessagesRequest: ValueObservationQueryable {
     var conversationId: UUID
 
     func fetch(_ db: Database) throws -> [ChatMessage] {
-        try AppDatabase.messages(db, conversationId: conversationId)
+        try AppDatabase.messages(
+            db,
+            conversationId: conversationId,
+            attachmentData: .metadataOnly
+        )
     }
 }
 
