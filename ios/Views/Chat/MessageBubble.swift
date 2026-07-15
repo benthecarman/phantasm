@@ -6,6 +6,7 @@ import SwiftUI
 /// markdown (with images + code copy).
 struct MessageBubble: View {
     let message: ChatMessage
+    var trustedImageBase: URL?
     /// Whether this row is currently being edited (drives the inline editor).
     var isEditing = false
     /// Whether the "Edit" action is offered (user messages, no turn in flight).
@@ -77,7 +78,7 @@ struct MessageBubble: View {
                             text: message.message.content,
                             storedImages: message.inlineImages,
                             cachedImages: cachedImages,
-                            trustedImageBase: env.activeProfile?.baseURL
+                            trustedImageBase: trustedImageBase
                         ) { index, image in
                             onTapImage(message.message.id, index, image)
                         }
@@ -241,6 +242,7 @@ struct StreamingBubble: View {
     /// complete and the bubble becomes a persisted `MessageBubble`. VM-owned so
     /// it's fresh each turn rather than reused by SwiftUI for the recycled bubble.
     let startedAt: Date
+    let trustedImageBase: URL?
 
     var body: some View {
         HStack {
@@ -264,7 +266,11 @@ struct StreamingBubble: View {
                 if text.isEmpty && reasoning.isEmpty && (status?.isEmpty ?? true) {
                     ConjuringLoader(seed: startedAt)
                 } else if !text.isEmpty {
-                    MarkdownMessageView(text: text, isStreaming: true)
+                    MarkdownMessageView(
+                        text: text,
+                        trustedImageBase: trustedImageBase,
+                        isStreaming: true
+                    )
                 }
             }
             Spacer(minLength: 40)

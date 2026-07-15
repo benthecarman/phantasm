@@ -5,24 +5,16 @@ import UserNotifications
 
 @MainActor
 protocol ChatViewModelEnvironment: AnyObject {
-    var activeProfile: BackendProfile? { get }
-    var activeToken: String? { get }
-    var backendMode: BackendMode { get }
-    var preferredModel: String? { get }
-    var chatStreamingClient: any ChatClienting { get }
-    var ollamaStreamingClient: any ChatClienting { get }
     var autoSpeakEnabled: Bool { get }
 
-    func supportsTools(_ model: String?) -> Bool
-    func thinkingEnabled(for model: String?) -> Bool
-    func reasoningEffort(for model: String?) -> String?
+    func backendSession(for profileID: UUID?) -> BackendSession?
     func setDefaultLocationEnabled(_ enabled: Bool)
     func requestLocationAuthorizationWhenInUse()
     func setDefaultHealthEnabled(_ enabled: Bool)
     func requestHealthAuthorization()
     func setDefaultCalendarEnabled(_ enabled: Bool)
     func requestCalendarAuthorization()
-    func warm(model: String)
+    func warm(model: String, profileID: UUID)
     func speak(_ text: String, messageID: UUID)
     /// Fire-and-forget: bring the semantic search index up to date after a
     /// turn commits new message rows.
@@ -30,10 +22,6 @@ protocol ChatViewModelEnvironment: AnyObject {
 }
 
 extension AppEnvironment: ChatViewModelEnvironment {
-    var chatStreamingClient: any ChatClienting {
-        backendMode.usesMapleEncryptedChat ? mapleChatClient : chatClient
-    }
-    var ollamaStreamingClient: any ChatClienting { ollamaChatClient }
     var autoSpeakEnabled: Bool { voicePreferenceStore.autoSpeak }
 
     func setDefaultLocationEnabled(_ enabled: Bool) {

@@ -81,6 +81,11 @@ public protocol ChatStore: Sendable {
         id: UUID, title: String?, modelID: String?, updatedAt: Date?
     ) async throws
 
+    /// Explicitly bind an unowned conversation to a backend profile. Changing
+    /// backend ownership clears backend-specific model and turn-mode choices.
+    /// A no-op for an unsent draft that has not been inserted yet.
+    func bindConversation(id: UUID, toProfileID profileID: UUID) async throws
+
     /// Persist a conversation's per-chat tool selection and selected
     /// research/turn mode (`turnModeID`, nil = ordinary). Does not bump
     /// `updatedAt`, so toggling doesn't reorder the history. A no-op if the

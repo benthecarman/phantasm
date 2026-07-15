@@ -250,6 +250,16 @@ extension AppDatabase: ChatStore {
         }
     }
 
+    public func bindConversation(id: UUID, toProfileID profileID: UUID) async throws {
+        try await dbWriter.write { db in
+            guard var conversation = try Conversation.fetchOne(db, key: id) else { return }
+            conversation.profileID = profileID
+            conversation.modelID = nil
+            conversation.turnModeID = nil
+            try conversation.update(db)
+        }
+    }
+
     public func setConversationOptions(
         id: UUID,
         toolSettings: ToolSettings,

@@ -43,6 +43,7 @@ final class ChatViewModel {
     /// preview is cleared (prompt park, recovery keep, reconcile after commit).
     private(set) var hasAssistantPreview = false
     var errorMessage: String?
+    private(set) var isBindingBackend = false
     /// A pending interactive app-tool prompt (e.g. `ask_user`'s multiple choice
     /// or a Calendar write confirmation) awaiting the user. Prompt views resolve
     /// it via the answer helpers below. Nil when there's nothing to answer.
@@ -60,6 +61,10 @@ final class ChatViewModel {
     /// new chat this is an in-memory draft that isn't written until the first send.
     private var conversation: Conversation?
     private var task: Task<Void, Never>?
+    /// Immutable backend snapshot captured for the active turn (and retained
+    /// while an interactive tool prompt is parked). Profile selection changes
+    /// elsewhere in the app cannot retarget this work.
+    private var turnSession: BackendSession?
     private var startingTurn: StartingTurn?
     private var pendingAssistantMessageID: UUID?
     private var pendingAssistantPreviewMessageID: UUID?
@@ -171,6 +176,12 @@ final class ChatViewModel {
 
     /// The model the composer should display / preselect for this conversation.
     var selectedModel: String? { conversation?.modelID }
+    /// The current conversation's backend. Resolution is exact and fails closed
+    /// for legacy chats or chats whose profile has been deleted.
+    var backendSession: BackendSession? {
+        guard let profileID = conversation?.profileID else { return nil }
+        return env?.backendSession(for: profileID)
+    }
 
     /// Per-chat tool selection for the composer's tool menu. Default to on so a
     /// fresh draft mirrors a tools-enabled backend's out-of-the-box behavior.
@@ -192,7 +203,9 @@ final class ChatViewModel {
 
     /// The research modes the active backend advertises whose needed tools are
     /// usable. Empty ⇒ no research UI. Drives the composer's mode picker.
-    var availableModes: [Capabilities.Mode] { env?.backendMode.availableModes ?? [] }
+    var availableModes: [Capabilities.Mode] {
+        backendSession?.mode.availableModes ?? []
+    }
 
     func setWebSearchEnabled(_ on: Bool) {
         setOptions(
@@ -303,8 +316,37 @@ final class ChatViewModel {
 
     var canSend: Bool {
         // The token is optional for direct no-auth backends such as local Ollama.
-        guard let env, env.activeProfile?.baseURL != nil else { return false }
+        guard backendSession != nil else { return false }
         return !isStreaming
+    }
+
+    /// Bind a legacy/deleted-profile conversation after the user explicitly
+    /// chooses where its full history may be sent.
+    func bindConversation(to profileID: UUID) {
+        guard !isStreaming, !isBindingBackend, let env, let store,
+              let conversation,
+              env.backendSession(for: profileID) != nil else { return }
+        isBindingBackend = true
+        errorMessage = nil
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isBindingBackend = false }
+            do {
+                try await store.bindConversation(
+                    id: conversation.id,
+                    toProfileID: profileID
+                )
+                guard var current = self.conversation,
+                      current.id == conversation.id,
+                      env.backendSession(for: profileID) != nil else { return }
+                current.profileID = profileID
+                current.modelID = nil
+                current.turnModeID = nil
+                self.conversation = current
+            } catch {
+                self.errorMessage = AppError.from(error).userMessage
+            }
+        }
     }
 
     func shouldShowAssistantPreview(alongside messages: [ChatMessage]) -> Bool {
@@ -350,13 +392,16 @@ final class ChatViewModel {
         }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!text.isEmpty || !attachments.isEmpty), canSend,
-              let env, let store, var conversation,
-              let base = env.activeProfile?.baseURL else { return false }
-        let token = env.activeToken ?? ""
+              let store, var conversation,
+              let session = backendSession else {
+            if self.conversation?.profileID == nil || backendSession == nil {
+                errorMessage = "Choose a backend before continuing this chat."
+            }
+            return false
+        }
 
-        guard let model = env.backendMode.resolvedChatModel(
-            conversationModel: conversation.modelID,
-            defaultModel: env.preferredModel
+        guard let model = session.resolvedModel(
+            conversationModel: conversation.modelID
         ) else {
             errorMessage = AppError.modelError(
                 "No chat model is selected. Choose a model in Settings or wait for model discovery to finish."
@@ -403,6 +448,7 @@ final class ChatViewModel {
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
         errorMessage = nil
+        turnSession = session
         startingTurn = StartingTurn(
             conversation: conversation,
             userMessage: userMessage,
@@ -419,9 +465,7 @@ final class ChatViewModel {
                 userMessage: userMessage,
                 attachments: messageAttachments,
                 model: model,
-                base: base,
-                token: token,
-                env: env,
+                session: session,
                 store: store
             )
         }
@@ -435,9 +479,7 @@ final class ChatViewModel {
         userMessage: Message,
         attachments: [Attachment],
         model: String,
-        base: URL,
-        token: String,
-        env: any ChatViewModelEnvironment,
+        session: BackendSession,
         store: ChatStore
     ) async {
         do {
@@ -468,7 +510,7 @@ final class ChatViewModel {
 
         await streamReply(
             conversationId: conversation.id, model: model,
-            base: base, token: token, env: env, store: store
+            session: session, store: store
         )
     }
 
@@ -525,9 +567,7 @@ final class ChatViewModel {
         let vm: ChatViewModel
         let convoID: UUID
         let model: String
-        let base: URL
-        let token: String
-        let env: any ChatViewModelEnvironment
+        let session: BackendSession
         let store: ChatStore
 
         /// Run `mutate` (truncate/edit the history), then stream a fresh reply.
@@ -551,7 +591,7 @@ final class ChatViewModel {
                 }
                 await vm.streamReply(
                     conversationId: convoID, model: model,
-                    base: base, token: token, env: env, store: store
+                    session: session, store: store
                 )
             }
         }
@@ -561,11 +601,10 @@ final class ChatViewModel {
     /// streaming state. Surfaces a user-facing error and returns nil if no turn
     /// can start (no backend, already streaming, or no model selected).
     private func beginTurn() -> TurnContext? {
-        guard canSend, let env, let store, let conversation,
-              let base = env.activeProfile?.baseURL else { return nil }
-        guard let model = env.backendMode.resolvedChatModel(
-            conversationModel: conversation.modelID,
-            defaultModel: env.preferredModel
+        guard canSend, let store, let conversation,
+              let session = backendSession else { return nil }
+        guard let model = session.resolvedModel(
+            conversationModel: conversation.modelID
         ) else {
             errorMessage = AppError.modelError(
                 "No chat model is selected. Choose a model in Settings or wait for model discovery to finish."
@@ -589,11 +628,12 @@ final class ChatViewModel {
         pendingPrompt = nil
         suspendedByScene = false
         errorMessage = nil
+        turnSession = session
         Task { await notifications.requestAuthorizationIfNeeded() }
 
         return TurnContext(
             vm: self, convoID: conversation.id, model: model,
-            base: base, token: env.activeToken ?? "", env: env, store: store
+            session: session, store: store
         )
     }
 
@@ -603,9 +643,7 @@ final class ChatViewModel {
     private func streamReply(
         conversationId: UUID,
         model: String,
-        base: URL,
-        token: String,
-        env: any ChatViewModelEnvironment,
+        session: BackendSession,
         store: ChatStore,
         measuresThroughput: Bool = true,
         measuresReasoningDuration: Bool = true
@@ -624,8 +662,8 @@ final class ChatViewModel {
         // place mode reaches the wire.
         let wireModel = detail.conversation.wireModel(
             base: model,
-            availableModes: env.backendMode.availableModes,
-            baseModelIsToolCapable: env.supportsTools(model)
+            availableModes: session.mode.availableModes,
+            baseModelIsToolCapable: session.supportsTools(model)
         )
         // Scope which server tools this turn may use (spec §2.3). Omitted entirely
         // for backends with no tool manifest, keeping those requests standard.
@@ -638,7 +676,7 @@ final class ChatViewModel {
         // Location and health are gated further by this chat's per-conversation
         // opt-in (both off by default); the always-on app tools (ask_user,
         // current_time) ride unconditionally.
-        let appTools = env.supportsTools(model)
+        let appTools = session.supportsTools(model)
             ? AppTools.all.filter { spec in
                 switch spec.function.name {
                 case ToolName.location: return detail.conversation.locationEnabled
@@ -653,9 +691,9 @@ final class ChatViewModel {
             model: wireModel,
             messages: detail.wireHistory(),
             stream: true,
-            reasoningEffort: env.reasoningEffort(for: model),
+            reasoningEffort: session.reasoningEffort(for: model),
             enabledTools: detail.conversation.requestedToolNames(
-                supporting: env.backendMode.capabilities?.toolSelectors
+                supporting: session.mode.capabilities?.toolSelectors
             ),
             appTools: appTools
         )
@@ -664,9 +702,12 @@ final class ChatViewModel {
         // resend, so a turn interrupted by backgrounding reconnects to the same
         // server-side turn instead of starting over.
         let turnID = pendingAssistantMessageID?.uuidString
-        let stream = env.backendMode.usesOllamaNativeChat
-            ? env.ollamaStreamingClient.stream(request, base: base, token: token, turnID: turnID)
-            : env.chatStreamingClient.stream(request, base: base, token: token, turnID: turnID)
+        let stream = session.client.stream(
+            request,
+            base: session.baseURL,
+            token: session.token,
+            turnID: turnID
+        )
 
         // App-hosted tool calls forwarded this turn, captured so the post-stream
         // step can resolve them (the turn ends once the model calls one).
@@ -717,7 +758,7 @@ final class ChatViewModel {
             if sawDone, let calls = batchedCalls, !calls.isEmpty {
                 resolveToolBatch(
                     calls, conversationId: conversationId, model: model,
-                    base: base, token: token, env: env, store: store
+                    session: session, store: store
                 )
                 return
             }
@@ -780,8 +821,9 @@ final class ChatViewModel {
 
     private func recoverPendingTurn() async {
         guard !isStreaming, isSceneActive, isViewVisible,
-              let env, let store, let conversation,
-              let base = env.activeProfile?.baseURL else { return }
+              let store, let conversation,
+              let session = backendSession else { return }
+        turnSession = session
         // A commit from the just-finished turn may still be landing; reading
         // before it does would mistake the not-yet-completed row for a
         // resumable turn and stream it a second time.
@@ -809,9 +851,8 @@ final class ChatViewModel {
         let previous = detail.messages.dropLast().last?.message
         guard let previous, previous.isComplete,
               previous.role == "user" || previous.role == "tool" else { return }
-        guard let model = env.backendMode.resolvedChatModel(
-            conversationModel: detail.conversation.modelID,
-            defaultModel: env.preferredModel
+        guard let model = session.resolvedModel(
+            conversationModel: detail.conversation.modelID
         ) else { return }
 
         isStreaming = true
@@ -828,14 +869,11 @@ final class ChatViewModel {
         pendingAssistantMessageID = pending.id
         pendingAssistantPreviewMessageID = nil
         errorMessage = nil
-
         task = Task { [weak self] in
             await self?.streamReply(
                 conversationId: conversation.id,
                 model: model,
-                base: base,
-                token: env.activeToken ?? "",
-                env: env,
+                session: session,
                 store: store,
                 measuresThroughput: false,
                 measuresReasoningDuration: false
@@ -920,11 +958,10 @@ final class ChatViewModel {
         result: @escaping @Sendable () async -> String
     ) {
         guard let prompt = pendingPrompt, !isStreaming,
-              let env, let store, let conversation,
-              let base = env.activeProfile?.baseURL else { return }
-        guard let model = env.backendMode.resolvedChatModel(
-            conversationModel: conversation.modelID,
-            defaultModel: env.preferredModel
+              let store, let conversation,
+              let session = turnSession ?? backendSession else { return }
+        guard let model = session.resolvedModel(
+            conversationModel: conversation.modelID
         ) else { return }
 
         let toolCallId = prompt.toolCallId
@@ -943,7 +980,7 @@ final class ChatViewModel {
         pendingAssistantPreviewMessageID = nil
         suspendedByScene = false
         errorMessage = nil
-        let token = env.activeToken ?? ""
+        turnSession = session
 
         task = Task { [weak self] in
             // Persist the result row first, run the side effect, then record
@@ -987,7 +1024,7 @@ final class ChatViewModel {
             }
             await self?.streamReply(
                 conversationId: conversation.id, model: model,
-                base: base, token: token, env: env, store: store
+                session: session, store: store
             )
         }
     }
@@ -1004,9 +1041,7 @@ final class ChatViewModel {
         _ calls: [WireToolCall],
         conversationId: UUID,
         model: String,
-        base: URL,
-        token: String,
-        env: any ChatViewModelEnvironment,
+        session: BackendSession,
         store: ChatStore
     ) {
         let json = Self.encodeToolCalls(calls)
@@ -1096,7 +1131,7 @@ final class ChatViewModel {
             }
             await self?.streamReply(
                 conversationId: conversationId, model: model,
-                base: base, token: token, env: env, store: store
+                session: session, store: store
             )
         }
     }
@@ -1137,13 +1172,15 @@ final class ChatViewModel {
         // A resumable turn no longer cancels on disconnect, so explicitly tell the
         // orchestrator to cancel it — freeing server resources and any running
         // image generation immediately rather than letting it finish unseen.
-        if let env, let turnID = pendingAssistantMessageID?.uuidString,
-           let base = env.activeProfile?.baseURL {
-            let token = env.activeToken ?? ""
-            let client: any ChatClienting = env.backendMode.usesOllamaNativeChat
-                ? env.ollamaStreamingClient
-                : env.chatStreamingClient
-            Task { await client.cancel(turnID: turnID, base: base, token: token) }
+        if let session = turnSession,
+           let turnID = pendingAssistantMessageID?.uuidString {
+            Task {
+                await session.client.cancel(
+                    turnID: turnID,
+                    base: session.baseURL,
+                    token: session.token
+                )
+            }
         }
         task?.cancel()
         finish(error: nil, emptyPendingDisposition: .delete)
@@ -1153,7 +1190,9 @@ final class ChatViewModel {
         guard var conversation else { return }
         conversation.modelID = model
         self.conversation = conversation
-        env?.warm(model: model)
+        if let profileID = conversation.profileID {
+            env?.warm(model: model, profileID: profileID)
+        }
         let id = conversation.id
         // Persist if the conversation already exists; for an unsent draft this is a
         // no-op and the model rides along on the first send instead.
@@ -1168,6 +1207,8 @@ final class ChatViewModel {
     ) {
         guard isStreaming else { return }
         isStreaming = false
+        let completedSession = turnSession
+        turnSession = nil
         statusText = nil
         statusProgress = nil
         task = nil
@@ -1236,7 +1277,8 @@ final class ChatViewModel {
                     messageID: pendingID,
                     content: committed,
                     notifyInBackground: shouldNotifyWhenCommitted,
-                    isCleanCompletion: error == nil
+                    isCleanCompletion: error == nil,
+                    session: completedSession
                 ) {
                     try await store.updateMessage(
                         id: pendingID,
@@ -1262,7 +1304,8 @@ final class ChatViewModel {
                     messageID: assistant.id,
                     content: committed,
                     notifyInBackground: shouldNotifyWhenCommitted,
-                    isCleanCompletion: error == nil
+                    isCleanCompletion: error == nil,
+                    session: completedSession
                 ) {
                     try await store.insertMessage(assistant, attachments: [])
                 }
@@ -1295,6 +1338,7 @@ final class ChatViewModel {
         content: String,
         notifyInBackground: Bool,
         isCleanCompletion: Bool,
+        session: BackendSession?,
         write: @escaping @Sendable () async throws -> Void
     ) {
         let rowCommit = Task { [weak self] () -> Bool in
@@ -1312,7 +1356,13 @@ final class ChatViewModel {
             guard await rowCommit.value else { return }
             // New rows for the semantic search index (fire-and-forget).
             self?.env?.indexSearchEmbeddings()
-            await self?.cacheServerImages(messageID: messageID, content: content)
+            if let session {
+                await self?.cacheServerImages(
+                    messageID: messageID,
+                    content: content,
+                    session: session
+                )
+            }
             try? await store.updateConversation(
                 id: conversationID, title: nil, modelID: nil, updatedAt: .now
             )
@@ -1321,7 +1371,7 @@ final class ChatViewModel {
                     conversationID: conversationID
                 )
             } else if isCleanCompletion && !content.isEmpty {
-                await self?.maybeGenerateTitle()
+                await self?.maybeGenerateTitle(session: session)
             }
             self?.endBackgroundStreamingTask()
         }
@@ -1344,22 +1394,34 @@ final class ChatViewModel {
     /// background-task assertion — otherwise a turn that completes as the app
     /// suspends (e.g. an interrupted image edit, recovered on reopen) would lose
     /// the caching to suspension, leaving the image to spin forever after restart.
-    private func cacheServerImages(messageID: UUID, content: String) async {
-        await cacheServerImages(messageID: messageID, refs: ServerImageRef.references(in: content))
+    private func cacheServerImages(
+        messageID: UUID,
+        content: String,
+        session: BackendSession
+    ) async {
+        await cacheServerImages(
+            messageID: messageID,
+            refs: ServerImageRef.references(in: content),
+            session: session
+        )
     }
 
     /// Fetch + persist `refs` as local `remoteImage` attachments on `messageID`.
     /// Best-effort: unreachable refs are skipped. The caller owns the enclosing
     /// `Task` / background assertion.
     private func cacheServerImages(
-        messageID: UUID, refs: [(id: String, url: String)]
+        messageID: UUID,
+        refs: [(id: String, url: String)],
+        session: BackendSession
     ) async {
-        guard !refs.isEmpty, let store,
-              let trustedBase = env?.activeProfile?.baseURL else { return }
+        guard !refs.isEmpty, let store else { return }
         var attachments: [Attachment] = []
         for ref in refs {
             guard let url = URL(string: ref.url),
-                  let img = await imageFetcher.fetch(url, trustedBase: trustedBase) else {
+                  let img = await imageFetcher.fetch(
+                      url,
+                      trustedBase: session.trustedMediaBaseURL
+                  ) else {
                 continue
             }
             attachments.append(
@@ -1376,7 +1438,8 @@ final class ChatViewModel {
     /// later open, where the live caching raced app suspension. Idempotent and
     /// best-effort; runs whenever the conversation is opened.
     private func healUncachedServerImages() {
-        guard let store, let conversation else { return }
+        guard let store, let conversation,
+              let session = backendSession else { return }
         let conversationID = conversation.id
         Task { [weak self] in
             guard let detail = try? await store.conversationDetail(id: conversationID) else {
@@ -1392,35 +1455,40 @@ final class ChatViewModel {
                 )
                 let missing = refs.filter { !cached.contains($0.id) }
                 guard !missing.isEmpty else { continue }
-                await self?.cacheServerImages(messageID: cm.message.id, refs: missing)
+                await self?.cacheServerImages(
+                    messageID: cm.message.id,
+                    refs: missing,
+                    session: session
+                )
             }
         }
     }
 
     /// After the very first assistant reply, replace the first-message placeholder
     /// title with a model-generated one (FR: auto-naming). Fire-and-forget.
-    private func maybeGenerateTitle() async {
+    private func maybeGenerateTitle(session: BackendSession?) async {
+        guard let session else { return }
         guard let store, let conversation,
               let detail = try? await store.conversationDetail(id: conversation.id) else { return }
         let assistantReplies = detail.messages.filter { $0.message.role == "assistant" }.count
         guard assistantReplies == 1 else { return }
-        await generateTitle(history: Self.titleHistory(from: detail.wireHistory()))
+        await generateTitle(
+            history: Self.titleHistory(from: detail.wireHistory()),
+            session: session
+        )
     }
 
     /// Side-query the model for a short conversation title. Failures leave the
     /// placeholder title in place and never surface to the user.
-    private func generateTitle(history: [WireMessage]) async {
-        guard let env, let store, let conversation,
-              let base = env.activeProfile?.baseURL,
-              let model = env.backendMode.resolvedChatModel(
-                  conversationModel: conversation.modelID,
-                  defaultModel: env.preferredModel
+    private func generateTitle(
+        history: [WireMessage],
+        session: BackendSession
+    ) async {
+        guard let store, let conversation,
+              let model = session.resolvedModel(
+                  conversationModel: conversation.modelID
               ) else { return }
-        let token = env.activeToken ?? ""
-        let client: any ChatClienting = env.backendMode.usesOllamaNativeChat
-            ? env.ollamaStreamingClient
-            : env.chatStreamingClient
-        let reasoningEffort = env.reasoningEffort(for: model)
+        let reasoningEffort = session.reasoningEffort(for: model)
         let titleMessages = history + [WireMessage(role: "user", content: Self.titlePrompt)]
 
         func complete(reasoningEffort: String?) async throws -> String {
@@ -1430,7 +1498,11 @@ final class ChatViewModel {
                 stream: true,
                 reasoningEffort: reasoningEffort
             )
-            return try await client.complete(request, base: base, token: token)
+            return try await session.client.complete(
+                request,
+                base: session.baseURL,
+                token: session.token
+            )
         }
 
         let raw: String

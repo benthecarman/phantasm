@@ -73,39 +73,40 @@ struct ChatView: View {
     }
 
     private var isEmpty: Bool { visibleMessages.isEmpty && !vm.hasAssistantPreview }
+    private var backendSession: BackendSession? { vm.backendSession }
 
     /// The model selected for this conversation (VM-owned once configured).
     private var currentModelID: String? {
-        vm.selectedModel ?? conversation.modelID ?? env.preferredModel
+        vm.selectedModel ?? conversation.modelID ?? backendSession?.preferredModel
     }
 
     /// Whether the selected model can accept images (vision-capable).
     private var allowsImageAttachments: Bool {
-        env.supportsVision(currentModelID)
+        backendSession?.supportsVision(currentModelID) ?? false
     }
 
     /// Whether the selected model can drive server tools (function calling). A
     /// tool also needs the backend to advertise it; this only gates the model.
     private var modelSupportsTools: Bool {
-        env.supportsTools(currentModelID)
+        backendSession?.supportsTools(currentModelID) ?? false
     }
 
     /// Whether the selected model can produce reasoning output through Phantasm.
     /// Non-Phantasm backends do not expose the app's Thinking toggle.
     private var modelSupportsThinking: Bool {
-        env.supportsThinking(currentModelID)
+        backendSession?.supportsThinking(currentModelID) ?? false
     }
 
     private var reasoningEfforts: [String] {
-        env.reasoningEfforts(for: currentModelID)
+        backendSession?.reasoningEfforts(for: currentModelID) ?? []
     }
 
     /// Whether this backend exposes the app's Thinking control at all. Unknown
     /// endpoint support hides the row; explicit unsupported renders disabled.
     private var showsThinkingToggle: Bool {
-        switch env.thinkingSupport(for: currentModelID) {
+        switch backendSession?.thinkingSupport(for: currentModelID) {
         case .supported, .unsupported: return true
-        case .unknown: return false
+        case .unknown, nil: return false
         }
     }
 
@@ -118,14 +119,14 @@ struct ChatView: View {
     /// Estimated context-window usage for this conversation, or `nil` when the
     /// model's window is unknown (then no usage indicator appears).
     private var contextUsage: ContextUsage? {
-        guard let length = currentModelID.flatMap({ env.contextLengths?[$0] }),
+        guard let length = currentModelID.flatMap({ backendSession?.contextLengths?[$0] }),
               length > 0 else { return nil }
         return ContextUsage(estimatedTokens: estimatedTokens, contextLength: length)
     }
 
     /// The active orchestrator manifest, or nil for raw Ollama / generic OpenAI.
     private var backendCapabilities: Capabilities? {
-        env.backendMode.capabilities
+        backendSession?.mode.capabilities
     }
 
     /// Whether app-hosted tools (e.g. location) can ride this turn. They resolve
@@ -150,6 +151,9 @@ struct ChatView: View {
             // strip with the page background filling the gap behind the keyboard.
             .safeAreaInset(edge: .bottom) {
               VStack(spacing: 8) {
+                if backendSession == nil {
+                    missingBackendBanner
+                }
                 if let prompt = vm.pendingPrompt {
                     // One view per interactive app-tool prompt kind. A new
                     // interactive tool adds a case here (and an `AppToolPrompt` one).
@@ -171,13 +175,13 @@ struct ChatView: View {
                     canSend: vm.canSend && (vm.pendingPrompt?.acceptsFreeTextAnswer ?? true),
                     focus: $composerFocused,
                     dictation: env.dictationController,
-                    availableModels: env.availableModels,
+                    availableModels: backendSession?.availableModels ?? [],
                     modelName: currentModelName,
                     modelSelection: modelBinding,
-                    visionModels: env.visionModels,
-                    toolModels: env.toolModels,
-                    contextLengths: env.contextLengths,
-                    defaultModel: env.defaultModelID,
+                    visionModels: backendSession?.visionModels,
+                    toolModels: backendSession?.toolModels,
+                    contextLengths: backendSession?.contextLengths,
+                    defaultModel: backendSession?.defaultModelID,
                     allowsImageAttachments: allowsImageAttachments,
                     supportsWebSearch: backendCapabilities?.hasToolSelector(ToolSelectorName.webSearch) ?? false,
                     supportsImageGeneration: backendCapabilities?.hasToolSelector(ToolSelectorName.imageGeneration) ?? false,
@@ -214,12 +218,32 @@ struct ChatView: View {
                     ),
                     reasoningEfforts: reasoningEfforts,
                     thinkingEnabled: Binding(
-                        get: { env.thinkingEnabled(for: currentModelID) },
-                        set: { env.setThinkingEnabled($0, for: currentModelID) }
+                        get: {
+                            backendSession?.thinkingEnabled(for: currentModelID) ?? false
+                        },
+                        set: { enabled in
+                            guard let profileID = backendSession?.profileID else { return }
+                            env.setThinkingEnabled(
+                                enabled,
+                                for: currentModelID,
+                                profileID: profileID
+                            )
+                        }
                     ),
                     selectedReasoningEffort: Binding(
-                        get: { env.selectedReasoningEffort(for: currentModelID) },
-                        set: { env.setSelectedReasoningEffort($0, for: currentModelID) }
+                        get: {
+                            backendSession?.selectedReasoningEffort(
+                                for: currentModelID
+                            ) ?? ReasoningEffort.enabledDefault
+                        },
+                        set: { effort in
+                            guard let profileID = backendSession?.profileID else { return }
+                            env.setSelectedReasoningEffort(
+                                effort,
+                                for: currentModelID,
+                                profileID: profileID
+                            )
+                        }
                     ),
                     onSend: send,
                     onStop: {
@@ -322,6 +346,7 @@ struct ChatView: View {
                     ForEach(visibleMessages) { message in
                         MessageBubble(
                             message: message,
+                            trustedImageBase: backendSession?.trustedMediaBaseURL,
                             isEditing: editingMessageID == message.id,
                             canEdit: message.message.role == "user" && !vm.isStreaming,
                             canResend: message.message.role == "user" && !vm.isStreaming,
@@ -347,6 +372,7 @@ struct ChatView: View {
                     StreamingPreviewSection(
                         vm: vm,
                         messages: messages,
+                        trustedImageBase: backendSession?.trustedMediaBaseURL,
                         onGrow: { followTail(proxy) }
                     )
                     Color.clear.frame(height: 1).id(bottomID)
@@ -440,6 +466,34 @@ struct ChatView: View {
         currentModelID ?? "model"
     }
 
+    private var missingBackendBanner: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.shield")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Backend required")
+                    .font(.subheadline.weight(.semibold))
+                Text("Choose where to continue. This chat's full history will be sent to that backend.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Menu("Choose") {
+                ForEach(env.profiles) { profile in
+                    Button(profile.name) {
+                        vm.bindConversation(to: profile.id)
+                    }
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(env.profiles.isEmpty || vm.isBindingBackend)
+        }
+        .padding(12)
+        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
+        .padding(.horizontal, 12)
+    }
+
     private var modelBinding: Binding<String> {
         Binding(
             get: { currentModelID ?? "" },
@@ -528,6 +582,7 @@ struct ChatView: View {
 private struct StreamingPreviewSection: View {
     let vm: ChatViewModel
     let messages: [ChatMessage]
+    let trustedImageBase: URL?
     /// Called when streamed content grows (token/reasoning): the parent scrolls
     /// the tail into view. Tokens arrive many-per-second; the parent follows
     /// without animation so overlapping animations don't jank.
@@ -542,7 +597,8 @@ private struct StreamingPreviewSection: View {
                     reasoningDuration: vm.streamingReasoningDuration,
                     status: vm.statusText,
                     progress: vm.statusProgress,
-                    startedAt: vm.streamingStartedAt
+                    startedAt: vm.streamingStartedAt,
+                    trustedImageBase: trustedImageBase
                 )
             }
         }

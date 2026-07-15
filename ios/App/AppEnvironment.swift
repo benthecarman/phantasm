@@ -79,11 +79,20 @@ final class AppEnvironment {
     /// choices for models with more than an on/off Thinking control.
     private var reasoningEffortPreferences: [String: [String: String]]
     private var capabilityRefreshGeneration = 0
+    /// Last fully-resolved capability state for each profile used this process.
+    /// Switching the Settings selection must not erase the state needed by an
+    /// already-open conversation owned by the previous profile.
+    private var backendStates: [UUID: BackendState] = [:]
 
-    enum ThinkingSupport {
-        case supported
-        case unsupported
-        case unknown
+    private struct BackendState {
+        let canonicalBaseURL: String
+        let effectiveTransport: BackendTransport
+        let mode: BackendMode
+        let visionModels: Set<String>?
+        let toolModels: Set<String>?
+        let reasoningEffortsByModel:
+            [String: Capabilities.Model.ReasoningEffortAvailability]?
+        let contextLengths: [String: Int]?
     }
 
     init() {
@@ -162,17 +171,94 @@ final class AppEnvironment {
         activeProfile.flatMap { keychain.token(for: $0.id) }
     }
 
+    /// Resolve an immutable session for the conversation's owning profile.
+    /// Missing/legacy profile ids fail closed; callers must never substitute the
+    /// globally selected profile because doing so can disclose the full history.
+    func backendSession(for profileID: UUID?) -> BackendSession? {
+        guard let profileID,
+              let profile = profiles.first(where: { $0.id == profileID }),
+              let baseURL = profile.baseURL else { return nil }
+
+        let state: BackendState
+        if profileID == activeProfileID {
+            state = currentBackendState(for: profile)
+        } else if let cached = backendStates[profileID],
+                  cached.canonicalBaseURL
+                    == BackendProfile.canonicalBaseURLString(profile.baseURLString),
+                  cached.effectiveTransport == profile.effectiveTransport {
+            state = cached
+        } else {
+            let models = profileStore.cachedModels(for: profileID)
+            state = BackendState(
+                canonicalBaseURL: BackendProfile.canonicalBaseURLString(
+                    profile.baseURLString
+                ),
+                effectiveTransport: profile.effectiveTransport,
+                mode: profile.effectiveTransport == .mapleEncrypted
+                    ? .mapleEncrypted(models: models)
+                    : .plainChatOnly(models: models),
+                visionModels: nil,
+                toolModels: nil,
+                reasoningEffortsByModel: nil,
+                contextLengths: nil
+            )
+        }
+
+        let client: any ChatClienting
+        if state.mode.usesOllamaNativeChat {
+            client = ollamaChatClient
+        } else if state.mode.usesMapleEncryptedChat {
+            client = mapleChatClient
+        } else {
+            client = chatClient
+        }
+        return BackendSession(
+            profile: profile,
+            baseURL: baseURL,
+            token: keychain.token(for: profileID) ?? "",
+            mode: state.mode,
+            visionModels: state.visionModels,
+            toolModels: state.toolModels,
+            reasoningEffortsByModel: state.reasoningEffortsByModel,
+            contextLengths: state.contextLengths,
+            client: client,
+            thinkingPreferences: thinkingPreferences[profileID.uuidString] ?? [:],
+            reasoningEffortPreferences:
+                reasoningEffortPreferences[profileID.uuidString] ?? [:]
+        )
+    }
+
+    private func currentBackendState(for profile: BackendProfile) -> BackendState {
+        BackendState(
+            canonicalBaseURL: BackendProfile.canonicalBaseURLString(
+                profile.baseURLString
+            ),
+            effectiveTransport: profile.effectiveTransport,
+            mode: backendMode,
+            visionModels: visionModels,
+            toolModels: toolModels,
+            reasoningEffortsByModel: reasoningEffortsByModel,
+            contextLengths: contextLengths
+        )
+    }
+
+    private func cacheActiveBackendState() {
+        guard let profile = activeProfile else { return }
+        backendStates[profile.id] = currentBackendState(for: profile)
+    }
+
     /// Delete the server-hosted image blobs a conversation referenced, so the
     /// app owns their lifecycle (spec §2.2b). Best-effort and fire-before-delete:
     /// must run while the messages still exist to read their `/v1/files/<id>`
     /// references. A failure is harmless — the server's TTL pruner is the
-    /// backstop. Uses the conversation's own backend profile (falling back to the
-    /// active one) for the base URL + token.
+    /// backstop. Uses only the conversation's own backend profile; an unbound
+    /// legacy conversation fails closed rather than contacting an unrelated one.
     func purgeServerImages(conversationID: UUID) async {
         guard let detail = try? await store.conversationDetail(id: conversationID) else { return }
         let ids = detail.messages.flatMap { ServerImageRef.ids(in: $0.message.content) }
         guard !ids.isEmpty else { return }
-        let profile = profiles.first { $0.id == detail.conversation.profileID } ?? activeProfile
+        guard let profileID = detail.conversation.profileID else { return }
+        let profile = profiles.first { $0.id == profileID }
         guard let profile, let base = profile.baseURL else { return }
         let token = keychain.token(for: profile.id) ?? ""
         await ImageClient().delete(ids: ids, base: base, token: token)
@@ -185,7 +271,7 @@ final class AppEnvironment {
         guard let details = try? await store.allConversationDetails() else { return }
         var idsByProfile: [UUID: Set<String>] = [:]
         for detail in details {
-            guard let profileID = detail.conversation.profileID ?? activeProfileID,
+            guard let profileID = detail.conversation.profileID,
                   profiles.contains(where: { $0.id == profileID })
             else { continue }
             let ids = detail.messages.flatMap { ServerImageRef.ids(in: $0.message.content) }
@@ -236,6 +322,7 @@ final class AppEnvironment {
     }
 
     func upsert(_ profile: BackendProfile, token: String?) {
+        backendStates[profile.id] = nil
         if let idx = profiles.firstIndex(where: { $0.id == profile.id }) {
             profiles[idx] = profile
         } else {
@@ -257,6 +344,7 @@ final class AppEnvironment {
     }
 
     func delete(_ profile: BackendProfile) {
+        backendStates[profile.id] = nil
         profiles.removeAll { $0.id == profile.id }
         try? keychain.delete(for: profile.id)
         profileStore.clearCachedModels(for: profile.id)
@@ -269,6 +357,7 @@ final class AppEnvironment {
     }
 
     func setActive(_ id: UUID?) {
+        cacheActiveBackendState()
         activeProfileID = id
         profileStore.activeProfileID = id
         seedBackendMode(from: profiles.first { $0.id == id })
@@ -344,6 +433,7 @@ final class AppEnvironment {
         toolModels = modelCapabilities.tools
         reasoningEffortsByModel = modelCapabilities.reasoningEfforts
         contextLengths = modelCapabilities.contextLengths
+        cacheActiveBackendState()
         warmActiveModel(base: base, token: token)
     }
 
@@ -408,80 +498,8 @@ final class AppEnvironment {
         }
     }
 
-    /// Whether `model` can accept image attachments. Unknown backends return
-    /// `true` (optimistic) so we never hide a capability that may exist.
-    func supportsVision(_ model: String?) -> Bool {
-        guard let visionModels else { return true }
-        guard let model else { return false }
-        return visionModels.contains(model)
-    }
-
-    /// Whether `model` can drive server tools (function calling). Unknown backends
-    /// return `true` (optimistic). Note this only gates *which* model can use a
-    /// tool — the backend must also advertise the tool (see `backendMode`).
-    func supportsTools(_ model: String?) -> Bool {
-        guard let toolModels else { return true }
-        guard let model else { return false }
-        return toolModels.contains(model)
-    }
-
-    /// Whether `model` can produce reasoning/thinking output through the Phantasm
-    /// orchestrator. The endpoint must explicitly advertise a non-empty
-    /// `reasoning_efforts` list; plain OpenAI-compatible/native Ollama backends
-    /// and older manifests without per-model effort data do not expose the app's
-    /// Thinking toggle.
-    func supportsThinking(_ model: String?) -> Bool {
-        thinkingSupport(for: model) == .supported
-    }
-
-    func reasoningEfforts(for model: String?) -> [String] {
+    func setThinkingEnabled(_ enabled: Bool, for model: String?, profileID: UUID) {
         guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              case .known(let efforts) = reasoningEffortsByModel?[model] else { return [] }
-        return efforts
-    }
-
-    func thinkingSupport(for model: String?) -> ThinkingSupport {
-        guard case .full = backendMode else { return .unsupported }
-        guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty else { return .unknown }
-        guard let availability = reasoningEffortsByModel?[model] else { return .unknown }
-        switch availability {
-        case .unknown:
-            return .unknown
-        case .known(let efforts):
-            return efforts.isEmpty ? .unsupported : .supported
-        }
-    }
-
-    /// The effective Thinking setting for `model`: the stored preference, defaulting
-    /// on only when the model actually supports reasoning. A model that can't
-    /// think reports `false` regardless of the saved toggle, so we never send
-    /// `reasoning_effort` to a backend that would ignore (or reject) it. The
-    /// preference itself is left intact for when a thinking-capable model is
-    /// reselected.
-    func thinkingEnabled(for model: String?) -> Bool {
-        guard let profileID = activeProfileID,
-              let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              supportsThinking(model) else { return false }
-        return thinkingPreferences[profileID.uuidString]?[model] ?? true
-    }
-
-    func reasoningEffort(for model: String?) -> String? {
-        guard thinkingSupport(for: model) == .supported else { return nil }
-        let efforts = reasoningEfforts(for: model)
-        guard efforts.count > 2 else {
-            return thinkingEnabled(for: model)
-                ? preferredEnabledReasoningEffort(from: efforts)
-                : disabledReasoningEffort(from: efforts)
-        }
-        return selectedReasoningEffort(for: model)
-    }
-
-    func setThinkingEnabled(_ enabled: Bool, for model: String?) {
-        guard let profileID = activeProfileID,
-              let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty else { return }
         var byModel = thinkingPreferences[profileID.uuidString] ?? [:]
         byModel[model] = enabled
@@ -489,43 +507,19 @@ final class AppEnvironment {
         modelPreferenceStore.saveThinkingPreferences(thinkingPreferences)
     }
 
-    func selectedReasoningEffort(for model: String?) -> String {
-        let efforts = reasoningEfforts(for: model)
-        guard let profileID = activeProfileID,
-              let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty else { return preferredEnabledReasoningEffort(from: efforts) }
-        if let stored = reasoningEffortPreferences[profileID.uuidString]?[model],
-           efforts.contains(stored) {
-            return stored
-        }
-        return defaultReasoningEffort(from: efforts)
-    }
-
-    func setSelectedReasoningEffort(_ effort: String, for model: String?) {
-        let efforts = reasoningEfforts(for: model)
-        guard efforts.contains(effort),
-              let profileID = activeProfileID,
+    func setSelectedReasoningEffort(
+        _ effort: String,
+        for model: String?,
+        profileID: UUID
+    ) {
+        guard let session = backendSession(for: profileID),
+              session.reasoningEfforts(for: model).contains(effort),
               let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty else { return }
         var byModel = reasoningEffortPreferences[profileID.uuidString] ?? [:]
         byModel[model] = effort
         reasoningEffortPreferences[profileID.uuidString] = byModel
         modelPreferenceStore.saveReasoningEffortPreferences(reasoningEffortPreferences)
-    }
-
-    private func disabledReasoningEffort(from efforts: [String]) -> String? {
-        efforts.first { $0.caseInsensitiveCompare(ReasoningEffort.disabled) == .orderedSame }
-    }
-
-    private func preferredEnabledReasoningEffort(from efforts: [String]) -> String {
-        if efforts.contains(ReasoningEffort.enabledDefault) { return ReasoningEffort.enabledDefault }
-        return efforts.first {
-            $0.caseInsensitiveCompare(ReasoningEffort.disabled) != .orderedSame
-        } ?? ReasoningEffort.enabledDefault
-    }
-
-    private func defaultReasoningEffort(from efforts: [String]) -> String {
-        preferredEnabledReasoningEffort(from: efforts)
     }
 
     /// Kick off a best-effort preload of the model new chats will use, so the
@@ -539,10 +533,17 @@ final class AppEnvironment {
     /// after the user picks a different model). Gated on the profile's `autoWarm`
     /// opt-in. Failures are silent and never block the UI.
     func warm(model: String) {
-        guard let profile = activeProfile, profile.autoWarm,
+        guard let profileID = activeProfileID else { return }
+        warm(model: model, profileID: profileID)
+    }
+
+    func warm(model: String, profileID: UUID) {
+        guard let profile = profiles.first(where: { $0.id == profileID }),
+              profile.autoWarm,
               let base = profile.baseURL else { return }
-        let token = activeToken ?? ""
-        let mode = backendMode
+        guard let session = backendSession(for: profileID) else { return }
+        let token = session.token
+        let mode = session.mode
         Task.detached { [warmupClient] in
             await warmupClient.warm(model: model, base: base, token: token, mode: mode)
         }

@@ -5,6 +5,183 @@ import XCTest
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testProfileSwitchKeepsTurnAndFollowupsOnOwningBackend() async throws {
+        let store = try AppDatabase.empty()
+        let ownerClient = ScriptedChatClient()
+        let otherClient = ScriptedChatClient()
+        let imageFetcher = FakeImageFetcher(
+            image: .init(data: Data("png".utf8), mime: "image/png")
+        )
+        let env = FakeChatEnvironment(client: ownerClient)
+        let other = env.addProfile(
+            name: "Other",
+            baseURL: "https://other.example",
+            token: "other-token",
+            client: otherClient
+        )
+        let conversation = Conversation(profileID: env.primaryProfileID)
+        let vm = makeViewModel(
+            env: env,
+            store: store,
+            conversation: conversation,
+            imageFetcher: imageFetcher
+        )
+        env.activeProfileID = other.id
+
+        let imageURL = "https://backend.example/v1/files/img_1/content"
+        ownerClient.enqueue(events: [.token("![image](\(imageURL))"), .done])
+        ownerClient.enqueue(events: [.token("Owned Chat"), .done])
+
+        XCTAssertTrue(vm.send("hello"))
+
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.conversation.title == "Owned Chat"
+                && detail?.messages.last?.attachments.count == 1
+        }
+
+        XCTAssertEqual(ownerClient.invocations.count, 2)
+        XCTAssertTrue(ownerClient.invocations.allSatisfy {
+            $0.base == URL(string: "https://backend.example")
+                && $0.token == "test-token"
+        })
+        XCTAssertTrue(otherClient.invocations.isEmpty)
+        XCTAssertEqual(
+            imageFetcher.trustedBases,
+            [URL(string: "https://backend.example")!]
+        )
+    }
+
+    func testProfileSwitchKeepsCancellationOnOwningBackend() async throws {
+        let store = try AppDatabase.empty()
+        let ownerClient = ScriptedChatClient()
+        let otherClient = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: ownerClient)
+        let other = env.addProfile(
+            name: "Other",
+            baseURL: "https://other.example",
+            token: "other-token",
+            client: otherClient
+        )
+        let conversation = Conversation(profileID: env.primaryProfileID)
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        env.activeProfileID = other.id
+        ownerClient.enqueue(
+            events: [.token("late"), .done],
+            leadingDelayNanoseconds: 400_000_000
+        )
+
+        XCTAssertTrue(vm.send("stop"))
+        try await waitUntil { ownerClient.invocations.count == 1 }
+        vm.stop()
+        try await waitUntil { ownerClient.cancellations.count == 1 }
+
+        XCTAssertEqual(
+            ownerClient.cancellations.first?.base,
+            URL(string: "https://backend.example")
+        )
+        XCTAssertEqual(ownerClient.cancellations.first?.token, "test-token")
+        XCTAssertTrue(otherClient.cancellations.isEmpty)
+    }
+
+    func testMissingProfileFailsClosedUntilExplicitlyBound() async throws {
+        let store = try AppDatabase.empty()
+        let ownerClient = ScriptedChatClient()
+        let replacementClient = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: ownerClient)
+        let replacement = env.addProfile(
+            name: "Replacement",
+            baseURL: "https://replacement.example",
+            token: "replacement-token",
+            client: replacementClient
+        )
+        let conversation = Conversation(profileID: nil)
+        try await store.insertConversation(conversation)
+        try await store.insertMessage(
+            Message(
+                conversationId: conversation.id,
+                role: "user",
+                content: "existing private history",
+                isComplete: true
+            ),
+            attachments: []
+        )
+        let vm = makeViewModel(
+            env: env,
+            store: store,
+            conversation: conversation,
+            bindDefaultProfile: false
+        )
+
+        XCTAssertFalse(vm.send("private history"))
+        XCTAssertTrue(ownerClient.invocations.isEmpty)
+        XCTAssertTrue(replacementClient.invocations.isEmpty)
+
+        replacementClient.enqueue(events: [.token("safe"), .done])
+        replacementClient.enqueue(events: [.token("Bound Chat"), .done])
+        vm.bindConversation(to: replacement.id)
+        try await waitUntil { vm.backendSession?.profileID == replacement.id }
+        XCTAssertTrue(vm.send("private history"))
+
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.conversation.title == "Bound Chat"
+        }
+        let detail = try await self.detail(store, conversation.id)
+        XCTAssertEqual(detail.conversation.profileID, replacement.id)
+        XCTAssertTrue(ownerClient.invocations.isEmpty)
+        XCTAssertTrue(replacementClient.invocations.allSatisfy {
+            $0.base == URL(string: "https://replacement.example")
+                && $0.token == "replacement-token"
+        })
+        XCTAssertTrue(
+            replacementClient.requests.first?.messages.contains {
+                $0.content.plainText == "existing private history"
+            } == true
+        )
+    }
+
+    func testProfileSwitchKeepsPromptContinuationOnOwningBackend() async throws {
+        let store = try AppDatabase.empty()
+        let ownerClient = ScriptedChatClient()
+        let otherClient = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: ownerClient)
+        env.backendMode = .full(Self.fullCapabilities())
+        let other = env.addProfile(
+            name: "Other",
+            baseURL: "https://other.example",
+            token: "other-token",
+            client: otherClient
+        )
+        let conversation = Conversation(profileID: env.primaryProfileID)
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        let calls = [WireToolCall(
+            index: 0,
+            id: "ask_call",
+            function: .init(
+                name: ToolName.askUser,
+                arguments: #"{"questions":[{"question":"Pick","options":["A","B"]}]}"#
+            )
+        )]
+        ownerClient.enqueue(events: [.toolCalls(calls), .done])
+        ownerClient.enqueue(events: [.token("Final"), .done])
+
+        XCTAssertTrue(vm.send("ask"))
+        try await waitUntil { vm.pendingPrompt != nil && !vm.isStreaming }
+        env.activeProfileID = other.id
+        vm.answerPendingPrompt("A")
+        try await waitUntil {
+            let detail = try await store.conversationDetail(id: conversation.id)
+            return detail?.messages.last?.message.content == "Final"
+        }
+
+        XCTAssertEqual(ownerClient.invocations.count, 2)
+        XCTAssertTrue(ownerClient.invocations.allSatisfy {
+            $0.base == URL(string: "https://backend.example")
+        })
+        XCTAssertTrue(otherClient.invocations.isEmpty)
+    }
+
     func testCompletedResponseRecordsEstimatedTokensPerSecond() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
@@ -368,8 +545,19 @@ final class ChatViewModelTests: XCTestCase {
     func testRecoverPendingAssistantRowReplaysStreamingInPlace() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
+        let otherClient = ScriptedChatClient()
         let env = FakeChatEnvironment(client: client)
-        var conversation = Conversation(modelID: "m")
+        let other = env.addProfile(
+            name: "Other",
+            baseURL: "https://other.example",
+            token: "other-token",
+            client: otherClient
+        )
+        env.activeProfileID = other.id
+        var conversation = Conversation(
+            modelID: "m",
+            profileID: env.primaryProfileID
+        )
         conversation.title = "Recovered"
         try await store.insertConversation(conversation)
         try await store.insertMessage(
@@ -397,6 +585,11 @@ final class ChatViewModelTests: XCTestCase {
                 && detail.messages.last?.message.isComplete == true
         }
         XCTAssertFalse(vm.isStreaming)
+        XCTAssertEqual(
+            client.invocations.first?.base,
+            URL(string: "https://backend.example")
+        )
+        XCTAssertTrue(otherClient.invocations.isEmpty)
     }
 
     func testRecoverContinuationInterruptedAfterToolBatch() async throws {
@@ -654,14 +847,24 @@ final class ChatViewModelTests: XCTestCase {
         env: FakeChatEnvironment,
         store: AppDatabase,
         conversation: Conversation,
-        imageFetcher: any ImageFetching = FakeImageFetcher()
+        imageFetcher: any ImageFetching = FakeImageFetcher(),
+        bindDefaultProfile: Bool = true
     ) -> ChatViewModel {
+        var configuredConversation = conversation
+        if bindDefaultProfile && configuredConversation.profileID == nil {
+            configuredConversation.profileID = env.primaryProfileID
+        }
         let vm = ChatViewModel(
             backgroundTasks: FakeBackgroundTaskManager(),
             notifications: FakeNotificationManager(),
             imageFetcher: imageFetcher
         )
-        vm.configure(env: env, store: store, conversation: conversation, sceneIsActive: true)
+        vm.configure(
+            env: env,
+            store: store,
+            conversation: configuredConversation,
+            sceneIsActive: true
+        )
         return vm
     }
 
@@ -740,17 +943,8 @@ private struct TestCalendarProvider: CalendarProviding {
 
 @MainActor
 private final class FakeChatEnvironment: ChatViewModelEnvironment {
-    var activeProfile: BackendProfile?
-    var activeToken: String? = "test-token"
     var backendMode: BackendMode = .plainChatOnly(models: ["m"])
-    var preferredModel: String? {
-        backendMode.resolvedChatModel(
-            conversationModel: nil,
-            defaultModel: activeProfile?.defaultModel
-        )
-    }
-    var chatStreamingClient: any ChatClienting { client }
-    var ollamaStreamingClient: any ChatClienting { ollamaClient }
+    var activeProfileID: UUID?
     var autoSpeakEnabled = false
     var defaultLocationEnabled = false
     var defaultHealthEnabled = false
@@ -761,32 +955,81 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
     var warmedModels: [String] = []
     var spokenTexts: [String] = []
     var searchIndexRequests = 0
+    var primaryProfileID: UUID { primaryProfile.id }
 
     private let client: ScriptedChatClient
-    private let ollamaClient = ScriptedChatClient()
+    private let primaryProfile: BackendProfile
+    private var additionalProfiles: [UUID: SessionConfiguration] = [:]
+
+    private struct SessionConfiguration {
+        let profile: BackendProfile
+        let token: String
+        let mode: BackendMode
+        let client: ScriptedChatClient
+    }
 
     init(client: ScriptedChatClient) {
         self.client = client
-        self.activeProfile = BackendProfile(
+        self.primaryProfile = BackendProfile(
             name: "Test",
             baseURLString: "https://backend.example",
             defaultModel: "m"
         )
+        self.activeProfileID = primaryProfile.id
     }
 
-    func supportsTools(_ model: String?) -> Bool {
-        guard let model else { return false }
-        return backendMode.capabilities?.toolModelIDs?.contains(model) ?? true
+    @discardableResult
+    func addProfile(
+        name: String,
+        baseURL: String,
+        token: String,
+        mode: BackendMode = .plainChatOnly(models: ["m"]),
+        client: ScriptedChatClient
+    ) -> BackendProfile {
+        let profile = BackendProfile(
+            name: name,
+            baseURLString: baseURL,
+            defaultModel: "m"
+        )
+        additionalProfiles[profile.id] = SessionConfiguration(
+            profile: profile,
+            token: token,
+            mode: mode,
+            client: client
+        )
+        return profile
     }
 
-    func thinkingEnabled(for model: String?) -> Bool {
-        guard let model else { return false }
-        return backendMode.capabilities?.reasoningEffortModelIDs?.contains(model) == true
-    }
-
-    func reasoningEffort(for model: String?) -> String? {
-        guard thinkingEnabled(for: model) else { return nil }
-        return ReasoningEffort.enabledDefault
+    func backendSession(for profileID: UUID?) -> BackendSession? {
+        guard let profileID else { return nil }
+        let configuration: SessionConfiguration
+        if profileID == primaryProfile.id {
+            configuration = SessionConfiguration(
+                profile: primaryProfile,
+                token: "test-token",
+                mode: backendMode,
+                client: client
+            )
+        } else if let additional = additionalProfiles[profileID] {
+            configuration = additional
+        } else {
+            return nil
+        }
+        guard let baseURL = configuration.profile.baseURL else { return nil }
+        let capabilities = configuration.mode.capabilities
+        return BackendSession(
+            profile: configuration.profile,
+            baseURL: baseURL,
+            token: configuration.token,
+            mode: configuration.mode,
+            visionModels: capabilities?.visionModelIDs,
+            toolModels: capabilities?.toolModelIDs,
+            reasoningEffortsByModel: capabilities?.reasoningEffortsByID,
+            contextLengths: capabilities?.contextLengthByID,
+            client: configuration.client,
+            thinkingPreferences: [:],
+            reasoningEffortPreferences: [:]
+        )
     }
 
     func setDefaultLocationEnabled(_ enabled: Bool) {
@@ -813,7 +1056,7 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
         requestedCalendarAuthorization = true
     }
 
-    func warm(model: String) {
+    func warm(model: String, profileID: UUID) {
         warmedModels.append(model)
     }
 
@@ -827,6 +1070,19 @@ private final class FakeChatEnvironment: ChatViewModelEnvironment {
 }
 
 private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
+    struct Invocation: Sendable {
+        var request: ChatRequest
+        var base: URL
+        var token: String
+        var turnID: String?
+    }
+
+    struct Cancellation: Sendable {
+        var turnID: String
+        var base: URL
+        var token: String
+    }
+
     struct Script: Sendable {
         var events: [ChatStreamEvent]
         var leadingDelayNanoseconds: UInt64
@@ -836,12 +1092,25 @@ private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
 
     private let lock = NSLock()
     private var scripts: [Script] = []
-    private var recordedRequests: [ChatRequest] = []
+    private var recordedInvocations: [Invocation] = []
+    private var recordedCancellations: [Cancellation] = []
 
     var requests: [ChatRequest] {
         lock.lock()
         defer { lock.unlock() }
-        return recordedRequests
+        return recordedInvocations.map(\.request)
+    }
+
+    var invocations: [Invocation] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedInvocations
+    }
+
+    var cancellations: [Cancellation] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCancellations
     }
 
     func enqueue(
@@ -865,7 +1134,14 @@ private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
     func stream(_ request: ChatRequest, base: URL, token: String, turnID: String?)
         -> AsyncThrowingStream<ChatStreamEvent, Error>
     {
-        let script = nextScript(recording: request)
+        let script = nextScript(
+            recording: Invocation(
+                request: request,
+                base: base,
+                token: token,
+                turnID: turnID
+            )
+        )
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -875,7 +1151,11 @@ private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
                     for event in script.events {
                         try Task.checkCancellation()
                         continuation.yield(event)
-                        if script.pauseAfterEventNanoseconds > 0 {
+                        // `.done` is terminal; model generation has already
+                        // finished, so do not make consumers wait through an
+                        // artificial post-completion delay.
+                        if script.pauseAfterEventNanoseconds > 0,
+                           event != .done {
                             try await Task.sleep(nanoseconds: script.pauseAfterEventNanoseconds)
                         }
                     }
@@ -894,10 +1174,18 @@ private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
         }
     }
 
-    private func nextScript(recording request: ChatRequest) -> Script {
+    func cancel(turnID: String, base: URL, token: String) async {
+        lock.lock()
+        recordedCancellations.append(
+            Cancellation(turnID: turnID, base: base, token: token)
+        )
+        lock.unlock()
+    }
+
+    private func nextScript(recording invocation: Invocation) -> Script {
         lock.lock()
         defer { lock.unlock() }
-        recordedRequests.append(request)
+        recordedInvocations.append(invocation)
         if scripts.isEmpty {
             return Script(events: [.done], leadingDelayNanoseconds: 0, pauseAfterEventNanoseconds: 0, error: nil)
         }
@@ -940,12 +1228,23 @@ private final class FakeNotificationManager: NotificationManaging {
 
 private final class FakeImageFetcher: ImageFetching, @unchecked Sendable {
     private let image: ServerImageRef.CachedImage?
+    private let lock = NSLock()
+    private var recordedTrustedBases: [URL] = []
+
+    var trustedBases: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedTrustedBases
+    }
 
     init(image: ServerImageRef.CachedImage? = nil) {
         self.image = image
     }
 
     func fetch(_ url: URL, trustedBase: URL) async -> ServerImageRef.CachedImage? {
+        lock.lock()
+        recordedTrustedBases.append(trustedBase)
+        lock.unlock()
         return image
     }
 }
