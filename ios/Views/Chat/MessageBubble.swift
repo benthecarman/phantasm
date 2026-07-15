@@ -30,6 +30,10 @@ struct MessageBubble: View {
     @FocusState private var editorFocused: Bool
 
     private var isUser: Bool { message.message.role == "user" }
+    /// Menu visibility only depends on persisted text. Restoring extracted
+    /// images here would rebuild multi-megabyte base64 strings on every layout;
+    /// the full content is reconstructed only if the user copies or speaks it.
+    private var hasMessageActions: Bool { !message.message.content.isEmpty }
     /// Persisted content with extracted inline images restored to data URIs
     /// (memoized), so the markdown pipeline sees what the model produced.
     private var content: String {
@@ -149,7 +153,7 @@ struct MessageBubble: View {
     private var footer: some View {
         HStack(spacing: 6) {
             timestamp
-            if !content.isEmpty {
+            if hasMessageActions {
                 actionMenu
             }
         }

@@ -76,21 +76,11 @@ These are static findings; Instruments profiling was not performed.
 
 - **Streaming reparses the entire growing Markdown answer for every delta** and issues repeated tail scrolls. Coalesce observable snapshots and scrolling at roughly frame cadence; consider plain/completed-block rendering during streaming and one full parse at completion. See [ChatViewModel.swift:684](../ios/ViewModels/ChatViewModel.swift#L684), [MarkdownMessageView.swift:32](../ios/Views/Chat/MarkdownMessageView.swift#L32), and [ChatView.swift:528](../ios/Views/Chat/ChatView.swift#L528).
 
-- **Image downloads iterate one byte at a time** for responses allowed up to 20 MB. Use `download(for:)` or chunked delegate callbacks with bounded size and concurrent-fetch limits. See [ImageClient.swift:19](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Networking/ImageClient.swift#L19).
-
-- **`attachment(messageId)` has no child-key index.** Conversation loads can scan the full attachment table. Add a migration for `attachment(messageId)`, potentially including ordering columns. See [AppDatabase.swift:101](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Persistence/AppDatabase.swift#L101).
-
 - **Every transcript load eagerly materializes all attachment BLOBs.** The same full-detail path is used for normal rendering, notification routing, image cleanup, bulk deletion, and cache healing. Split metadata from BLOB access, load thumbnails/full bytes on demand, and paginate long transcripts. See [AppDatabase.swift:566](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Persistence/AppDatabase.swift#L566).
 
 - **Full image decoding and JPEG preparation occur synchronously in main/UI paths.** Move decoding/downsampling to a worker, cache thumbnails by attachment ID with decoded-byte costs, and load full resolution only in the viewer. See [AttachmentViews.swift:115](../ios/Views/Chat/AttachmentViews.swift#L115), [ImageViewer.swift:102](../ios/Views/Chat/ImageViewer.swift#L102), and [ComposerOptionsSheet.swift:164](../ios/Views/Chat/ComposerOptionsSheet.swift#L164).
 
-- **Remote image caching is unbudgeted and can decode twice.** The permitted pixel/frame budgets can retain hundreds of MB. Validate metadata without decoding, downsample once, set `NSCache.totalCostLimit`, and tighten animated-image limits. See [MarkdownMessageView.swift:703](../ios/Views/Chat/MarkdownMessageView.swift#L703).
-
-- **Bubble rendering reconstructs large base64 data solely to test whether actions should appear.** Use raw stored content for menu visibility and reconstruct data URIs only when the user explicitly copies. See [MessageBubble.swift:31](../ios/Views/Chat/MessageBubble.swift#L31) and [InlineImageRef.swift:101](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Markdown/InlineImageRef.swift#L101).
-
 - **Every send builds the complete wire history on `@MainActor`, including base64 images.** Build immutable wire snapshots off-main and consider deliberate context compaction for old binary content. See [ChatViewModel.swift:603](../ios/ViewModels/ChatViewModel.swift#L603) and [Models.swift:329](../ios/Packages/PhantasmKit/Sources/PhantasmKit/Persistence/Models.swift#L329).
-
-- **Automatic title generation re-encodes and re-uploads images.** Generate titles from a bounded text-only synopsis. See [ChatViewModel.swift:1400](../ios/ViewModels/ChatViewModel.swift#L1400).
 
 ### Scalability and polish
 

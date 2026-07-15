@@ -150,6 +150,15 @@ public final class AppDatabase: Sendable {
                 t.add(column: "reasoningDuration", .double)
             }
         }
+        migrator.registerMigration("v3_attachment_lookup_index") { db in
+            // Transcript loads fetch every attachment for a bounded set of
+            // message ids and then order them chronologically. Without this
+            // child-key index SQLite scans the whole attachment table.
+            try db.create(
+                index: "attachment_message_created_at",
+                on: "attachment", columns: ["messageId", "createdAt"]
+            )
+        }
         return migrator
     }
 }

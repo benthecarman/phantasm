@@ -7,6 +7,7 @@ import Foundation
 public struct ImageClient: Sendable {
     private let session: URLSession
     private let maxResponseBytes: Int
+    private static let fetchLimiter = ImageFetchLimiter(maxConcurrent: 4)
 
     public init(session: URLSession = .shared, maxResponseBytes: Int = 20 * 1024 * 1024) {
         self.session = session
@@ -18,10 +19,17 @@ public struct ImageClient: Sendable {
     /// loading the URL directly until it expires).
     public func fetch(_ url: URL, trustedBase: URL) async -> ServerImageRef.CachedImage? {
         guard ServerImageRef.isTrustedContentURL(url, backendBase: trustedBase) else { return nil }
+        await Self.fetchLimiter.acquire()
+        defer { Task { await Self.fetchLimiter.release() } }
+        guard !Task.isCancelled else { return nil }
+
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.setValue("image/*", forHTTPHeaderField: "Accept")
         do {
-            let (bytes, response) = try await session.bytes(for: request)
+            // Download to URLSession's temporary file. Iterating AsyncBytes one
+            // byte at a time made a permitted 20 MB image need millions of
+            // actor/iterator hops; file-backed delivery keeps that work native.
+            let (fileURL, response) = try await session.download(for: request)
             guard let http = response as? HTTPURLResponse,
                   (200..<300).contains(http.statusCode) else { return nil }
             let mime = (http.value(forHTTPHeaderField: "Content-Type") ?? "")
@@ -30,12 +38,10 @@ public struct ImageClient: Sendable {
                   response.expectedContentLength <= 0
                     || response.expectedContentLength <= Int64(maxResponseBytes)
             else { return nil }
-            var data = Data()
-            data.reserveCapacity(min(maxResponseBytes, max(0, Int(response.expectedContentLength))))
-            for try await byte in bytes {
-                guard data.count < maxResponseBytes else { return nil }
-                data.append(byte)
-            }
+            guard let fileSize = try fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                  fileSize <= maxResponseBytes else { return nil }
+            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+            guard data.count <= maxResponseBytes else { return nil }
             return ServerImageRef.CachedImage(data: data, mime: mime)
         } catch {
             return nil
@@ -73,5 +79,33 @@ public struct ImageClient: Sendable {
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         _ = try? await session.data(for: req)
+    }
+}
+
+/// Process-wide cap for remote-image transfers. A long transcript can create
+/// many visible image rows at once; bounding the network work avoids competing
+/// downloads and their decode allocations overwhelming the foreground turn.
+private actor ImageFetchLimiter {
+    private var available: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(maxConcurrent: Int) {
+        self.available = max(1, maxConcurrent)
+    }
+
+    func acquire() async {
+        if available > 0 {
+            available -= 1
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            available += 1
+        } else {
+            waiters.removeFirst().resume()
+        }
     }
 }

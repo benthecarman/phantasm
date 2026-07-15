@@ -705,7 +705,13 @@ private struct RemoteImage: View {
 /// under memory pressure.
 private final class RemoteImageCache: @unchecked Sendable {
     static let shared = RemoteImageCache()
-    private let cache = NSCache<NSURL, UIImage>()
+    private static let maxEntryCost = 32 * 1024 * 1024
+    private let cache: NSCache<NSURL, UIImage> = {
+        let cache = NSCache<NSURL, UIImage>()
+        cache.countLimit = 24
+        cache.totalCostLimit = 64 * 1024 * 1024
+        return cache
+    }()
 
     func image(for url: URL, trustedBase: URL) async -> UIImage? {
         if let hit = cache.object(forKey: url as NSURL) { return hit }
@@ -719,12 +725,34 @@ private final class RemoteImageCache: @unchecked Sendable {
               let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
               width.intValue > 0, height.intValue > 0,
               width.intValue <= 16_384, height.intValue <= 16_384,
-              width.int64Value * height.int64Value <= 40_000_000,
-              CGImageSourceCreateImageAtIndex(source, 0, nil) != nil
+              width.int64Value * height.int64Value <= 40_000_000
         else { return nil }
         guard let image = decodedUIImage(cached.data) else { return nil }
-        cache.setObject(image, forKey: url as NSURL)
+        let cost = decodedImageCost(image)
+        if cost <= Self.maxEntryCost {
+            cache.setObject(image, forKey: url as NSURL, cost: cost)
+        }
         return image
+    }
+}
+
+/// Approximate retained decoded bytes, including every frame of an animated
+/// image. Encoded `Data.count` dramatically underestimates cache pressure.
+private func decodedImageCost(_ image: UIImage) -> Int {
+    let frames = image.images ?? [image]
+    return frames.reduce(into: 0) { total, frame in
+        let bytes: Int
+        if let cgImage = frame.cgImage {
+            bytes = cgImage.bytesPerRow * cgImage.height
+        } else {
+            let pixels = frame.size.width * frame.scale * frame.size.height * frame.scale
+            if !pixels.isFinite || pixels >= CGFloat(Int.max / 4) {
+                bytes = Int.max
+            } else {
+                bytes = Int(pixels) * 4
+            }
+        }
+        total = total > Int.max - bytes ? Int.max : total + bytes
     }
 }
 

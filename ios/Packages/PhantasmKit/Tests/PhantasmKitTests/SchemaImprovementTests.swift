@@ -215,6 +215,17 @@ final class SchemaImprovementTests: XCTestCase {
         XCTAssertEqual(fetched?.title, "Keep me")
     }
 
+    func testAttachmentLookupHasChildKeyIndex() throws {
+        let db = try AppDatabase.empty()
+        let columns = try db.reader.read { db in
+            try String.fetchAll(
+                db,
+                sql: "SELECT name FROM pragma_index_info('attachment_message_created_at') ORDER BY seqno"
+            )
+        }
+        XCTAssertEqual(columns, ["messageId", "createdAt"])
+    }
+
     // MARK: - Tool settings forward compatibility
 
     func testToolSettingsDecodeDefaultsMissingKeys() throws {

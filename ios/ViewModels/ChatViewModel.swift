@@ -1585,7 +1585,7 @@ final class ChatViewModel {
         let assistantReplies = detail.messages.filter { $0.message.role == "assistant" }.count
         guard assistantReplies == 1 else { return }
         await generateTitle(
-            history: Self.titleHistory(from: detail.wireHistory()),
+            history: Self.titleHistory(from: detail.messages),
             session: session
         )
     }
@@ -1644,14 +1644,27 @@ final class ChatViewModel {
         "Write a short, descriptive title (3-6 words) for this conversation. "
         + "Reply with only the title text — no quotes, no punctuation, no preamble."
 
-    private static func titleHistory(from history: [WireMessage]) -> [WireMessage] {
-        history.map { message in
-            var sanitized = WireMessage(role: message.role, content: message.content.strippingThinkingBlocks())
-            sanitized.toolCalls = message.toolCalls
-            sanitized.toolCallId = message.toolCallId
-            sanitized.name = message.name
-            return sanitized
+    /// A deliberately small, text-only synopsis for the title side-query.
+    /// Building this from persisted content (rather than `wireHistory`) avoids
+    /// restoring inline images or encoding photo attachments to base64 only to
+    /// discard them before the model names the chat.
+    private static func titleHistory(from history: [ChatMessage]) -> [WireMessage] {
+        let perMessageLimit = 2_000
+        var remaining = 4_000
+        var result: [WireMessage] = []
+
+        for item in history where item.message.isComplete && remaining > 0 {
+            let message = item.message
+            guard message.role == "user" || message.role == "assistant" else { continue }
+            let plain = SpeakableText.plainText(
+                from: message.content.strippingThinkingBlocks()
+            )
+            guard !plain.isEmpty else { continue }
+            let text = String(plain.prefix(min(perMessageLimit, remaining)))
+            result.append(WireMessage(role: message.role, content: text))
+            remaining -= text.count
         }
+        return result
     }
 
     /// Clean up a raw model title: strip quotes/markdown, drop a "Title:" prefix,
@@ -1666,22 +1679,6 @@ final class ChatViewModel {
         }
         t = t.trimmingCharacters(in: CharacterSet(charactersIn: "\"'`*.# "))
         return String(t.prefix(60))
-    }
-}
-
-private extension WireContent {
-    func strippingThinkingBlocks() -> WireContent {
-        switch self {
-        case .text(let text):
-            return .text(text.strippingThinkingBlocks())
-        case .parts(let parts):
-            return .parts(parts.map { part in
-                if case .text(let text) = part {
-                    return .text(text.strippingThinkingBlocks())
-                }
-                return part
-            })
-        }
     }
 }
 

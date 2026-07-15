@@ -347,6 +347,39 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(titleHistory.contains("Visible answer"))
     }
 
+    func testTitleGenerationUsesBoundedTextOnlyHistory() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        let imageBytes = Data(repeating: 0xAB, count: 32_000)
+        let attachment = PendingAttachment(
+            kind: .image,
+            name: "Photo",
+            imageData: imageBytes,
+            mimeType: "image/jpeg"
+        )
+
+        client.enqueue(events: [.token(String(repeating: "answer ", count: 600)), .done])
+        client.enqueue(events: [.token("Image Chat"), .done])
+
+        XCTAssertTrue(vm.send(String(repeating: "question ", count: 400), attachments: [attachment]))
+        try await waitUntil { client.requests.count == 2 }
+
+        guard case .parts = client.requests[0].messages.first?.content else {
+            return XCTFail("the main turn should still include the image")
+        }
+        let titleHistory = client.requests[1].messages.dropLast()
+        XCTAssertFalse(titleHistory.isEmpty)
+        XCTAssertTrue(titleHistory.allSatisfy {
+            if case .text = $0.content { return true }
+            return false
+        })
+        XCTAssertLessThanOrEqual(titleHistory.reduce(0) { $0 + $1.content.plainText.count }, 4_000)
+        XCTAssertTrue(titleHistory.allSatisfy { $0.content.imageData.isEmpty })
+    }
+
     func testSecondSendKeepsGeneratedTitle() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()
