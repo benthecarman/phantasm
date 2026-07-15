@@ -230,14 +230,16 @@ struct ProfileEditView: View {
 
     private func loadModels() async {
         let requestedURLString = normalizedURLString
+        let requestedToken = normalizedToken
         guard let base = URL(string: requestedURLString) else { return }
         loadingModels = true
         let result = await env.backendResolver.resolve(
             base: base,
-            token: normalizedToken,
+            token: requestedToken,
             preferMaple: effectiveTransportForCurrentURL == .mapleEncrypted
         )
-        guard normalizedURLString == requestedURLString else {
+        guard normalizedURLString == requestedURLString,
+              normalizedToken == requestedToken else {
             loadingModels = false
             return
         }
@@ -256,15 +258,17 @@ struct ProfileEditView: View {
 
     private func test() async {
         let requestedURLString = normalizedURLString
+        let requestedToken = normalizedToken
         guard let base = URL(string: requestedURLString) else { return }
         isTesting = true
         testResult = nil
         let result = await env.backendResolver.resolve(
             base: base,
-            token: normalizedToken,
+            token: requestedToken,
             preferMaple: effectiveTransportForCurrentURL == .mapleEncrypted
         )
-        guard normalizedURLString == requestedURLString else {
+        guard normalizedURLString == requestedURLString,
+              normalizedToken == requestedToken else {
             isTesting = false
             return
         }

@@ -262,21 +262,29 @@ struct OnboardingView: View {
     }
 
     private func testConnection() async {
-        guard let base = URL(string: normalizedURLString) else { return }
+        let requestedURLString = normalizedURLString
+        let requestedToken = normalizedToken
+        guard let base = URL(string: requestedURLString) else { return }
         isTesting = true
         testResult = nil
         let result = await env.backendResolver.resolve(
             base: base,
-            token: normalizedToken,
-            preferMaple: BackendProfile.defaultTransport(for: normalizedURLString) == .mapleEncrypted
+            token: requestedToken,
+            preferMaple:
+                BackendProfile.defaultTransport(for: requestedURLString) == .mapleEncrypted
         )
+        guard normalizedURLString == requestedURLString,
+              normalizedToken == requestedToken else {
+            isTesting = false
+            return
+        }
         isTesting = false
         switch result {
         case .success(let mode):
             models = mode.models
             resolvedTransport = mode.usesMapleEncryptedChat ? .mapleEncrypted : .standard
-            testedURLString = normalizedURLString
-            testedToken = normalizedToken
+            testedURLString = requestedURLString
+            testedToken = requestedToken
             Haptics.notify(.success)
             testResult = .success(mode.connectionTestMessage)
         case .failure(let error):

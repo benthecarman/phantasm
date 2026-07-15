@@ -20,8 +20,6 @@ The most urgent findings are:
 
 ### High severity
 
-- **Onboarding can accept credentials that were never tested.** The test request snapshots neither URL nor token, but success records whatever happens to be in the editable fields after the request completes. Snapshot inputs and discard stale results, or disable editing during validation. The profile editor checks URL changes but not token changes. See [OnboardingView.swift:263](../ios/Views/Settings/OnboardingView.swift#L263) and [ProfileEditView.swift:231](../ios/Views/Settings/ProfileEditView.swift#L231).
-
 - **“Delete All” is not coordinated with live turns.** Cached view models can continue network/tool work and recreate messages after deletion. Database errors are swallowed while the UI unconditionally starts a new chat. Stop and await every live turn and commit, then delete with visible failure handling. See [SettingsView.swift:137](../ios/Views/Settings/SettingsView.swift#L137) and [RootView.swift:317](../ios/Views/RootView.swift#L317).
 
 ### Medium severity
