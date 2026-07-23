@@ -20,6 +20,9 @@ pub enum TurnEvent {
     Reasoning(String),
     /// A token of the final assistant answer.
     Token(String),
+    /// Authoritative generation throughput from the upstream. Surfaced through
+    /// the additive `x_tokens_per_second` SSE field.
+    Throughput(f64),
     /// App-hosted tool calls handed back to the app to execute, emitted in place
     /// of a final answer and immediately followed by `Done { reason:
     /// "tool_calls" }`. The app fulfills them and resumes the turn next request.

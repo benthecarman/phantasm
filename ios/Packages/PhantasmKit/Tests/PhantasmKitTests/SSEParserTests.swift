@@ -78,6 +78,17 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(events, [.progress("generating image…", 0.42), .done])
     }
 
+    func testStreamYieldsServerReportedThroughput() async throws {
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{}}],\"x_tokens_per_second\":192.9}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            "",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        XCTAssertEqual(events, [.throughput(192.9), .done])
+    }
+
     func testProgressWithoutStatusStillSurfaces() async throws {
         let lines = [
             "data: {\"choices\":[{\"delta\":{}}],\"x_progress\":0.5}",

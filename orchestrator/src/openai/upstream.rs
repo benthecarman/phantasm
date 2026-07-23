@@ -36,7 +36,8 @@ pub struct OpenAICompatibleClient {
     thinking_hint: bool,
     /// Metrics registry for token-usage recording. OpenAI-compatible hosts that
     /// honor `stream_options.include_usage` report final streaming token counts;
-    /// for those we use the observed stream duration as the throughput window.
+    /// llama.cpp also reports authoritative generation timings on that trailer.
+    /// Other hosts use the observed stream duration as the throughput window.
     metrics: Option<Arc<crate::metrics::Metrics>>,
     /// Transient-failure retry tuning for chat request initiation (see
     /// [`RetryPolicy`]).
@@ -102,8 +103,9 @@ impl OpenAICompatibleClient {
     }
 
     /// Per-model context lengths advertised on `/v1/models`, for hosts that
-    /// extend the listing with one — vLLM's `max_model_len`, or a literal
-    /// `context_length` field. Hosts without the extension yield an empty map.
+    /// extend the listing with one — vLLM's `max_model_len`, a literal
+    /// `context_length`, or llama.cpp's nested `meta.n_ctx`. Hosts without an
+    /// extension yield an empty map.
     pub async fn model_context_lengths(&self) -> Result<HashMap<String, u64>, AppError> {
         Ok(self
             .models_data()
@@ -328,11 +330,12 @@ impl ChatBackend for OpenAICompatibleClient {
         if let Some(metrics) = &self.metrics {
             let usage = response.get("usage");
             let count = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
+            let completion_tokens = count("completion_tokens");
             metrics.record_usage(
                 model,
                 count("prompt_tokens"),
-                count("completion_tokens"),
-                None,
+                completion_tokens,
+                llama_cpp_eval_duration_ns(&response, completion_tokens),
                 None,
             );
         }
@@ -434,6 +437,7 @@ where
         let started_at = Instant::now();
         let mut recorded_usage = false;
         let mut pending_done_reason: Option<String> = None;
+        let mut pending_tokens_per_second: Option<f64> = None;
         'read: while let Some(next) = bytes.next().await {
             let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
             buf.extend_from_slice(&chunk);
@@ -445,7 +449,10 @@ where
                 };
                 if payload == b"[DONE]" {
                     if metrics.is_some() {
-                        yield StreamDelta::new("", "", true, pending_done_reason.take());
+                        let mut delta =
+                            StreamDelta::new("", "", true, pending_done_reason.take());
+                        delta.tokens_per_second = pending_tokens_per_second;
+                        yield delta;
                     }
                     break 'read;
                 }
@@ -453,6 +460,9 @@ where
                     .map_err(|e| AppError::UpstreamError(format!("bad SSE data line: {e}")))?;
                 if let Some(message) = in_band_error(&value) {
                     Err(AppError::UpstreamError(message))?;
+                }
+                if let Some(rate) = llama_cpp_tokens_per_second(&value) {
+                    pending_tokens_per_second = Some(rate);
                 }
                 if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
                     continue;
@@ -503,6 +513,7 @@ where
         let started_at = Instant::now();
         let mut recorded_usage = false;
         let mut pending_done_reason: Option<String> = None;
+        let mut pending_tokens_per_second: Option<f64> = None;
         'read: while let Some(next) = bytes.next().await {
             let chunk = next.map_err(|e| AppError::UpstreamError(e.to_string()))?;
             buf.extend_from_slice(&chunk);
@@ -514,11 +525,13 @@ where
                 };
                 if payload == b"[DONE]" {
                     if metrics.is_some() {
-                        yield finish_tool_stream(
+                        let mut delta = finish_tool_stream(
                             &tool_calls,
                             &mut scan,
                             pending_done_reason.take(),
                         )?;
+                        delta.tokens_per_second = pending_tokens_per_second;
+                        yield delta;
                         terminal_seen = true;
                     }
                     break 'read;
@@ -527,6 +540,9 @@ where
                     .map_err(|e| AppError::UpstreamError(format!("bad SSE data line: {e}")))?;
                 if let Some(message) = in_band_error(&value) {
                     Err(AppError::UpstreamError(message))?;
+                }
+                if let Some(rate) = llama_cpp_tokens_per_second(&value) {
+                    pending_tokens_per_second = Some(rate);
                 }
                 if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
                     continue;
@@ -664,9 +680,11 @@ fn record_stream_usage(
         return true;
     }
     if let Some((metrics, model)) = metrics {
-        let eval_duration_ns = completion_tokens
-            .filter(|tokens| *tokens > 0)
-            .map(|_| started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        let eval_duration_ns = llama_cpp_eval_duration_ns(value, completion_tokens).or_else(|| {
+            completion_tokens
+                .filter(|tokens| *tokens > 0)
+                .map(|_| started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+        });
         metrics.record_usage(
             model,
             prompt_tokens,
@@ -677,6 +695,47 @@ fn record_stream_usage(
     }
     *recorded = true;
     true
+}
+
+/// Authoritative generation throughput from a llama.cpp completion response or
+/// final streaming usage trailer. Prefer the direct rate, then derive it from
+/// the generated-token count and generation duration when necessary.
+fn llama_cpp_tokens_per_second(value: &Value) -> Option<f64> {
+    let timings = value.get("timings")?;
+    if let Some(tokens_per_second) = timings
+        .get("predicted_per_second")
+        .and_then(Value::as_f64)
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+    {
+        return Some(tokens_per_second);
+    }
+
+    let completion_tokens = value
+        .get("usage")
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .filter(|tokens| *tokens > 0)?;
+    let predicted_ms = timings
+        .get("predicted_ms")
+        .and_then(Value::as_f64)
+        .filter(|millis| millis.is_finite() && *millis > 0.0)?;
+    Some(completion_tokens as f64 / (predicted_ms / 1_000.0))
+}
+
+/// Convert llama.cpp's authoritative rate into the duration shape used by the
+/// shared metrics registry.
+fn llama_cpp_eval_duration_ns(value: &Value, completion_tokens: Option<u64>) -> Option<u64> {
+    let completion_tokens = completion_tokens.filter(|tokens| *tokens > 0)?;
+    let tokens_per_second = llama_cpp_tokens_per_second(value)?;
+    seconds_to_ns(completion_tokens as f64 / tokens_per_second)
+}
+
+fn seconds_to_ns(seconds: f64) -> Option<u64> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let nanos = seconds * 1_000_000_000.0;
+    Some(nanos.round().clamp(1.0, u64::MAX as f64) as u64)
 }
 
 /// The error message of an in-band error object some compat servers report as
@@ -968,11 +1027,20 @@ struct ModelEntry {
     max_model_len: Option<u64>,
     /// The same extension under the name other hosts use (e.g. OpenRouter).
     context_length: Option<u64>,
+    /// llama.cpp nests the active server context in its model metadata.
+    meta: Option<ModelMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelMeta {
+    n_ctx: Option<u64>,
 }
 
 impl ModelEntry {
     fn context_length(&self) -> Option<u64> {
-        self.max_model_len.or(self.context_length)
+        self.max_model_len
+            .or(self.context_length)
+            .or_else(|| self.meta.as_ref()?.n_ctx)
     }
 }
 
@@ -997,12 +1065,42 @@ mod tests {
         let json = r#"{"data":[
             {"id":"vllm-model","object":"model","max_model_len":40960},
             {"id":"router-model","context_length":131072},
+            {"id":"llama-cpp-model","meta":{"n_ctx":32768,"n_ctx_train":1048576}},
             {"id":"plain","object":"model"}
         ]}"#;
         let parsed: ModelsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.data[0].context_length(), Some(40960));
         assert_eq!(parsed.data[1].context_length(), Some(131072));
-        assert_eq!(parsed.data[2].context_length(), None);
+        assert_eq!(parsed.data[2].context_length(), Some(32768));
+        assert_eq!(parsed.data[3].context_length(), None);
+    }
+
+    #[test]
+    fn llama_cpp_timings_prefer_reported_generation_rate() {
+        let response = json!({
+            "usage": {"completion_tokens": 2},
+            "timings": {
+                "predicted_n": 2,
+                "predicted_ms": 1000.0,
+                "predicted_per_second": 200.0
+            }
+        });
+        assert_eq!(
+            llama_cpp_eval_duration_ns(&response, Some(2)),
+            Some(10_000_000)
+        );
+    }
+
+    #[test]
+    fn llama_cpp_timings_fall_back_to_generation_duration() {
+        let response = json!({
+            "usage": {"completion_tokens": 2},
+            "timings": {"predicted_ms": 12.5}
+        });
+        assert_eq!(
+            llama_cpp_eval_duration_ns(&response, Some(2)),
+            Some(12_500_000)
+        );
     }
 
     #[test]
@@ -1466,7 +1564,7 @@ mod tests {
         let chunks: Vec<reqwest::Result<Bytes>> = vec![Ok(Bytes::from_static(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}],\"usage\":null}\n\n\
               data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n\
-              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n\
+              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10},\"timings\":{\"predicted_n\":3,\"predicted_ms\":15.0,\"predicted_per_second\":200.0}}\n\n\
               data: [DONE]\n\n",
         ))];
         let deltas: Vec<StreamDelta> =
@@ -1480,7 +1578,10 @@ mod tests {
         let stats = metrics.model("m");
         assert_eq!(stats.prompt_tokens.get(), 7);
         assert_eq!(stats.completion_tokens.get(), 3);
-        assert_eq!(stats.tokens_per_sec.snapshot().count, 1);
+        let throughput = stats.tokens_per_sec.snapshot();
+        assert_eq!(throughput.count, 1);
+        assert!((throughput.sum - 200.0).abs() < 0.001);
+        assert_eq!(deltas[2].tokens_per_second, Some(200.0));
     }
 
     #[tokio::test]

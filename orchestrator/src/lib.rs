@@ -400,7 +400,8 @@ async fn detect_model_metadata(
 }
 
 /// One best-effort `/v1/models` fetch, mapping each model to the context
-/// length the host advertises in the listing (vLLM's `max_model_len`).
+/// length the host advertises in the listing (vLLM's `max_model_len` or
+/// llama.cpp's `meta.n_ctx`).
 /// Capabilities stay unknown (`None`) — an OpenAI-compatible host exposes no
 /// per-model vision/tool support.
 async fn detect_openai_context_lengths(

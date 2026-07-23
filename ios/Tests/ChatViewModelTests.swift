@@ -251,6 +251,22 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertLessThan(rate, 65)
     }
 
+    func testCompletedResponsePrefersServerReportedTokensPerSecond() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+
+        client.enqueue(events: [.token("answer"), .throughput(192.9), .done])
+        client.enqueue(events: [.token("Speed test"), .done])
+
+        vm.send("hello")
+
+        try await waitUntil { !vm.isStreaming }
+        XCTAssertEqual(vm.latestTokensPerSecond, 192.9)
+    }
+
     func testRapidStreamCoalescesPublicationsWithoutLosingText() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()

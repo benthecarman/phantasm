@@ -661,9 +661,9 @@ impl RawArguments {
 
 // ---- Streaming chunk emitted to the client ----
 
-/// One `chat.completion.chunk` SSE event. `x_status` / `x_progress` are
-/// additive, non-standard fields (spec §2.3): strict OpenAI clients ignore them,
-/// our app reads them for progress.
+/// One `chat.completion.chunk` SSE event. The `x_` fields are additive and
+/// non-standard (spec §2.3): strict OpenAI clients ignore them, while our app
+/// reads progress and authoritative generation throughput.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatChunk {
     pub id: String,
@@ -675,6 +675,8 @@ pub struct ChatChunk {
     pub x_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x_progress: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_tokens_per_second: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

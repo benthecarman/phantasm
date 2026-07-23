@@ -75,7 +75,7 @@ struct ContextUsageIndicator: View {
                 HStack {
                     Label("Latest response", systemImage: "gauge.with.dots.needle.50percent")
                     Spacer()
-                    Text("~\(tokensPerSecond.formatted(.number.precision(.fractionLength(1)))) tok/s")
+                    Text("\(tokensPerSecond.formatted(.number.precision(.fractionLength(1)))) tok/s")
                         .monospacedDigit()
                 }
                 .font(.subheadline.weight(.medium))
@@ -98,6 +98,6 @@ struct ContextUsageIndicator: View {
         if usage.isNearLimit {
             return "This chat is approaching the model's context limit. Token use is estimated from saved messages and attachments."
         }
-        return "Token use and generation speed are estimated. Actual tokenization varies by model."
+        return "Token use is estimated. Generation speed uses backend timing when available and otherwise uses a local estimate."
     }
 }

@@ -529,6 +529,15 @@ async fn stream_tool_resolution<B: ChatBackend>(
                 if let Some(calls) = delta.tool_calls.filter(|calls| !calls.is_empty()) {
                     return StreamToolResolution::ToolCalls(calls);
                 }
+                if let Some(tokens_per_second) = delta.tokens_per_second {
+                    if tx
+                        .send(TurnEvent::Throughput(tokens_per_second))
+                        .await
+                        .is_err()
+                    {
+                        return StreamToolResolution::FinalAnswer;
+                    }
+                }
                 if let Some(r) = delta.done_reason.clone() {
                     reason = r;
                 }
@@ -777,6 +786,15 @@ async fn stream_final<B: ChatBackend>(
                     && tx.send(TurnEvent::Token(delta.content)).await.is_err()
                 {
                     return; // client gone
+                }
+                if let Some(tokens_per_second) = delta.tokens_per_second {
+                    if tx
+                        .send(TurnEvent::Throughput(tokens_per_second))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
                 if let Some(r) = delta.done_reason.clone() {
                     reason = r;

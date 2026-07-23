@@ -233,6 +233,7 @@ fn event_size(event: &TurnEvent) -> usize {
             | TurnEvent::Token(text)
             | TurnEvent::Error(text) => text.len(),
             TurnEvent::Progress { status, .. } => status.len() + std::mem::size_of::<f64>(),
+            TurnEvent::Throughput(_) => std::mem::size_of::<f64>(),
             TurnEvent::Done { reason } => reason.len(),
             TurnEvent::ToolCalls { app, held } => serde_json::to_vec(&(app, held))
                 .map(|bytes| bytes.len())

@@ -19,6 +19,8 @@ pub struct StreamDelta {
     pub reasoning: String,
     pub done: bool,
     pub done_reason: Option<String>,
+    /// Authoritative upstream generation throughput, when reported.
+    pub tokens_per_second: Option<f64>,
 }
 
 impl StreamDelta {
@@ -33,6 +35,7 @@ impl StreamDelta {
             reasoning: reasoning.into(),
             done,
             done_reason,
+            tokens_per_second: None,
         }
     }
 
@@ -53,6 +56,8 @@ pub struct ToolStreamDelta {
     pub tool_calls: Option<Vec<ToolCall>>,
     pub done: bool,
     pub done_reason: Option<String>,
+    /// Authoritative upstream generation throughput, when reported.
+    pub tokens_per_second: Option<f64>,
 }
 
 impl ToolStreamDelta {
@@ -69,6 +74,7 @@ impl ToolStreamDelta {
             tool_calls,
             done,
             done_reason,
+            tokens_per_second: None,
         }
     }
 }

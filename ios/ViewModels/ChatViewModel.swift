@@ -40,8 +40,9 @@ final class ChatViewModel {
     /// VM-owned (not view `@State`) so it's reset every turn rather than reused by
     /// SwiftUI for the recycled bubble.
     private(set) var streamingStartedAt = Date.now
-    /// Estimated generation speed for the latest clean response. Updated once
-    /// at completion so the full chat view does not re-render for every token.
+    /// Generation speed for the latest clean response: authoritative backend
+    /// timing when available, otherwise a local estimate. Updated once at
+    /// completion so the full chat view does not re-render for every token.
     private(set) var latestTokensPerSecond: Double?
     private(set) var statusText: String?
     private(set) var statusProgress: Double?
@@ -858,6 +859,7 @@ final class ChatViewModel {
         var batchedCalls: [WireToolCall]?
         var firstAnswerTokenAt: Date?
         var generatedCharacterCount = 0
+        var reportedTokensPerSecond: Double?
         var firstReasoningTokenAt: Date?
         // Whether the turn actually finished (a terminal `.done`) versus the
         // stream just ending because the connection dropped — e.g. the app was
@@ -891,6 +893,8 @@ final class ChatViewModel {
                 case .progress(let s, let progress):
                     statusText = s
                     statusProgress = progress
+                case .throughput(let tokensPerSecond):
+                    reportedTokensPerSecond = tokensPerSecond
                 case .toolCalls(let calls):
                     if statusText != nil { statusText = nil }
                     if statusProgress != nil { statusProgress = nil }
@@ -945,11 +949,14 @@ final class ChatViewModel {
                 } else {
                     completionError = nil
                 }
-                if completionError == nil, measuresThroughput, let firstAnswerTokenAt {
-                    latestTokensPerSecond = ContextWindow.estimatedTokensPerSecond(
-                        characterCount: generatedCharacterCount,
-                        duration: Date.now.timeIntervalSince(firstAnswerTokenAt)
-                    )
+                if completionError == nil, measuresThroughput {
+                    latestTokensPerSecond = reportedTokensPerSecond
+                        ?? firstAnswerTokenAt.flatMap {
+                            ContextWindow.estimatedTokensPerSecond(
+                                characterCount: generatedCharacterCount,
+                                duration: Date.now.timeIntervalSince($0)
+                            )
+                        }
                 }
                 finish(generation: generation, error: completionError)
             }

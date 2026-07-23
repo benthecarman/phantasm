@@ -111,7 +111,7 @@ Two things change meaning slightly in multi-upstream mode:
   window is the one actually served. OpenAI-compatible upstreams omit
   capabilities unless explicitly supplied through `MODEL_CAPABILITIES`, but
   report `context_length` when the host extends `/v1/models` with one (vLLM's
-  `max_model_len` — exact by construction).
+  `max_model_len` or llama.cpp's served `meta.n_ctx`).
 
 ## Verifying it works
 

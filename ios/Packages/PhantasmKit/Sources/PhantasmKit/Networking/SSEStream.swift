@@ -62,6 +62,7 @@ public enum ChatStreamEvent: Sendable, Equatable {
     case reasoning(String)  // append model thinking/reasoning deltas
     case status(String)     // x_status -> progress UI (FR-A8)
     case progress(String, Double) // x_status + normalized x_progress
+    case throughput(Double) // authoritative x_tokens_per_second
     case toolCalls([WireToolCall]) // forwarded app-hosted tool calls (finish_reason: tool_calls)
     case done
 }
@@ -107,6 +108,10 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                     continuation.yield(.progress(chunk.xStatus ?? "", min(max(progress, 0), 1)))
                 } else if let status = chunk.xStatus {
                     continuation.yield(.status(status))
+                }
+                if let tokensPerSecond = chunk.xTokensPerSecond,
+                   tokensPerSecond.isFinite, tokensPerSecond > 0 {
+                    continuation.yield(.throughput(tokensPerSecond))
                 }
                 if let reasoning = chunk.choices.first?.delta?.reasoningText,
                    !reasoning.isEmpty {

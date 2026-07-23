@@ -41,6 +41,7 @@ impl ChunkFactory {
             choices,
             x_status,
             x_progress,
+            x_tokens_per_second: None,
         }
     }
 
@@ -113,6 +114,27 @@ impl ChunkFactory {
             Some(progress.clamp(0.0, 1.0)),
         );
         to_event(&chunk)
+    }
+
+    /// Authoritative generation throughput reported by the selected upstream.
+    /// This is a separate additive chunk so standard OpenAI clients can ignore
+    /// it and native clients can prefer it over a local timing estimate.
+    pub fn throughput(&self, tokens_per_second: f64) -> Event {
+        to_event(&self.throughput_chunk(tokens_per_second))
+    }
+
+    fn throughput_chunk(&self, tokens_per_second: f64) -> ChatChunk {
+        let mut chunk = self.base(
+            vec![ChunkChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: None,
+            }],
+            None,
+            None,
+        );
+        chunk.x_tokens_per_second = Some(tokens_per_second);
+        chunk
     }
 
     /// A chunk handing app-hosted tool calls back to the app to execute
@@ -398,6 +420,14 @@ mod tests {
         assert_eq!(v["x_status"], "generating image…");
         assert_eq!(v["x_progress"], 0.42);
         assert!(v["choices"][0]["delta"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn throughput_chunk_carries_server_reported_rate() {
+        let f = ChunkFactory::new("llama-cpp");
+        let value = chunk_json(&f.throughput_chunk(192.9));
+        assert_eq!(value["x_tokens_per_second"], 192.9);
+        assert_eq!(value["choices"][0]["delta"], serde_json::json!({}));
     }
 
     #[test]

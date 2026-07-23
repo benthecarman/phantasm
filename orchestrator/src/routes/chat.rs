@@ -490,6 +490,7 @@ fn attach_response(
                         yield factory.progress(&status, progress).id(id)
                     }
                     TurnEvent::Reasoning(r) => yield factory.reasoning(&r).id(id),
+                    TurnEvent::Throughput(rate) => yield factory.throughput(rate).id(id),
                     // Re-inline any image the pump spilled to the store, so the
                     // client receives the same base64 it would have un-spilled.
                     TurnEvent::Token(t) => {
@@ -620,6 +621,7 @@ fn stream_response(
                 TurnEvent::Status(s) => yield factory.status(&s),
                 TurnEvent::Progress { status, progress } => yield factory.progress(&status, progress),
                 TurnEvent::Reasoning(r) => yield factory.reasoning(&r),
+                TurnEvent::Throughput(rate) => yield factory.throughput(rate),
                 TurnEvent::Token(t) => yield factory.token(&t),
                 TurnEvent::ToolCalls { app, held } => {
                     // Stash the paused turn (server results + assistant message)
@@ -689,7 +691,10 @@ async fn collect_response(
                 // Collected before responding, so we can use a real status.
                 return AppError::UpstreamError(e).into_response();
             }
-            TurnEvent::Status(_) | TurnEvent::Progress { .. } | TurnEvent::Reasoning(_) => {
+            TurnEvent::Status(_)
+            | TurnEvent::Progress { .. }
+            | TurnEvent::Reasoning(_)
+            | TurnEvent::Throughput(_) => {
                 // Non-streaming OpenAI completions expose only final content.
             }
         }

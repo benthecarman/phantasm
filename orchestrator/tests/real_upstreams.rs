@@ -193,6 +193,16 @@ async fn real_upstream_plain_chat_smoke() {
             .is_some_and(|data| !data.is_empty()),
         "expected /v1/capabilities to advertise at least one model, got {capabilities}"
     );
+    if upstream_kind_env() == "llama_cpp" {
+        let context_length = capabilities["models"]
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == h.model))
+            .and_then(|model| model["context_length"].as_u64());
+        assert!(
+            context_length.is_some_and(|length| length > 0),
+            "expected llama.cpp's served context length in /v1/capabilities, got {capabilities}"
+        );
+    }
 
     let non_stream = h
         .post("/v1/chat/completions")
@@ -239,7 +249,7 @@ async fn real_upstream_plain_chat_smoke() {
     let body = stream.text().await.expect("stream body");
     let (events, saw_done) = sse_events(&body);
     let mut content = String::new();
-    for event in events {
+    for event in &events {
         if let Some(delta) = event["choices"][0]["delta"]["content"].as_str() {
             content.push_str(delta);
         }
@@ -249,6 +259,14 @@ async fn real_upstream_plain_chat_smoke() {
         !content.trim().is_empty(),
         "expected streaming content delta, got {body}"
     );
+    if upstream_kind_env() == "llama_cpp" {
+        assert!(
+            events.iter().any(|event| event["x_tokens_per_second"]
+                .as_f64()
+                .is_some_and(|rate| rate > 0.0)),
+            "expected llama.cpp's generation rate in downstream SSE, got {body}"
+        );
+    }
 }
 
 #[tokio::test]

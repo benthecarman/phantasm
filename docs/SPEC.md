@@ -381,8 +381,10 @@ Consequences:
 - **Progress** rides optional additive fields on the SSE chunk, e.g.
   `"x_status": "generating image…"` plus `"x_progress": 0.42` for
   determinate work such as ComfyUI image generation. Standard clients ignore
-  unknown fields; the app reads these `x_` fields. Future custom fields should
-  be `x_`-prefixed.
+  unknown fields; the app reads these `x_` fields. When an upstream reports
+  authoritative generation throughput, the orchestrator emits
+  `"x_tokens_per_second": 192.9`; the app prefers it over its local estimate.
+  Future custom fields should be `x_`-prefixed.
 - Conversation is stateless server-side: the app sends full history each turn.
 - Cancellation: for a plain turn the client aborts the SSE connection and the
   orchestrator halts generation and in-flight tool work. A **resumable** turn
@@ -490,8 +492,9 @@ already reachable from their device.
 
 ## 8. Resolved decisions
 
-- Single OpenAI-compatible SSE endpoint; tools server-side; the only
-  non-standard *body* element is the `x_`-prefixed `x_status` (progress) field.
+- Single OpenAI-compatible SSE endpoint; tools server-side; additive
+  non-standard body fields are `x_`-prefixed (`x_status`, `x_progress`, and
+  `x_tokens_per_second`).
   Deep Research rides the standard `model` id (a `"<base>:<mode>"` suffix
   resolved server-side, §2.3) rather than a proprietary flag, so research stops
   being non-standard wire surface — the headline win. Tool selection rides
