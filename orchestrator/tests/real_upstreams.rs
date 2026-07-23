@@ -193,7 +193,8 @@ async fn real_upstream_plain_chat_smoke() {
             .is_some_and(|data| !data.is_empty()),
         "expected /v1/capabilities to advertise at least one model, got {capabilities}"
     );
-    if upstream_kind_env() == "llama_cpp" {
+    let upstream_kind = upstream_kind_env();
+    if upstream_kind == "llama_cpp" {
         let context_length = capabilities["models"]
             .as_array()
             .and_then(|models| models.iter().find(|model| model["id"] == h.model))
@@ -259,12 +260,15 @@ async fn real_upstream_plain_chat_smoke() {
         !content.trim().is_empty(),
         "expected streaming content delta, got {body}"
     );
-    if upstream_kind_env() == "llama_cpp" {
+    if matches!(
+        upstream_kind.as_str(),
+        "llama_cpp" | "ollama" | "native_ollama"
+    ) {
         assert!(
             events.iter().any(|event| event["x_tokens_per_second"]
                 .as_f64()
                 .is_some_and(|rate| rate > 0.0)),
-            "expected llama.cpp's generation rate in downstream SSE, got {body}"
+            "expected upstream generation rate in downstream SSE, got {body}"
         );
     }
 }

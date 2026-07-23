@@ -276,6 +276,13 @@ extension WirePart: Codable {
 /// One streamed `chat.completion.chunk`. The `x_` fields are additive; absence
 /// is normal (e.g. raw Ollama) and must not break decoding.
 public struct ChatChunk: Decodable, Sendable {
+    public struct Usage: Decodable, Sendable {
+        public let completionTokens: Int?
+    }
+    public struct Timings: Decodable, Sendable {
+        public let predictedMs: Double?
+        public let predictedPerSecond: Double?
+    }
     public struct Choice: Decodable, Sendable {
         public struct Delta: Decodable, Sendable {
             public let content: String?
@@ -295,6 +302,11 @@ public struct ChatChunk: Decodable, Sendable {
     public let xStatus: String?
     public let xProgress: Double?
     public let xTokensPerSecond: Double?
+    /// Standard OpenAI-compatible usage plus llama.cpp's additive timing data.
+    /// These let direct backend profiles surface throughput without an
+    /// orchestrator-provided `x_tokens_per_second`.
+    public let usage: Usage?
+    public let timings: Timings?
 }
 
 public extension ChatChunk.Choice.Delta {

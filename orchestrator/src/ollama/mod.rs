@@ -42,6 +42,11 @@ impl StreamDelta {
     pub fn content(content: impl Into<String>, done: bool, done_reason: Option<String>) -> Self {
         Self::new(content, "", done, done_reason)
     }
+
+    pub fn with_tokens_per_second(mut self, tokens_per_second: Option<f64>) -> Self {
+        self.tokens_per_second = tokens_per_second;
+        self
+    }
 }
 
 /// A boxed stream of final-answer deltas (the streaming chat result).
@@ -76,6 +81,11 @@ impl ToolStreamDelta {
             done_reason,
             tokens_per_second: None,
         }
+    }
+
+    pub fn with_tokens_per_second(mut self, tokens_per_second: Option<f64>) -> Self {
+        self.tokens_per_second = tokens_per_second;
+        self
     }
 }
 

@@ -382,9 +382,11 @@ Consequences:
   `"x_status": "generating image…"` plus `"x_progress": 0.42` for
   determinate work such as ComfyUI image generation. Standard clients ignore
   unknown fields; the app reads these `x_` fields. When an upstream reports
-  authoritative generation throughput, the orchestrator emits
-  `"x_tokens_per_second": 192.9`; the app prefers it over its local estimate.
-  Future custom fields should be `x_`-prefixed.
+  generation throughput, the orchestrator emits
+  `"x_tokens_per_second": 192.9`; native Ollama and llama.cpp provide exact
+  evaluation timing, while other OpenAI-compatible hosts use reported token
+  counts over observed stream time. The app prefers this over its local
+  character-based estimate. Future custom fields should be `x_`-prefixed.
 - Conversation is stateless server-side: the app sends full history each turn.
 - Cancellation: for a plain turn the client aborts the SSE connection and the
   orchestrator halts generation and in-flight tool work. A **resumable** turn

@@ -75,6 +75,15 @@ public struct OllamaNativeChatClient: ChatClienting {
                             ))
                         }
                         if chunk.done {
+                            // ollama-swift preserves the native API's duration
+                            // number (nanoseconds) in this TimeInterval field.
+                            if let evalCount = chunk.evalCount,
+                               let evalDuration = chunk.evalDuration,
+                               evalCount > 0, evalDuration > 0 {
+                                continuation.yield(
+                                    .throughput(Double(evalCount) / (evalDuration / 1_000_000_000))
+                                )
+                            }
                             if !toolCalls.isEmpty {
                                 continuation.yield(.toolCalls(toolCalls))
                             }

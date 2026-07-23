@@ -582,6 +582,12 @@ fn record_chunk_usage(recorder: &UsageRecorder, chunk: &OllamaChatChunk) {
     }
 }
 
+fn chunk_tokens_per_second(chunk: &OllamaChatChunk) -> Option<f64> {
+    let eval_count = chunk.eval_count.filter(|count| *count > 0)?;
+    let eval_duration = chunk.eval_duration.filter(|duration| *duration > 0)?;
+    Some(eval_count as f64 / (eval_duration as f64 / 1_000_000_000.0))
+}
+
 /// One NDJSON response's chunk-to-delta assembly policy. The framing
 /// (line buffering, parse, usage recording) is shared by `ndjson_stream`;
 /// what differs per pass is only how chunks become deltas.
@@ -651,13 +657,17 @@ impl ChunkAssembler for VerbatimAssembler {
     type Delta = StreamDelta;
 
     fn push_chunk(&mut self, chunk: OllamaChatChunk) -> Option<StreamDelta> {
+        let tokens_per_second = chunk_tokens_per_second(&chunk);
         let message = chunk.message.unwrap_or_default();
-        Some(StreamDelta::new(
-            message.content.unwrap_or_default(),
-            message.thinking.unwrap_or_default(),
-            chunk.done,
-            chunk.done_reason,
-        ))
+        Some(
+            StreamDelta::new(
+                message.content.unwrap_or_default(),
+                message.thinking.unwrap_or_default(),
+                chunk.done,
+                chunk.done_reason,
+            )
+            .with_tokens_per_second(tokens_per_second),
+        )
     }
 
     fn finish(self) -> Option<StreamDelta> {
@@ -681,6 +691,7 @@ impl ChunkAssembler for PostToolsAssembler {
     type Delta = StreamDelta;
 
     fn push_chunk(&mut self, chunk: OllamaChatChunk) -> Option<StreamDelta> {
+        let tokens_per_second = chunk_tokens_per_second(&chunk);
         let message = chunk.message.unwrap_or_default();
         let content = message.content.unwrap_or_default();
         let reasoning = message.thinking.unwrap_or_default();
@@ -688,12 +699,10 @@ impl ChunkAssembler for PostToolsAssembler {
 
         if chunk.done {
             released.push_str(&drain_excised(&mut self.scan));
-            return Some(StreamDelta::new(
-                released,
-                reasoning,
-                true,
-                chunk.done_reason,
-            ));
+            return Some(
+                StreamDelta::new(released, reasoning, true, chunk.done_reason)
+                    .with_tokens_per_second(tokens_per_second),
+            );
         }
 
         if !released.is_empty() || !reasoning.is_empty() {
@@ -725,7 +734,11 @@ struct ToolDeltaAssembler {
 
 impl ToolDeltaAssembler {
     /// The terminal delta carrying the accumulated native tool-call batch.
-    fn native_batch(&mut self, done_reason: Option<String>) -> ToolStreamDelta {
+    fn native_batch(
+        &mut self,
+        done_reason: Option<String>,
+        tokens_per_second: Option<f64>,
+    ) -> ToolStreamDelta {
         ToolStreamDelta::new(
             "",
             "",
@@ -733,6 +746,7 @@ impl ToolDeltaAssembler {
             true,
             done_reason,
         )
+        .with_tokens_per_second(tokens_per_second)
     }
 }
 
@@ -740,6 +754,7 @@ impl ChunkAssembler for ToolDeltaAssembler {
     type Delta = ToolStreamDelta;
 
     fn push_chunk(&mut self, chunk: OllamaChatChunk) -> Option<ToolStreamDelta> {
+        let tokens_per_second = chunk_tokens_per_second(&chunk);
         let mut message = chunk.message.unwrap_or_default();
         if let Some(calls) = message.tool_calls.take() {
             self.pending_tool_calls.extend(
@@ -756,27 +771,27 @@ impl ChunkAssembler for ToolDeltaAssembler {
                 // Native calls win outright; drop any scanned XML so the
                 // post-stream finish() can't replay it as a second batch.
                 self.scan = XmlToolScan::default();
-                return Some(self.native_batch(chunk.done_reason));
+                return Some(self.native_batch(chunk.done_reason, tokens_per_second));
             }
             let mut released = self.scan.push(&content);
             let end = std::mem::take(&mut self.scan).finish();
             if !end.calls.is_empty() {
-                return Some(ToolStreamDelta::new(
-                    released,
-                    reasoning,
-                    Some(end.calls),
-                    true,
-                    Some("tool_calls".into()),
-                ));
+                return Some(
+                    ToolStreamDelta::new(
+                        released,
+                        reasoning,
+                        Some(end.calls),
+                        true,
+                        Some("tool_calls".into()),
+                    )
+                    .with_tokens_per_second(tokens_per_second),
+                );
             }
             released.push_str(&end.raw);
-            return Some(ToolStreamDelta::new(
-                released,
-                reasoning,
-                None,
-                true,
-                chunk.done_reason,
-            ));
+            return Some(
+                ToolStreamDelta::new(released, reasoning, None, true, chunk.done_reason)
+                    .with_tokens_per_second(tokens_per_second),
+            );
         }
 
         if !self.pending_tool_calls.is_empty() {
@@ -792,7 +807,7 @@ impl ChunkAssembler for ToolDeltaAssembler {
     /// Flush after the byte stream ends without a `done` chunk (defensive).
     fn finish(mut self) -> Option<ToolStreamDelta> {
         if !self.pending_tool_calls.is_empty() {
-            return Some(self.native_batch(Some("tool_calls".into())));
+            return Some(self.native_batch(Some("tool_calls".into()), None));
         }
         let end = self.scan.finish();
         if !end.calls.is_empty() {
@@ -953,6 +968,7 @@ mod tests {
         .map(|r| r.unwrap())
         .collect();
         assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[1].tokens_per_second, Some(20.0));
         let stats = metrics.model("m1");
         assert_eq!(stats.prompt_tokens.get(), 10);
         assert_eq!(stats.completion_tokens.get(), 30);

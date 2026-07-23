@@ -89,6 +89,37 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(events, [.throughput(192.9), .done])
     }
 
+    func testStreamReadsLlamaTimingTrailerAfterFinish() async throws {
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            "",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":4},\"timings\":{\"predicted_per_second\":80.0}}",
+            "",
+            "data: [DONE]",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        XCTAssertEqual(events, [.token("ok"), .throughput(80), .done])
+    }
+
+    func testStreamDerivesThroughputFromTerminalUsage() async throws {
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":4}}",
+            "",
+            "data: [DONE]",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        XCTAssertEqual(events.first, .token("ok"))
+        guard events.count == 3, case .throughput(let rate) = events[1] else {
+            return XCTFail("expected token, throughput, done; got \(events)")
+        }
+        XCTAssertTrue(rate.isFinite && rate > 0)
+        XCTAssertEqual(events.last, .done)
+    }
+
     func testProgressWithoutStatusStillSurfaces() async throws {
         let lines = [
             "data: {\"choices\":[{\"delta\":{}}],\"x_progress\":0.5}",
@@ -281,7 +312,7 @@ final class OllamaNativeChatClientTests: XCTestCase {
         NativeProtocol.lastBody = nil
         NativeProtocol.responseBody = """
         {"model":"native-model","created_at":"2026-06-24T07:17:27.100196506Z","message":{"role":"assistant","content":"hi"},"done":false}
-        {"model":"native-model","created_at":"2026-06-24T07:17:27.112648860Z","message":{"role":"assistant","content":""},"done":true}
+        {"model":"native-model","created_at":"2026-06-24T07:17:27.112648860Z","message":{"role":"assistant","content":""},"done":true,"eval_count":30,"eval_duration":1500000000}
 
         """
     }
@@ -297,7 +328,7 @@ final class OllamaNativeChatClientTests: XCTestCase {
 
         let events = try await collect(stream)
 
-        XCTAssertEqual(events, [.token("hi"), .done])
+        XCTAssertEqual(events, [.token("hi"), .throughput(20), .done])
         XCTAssertEqual(NativeProtocol.lastPath, "/api/chat")
 
         let data = try XCTUnwrap(NativeProtocol.lastBody)

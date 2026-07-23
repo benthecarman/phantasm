@@ -62,7 +62,7 @@ public enum ChatStreamEvent: Sendable, Equatable {
     case reasoning(String)  // append model thinking/reasoning deltas
     case status(String)     // x_status -> progress UI (FR-A8)
     case progress(String, Double) // x_status + normalized x_progress
-    case throughput(Double) // authoritative x_tokens_per_second
+    case throughput(Double) // upstream-reported or usage-derived token rate
     case toolCalls([WireToolCall]) // forwarded app-hosted tool calls (finish_reason: tool_calls)
     case done
 }
@@ -79,13 +79,17 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
     AsyncThrowingStream { continuation in
         let task = Task {
             var dataBuffer: [String] = []
+            let startedAt = Date()
+            var sawFinish = false
+            var reportedThroughput = false
+            var pendingObservedThroughput: Double?
             // Forwarded tool calls accumulate across chunks (merged by index, so
             // standard fragmented streaming works); flushed on the terminating
             // frame before `.done`.
             var toolCalls: [Int: WireToolCall] = [:]
 
             func flush() throws -> Bool {
-                // Returns true if the stream should end (decoded a finish).
+                // Returns true when this frame carries a finish reason.
                 guard !dataBuffer.isEmpty else { return false }
                 let payload = dataBuffer.joined(separator: "\n")
                 dataBuffer.removeAll(keepingCapacity: true)
@@ -109,9 +113,42 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                 } else if let status = chunk.xStatus {
                     continuation.yield(.status(status))
                 }
-                if let tokensPerSecond = chunk.xTokensPerSecond,
+                let completionTokens = chunk.usage?.completionTokens
+                let exactTimingRate = chunk.timings?.predictedPerSecond
+                    ?? {
+                        guard let tokens = completionTokens,
+                              let milliseconds = chunk.timings?.predictedMs,
+                              tokens > 0, milliseconds > 0
+                        else { return nil }
+                        return Double(tokens) / (milliseconds / 1_000)
+                    }()
+                let isTerminalUsage = chunk.choices.isEmpty
+                    || chunk.choices.contains {
+                        $0.finishReason?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .isEmpty == false
+                    }
+                let observedRate: Double? = {
+                    guard isTerminalUsage,
+                          let tokens = completionTokens,
+                          tokens > 0
+                    else { return nil }
+                    let elapsed = Date().timeIntervalSince(startedAt)
+                    return elapsed > 0 ? Double(tokens) / elapsed : nil
+                }()
+                let exactRate = chunk.xTokensPerSecond ?? exactTimingRate
+                if !reportedThroughput,
+                   let tokensPerSecond = exactRate,
                    tokensPerSecond.isFinite, tokensPerSecond > 0 {
                     continuation.yield(.throughput(tokensPerSecond))
+                    reportedThroughput = true
+                } else if !reportedThroughput,
+                          let observedRate,
+                          observedRate.isFinite, observedRate > 0 {
+                    // Hold an elapsed-time estimate until the trailer/[DONE].
+                    // A later llama.cpp timing trailer should replace it with
+                    // the backend's exact generation-only rate.
+                    pendingObservedThroughput = observedRate
                 }
                 if let reasoning = chunk.choices.first?.delta?.reasoningText,
                    !reasoning.isEmpty {
@@ -143,13 +180,13 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                         dataBuffer.append(data)
                     case .blank:
                         if try flush() {
-                            emitToolCallsIfAny()
-                            continuation.yield(.done)
-                            continuation.finish()
-                            return
+                            sawFinish = true
                         }
                     case .done:
-                        _ = try flush()
+                        sawFinish = try flush() || sawFinish
+                        if !reportedThroughput, let pendingObservedThroughput {
+                            continuation.yield(.throughput(pendingObservedThroughput))
+                        }
                         emitToolCallsIfAny()
                         continuation.yield(.done)
                         continuation.finish()
@@ -158,8 +195,16 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                         continue
                     }
                 }
-                _ = try flush() // trailing frame without a closing blank line
+                sawFinish = try flush() || sawFinish
+                if !reportedThroughput, let pendingObservedThroughput {
+                    continuation.yield(.throughput(pendingObservedThroughput))
+                }
                 emitToolCallsIfAny()
+                // Some compatibility hosts close after finish_reason without
+                // sending the optional OpenAI [DONE] sentinel.
+                if sawFinish {
+                    continuation.yield(.done)
+                }
                 continuation.finish()
             } catch is CancellationError {
                 continuation.finish()

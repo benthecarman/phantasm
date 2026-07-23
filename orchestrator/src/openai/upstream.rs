@@ -461,7 +461,7 @@ where
                 if let Some(message) = in_band_error(&value) {
                     Err(AppError::UpstreamError(message))?;
                 }
-                if let Some(rate) = llama_cpp_tokens_per_second(&value) {
+                if let Some(rate) = stream_tokens_per_second(&value, started_at) {
                     pending_tokens_per_second = Some(rate);
                 }
                 if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
@@ -541,7 +541,7 @@ where
                 if let Some(message) = in_band_error(&value) {
                     Err(AppError::UpstreamError(message))?;
                 }
-                if let Some(rate) = llama_cpp_tokens_per_second(&value) {
+                if let Some(rate) = stream_tokens_per_second(&value, started_at) {
                     pending_tokens_per_second = Some(rate);
                 }
                 if record_stream_usage(&metrics, &value, started_at, &mut recorded_usage) {
@@ -680,11 +680,10 @@ fn record_stream_usage(
         return true;
     }
     if let Some((metrics, model)) = metrics {
-        let eval_duration_ns = llama_cpp_eval_duration_ns(value, completion_tokens).or_else(|| {
-            completion_tokens
-                .filter(|tokens| *tokens > 0)
-                .map(|_| started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64)
-        });
+        let eval_duration_ns = completion_tokens
+            .filter(|tokens| *tokens > 0)
+            .zip(stream_tokens_per_second(value, started_at))
+            .and_then(|(tokens, rate)| seconds_to_ns(tokens as f64 / rate));
         metrics.record_usage(
             model,
             prompt_tokens,
@@ -695,6 +694,34 @@ fn record_stream_usage(
     }
     *recorded = true;
     true
+}
+
+/// Throughput for a streaming OpenAI-compatible response. llama.cpp reports an
+/// authoritative generation rate; other hosts commonly report only final token
+/// usage, for which the observed stream duration is the best available timing.
+fn stream_tokens_per_second(value: &Value, started_at: Instant) -> Option<f64> {
+    if let Some(rate) = llama_cpp_tokens_per_second(value) {
+        return Some(rate);
+    }
+
+    let choices = value.get("choices").and_then(Value::as_array)?;
+    let terminal_usage = choices.is_empty()
+        || choices.iter().any(|choice| {
+            choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.trim().is_empty())
+        });
+    if !terminal_usage {
+        return None;
+    }
+    let completion_tokens = value
+        .get("usage")
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .filter(|tokens| *tokens > 0)?;
+    let elapsed = started_at.elapsed().as_secs_f64();
+    (elapsed > 0.0).then_some(completion_tokens as f64 / elapsed)
 }
 
 /// Authoritative generation throughput from a llama.cpp completion response or
@@ -1101,6 +1128,28 @@ mod tests {
             llama_cpp_eval_duration_ns(&response, Some(2)),
             Some(12_500_000)
         );
+    }
+
+    #[test]
+    fn standard_usage_derives_throughput_from_observed_stream_duration() {
+        let value = json!({
+            "choices": [],
+            "usage": {"completion_tokens": 4}
+        });
+        let started_at = Instant::now() - std::time::Duration::from_secs(2);
+        let rate = stream_tokens_per_second(&value, started_at).unwrap();
+        assert!((rate - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn terminal_continuous_usage_derives_throughput_without_a_trailer() {
+        let value = json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 4}
+        });
+        let started_at = Instant::now() - std::time::Duration::from_secs(2);
+        let rate = stream_tokens_per_second(&value, started_at).unwrap();
+        assert!((rate - 2.0).abs() < 0.01);
     }
 
     #[test]
@@ -1624,6 +1673,10 @@ mod tests {
         let terminal = deltas.last().expect("terminal delta");
         assert!(terminal.done);
         assert_eq!(terminal.done_reason.as_deref(), Some("stop"));
+        assert!(
+            terminal.tokens_per_second.is_some_and(|rate| rate > 0.0),
+            "standard usage should produce observed throughput"
+        );
 
         let stats = metrics.model("m");
         assert_eq!(stats.prompt_tokens.get(), 7);
