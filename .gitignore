@@ -13,7 +13,17 @@
 .wrangler/
 
 # iOS / Xcode
-ios/Phantasm.xcodeproj/
+# Keep the app-level SwiftPM lockfile so Xcode Cloud can resolve packages with
+# automatic dependency resolution disabled. All other generated project files
+# remain ignored.
+ios/Phantasm.xcodeproj/*
+!ios/Phantasm.xcodeproj/project.xcworkspace/
+ios/Phantasm.xcodeproj/project.xcworkspace/*
+!ios/Phantasm.xcodeproj/project.xcworkspace/xcshareddata/
+ios/Phantasm.xcodeproj/project.xcworkspace/xcshareddata/*
+!ios/Phantasm.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+ios/Phantasm.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/*
+!ios/Phantasm.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 ios/build/
 ios/build-device/
 ios/DerivedData/
