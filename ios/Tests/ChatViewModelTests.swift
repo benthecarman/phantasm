@@ -1219,6 +1219,8 @@ final class ChatViewModelTests: XCTestCase {
         let gate = TestAsyncGate()
         let store = BlockingOptionsStore(base: database, gate: gate)
         let client = ScriptedChatClient()
+        let requestStarted = expectation(description: "chat request started")
+        client.onNextInvocation { requestStarted.fulfill() }
         let env = FakeChatEnvironment(client: client)
         env.backendMode = .full(Self.fullCapabilities())
         var conversation = Conversation(profileID: env.primaryProfileID)
@@ -1236,7 +1238,8 @@ final class ChatViewModelTests: XCTestCase {
         )
 
         await gate.open()
-        try await waitUntil { client.invocations.count == 1 }
+        await fulfillment(of: [requestStarted], timeout: 3)
+        XCTAssertEqual(client.invocations.count, 1)
         XCTAssertFalse(client.requests[0].tools?.contains {
             $0.function.name == ToolName.webSearch
         } ?? false)
@@ -1705,6 +1708,7 @@ private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
     private var scripts: [Script] = []
     private var recordedInvocations: [Invocation] = []
     private var recordedCancellations: [Cancellation] = []
+    private var nextInvocationHandler: (() -> Void)?
 
     var requests: [ChatRequest] {
         lock.lock()
@@ -1739,6 +1743,12 @@ private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
                 error: error
             )
         )
+        lock.unlock()
+    }
+
+    func onNextInvocation(_ handler: @escaping () -> Void) {
+        lock.lock()
+        nextInvocationHandler = handler
         lock.unlock()
     }
 
@@ -1795,12 +1805,23 @@ private final class ScriptedChatClient: ChatClienting, @unchecked Sendable {
 
     private func nextScript(recording invocation: Invocation) -> Script {
         lock.lock()
-        defer { lock.unlock() }
         recordedInvocations.append(invocation)
+        let handler = nextInvocationHandler
+        nextInvocationHandler = nil
+        let script: Script
         if scripts.isEmpty {
-            return Script(events: [.done], leadingDelayNanoseconds: 0, pauseAfterEventNanoseconds: 0, error: nil)
+            script = Script(
+                events: [.done],
+                leadingDelayNanoseconds: 0,
+                pauseAfterEventNanoseconds: 0,
+                error: nil
+            )
+        } else {
+            script = scripts.removeFirst()
         }
-        return scripts.removeFirst()
+        lock.unlock()
+        handler?()
+        return script
     }
 }
 
