@@ -188,6 +188,18 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertNil(json["tools"], "plain-chat selection sends only tool_choice:none")
     }
 
+    func testChatRequestEncodesMaxTokensForBoundedSideQuery() throws {
+        let request = ChatRequest(
+            model: "m",
+            messages: [WireMessage(role: "user", content: "name this chat")],
+            maxTokens: 24,
+            enabledTools: []
+        )
+        let json = try encodedKeys(request)
+        XCTAssertEqual(json["max_tokens"] as? Int, 24)
+        XCTAssertEqual(json["tool_choice"] as? String, "none")
+    }
+
     func testChatRequestStaysStandardWithNoCustomFields() throws {
         // Image URL delivery is a server-side choice — the request carries no
         // bespoke field for it, staying byte-for-byte standard.

@@ -67,6 +67,9 @@ final class ChatViewModel {
     /// next turn's history read awaits it so a fast follow-up send can't load
     /// a history that is missing the last reply.
     private var commitTask: Task<Void, Never>?
+    /// Best-effort title side query. A fast follow-up turn cancels it so this
+    /// low-priority request cannot take the next slot on a single-model backend.
+    private var titleGenerationTask: Task<Void, Never>?
     /// Conversation-option/model writes are chained so rapid picker changes
     /// reach storage in the same order as the in-memory selections.
     private var settingsPersistenceTask: Task<Result<Void, AppError>, Never>?
@@ -728,6 +731,9 @@ final class ChatViewModel {
             return nil
         }
 
+        titleGenerationTask?.cancel()
+        titleGenerationTask = nil
+
         isStreaming = true
         hasAssistantPreview = true
         streamingStartedAt = .now
@@ -780,7 +786,10 @@ final class ChatViewModel {
             return
         }
         guard ownsTurn(generation) else { return }
-        guard let detail = try? await store.conversationDetail(id: conversationId) else {
+        guard let detail = try? await store.conversationDetail(
+            id: conversationId,
+            attachmentData: .metadataOnly
+        ) else {
             finish(
                 generation: generation,
                 error: .modelError("Could not load the conversation history.")
@@ -810,6 +819,22 @@ final class ChatViewModel {
             availableModes: session.mode.availableModes,
             baseModelIsToolCapable: session.supportsTools(model)
         )
+        let prepared = HistoryCompactor.prepare(
+            detail.messages,
+            contextLength: session.contextLengths?[model]
+        )
+        guard let attachmentPayloads = try? await store.attachmentPayloads(
+            ids: prepared.requiredAttachmentIDs
+        ) else {
+            finish(
+                generation: generation,
+                error: .modelError("Could not load the conversation attachments.")
+            )
+            return
+        }
+        let wireHistory = prepared
+            .hydratingAttachments(from: attachmentPayloads)
+            .wireHistory()
         // Scope which server tools this turn may use (spec §2.3). Omitted entirely
         // for backends with no tool manifest, keeping those requests standard.
         // App-hosted tools (e.g. ask_user) ride as full schemas the orchestrator
@@ -834,7 +859,7 @@ final class ChatViewModel {
             : []
         let request = ChatRequest(
             model: wireModel,
-            messages: detail.wireHistory(),
+            messages: wireHistory,
             stream: true,
             reasoningEffort: session.reasoningEffort(for: model),
             enabledTools: detail.conversation.requestedToolNames(
@@ -1706,7 +1731,12 @@ final class ChatViewModel {
                     conversationID: conversationID
                 )
             } else if isCleanCompletion && !content.isEmpty {
-                await self?.maybeGenerateTitle(session: session)
+                let titleTask = Task { [weak self] in
+                    guard let self else { return }
+                    await self.maybeGenerateTitle(session: session)
+                }
+                self?.titleGenerationTask = titleTask
+                await titleTask.value
             }
             self?.endBackgroundStreamingTask(for: generation)
         }
@@ -1832,7 +1862,7 @@ final class ChatViewModel {
               let model = session.resolvedModel(
                   conversationModel: conversation.modelID
               ) else { return }
-        let reasoningEffort = session.reasoningEffort(for: model)
+        let reasoningEffort = session.disabledReasoningEffort(for: model)
         let titleMessages = history + [WireMessage(role: "user", content: Self.titlePrompt)]
 
         func complete(reasoningEffort: String?) async throws -> String {
@@ -1840,7 +1870,9 @@ final class ChatViewModel {
                 model: model,
                 messages: titleMessages,
                 stream: true,
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                maxTokens: 24,
+                enabledTools: []
             )
             return try await session.client.complete(
                 request,

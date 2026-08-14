@@ -16,14 +16,15 @@
 //!   * every image is sniffed and rejected if it isn't a real, supported image,
 //!     instead of failing opaquely deep inside Ollama.
 //!
-//! Downscaling is deliberately *not* done here. The boundary keeps images at
-//! full fidelity so the tools (OCR, image-edit) and the app operate on the
-//! original resolution; the size reduction happens later, on a throwaway copy
-//! bound only for Ollama's vision field — see [`downscale_messages_for_vision`].
+//! The boundary keeps full-fidelity images in history for tools (OCR/image-edit),
+//! while computing an inference-only downscaled projection from the same decoded
+//! bytes. That avoids decoding each image twice. The standalone
+//! [`downscale_messages_for_vision`] remains the fallback for non-HTTP callers.
 //!
 //! Errors are per-image and precise (which image, why), returned before the turn
 //! starts so the client gets a clean HTTP status rather than a mangled stream.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::time::Duration;
 
@@ -52,6 +53,52 @@ pub async fn normalize_request_images(
     cfg: &Config,
     store: Option<&BlobStore>,
 ) -> Result<(), AppError> {
+    normalize_request_images_with_projection(messages, cfg, store)
+        .await
+        .map(|_| ())
+}
+
+/// Downscaled replacements computed while the full-resolution request images
+/// are already decoded for validation. Applying the cache clones messages only
+/// when at least one image actually needs a smaller vision projection.
+#[derive(Debug, Default)]
+pub struct VisionProjectionCache {
+    replacements: HashMap<String, String>,
+}
+
+impl VisionProjectionCache {
+    pub fn project(&self, messages: &[ChatMessage]) -> Option<Vec<ChatMessage>> {
+        if self.replacements.is_empty() {
+            return None;
+        }
+        let mut out = messages.to_vec();
+        let mut replaced = false;
+        for message in &mut out {
+            let Some(MessageContent::Parts(parts)) = message.content.as_mut() else {
+                continue;
+            };
+            for part in parts {
+                let ContentPart::ImageUrl { image_url } = part else {
+                    continue;
+                };
+                if let Some(smaller) = self.replacements.get(&image_url.url) {
+                    image_url.url.clone_from(smaller);
+                    replaced = true;
+                }
+            }
+        }
+        replaced.then_some(out)
+    }
+}
+
+/// Normalize request images and build their smaller inference-only projection
+/// in the same pass, avoiding a second base64 and image decode later in the turn.
+pub async fn normalize_request_images_with_projection(
+    messages: &mut [ChatMessage],
+    cfg: &Config,
+    store: Option<&BlobStore>,
+) -> Result<VisionProjectionCache, AppError> {
+    let mut projection = VisionProjectionCache::default();
     let mut index = 0usize;
     for msg in messages.iter_mut() {
         let Some(MessageContent::Parts(parts)) = msg.content.as_mut() else {
@@ -75,6 +122,11 @@ pub async fn normalize_request_images(
                 if recognized_image_type(&bytes).is_none() {
                     return Err(label(index, AppError::BadRequest(UNSUPPORTED.into())));
                 }
+                if let Some(smaller) = downscale_bytes(bytes, cfg).await {
+                    projection
+                        .replacements
+                        .insert(image_url.url.clone(), smaller);
+                }
             } else {
                 // Resolve a store ref / remote URL / bare base64, then inline it.
                 // Downscaling is the vision projection's job
@@ -83,14 +135,19 @@ pub async fn normalize_request_images(
                 let bytes = load_external(&image_url.url, cfg, store)
                     .await
                     .map_err(|e| label(index, e))?;
+                check_cap(&bytes, cfg).map_err(|e| label(index, e))?;
                 let Some(mime) = recognized_image_type(&bytes) else {
                     return Err(label(index, AppError::BadRequest(UNSUPPORTED.into())));
                 };
-                image_url.url = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
+                let normalized = format!("data:{mime};base64,{}", STANDARD.encode(&bytes));
+                if let Some(smaller) = downscale_bytes(bytes, cfg).await {
+                    projection.replacements.insert(normalized.clone(), smaller);
+                }
+                image_url.url = normalized;
             }
         }
     }
-    Ok(())
+    Ok(projection)
 }
 
 /// Prefix an error with which image it concerns (images are 1-indexed in request
@@ -213,6 +270,10 @@ fn data_uri_over_trigger(url: &str, cfg: &Config) -> bool {
 /// Runs the CPU-heavy decode off the async runtime.
 async fn downscale_data_uri(url: &str, cfg: &Config) -> Option<String> {
     let bytes = STANDARD.decode(data_uri_payload(url)?.trim()).ok()?;
+    downscale_bytes(bytes, cfg).await
+}
+
+async fn downscale_bytes(bytes: Vec<u8>, cfg: &Config) -> Option<String> {
     if bytes.len() <= cfg.image_downscale_trigger_bytes {
         return None;
     }
@@ -388,6 +449,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded_width(&url_of(&msgs[0])), 200);
+    }
+
+    #[tokio::test]
+    async fn normalization_cache_reuses_decode_for_vision_projection() {
+        let mut cfg = minimal();
+        cfg.image_downscale_trigger_bytes = 1;
+        cfg.image_max_dimension = 64;
+        let mut msgs = vec![parts_msg(&png_data_uri(200, 100))];
+
+        let cache = normalize_request_images_with_projection(&mut msgs, &cfg, None)
+            .await
+            .unwrap();
+        let projected = cache.project(&msgs).expect("oversized image is cached");
+
+        assert_eq!(decoded_width(&url_of(&msgs[0])), 200);
+        assert_eq!(decoded_width(&url_of(&projected[0])), 64);
     }
 
     #[tokio::test]

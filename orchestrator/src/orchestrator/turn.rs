@@ -65,6 +65,14 @@ pub(crate) struct OfferedToolSchemas {
     pub app_names: HashSet<String>,
 }
 
+/// Request-bound work prepared at the HTTP boundary and reused after queueing.
+/// This keeps schema construction/merging and image projection out of the hot
+/// turn path without changing the generic entry point used by tests/research.
+pub(crate) struct PreparedOrdinaryTurn {
+    pub offered: OfferedToolSchemas,
+    pub vision: Option<Vec<ChatMessage>>,
+}
+
 pub(crate) fn merge_tool_schemas(
     server_schemas: Vec<Value>,
     enabled: &Option<Vec<String>>,
@@ -138,6 +146,91 @@ pub async fn run_turn<B, T>(
     backend: B,
     tools: T,
     sem: Arc<Semaphore>,
+    messages: Vec<ChatMessage>,
+    model: String,
+    options: Map<String, Value>,
+    enabled_tools: Option<Vec<String>>,
+    app_tools: Vec<Value>,
+    preset: Option<&'static ResearchPreset>,
+    images: Option<crate::images::BlobStore>,
+    recorder: crate::metrics::TurnRecorder,
+    tx: mpsc::Sender<TurnEvent>,
+    cancel: CancellationToken,
+    hard_cancel: bool,
+) where
+    B: ChatBackend,
+    T: ToolExecutor,
+{
+    run_turn_inner(
+        cfg,
+        backend,
+        tools,
+        sem,
+        messages,
+        model,
+        options,
+        enabled_tools,
+        app_tools,
+        preset,
+        images,
+        recorder,
+        tx,
+        cancel,
+        hard_cancel,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_turn_prepared<B, T>(
+    cfg: Arc<Config>,
+    backend: B,
+    tools: T,
+    sem: Arc<Semaphore>,
+    messages: Vec<ChatMessage>,
+    model: String,
+    options: Map<String, Value>,
+    enabled_tools: Option<Vec<String>>,
+    app_tools: Vec<Value>,
+    preset: Option<&'static ResearchPreset>,
+    images: Option<crate::images::BlobStore>,
+    recorder: crate::metrics::TurnRecorder,
+    tx: mpsc::Sender<TurnEvent>,
+    cancel: CancellationToken,
+    hard_cancel: bool,
+    prepared: PreparedOrdinaryTurn,
+) where
+    B: ChatBackend,
+    T: ToolExecutor,
+{
+    run_turn_inner(
+        cfg,
+        backend,
+        tools,
+        sem,
+        messages,
+        model,
+        options,
+        enabled_tools,
+        app_tools,
+        preset,
+        images,
+        recorder,
+        tx,
+        cancel,
+        hard_cancel,
+        Some(prepared),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_inner<B, T>(
+    cfg: Arc<Config>,
+    backend: B,
+    tools: T,
+    sem: Arc<Semaphore>,
     mut messages: Vec<ChatMessage>,
     model: String,
     options: Map<String, Value>,
@@ -149,6 +242,7 @@ pub async fn run_turn<B, T>(
     tx: mpsc::Sender<TurnEvent>,
     cancel: CancellationToken,
     hard_cancel: bool,
+    prepared: Option<PreparedOrdinaryTurn>,
 ) where
     B: ChatBackend,
     T: ToolExecutor,
@@ -223,11 +317,18 @@ pub async fn run_turn<B, T>(
     // any app-hosted tools the request defined. On a name collision the server
     // tool wins (the app entry is dropped); `app_names` records which offered
     // tools must be forwarded to the app rather than executed here.
+    let (offered, prepared_vision) = match prepared {
+        Some(prepared) => (prepared.offered, prepared.vision),
+        None => (
+            merge_tool_schemas(tools.schemas(), &enabled_tools, app_tools),
+            crate::image_norm::downscale_messages_for_vision(&messages, &cfg).await,
+        ),
+    };
     let OfferedToolSchemas {
         schemas,
         server_names,
         app_names,
-    } = merge_tool_schemas(tools.schemas(), &enabled_tools, app_tools);
+    } = offered;
 
     // Vision projection (FR/#2): the images the model *sees* are downscaled to a
     // bounded resolution — models cap resolution internally, so anything larger
@@ -237,7 +338,7 @@ pub async fn run_turn<B, T>(
     // upstream view is just `messages` (no clone on the plain/text fast path).
     // `mut` so mid-turn tool messages (assistant + tool results, which carry no
     // images) can be mirrored into the projection as the loop appends them.
-    let mut vision = crate::image_norm::downscale_messages_for_vision(&messages, &cfg).await;
+    let mut vision = prepared_vision;
 
     // Plain fast path: no tools to offer => one streaming call.
     if schemas.is_empty() {

@@ -102,7 +102,8 @@ enum AskService {
             model: model,
             messages: [WireMessage(role: "user", content: question)],
             stream: true,
-            reasoningEffort: disabledReasoningEffort(for: model, mode: mode)
+            reasoningEffort: disabledReasoningEffort(for: model, mode: mode),
+            enabledTools: []
         )
 
         let client: any ChatClienting = mode.usesMapleEncryptedChat

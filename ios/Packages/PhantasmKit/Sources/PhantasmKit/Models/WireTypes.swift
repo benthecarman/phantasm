@@ -95,6 +95,9 @@ public struct ChatRequest: Encodable, Sendable {
     public var messages: [WireMessage]
     public var stream: Bool
     public var reasoningEffort: String?
+    /// Bound short side queries (for example automatic titles) so they cannot
+    /// occupy a single-slot local model after their useful answer is complete.
+    public var maxTokens: Int?
     /// Per-request tool selection via the **standard** OpenAI `tools` array
     /// (spec §2.3): the names of the server tools to offer this turn. The server
     /// fills in the real schemas and intersects with what it has configured. `nil`
@@ -109,6 +112,7 @@ public struct ChatRequest: Encodable, Sendable {
         messages: [WireMessage],
         stream: Bool = true,
         reasoningEffort: String? = nil,
+        maxTokens: Int? = nil,
         enabledTools: [String]? = nil,
         appTools: [ToolSpec] = []
     ) {
@@ -116,6 +120,7 @@ public struct ChatRequest: Encodable, Sendable {
         self.messages = messages
         self.stream = stream
         self.reasoningEffort = reasoningEffort
+        self.maxTokens = maxTokens
         // Translate the per-turn selection into standard OpenAI fields. Server
         // tools ride as name-only concrete names; app-hosted tools ride as full
         // schemas the server forwards back to us. `tool_choice:"none"` only when

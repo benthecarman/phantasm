@@ -5,14 +5,17 @@
 //! cheap.
 //!
 //! Writes go through a dedicated OS thread that owns the connection (WAL
-//! mode), fed by an unbounded channel — recorder call sites never block and
-//! never fail. Reads happen on separate read-only connections opened by the
+//! mode), fed by a bounded channel — recorder call sites never block, and a
+//! stalled disk cannot grow process memory without limit. Reads happen on
+//! separate read-only connections opened by the
 //! dashboard route inside `spawn_blocking`. If the database can't be opened
 //! at boot the orchestrator degrades to memory-only metrics; storage is never
 //! fatal, matching the tool-failure philosophy (NFR-O6).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OpenFlags};
@@ -57,20 +60,26 @@ enum StoreMsg {
 /// Cheap-clone handle to the writer thread plus the path read connections use.
 #[derive(Clone)]
 pub struct StoreHandle {
-    tx: mpsc::UnboundedSender<StoreMsg>,
+    tx: mpsc::Sender<StoreMsg>,
     path: PathBuf,
+    dropped: Arc<AtomicU64>,
 }
 
 impl StoreHandle {
     /// Fire-and-forget; a closed writer (shutdown) drops the event silently.
     pub fn send(&self, ev: MetricEvent) {
-        let _ = self.tx.send(StoreMsg::Event(ev));
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(StoreMsg::Event(ev)) {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(dropped, "metrics store queue full; dropping events");
+            }
+        }
     }
 
     /// Wait until all previously sent events are committed.
     pub async fn flush(&self) {
         let (ack, done) = oneshot::channel();
-        if self.tx.send(StoreMsg::Flush(ack)).is_ok() {
+        if self.tx.send(StoreMsg::Flush(ack)).await.is_ok() {
             let _ = done.await;
         }
     }
@@ -133,19 +142,19 @@ fn init_connection(path: &Path) -> rusqlite::Result<Connection> {
 /// memory-only fallback) if the database can't be opened or initialized.
 pub fn spawn(path: PathBuf, retention_days: u32) -> Result<StoreHandle, String> {
     let conn = init_connection(&path).map_err(|e| e.to_string())?;
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(4_096);
     std::thread::Builder::new()
         .name("metrics-store".into())
         .spawn(move || writer_loop(conn, rx, retention_days))
         .map_err(|e| e.to_string())?;
-    Ok(StoreHandle { tx, path })
+    Ok(StoreHandle {
+        tx,
+        path,
+        dropped: Arc::new(AtomicU64::new(0)),
+    })
 }
 
-fn writer_loop(
-    mut conn: Connection,
-    mut rx: mpsc::UnboundedReceiver<StoreMsg>,
-    retention_days: u32,
-) {
+fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<StoreMsg>, retention_days: u32) {
     let mut last_prune = Instant::now();
     prune(&conn, retention_days);
     while let Some(first) = rx.blocking_recv() {

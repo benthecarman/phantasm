@@ -93,6 +93,13 @@ struct BackendSession: Sendable {
         return selectedReasoningEffort(for: model)
     }
 
+    /// Side queries such as automatic titles should never inherit the user's
+    /// expensive chat reasoning preference. Return the backend's advertised
+    /// disabled value when it has one, otherwise omit the field for compatibility.
+    func disabledReasoningEffort(for model: String?) -> String? {
+        disabledReasoningEffort(from: reasoningEfforts(for: model))
+    }
+
     func selectedReasoningEffort(for model: String?) -> String {
         let efforts = reasoningEfforts(for: model)
         guard let model = model?.nonEmptyTrimmed else {

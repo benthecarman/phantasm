@@ -47,15 +47,16 @@ pub async fn chat_completions(
     ) {
         return e.into_response();
     }
-    if let Err(e) = crate::image_norm::normalize_request_images(
+    let image_projection = match crate::image_norm::normalize_request_images_with_projection(
         &mut req.messages,
         &state.cfg,
         state.images.as_ref(),
     )
     .await
     {
-        return e.into_response();
-    }
+        Ok(projection) => projection,
+        Err(e) => return e.into_response(),
+    };
 
     // The downstream OpenAI response echoes back the model the client asked for
     // (including any mode suffix); the base model is what we run upstream and is
@@ -85,7 +86,7 @@ pub async fn chat_completions(
             // A resumable turn's token is only ever fired by the explicit cancel
             // endpoint or the abandoned-turn watchdog — never by a disconnect —
             // so a cancel here is always HARD (nobody will read the buffer).
-            let rx = spawn_turn(&state, req, active.cancel.clone(), true).await;
+            let rx = spawn_turn(&state, req, image_projection, active.cancel.clone(), true).await;
             spawn_pump(
                 rx,
                 active.clone(),
@@ -103,7 +104,7 @@ pub async fn chat_completions(
     // cancelled on disconnect via the SSE drop-guard (see `stream_response`) —
     // a SOFT cancel (the client went away; salvage work may still be useful).
     let cancel = CancellationToken::new();
-    let rx = spawn_turn(&state, req, cancel.clone(), false).await;
+    let rx = spawn_turn(&state, req, image_projection, cancel.clone(), false).await;
     if stream {
         stream_response(model_name, rx, cancel, state.continuations.clone())
     } else {
@@ -187,6 +188,7 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 async fn spawn_turn(
     state: &AppState,
     req: ChatRequest,
+    image_projection: crate::image_norm::VisionProjectionCache,
     cancel: CancellationToken,
     hard_cancel: bool,
 ) -> mpsc::Receiver<TurnEvent> {
@@ -261,26 +263,33 @@ async fn spawn_turn(
     // arguments, or message content. Research deliberately offers only its
     // preset's server tools; ordinary turns merge app-hosted definitions after
     // applying the client's server-tool selection.
-    let (tools_offered, server_tools_offered, app_tool_names) = if let Some(preset) = preset {
-        let allow = Some(
-            preset
-                .tools
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-        );
-        let server = crate::orchestrator::turn::select_schemas(tools.schemas(), &allow);
-        (server.len(), server.len(), Vec::new())
-    } else {
-        let offered = crate::orchestrator::turn::merge_tool_schemas(
-            tools.schemas(),
-            &enabled_tools,
-            app_tools.clone(),
-        );
-        let mut app_names: Vec<String> = offered.app_names.into_iter().collect();
-        app_names.sort_unstable();
-        (offered.schemas.len(), offered.server_names.len(), app_names)
-    };
+    let server_schemas = tools.schemas();
+    let (tools_offered, server_tools_offered, app_tool_names, offered) =
+        if let Some(preset) = preset {
+            let allow = Some(
+                preset
+                    .tools
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            );
+            let server = crate::orchestrator::turn::select_schemas(server_schemas, &allow);
+            (server.len(), server.len(), Vec::new(), None)
+        } else {
+            let offered = crate::orchestrator::turn::merge_tool_schemas(
+                server_schemas,
+                &enabled_tools,
+                app_tools.clone(),
+            );
+            let mut app_names: Vec<String> = offered.app_names.iter().cloned().collect();
+            app_names.sort_unstable();
+            (
+                offered.schemas.len(),
+                offered.server_names.len(),
+                app_names,
+                Some(offered),
+            )
+        };
     let app_tools_offered = app_tool_names.len();
     let log_model = model.clone();
     // Resolved research mode id (if any) for per-turn logging.
@@ -302,6 +311,10 @@ async fn spawn_turn(
     if cfg.log_content {
         tracing::debug!(turn_id, messages = ?messages, "turn content");
     }
+    let prepared = offered.map(|offered| crate::orchestrator::turn::PreparedOrdinaryTurn {
+        offered,
+        vision: image_projection.project(&messages),
+    });
 
     let recorder = crate::metrics::TurnRecorder::new(state.metrics.clone());
     let observed = observe_turn(
@@ -326,24 +339,46 @@ async fn spawn_turn(
             mode,
             "turn started"
         );
-        run_turn(
-            cfg,
-            backend,
-            tools,
-            sem,
-            messages,
-            model,
-            options,
-            enabled_tools,
-            app_tools,
-            preset,
-            images,
-            recorder,
-            tx,
-            cancel,
-            hard_cancel,
-        )
-        .await;
+        if let Some(prepared) = prepared {
+            crate::orchestrator::turn::run_turn_prepared(
+                cfg,
+                backend,
+                tools,
+                sem,
+                messages,
+                model,
+                options,
+                enabled_tools,
+                app_tools,
+                preset,
+                images,
+                recorder,
+                tx,
+                cancel,
+                hard_cancel,
+                prepared,
+            )
+            .await;
+        } else {
+            run_turn(
+                cfg,
+                backend,
+                tools,
+                sem,
+                messages,
+                model,
+                options,
+                enabled_tools,
+                app_tools,
+                preset,
+                images,
+                recorder,
+                tx,
+                cancel,
+                hard_cancel,
+            )
+            .await;
+        }
         tracing::info!(
             turn_id,
             model = %log_model,
@@ -384,7 +419,17 @@ fn observe_turn(
         let mut ttft = None;
         let mut outcome = TurnOutcome::Cancelled;
         let mut disconnected = false;
-        while let Some(ev) = rx.recv().await {
+        let mut pending = None;
+        let mut sent_token = false;
+        let mut sent_reasoning = false;
+        loop {
+            let ev = match pending.take() {
+                Some(ev) => ev,
+                None => match rx.recv().await {
+                    Some(ev) => ev,
+                    None => break,
+                },
+            };
             match &ev {
                 TurnEvent::Token(_) | TurnEvent::Reasoning(_) if ttft.is_none() => {
                     ttft = Some(started.elapsed());
@@ -393,6 +438,54 @@ fn observe_turn(
                 TurnEvent::Error(_) => outcome = TurnOutcome::Errored,
                 _ => {}
             }
+
+            let (is_reasoning, mut text) = match ev {
+                TurnEvent::Token(text) => (false, text),
+                TurnEvent::Reasoning(text) => (true, text),
+                other => {
+                    if tx.send(other).await.is_err() {
+                        disconnected = true;
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let first_of_kind = if is_reasoning {
+                !std::mem::replace(&mut sent_reasoning, true)
+            } else {
+                !std::mem::replace(&mut sent_token, true)
+            };
+
+            // Preserve each stream's first delta for TTFT/UI responsiveness.
+            // Thereafter combine adjacent deltas for a few milliseconds, which
+            // greatly cuts JSON/SSE parsing and SwiftUI publication overhead at
+            // high decode rates without changing the final text.
+            if !first_of_kind {
+                let delay = tokio::time::sleep(Duration::from_millis(12));
+                tokio::pin!(delay);
+                loop {
+                    tokio::select! {
+                        next = rx.recv() => match next {
+                            Some(TurnEvent::Token(next)) if !is_reasoning => text.push_str(&next),
+                            Some(TurnEvent::Reasoning(next)) if is_reasoning => text.push_str(&next),
+                            Some(other) => {
+                                pending = Some(other);
+                                break;
+                            }
+                            None => break,
+                        },
+                        _ = &mut delay => break,
+                    }
+                    if text.len() >= 4_096 {
+                        break;
+                    }
+                }
+            }
+            let ev = if is_reasoning {
+                TurnEvent::Reasoning(text)
+            } else {
+                TurnEvent::Token(text)
+            };
             if tx.send(ev).await.is_err() {
                 disconnected = true;
                 break;
@@ -915,6 +1008,24 @@ mod tests {
         assert_eq!(stats.turn_duration.snapshot().count, 1);
         assert_eq!(metrics.turns_active.get(), 0);
         assert_eq!(metrics.sse_disconnects.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn forwarder_preserves_first_delta_then_coalesces_the_burst() {
+        let (_metrics, tx, mut out) = forwarder_fixture();
+        tx.send(TurnEvent::Token("first".into())).await.unwrap();
+        tx.send(TurnEvent::Token(" second".into())).await.unwrap();
+        tx.send(TurnEvent::Token(" third".into())).await.unwrap();
+        tx.send(TurnEvent::Done {
+            reason: "stop".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        assert!(matches!(out.recv().await, Some(TurnEvent::Token(t)) if t == "first"));
+        assert!(matches!(out.recv().await, Some(TurnEvent::Token(t)) if t == " second third"));
+        assert!(matches!(out.recv().await, Some(TurnEvent::Done { .. })));
     }
 
     #[tokio::test]
