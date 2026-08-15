@@ -166,6 +166,18 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(events, [.token("one "), .token("two"), .done])
     }
 
+    func testLengthFinishSurfacesOutputLimit() async throws {
+        let lines = [
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"plan\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}",
+            "",
+            "data: [DONE]",
+        ]
+        let events = try await collect(chatEventStream(lines: linesStream(lines)))
+        XCTAssertEqual(events, [.reasoning("plan"), .outputLimit, .done])
+    }
+
     func testJunkChunkIsTolerated() async throws {
         // A malformed data line must not break the stream (FR-A8 robustness).
         let lines = [

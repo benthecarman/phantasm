@@ -1,6 +1,6 @@
 //! Shared application state, cheaply cloneable (`Arc` internals).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -165,6 +165,10 @@ pub struct CapabilitySnapshot {
     pub version: String,
     pub models: Vec<ModelInfo>,
     pub tool_selectors: Vec<ToolSelector>,
+    /// Estimated prompt tokens for each concrete server-tool schema. Clients
+    /// subtract selected entries from their history budget before inference.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_prompt_tokens: BTreeMap<String, u64>,
     /// Research modes (mode-suffixed model ids) the app may offer, populated from
     /// the server-side preset table — but only when their required tools are
     /// usable (currently `web_search`). Empty otherwise. Additive, ignorable by

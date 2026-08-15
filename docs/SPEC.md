@@ -94,7 +94,12 @@ image generation on top of plain inference.
       "label": "Media generation",
       "tools": ["image_generation", "image_edit", "audio_generation", "video_generation"]
     }
-  ]
+  ],
+  "tool_prompt_tokens": {
+    "web_search": 812,
+    "web_fetch": 246,
+    "calculator": 96
+  }
 }
 ```
 
@@ -148,6 +153,12 @@ enabled, the app sends the concrete server-side schema names listed in that
 entry's `tools[]` as standard OpenAI `tools[].function.name` entries; e.g. the
 `web_search` selector may send `web_search`, `weather`, and `github` together
 when all three concrete tools are listed.
+
+`tool_prompt_tokens`, when present, maps each concrete server-tool name to a
+conservative estimate of its schema cost. The app adds the selected estimates
+and its app-hosted schema costs before it compacts history. This preserves the
+model's output reserve. Older clients can ignore this additive field. Clients
+use a conservative fallback when an older server omits it.
 
 Buckets are grouped by what a user reasons about, not by implementation:
 `web_search` holds the tools that reach **out to the internet** (search, fetch,

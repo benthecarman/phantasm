@@ -771,6 +771,26 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(client.requests.count, 1)
     }
 
+    func testReasoningOutputLimitSurfacesActionableError() async throws {
+        let store = try AppDatabase.empty()
+        let client = ScriptedChatClient()
+        let env = FakeChatEnvironment(client: client)
+        let conversation = Conversation()
+        let vm = makeViewModel(env: env, store: store, conversation: conversation)
+        vm.setViewVisible(true)
+
+        client.enqueue(events: [.reasoning("thinking trace"), .outputLimit, .done])
+
+        vm.send("think but do not answer")
+
+        let expected = AppError.modelError(
+            "The model reached its output limit while thinking. Disable some tools, shorten the conversation, or use a larger context window."
+        ).userMessage
+        try await waitUntil { vm.errorMessage == expected }
+        XCTAssertFalse(vm.isStreaming)
+        XCTAssertEqual(client.requests.count, 1)
+    }
+
     func testCompletedThinkingDurationIsPersisted() async throws {
         let store = try AppDatabase.empty()
         let client = ScriptedChatClient()

@@ -37,6 +37,14 @@ public struct ToolSpec: Encodable, Sendable {
         self.type = "function"
         self.function = Function(name: name, description: description, parameters: parameters)
     }
+
+    /// Conservative prompt cost for an app-hosted schema. Server tools use the
+    /// estimates advertised by `/v1/capabilities` because their schemas stay
+    /// invisible to the app.
+    public var estimatedPromptTokens: Int {
+        let bytes = (try? Wire.encoder().encode(self))?.count ?? 0
+        return (bytes + 3) / 4 + 16
+    }
 }
 
 /// A minimal JSON value, just enough to express an app tool's JSON-Schema
@@ -440,6 +448,9 @@ public struct Capabilities: Decodable, Sendable, Equatable {
     public let version: String
     public let modelEntries: [Model]
     public let toolSelectors: [ToolSelector]
+    /// Per-concrete-server-tool prompt estimates advertised by Phantasm.
+    /// Missing on older servers and non-Phantasm backends.
+    public let toolPromptTokens: [String: Int]
     public let modes: [Mode]
 
     /// Model ids to offer in the chat picker. Unknown capabilities stay
@@ -498,11 +509,13 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         version: String,
         modelEntries: [Model],
         toolSelectors: [ToolSelector] = [],
+        toolPromptTokens: [String: Int] = [:],
         modes: [Mode] = []
     ) {
         self.version = version
         self.modelEntries = modelEntries
         self.toolSelectors = toolSelectors
+        self.toolPromptTokens = toolPromptTokens
         self.modes = modes
     }
 
@@ -514,6 +527,7 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         case version
         case models
         case toolSelectors
+        case toolPromptTokens
         case modes
     }
 
@@ -522,6 +536,10 @@ public struct Capabilities: Decodable, Sendable, Equatable {
         version = try container.decode(String.self, forKey: .version)
         modelEntries = try container.decode([Model].self, forKey: .models)
         toolSelectors = try container.decodeIfPresent([ToolSelector].self, forKey: .toolSelectors) ?? []
+        toolPromptTokens = try container.decodeIfPresent(
+            [String: Int].self,
+            forKey: .toolPromptTokens
+        ) ?? [:]
         modes = try container.decodeIfPresent([Mode].self, forKey: .modes) ?? []
     }
 

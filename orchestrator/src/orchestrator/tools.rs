@@ -4,7 +4,7 @@
 //! scripted executor. `ToolRegistry` is the production implementation: it owns
 //! the HTTP client + config and dispatches to the concrete tool modules.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -130,62 +130,85 @@ impl ToolRegistry {
     }
 }
 
+/// Approximate prompt tokens contributed by each advertised server-tool schema.
+/// The app has no model tokenizer, so use the same conservative four-byte
+/// heuristic as its history compactor, plus a small per-tool envelope reserve.
+/// Only `names` requested by the capability manifest are returned.
+pub(crate) fn schema_token_estimates(
+    cfg: &Config,
+    names: &HashSet<String>,
+) -> BTreeMap<String, u64> {
+    configured_schemas(cfg, true)
+        .into_iter()
+        .filter_map(|schema| {
+            let name = schema.get("function")?.get("name")?.as_str()?.to_string();
+            if !names.contains(&name) {
+                return None;
+            }
+            let bytes = serde_json::to_vec(&schema).ok()?.len() as u64;
+            Some((name, bytes.div_ceil(4) + 16))
+        })
+        .collect()
+}
+
+fn configured_schemas(cfg: &Config, include_code_exec: bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    if cfg.web_search_usable() {
+        out.push(web_search::schema(cfg.search_thorough_usable()));
+    }
+    if cfg.web_fetch_usable() {
+        out.push(web_fetch::schema());
+    }
+    if cfg.calculator_usable() {
+        out.push(calculator::schema());
+    }
+    if cfg.time_usable() {
+        out.push(time_tool::schema());
+    }
+    if cfg.unit_convert_usable() {
+        out.push(unit_convert::schema());
+    }
+    if cfg.weather_usable() {
+        out.push(weather::schema());
+    }
+    if cfg.sports_usable() {
+        out.push(sports::schema());
+    }
+    if cfg.maps_places_usable() {
+        out.push(maps_places::schema());
+    }
+    if cfg.market_data_usable() {
+        out.push(market_data::schema());
+    }
+    if cfg.github_usable() {
+        out.push(github::schema());
+    }
+    if cfg.ocr_usable() {
+        out.push(ocr::schema());
+    }
+    if cfg.code_exec_usable() && include_code_exec {
+        out.push(code_exec::schema(&cfg.code_exec_languages));
+    }
+    if cfg.image_gen_usable() {
+        out.push(image_gen::schema());
+    }
+    if cfg.image_edit_usable() {
+        out.push(image_edit::schema());
+    }
+    if cfg.audio_gen_usable() {
+        out.push(audio_gen::schema());
+    }
+    if cfg.video_gen_usable() {
+        out.push(video_gen::schema());
+    }
+    out
+}
+
 impl ToolExecutor for ToolRegistry {
     fn schemas(&self) -> Vec<Value> {
-        let mut out = Vec::new();
-        if self.cfg.web_search_usable() {
-            out.push(web_search::schema(self.cfg.search_thorough_usable()));
-        }
-        if self.cfg.web_fetch_usable() {
-            out.push(web_fetch::schema());
-        }
-        if self.cfg.calculator_usable() {
-            out.push(calculator::schema());
-        }
-        if self.cfg.time_usable() {
-            out.push(time_tool::schema());
-        }
-        if self.cfg.unit_convert_usable() {
-            out.push(unit_convert::schema());
-        }
-        if self.cfg.weather_usable() {
-            out.push(weather::schema());
-        }
-        if self.cfg.sports_usable() {
-            out.push(sports::schema());
-        }
-        if self.cfg.maps_places_usable() {
-            out.push(maps_places::schema());
-        }
-        if self.cfg.market_data_usable() {
-            out.push(market_data::schema());
-        }
-        if self.cfg.github_usable() {
-            out.push(github::schema());
-        }
-        if self.cfg.ocr_usable() {
-            out.push(ocr::schema());
-        }
-        if self.cfg.code_exec_usable() && self.code_exec.is_some() {
-            // A single `code_exec` tool, advertised in both the utilities and
-            // web-access buckets. Whether the run gets internet is decided per turn
-            // from whether web access is on (see `TurnContext::web_access`), not
-            // from the tool name.
-            out.push(code_exec::schema(&self.cfg.code_exec_languages));
-        }
-        if self.cfg.image_gen_usable() {
-            out.push(image_gen::schema());
-        }
-        if self.cfg.image_edit_usable() {
-            out.push(image_edit::schema());
-        }
-        if self.cfg.audio_gen_usable() {
-            out.push(audio_gen::schema());
-        }
-        if self.cfg.video_gen_usable() {
-            out.push(video_gen::schema());
-        }
-        out
+        // A single `code_exec` schema appears only when its warm pools exist.
+        // Whether execution gets internet is selected later from `TurnContext`.
+        configured_schemas(&self.cfg, self.code_exec.is_some())
     }
 
     async fn execute(

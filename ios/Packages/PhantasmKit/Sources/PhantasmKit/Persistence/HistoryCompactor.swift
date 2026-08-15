@@ -63,15 +63,31 @@ public enum HistoryCompactor {
     private static let maximumSummaryCharacters = 4_000
     private static let maximumSummaryCharactersPerMessage = 400
 
-    public static func inputTokenBudget(contextLength: Int?) -> Int {
+    public static func inputTokenBudget(
+        contextLength: Int?,
+        reservedInputTokens: Int = 0
+    ) -> Int {
         let context = max(contextLength ?? defaultContextLength, minimumInputTokens)
         let outputReserve = max(2_048, context / 8)
-        return min(maximumInputTokens, max(1_024, context - outputReserve))
+        let available = context - outputReserve - max(0, reservedInputTokens)
+        return min(maximumInputTokens, max(1_024, available))
+    }
+
+    /// Whether selected tool schemas leave enough room for at least one small
+    /// user turn after preserving the normal output reserve.
+    public static func toolsFit(
+        contextLength: Int?,
+        reservedInputTokens: Int
+    ) -> Bool {
+        guard let contextLength, contextLength > 0 else { return true }
+        let outputReserve = max(2_048, contextLength / 8)
+        return contextLength - outputReserve - max(0, reservedInputTokens) >= 1_024
     }
 
     public static func prepare(
         _ history: [ChatMessage],
-        contextLength: Int?
+        contextLength: Int?,
+        reservedInputTokens: Int = 0
     ) -> PreparedHistory {
         let completed = history.filter { $0.message.isComplete }
         guard !completed.isEmpty else {
@@ -79,7 +95,10 @@ public enum HistoryCompactor {
         }
 
         let groups = historyGroups(completed)
-        let budget = inputTokenBudget(contextLength: contextLength)
+        let budget = inputTokenBudget(
+            contextLength: contextLength,
+            reservedInputTokens: reservedInputTokens
+        )
         let recentBudget = max(1_024, budget - summaryReserveTokens)
         var selected: [[ChatMessage]] = []
         var used = 0

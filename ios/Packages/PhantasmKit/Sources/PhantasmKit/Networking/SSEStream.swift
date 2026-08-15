@@ -64,6 +64,7 @@ public enum ChatStreamEvent: Sendable, Equatable {
     case progress(String, Double) // x_status + normalized x_progress
     case throughput(Double) // upstream-reported or usage-derived token rate
     case toolCalls([WireToolCall]) // forwarded app-hosted tool calls (finish_reason: tool_calls)
+    case outputLimit        // finish_reason: length
     case done
 }
 
@@ -161,8 +162,12 @@ public func chatEventStream<Lines: AsyncSequence & Sendable>(
                     let key = call.index ?? offset
                     mergeToolCall(call, into: &toolCalls, key: key)
                 }
-                return chunk.choices.first?.finishReason?
-                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                let finishReason = chunk.choices.first?.finishReason?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if finishReason?.caseInsensitiveCompare("length") == .orderedSame {
+                    continuation.yield(.outputLimit)
+                }
+                return finishReason?.isEmpty == false
             }
 
             // Emit accumulated tool calls (ordered by index) before `.done`.

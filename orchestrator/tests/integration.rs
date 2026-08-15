@@ -552,6 +552,7 @@ fn test_capabilities() -> CapabilitySnapshot {
             reasoning_efforts: vec![],
         }],
         tool_selectors: vec![],
+        tool_prompt_tokens: Default::default(),
         modes: vec![],
     }
 }

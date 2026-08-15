@@ -17,7 +17,8 @@ final class CapabilityDecodeTests: XCTestCase {
          "tool_selectors":[
            {"id":"web_search","label":"Web search","tools":["web_search","weather"]},
            {"id":"utilities","label":"Utilities","tools":["calculator"]}
-         ]}
+         ],
+         "tool_prompt_tokens":{"web_search":812,"weather":224,"calculator":96}}
         """
         let caps = try Wire.decoder().decode(Capabilities.self, from: Data(json.utf8))
         XCTAssertEqual(caps.models, ["llama3.1", "qwen2.5:14b"])
@@ -35,6 +36,7 @@ final class CapabilityDecodeTests: XCTestCase {
         XCTAssertTrue(caps.hasToolSelector(ToolSelectorName.webSearch))
         XCTAssertTrue(caps.hasToolSelector(ToolSelectorName.utilities))
         XCTAssertFalse(caps.hasToolSelector(ToolSelectorName.imageGeneration))
+        XCTAssertEqual(caps.toolPromptTokens["web_search"], 812)
         XCTAssertEqual(caps.toolModelIDs, ["qwen2.5:14b"])
 
         let mode = BackendMode.full(caps)

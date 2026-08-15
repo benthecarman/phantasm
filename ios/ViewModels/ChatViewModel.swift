@@ -819,22 +819,6 @@ final class ChatViewModel {
             availableModes: session.mode.availableModes,
             baseModelIsToolCapable: session.supportsTools(model)
         )
-        let prepared = HistoryCompactor.prepare(
-            detail.messages,
-            contextLength: session.contextLengths?[model]
-        )
-        guard let attachmentPayloads = try? await store.attachmentPayloads(
-            ids: prepared.requiredAttachmentIDs
-        ) else {
-            finish(
-                generation: generation,
-                error: .modelError("Could not load the conversation attachments.")
-            )
-            return
-        }
-        let wireHistory = prepared
-            .hydratingAttachments(from: attachmentPayloads)
-            .wireHistory()
         // Scope which server tools this turn may use (spec §2.3). Omitted entirely
         // for backends with no tool manifest, keeping those requests standard.
         // App-hosted tools (e.g. ask_user) ride as full schemas the orchestrator
@@ -857,14 +841,53 @@ final class ChatViewModel {
                 }
             }
             : []
+        let enabledTools = detail.conversation.requestedToolNames(
+            supporting: session.mode.capabilities?.toolSelectors
+        )
+        let advertisedToolCosts = session.mode.capabilities?.toolPromptTokens ?? [:]
+        let serverToolTokens = Set(enabledTools ?? []).reduce(0) { total, name in
+            // Older Phantasm servers do not advertise estimates. Reserve a
+            // conservative fallback instead of recreating the original blind spot.
+            total + (advertisedToolCosts[name] ?? 512)
+        }
+        let toolPromptTokens = serverToolTokens
+            + appTools.reduce(0) { $0 + $1.estimatedPromptTokens }
+        let contextLength = session.contextLengths?[model]
+        guard HistoryCompactor.toolsFit(
+            contextLength: contextLength,
+            reservedInputTokens: toolPromptTokens
+        ) else {
+            finish(
+                generation: generation,
+                error: .modelError(
+                    "Enabled tools use too much of this model's context window. Disable some tools or select a model with a larger context window."
+                )
+            )
+            return
+        }
+        let prepared = HistoryCompactor.prepare(
+            detail.messages,
+            contextLength: contextLength,
+            reservedInputTokens: toolPromptTokens
+        )
+        guard let attachmentPayloads = try? await store.attachmentPayloads(
+            ids: prepared.requiredAttachmentIDs
+        ) else {
+            finish(
+                generation: generation,
+                error: .modelError("Could not load the conversation attachments.")
+            )
+            return
+        }
+        let wireHistory = prepared
+            .hydratingAttachments(from: attachmentPayloads)
+            .wireHistory()
         let request = ChatRequest(
             model: wireModel,
             messages: wireHistory,
             stream: true,
             reasoningEffort: session.reasoningEffort(for: model),
-            enabledTools: detail.conversation.requestedToolNames(
-                supporting: session.mode.capabilities?.toolSelectors
-            ),
+            enabledTools: enabledTools,
             appTools: appTools
         )
         // The pending assistant message id keys this turn for resume: it's sent as
@@ -892,6 +915,7 @@ final class ChatViewModel {
         // `URLSession.bytes` ends the stream *without throwing*, so this flag, not
         // the catch below, is what tells a real completion from an interruption.
         var sawDone = false
+        var reachedOutputLimit = false
         do {
             for try await event in stream {
                 guard ownsTurn(generation) else { return }
@@ -924,6 +948,8 @@ final class ChatViewModel {
                     if statusText != nil { statusText = nil }
                     if statusProgress != nil { statusProgress = nil }
                     batchedCalls = calls
+                case .outputLimit:
+                    reachedOutputLimit = true
                 case .done:
                     sawDone = true
                 }
@@ -967,6 +993,14 @@ final class ChatViewModel {
                 let completionError: AppError?
                 if !sawDone {
                     completionError = .modelError("The connection closed before the response finished.")
+                } else if reachedOutputLimit, reasoningOnlyResponse {
+                    completionError = .modelError(
+                        "The model reached its output limit while thinking. Disable some tools, shorten the conversation, or use a larger context window."
+                    )
+                } else if reachedOutputLimit {
+                    completionError = .modelError(
+                        "The model reached its output limit before the response finished. Shorten the conversation or use a larger context window."
+                    )
                 } else if reasoningOnlyResponse {
                     completionError = .modelError("The model produced thinking but no answer.")
                 } else if emptyResponse {

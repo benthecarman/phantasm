@@ -214,6 +214,12 @@ pub async fn probe_capabilities(
 
     let brave_web_search = cfg.web_search_usable();
     let tool_selectors = tool_selectors(cfg, http).await;
+    let advertised_tool_names = tool_selectors
+        .iter()
+        .flat_map(|selector| selector.tools.iter().cloned())
+        .collect();
+    let tool_prompt_tokens =
+        crate::orchestrator::tools::schema_token_estimates(cfg, &advertised_tool_names);
     let image_generation = tool_selectors
         .iter()
         .any(|selector| selector.id == "image_generation");
@@ -245,6 +251,7 @@ pub async fn probe_capabilities(
         version: env!("CARGO_PKG_VERSION").to_string(),
         models,
         tool_selectors,
+        tool_prompt_tokens,
         modes,
     }
 }
@@ -583,6 +590,7 @@ pub fn build_state_with_upstreams(
 #[cfg(test)]
 mod tests {
     use super::{make_selector, offline_tool_selectors, tool_selector_id};
+    use std::collections::HashSet;
 
     #[test]
     fn tool_selector_id_groups_network_and_local_tools() {
@@ -652,5 +660,16 @@ mod tests {
                 .all(|tool| tool != "code_exec"),
             "code_exec must fail closed when deployment preflight fails"
         );
+    }
+
+    #[test]
+    fn tool_prompt_estimates_cover_advertised_names() {
+        let mut cfg = crate::config::tests_support::minimal();
+        cfg.calculator_enabled = true;
+        let names = HashSet::from(["calculator".to_string()]);
+        let estimates = crate::orchestrator::tools::schema_token_estimates(&cfg, &names);
+
+        assert!(estimates["calculator"] > 16);
+        assert_eq!(estimates.len(), 1);
     }
 }

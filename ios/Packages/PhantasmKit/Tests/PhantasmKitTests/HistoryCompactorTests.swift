@@ -37,6 +37,28 @@ final class HistoryCompactorTests: XCTestCase {
         XCTAssertNil(prepared.earlierSummary)
     }
 
+    func testToolSchemasReduceHistoryBudget() {
+        XCTAssertEqual(
+            HistoryCompactor.inputTokenBudget(
+                contextLength: 8_192,
+                reservedInputTokens: 2_000
+            ),
+            4_144
+        )
+        XCTAssertTrue(
+            HistoryCompactor.toolsFit(
+                contextLength: 8_192,
+                reservedInputTokens: 5_000
+            )
+        )
+        XCTAssertFalse(
+            HistoryCompactor.toolsFit(
+                contextLength: 8_192,
+                reservedInputTokens: 5_121
+            )
+        )
+    }
+
     func testLargeOlderPrefixBecomesSummaryAndNewestMessageRemains() {
         let history = [
             chat(role: "user", content: "old " + String(repeating: "x", count: 3_000), position: 1),
