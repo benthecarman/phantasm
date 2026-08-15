@@ -42,7 +42,9 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::ollama::ChatBackend;
 use crate::openai::types::ChatMessage;
-use crate::orchestrator::tools::{ToolExecutor, TurnContext};
+use crate::orchestrator::tools::{
+    guard_tool_calls, invalid_arguments_outcome, ToolExecutor, TurnContext,
+};
 use crate::orchestrator::turn::{select_schemas, stream_relay};
 use crate::orchestrator::{ResearchPreset, TurnEvent};
 
@@ -318,7 +320,7 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
         if cancel.is_cancelled() {
             break;
         }
-        let resp =
+        let mut resp =
             match chat_once_permit(backend, sem, model, &msgs, schemas, options, cancel).await {
                 Some(Ok(m)) => m,
                 Some(Err(e)) => {
@@ -329,16 +331,26 @@ async fn run_subagent<B: ChatBackend, T: ToolExecutor>(
                 }
                 None => break, // cancelled
             };
-        match resp.tool_calls.clone().filter(|c| !c.is_empty()) {
+        match resp.tool_calls.take().filter(|c| !c.is_empty()) {
             None => {
                 msgs.push(resp);
                 break; // sub-agent decided it is done searching
             }
             Some(calls) => {
+                let calls = guard_tool_calls(calls);
+                resp.tool_calls = Some(calls.iter().map(|c| c.call.clone()).collect());
                 msgs.push(resp);
-                for call in &calls {
+                for guarded in &calls {
+                    let call = &guarded.call;
                     if cancel.is_cancelled() || searches_left == 0 {
                         break 'agent;
+                    }
+                    if !guarded.arguments_valid {
+                        if allowed_tools.contains(call.function.name.as_str()) {
+                            tools.record_guard_rejection(call);
+                        }
+                        msgs.push(invalid_arguments_outcome(call).message);
+                        continue;
                     }
                     if !allowed_tools.contains(call.function.name.as_str()) {
                         tracing::warn!(

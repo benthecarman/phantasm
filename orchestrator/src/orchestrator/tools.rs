@@ -13,7 +13,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::openai::types::{ChatMessage, ToolCall};
+use crate::openai::sse::ensure_call_id;
+use crate::openai::types::{ChatMessage, RawArguments, ToolCall};
 use crate::orchestrator::TurnEvent;
 use crate::tools::{
     audio_gen, calculator, code_exec, code_exec_pool::CodeExecPools, github, image_edit, image_gen,
@@ -32,6 +33,79 @@ pub struct ToolOutcome {
     /// otherwise invisible outside logs, and the message text is deliberately
     /// not sniffed (tools word their errors freely).
     pub is_error: bool,
+}
+
+/// A model-produced call after the common tool boundary has made it safe to
+/// store and send to an upstream again. Invalid arguments become `{}` on the
+/// wire, while `arguments_valid` keeps execution from using that replacement.
+#[derive(Clone)]
+pub(crate) struct GuardedToolCall {
+    pub call: ToolCall,
+    pub arguments_valid: bool,
+}
+
+/// Normalize tool-call ids and arguments before dispatch or history storage.
+///
+/// OpenAI-compatible hosts require `function.arguments` in assistant history
+/// to contain a complete JSON object. Some models stream a truncated string.
+/// Sending that string back makes strict hosts reject the recovery turn. Keep
+/// the call/result pair valid by storing `{}` and folding a structured error
+/// into the tool result instead. The placeholder is never executed. Empty
+/// arguments are invalid too; only an explicit JSON object can run a tool.
+pub(crate) fn guard_tool_calls(calls: Vec<ToolCall>) -> Vec<GuardedToolCall> {
+    calls
+        .into_iter()
+        .map(|mut call| {
+            call.id = Some(ensure_call_id(&call));
+            let canonical = canonical_argument_object(&call.function.arguments);
+            let arguments_valid = canonical.is_some();
+            call.function.arguments = RawArguments::Str(canonical.unwrap_or_else(|| "{}".into()));
+
+            if !arguments_valid {
+                tracing::warn!(
+                    tool = %call.function.name,
+                    call_id = %call.id.as_deref().unwrap_or_default(),
+                    "tool call rejected because arguments are not a complete JSON object"
+                );
+            }
+
+            GuardedToolCall {
+                call,
+                arguments_valid,
+            }
+        })
+        .collect()
+}
+
+fn canonical_argument_object(arguments: &RawArguments) -> Option<String> {
+    let value = match arguments {
+        RawArguments::Str(raw) => serde_json::from_str(raw).ok()?,
+        RawArguments::Obj(value) => value.clone(),
+    };
+    value.is_object().then(|| value.to_string())
+}
+
+/// A safe model-visible result for a call rejected by [`guard_tool_calls`].
+/// The original argument text is not included because it can contain user data.
+pub(crate) fn invalid_arguments_outcome(call: &ToolCall) -> ToolOutcome {
+    let content = json!({
+        "ok": false,
+        "error": {
+            "code": "invalid_arguments",
+            "retryable": true,
+            "message": "Arguments must be one complete JSON object. Call the tool again with valid arguments."
+        }
+    })
+    .to_string();
+    ToolOutcome {
+        message: ChatMessage::tool_result(
+            call.id.as_deref().unwrap_or_default(),
+            &call.function.name,
+            content,
+        ),
+        append_to_answer: None,
+        is_error: true,
+    }
 }
 
 /// A within-turn dedup cache, shared (cheaply, behind `Arc<Mutex<_>>`) across
@@ -85,6 +159,10 @@ pub struct TurnContext {
 pub trait ToolExecutor: Send + Sync + Clone + 'static {
     /// JSON-Schema tool definitions offered to the model (empty => plain chat).
     fn schemas(&self) -> Vec<Value>;
+
+    /// Record a call that the shared guard rejected before execution. Test and
+    /// alternate executors need no bookkeeping, so their default is a no-op.
+    fn record_guard_rejection(&self, _call: &ToolCall) {}
 
     /// Execute one tool call. Never returns an error: tool failures are folded
     /// into the returned `tool` message so the model can continue (NFR-O6).
@@ -209,6 +287,16 @@ impl ToolExecutor for ToolRegistry {
         // A single `code_exec` schema appears only when its warm pools exist.
         // Whether execution gets internet is selected later from `TurnContext`.
         configured_schemas(&self.cfg, self.code_exec.is_some())
+    }
+
+    fn record_guard_rejection(&self, call: &ToolCall) {
+        self.metrics.record_tool_call(
+            &call.function.name,
+            true,
+            &self.model,
+            std::time::Duration::ZERO,
+            true,
+        );
     }
 
     async fn execute(
@@ -348,4 +436,63 @@ pub fn tool_envelope(name: &str, description: &str, parameters: Value) -> Value 
             "parameters": parameters,
         }
     })
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use crate::openai::types::FunctionCall;
+
+    fn call(arguments: RawArguments) -> ToolCall {
+        ToolCall {
+            id: None,
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "test_tool".into(),
+                arguments,
+            },
+        }
+    }
+
+    #[test]
+    fn guard_canonicalizes_valid_argument_objects() {
+        let guarded = guard_tool_calls(vec![
+            call(RawArguments::Str("{ \"value\": 1 }".into())),
+            call(RawArguments::Obj(json!({"value": 2}))),
+        ]);
+
+        assert!(guarded.iter().all(|call| call.arguments_valid));
+        assert!(guarded.iter().all(|call| call.call.id.is_some()));
+        assert_eq!(
+            guarded[0].call.function.arguments.to_json_string(),
+            r#"{"value":1}"#
+        );
+        assert_eq!(
+            guarded[1].call.function.arguments.to_json_string(),
+            r#"{"value":2}"#
+        );
+    }
+
+    #[test]
+    fn guard_rejects_incomplete_and_non_object_arguments() {
+        let guarded = guard_tool_calls(vec![
+            call(RawArguments::Str("  ".into())),
+            call(RawArguments::Str(r#"{"value":"incomplete"#.into())),
+            call(RawArguments::Str("[]".into())),
+        ]);
+
+        assert!(guarded.iter().all(|call| !call.arguments_valid));
+        assert!(guarded
+            .iter()
+            .all(|call| call.call.function.arguments.to_json_string() == "{}"));
+        let outcome = invalid_arguments_outcome(&guarded[0].call);
+        let text = outcome
+            .message
+            .content
+            .and_then(|content| content.into_text_and_images().0)
+            .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_arguments");
+        assert_eq!(value["error"]["retryable"], true);
+    }
 }

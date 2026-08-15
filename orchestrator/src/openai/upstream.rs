@@ -870,11 +870,11 @@ impl ToolCallAccumulator {
                     kind: call.kind.clone().unwrap_or_else(|| "function".into()),
                     function: FunctionCall {
                         name: call.name.clone(),
-                        arguments: RawArguments::Str(if call.arguments.trim().is_empty() {
-                            "{}".into()
-                        } else {
-                            call.arguments.clone()
-                        }),
+                        // Preserve an empty or incomplete stream exactly. The
+                        // shared tool guard rejects it before execution and
+                        // inserts a safe history placeholder. Coercing here
+                        // would make malformed calls look executable.
+                        arguments: RawArguments::Str(call.arguments.clone()),
                     },
                 })
             })
@@ -1545,6 +1545,21 @@ mod tests {
         assert_eq!(calls[1].id.as_deref(), Some("call_b"));
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(calls[1].function.name, "get_weather");
+    }
+
+    #[test]
+    fn tool_call_accumulator_preserves_empty_arguments_for_guard() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.absorb_chunk(&json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_empty",
+                "function": {"name": "time"}
+            }]}}]
+        }));
+
+        let calls = acc.finish().unwrap().expect("one call");
+        assert_eq!(calls[0].function.arguments.to_json_string(), "");
     }
 
     #[test]

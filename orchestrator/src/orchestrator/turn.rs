@@ -26,9 +26,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::ollama::ChatBackend;
-use crate::openai::sse::ensure_call_id;
 use crate::openai::types::{ChatMessage, MessageContent, ToolCall};
-use crate::orchestrator::tools::{ToolExecutor, ToolOutcome, TurnContext};
+use crate::orchestrator::tools::{
+    guard_tool_calls, invalid_arguments_outcome, GuardedToolCall, ToolExecutor, ToolOutcome,
+    TurnContext,
+};
 use crate::orchestrator::{ResearchPreset, TurnEvent};
 
 /// Narrow a set of tool schemas to those the client asked for this turn.
@@ -417,7 +419,11 @@ async fn run_turn_inner<B, T>(
 
         {
             // Tool names are identifiers, not message content — safe to log.
-            let requested: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+            let calls = guard_tool_calls(calls);
+            let requested: Vec<&str> = calls
+                .iter()
+                .map(|c| c.call.function.name.as_str())
+                .collect();
             tracing::info!(
                 iter,
                 count = calls.len(),
@@ -433,28 +439,31 @@ async fn run_turn_inner<B, T>(
             // history (with their results) server-side as `held`, keyed off
             // the forwarded app call. The continuation request resumes from it
             // and the server tools stay invisible to the app.
-            let mut calls = calls;
-            for c in &mut calls {
-                // Normalize ids so the held assistant message, the forwarded
-                // app calls (the cache key), and the app's echoed
-                // `tool_call_id` all agree.
-                c.id = Some(ensure_call_id(c));
-            }
-            let (app_calls, server_calls): (Vec<ToolCall>, Vec<ToolCall>) = calls
+            // Only valid app calls leave the server. A malformed app call stays
+            // in the loop and receives the same structured rejection as a
+            // malformed server call, so the model can issue a corrected call.
+            let app_calls: Vec<GuardedToolCall> = calls
                 .iter()
+                .filter(|c| c.arguments_valid && app_names.contains(&c.call.function.name))
                 .cloned()
-                .partition(|c| app_names.contains(&c.function.name));
+                .collect();
+            let inline_calls: Vec<GuardedToolCall> = calls
+                .iter()
+                .filter(|c| !c.arguments_valid || !app_names.contains(&c.call.function.name))
+                .cloned()
+                .collect();
+            let history_calls: Vec<ToolCall> = calls.iter().map(|c| c.call.clone()).collect();
             if !app_calls.is_empty() {
-                let held = if server_calls.is_empty() {
+                let held = if inline_calls.is_empty() {
                     None
                 } else {
                     // Hold the assistant message (carrying *every* call) plus a
                     // `tool` result per executed server call, atop the history
                     // so far — exactly what resuming the loop needs.
-                    let resp = assistant_tool_calls_message(calls.clone());
+                    let resp = assistant_tool_calls_message(history_calls);
                     messages.push(resp);
                     let Some(outcomes) =
-                        execute_calls(&tools, &server_calls, &server_names, &ctx, &tx, &cancel)
+                        execute_calls(&tools, &inline_calls, &server_names, &ctx, &tx, &cancel)
                             .await
                     else {
                         return;
@@ -464,17 +473,19 @@ async fn run_turn_inner<B, T>(
                     }
                     Some(std::mem::take(&mut messages))
                 };
-                let forwarded: Vec<&str> =
-                    app_calls.iter().map(|c| c.function.name.as_str()).collect();
-                let server_ran: Vec<&str> = server_calls
+                let forwarded: Vec<&str> = app_calls
                     .iter()
-                    .map(|c| c.function.name.as_str())
+                    .map(|c| c.call.function.name.as_str())
+                    .collect();
+                let handled_inline: Vec<&str> = inline_calls
+                    .iter()
+                    .map(|c| c.call.function.name.as_str())
                     .collect();
                 tracing::info!(
                     app = ?forwarded,
-                    server = ?server_ran,
+                    inline = ?handled_inline,
                     held = held.is_some(),
-                    "forwarding app-hosted tool calls; co-occurring server calls executed inline"
+                    "forwarding app-hosted tool calls; co-occurring calls handled inline"
                 );
                 // Content queued for the final answer (e.g. an image a server
                 // tool generated in an EARLIER iteration) would be silently
@@ -486,7 +497,7 @@ async fn run_turn_inner<B, T>(
                 }
                 let _ = tx
                     .send(TurnEvent::ToolCalls {
-                        app: app_calls,
+                        app: app_calls.into_iter().map(|c| c.call).collect(),
                         held,
                     })
                     .await;
@@ -503,14 +514,14 @@ async fn run_turn_inner<B, T>(
             // omit ids, and history where `tool` results echo minted ids the
             // assistant `tool_calls` message lacks gets a 400 from strict
             // servers on the very next call.
-            let resp = assistant_tool_calls_message(calls.clone());
+            let resp = assistant_tool_calls_message(history_calls);
             // Mirror into the vision projection (when active) so the next
             // upstream call sees the same continuation. These messages carry
             // no images, so the clone is cheap and needs no downscaling.
             push_vision(&mut vision, &resp);
             messages.push(resp); // assistant message carrying the tool_calls
             let Some(outcomes) =
-                execute_calls(&tools, &calls, &server_names, &ctx, &tx, &cancel).await
+                execute_calls(&tools, &inline_calls, &server_names, &ctx, &tx, &cancel).await
             else {
                 return;
             };
@@ -695,13 +706,20 @@ fn assistant_tool_calls_message(calls: Vec<ToolCall>) -> ChatMessage {
 /// non-fatal "not offered" tool result instead, so the model recovers (NFR-O6).
 async fn execute_calls<T: ToolExecutor>(
     tools: &T,
-    calls: &[ToolCall],
+    calls: &[GuardedToolCall],
     offered: &HashSet<String>,
     ctx: &TurnContext,
     tx: &mpsc::Sender<TurnEvent>,
     cancel: &CancellationToken,
 ) -> Option<Vec<ToolOutcome>> {
-    let runs = calls.iter().map(|call| async move {
+    let runs = calls.iter().map(|guarded| async move {
+        let call = &guarded.call;
+        if !guarded.arguments_valid {
+            if offered.contains(&call.function.name) {
+                tools.record_guard_rejection(call);
+            }
+            return invalid_arguments_outcome(call);
+        }
         if offered.contains(&call.function.name) {
             return tools.execute(call, ctx, tx.clone(), cancel.clone()).await;
         }
@@ -1067,6 +1085,13 @@ mod tests {
             c.id = None;
         }
         m
+    }
+
+    fn assistant_calling_with_raw_arguments(tool: &str, arguments: &str) -> ChatMessage {
+        let mut message = assistant_calling(tool);
+        message.tool_calls.as_mut().unwrap()[0].function.arguments =
+            RawArguments::Str(arguments.into());
+        message
     }
 
     impl ChatBackend for ScriptedBackend {
@@ -2015,6 +2040,113 @@ mod tests {
             folded.contains("not offered"),
             "the model gets a non-fatal refusal, got: {folded}"
         );
+        assert_eq!(collect_text(&events), "answer", "the turn still completes");
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_arguments_are_folded_into_a_safe_retry() {
+        let backend = ScriptedBackend::new(
+            vec![assistant_calling_with_raw_arguments(
+                "web_search",
+                r#"{"query":"unterminated"#,
+            )],
+            vec!["answer".into()],
+        );
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![named_schema("web_search")]),
+            executed: executed.clone(),
+        };
+        let (tx, rx) = mpsc::channel(64);
+
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            test_recorder(),
+            tx,
+            CancellationToken::new(),
+            false,
+        )
+        .await;
+        let events = drain(rx).await;
+
+        assert!(
+            executed.lock().unwrap().is_empty(),
+            "invalid arguments must not reach the tool"
+        );
+        let seen = backend.seen.lock().unwrap();
+        let stored_call = seen
+            .iter()
+            .find_map(|message| message.tool_calls.as_ref()?.first())
+            .expect("the corrected assistant call reached the retry turn");
+        assert_eq!(stored_call.function.arguments.to_json_string(), "{}");
+        let folded = seen
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.clone())
+            .and_then(|content| content.into_text_and_images().0)
+            .expect("a structured tool error reached the retry turn");
+        let error: Value = serde_json::from_str(&folded).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_arguments");
+        assert_eq!(error["error"]["retryable"], true);
+        assert_eq!(collect_text(&events), "answer", "the turn still completes");
+    }
+
+    #[tokio::test]
+    async fn malformed_app_tool_call_is_corrected_before_forwarding() {
+        let backend = ScriptedBackend::new(
+            vec![assistant_calling_with_raw_arguments(
+                "ask_user",
+                r#"{"question":"incomplete"#,
+            )],
+            vec!["answer".into()],
+        );
+        let executed = Arc::new(Mutex::new(vec![]));
+        let tools = ScriptedTools {
+            schemas: Arc::new(vec![]),
+            executed: executed.clone(),
+        };
+        let (tx, rx) = mpsc::channel(64);
+
+        run_turn(
+            cfg_with_iters(5),
+            backend.clone(),
+            tools,
+            Arc::new(Semaphore::new(1)),
+            vec![assistant("hi")],
+            "m".into(),
+            Map::new(),
+            Some(vec![]),
+            vec![app_schema("ask_user")],
+            None,
+            None,
+            test_recorder(),
+            tx,
+            CancellationToken::new(),
+            false,
+        )
+        .await;
+        let events = drain(rx).await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, TurnEvent::ToolCalls { .. })),
+            "invalid calls must not reach the app"
+        );
+        assert!(executed.lock().unwrap().is_empty());
+        let folded = seen_tool_result(&backend).expect("the model received a retry result");
+        let error: Value = serde_json::from_str(&folded).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_arguments");
         assert_eq!(collect_text(&events), "answer", "the turn still completes");
     }
 
