@@ -442,7 +442,7 @@ final class ChatViewModelTests: XCTestCase {
         }
 
         XCTAssertEqual(client.requests.count, 3)
-        XCTAssertEqual(client.requests[1].reasoningEffort, ReasoningEffort.enabledDefault)
+        XCTAssertEqual(client.requests[1].reasoningEffort, ReasoningEffort.disabled)
         XCTAssertNil(client.requests[2].reasoningEffort)
     }
 
